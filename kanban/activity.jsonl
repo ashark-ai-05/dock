@@ -14,3 +14,9 @@
 {"timestamp":"2026-08-20T12:57:12.089724+10:00","action":"move","task_id":3,"detail":"in-progress -\u003e review"}
 {"timestamp":"2026-08-20T12:57:12.089943+10:00","action":"handoff","task_id":3,"detail":"Implement Git worktree facts and delta diff adapter"}
 {"timestamp":"2026-08-20T12:57:12.090354+10:00","action":"release","task_id":3,"detail":"Implement Git worktree facts and delta diff adapter"}
+{"timestamp":"2026-08-20T13:01:03.407748+10:00","action":"create","task_id":4,"detail":"Persist local run bindings and handoff packets"}
+{"timestamp":"2026-08-20T13:01:03.455899+10:00","action":"claim","task_id":4,"detail":"dock-persistence-agent"}
+{"timestamp":"2026-08-20T13:01:03.456278+10:00","action":"move","task_id":4,"detail":"backlog -\u003e in-progress"}
+{"timestamp":"2026-08-20T13:18:37.092713+10:00","action":"move","task_id":4,"detail":"in-progress -\u003e review"}
+{"timestamp":"2026-08-20T13:18:37.092918+10:00","action":"handoff","task_id":4,"detail":"Persist local run bindings and handoff packets"}
+{"timestamp":"2026-08-20T13:18:37.093168+10:00","action":"release","task_id":4,"detail":"Persist local run bindings and handoff packets"}

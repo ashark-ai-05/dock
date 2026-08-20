@@ -57,6 +57,15 @@ cargo run -- --git-dir=. --base=HEAD~1
 
 The adapter resolves Git facts through argument-safe subprocess calls and prefers `delta` as a renderer. It falls back to raw Git diff output if delta is unavailable or fails. Dock still never stages, commits, rebases, merges, or pushes.
 
+### Save a local-only explicit handoff
+
+```bash
+cargo run -- --save-handoff=fixtures/demo-handoff.json
+cargo run -- --load-handoff=fixture_DOCK7
+```
+
+By default, Dock writes to `.dock/local/handoffs/`, which is Git-ignored. Each save is atomic, each load validates the strict packet schema, and run IDs cannot escape the storage directory.
+
 ## Planned adapters
 
 - kanban-md CLI adapter: atomic claim/status transition

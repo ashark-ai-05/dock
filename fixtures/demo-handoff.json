@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "run_id": "fixture_DOCK7",
+  "task_id": "DOCK-7",
+  "workspace_id": "dock-fixture",
+  "pane_id": "fixture-agent",
+  "worktree": "/local/fixture-worktree",
+  "branch": "dock/fixture-handoff",
+  "base_sha": "3fa91c2",
+  "summary": "Implementation complete; one bounded decision remains.",
+  "question": "Accept V0.1 scope?",
+  "checks": [
+    { "name": "cargo test", "passed": true }
+  ]
+}

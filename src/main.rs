@@ -2,8 +2,9 @@ mod app;
 mod git;
 mod kanban;
 mod model;
+mod storage;
 
-use std::{error::Error, io};
+use std::{error::Error, fs, io};
 
 use app::{Action, App};
 use crossterm::{
@@ -23,6 +24,32 @@ use ratatui::{
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let dock_dir = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--dock-dir=").map(str::to_owned))
+        .unwrap_or_else(|| ".dock/local".into());
+    if let Some(run_id) = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--load-handoff=").map(str::to_owned))
+    {
+        let packet = storage::LocalStore::new(dock_dir)
+            .load_handoff(&run_id)
+            .map_err(io::Error::other)?;
+        println!("{}", serde_json::to_string_pretty(&packet)?);
+        return Ok(());
+    }
+    if let Some(packet_path) = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--save-handoff=").map(str::to_owned))
+    {
+        let json = fs::read(packet_path)?;
+        let packet = serde_json::from_slice(&json)?;
+        let location = storage::LocalStore::new(dock_dir)
+            .save_handoff(&packet)
+            .map_err(io::Error::other)?;
+        println!("saved {}", location.display());
+        return Ok(());
+    }
     if let Some(worktree) = args
         .iter()
         .find_map(|argument| argument.strip_prefix("--git-dir=").map(str::to_owned))

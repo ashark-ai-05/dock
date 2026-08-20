@@ -195,4 +195,4 @@ Completed before this reframe:
 - explicit LazyGit launch intent;
 - documented task contract and local smoke tests.
 
-Slices 1–5 now provide the Dock-owned PTY runtime, repository-bound adapter lifecycle, strict handoff/review loop, and explicit local multi-repository programme gates. Daily terminal-runtime parity and the later full Git/plugin/release bridge remain unimplemented.
+Slices 1–5 provide the Dock-owned PTY runtime, repository-bound adapter lifecycle, strict handoff/review loop, and explicit local multi-repository programme gates. Slice 6 now has its initial dynamic workspace/pane, strict control API, and metadata-only restart-recovery foundation; swap, zoom, terminal input/emulation, themes, notifications, and scoped mouse support remain follow-on parity work. The later full Git/plugin/release bridge remains unimplemented.

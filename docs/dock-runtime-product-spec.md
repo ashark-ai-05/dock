@@ -144,6 +144,10 @@ A developer starts `dockd`, opens two repositories, and connects one Control Pan
 
 Owned process state and bounded scrollback remain in daemon memory only. Reconnect works while the same daemon remains alive; restart does not reattach processes. Queued dependency gates persist atomically in owner-only local state, use relative path bindings, and are re-canonicalized and validated before the daemon accepts them after restart. Owner-only durable receipts reserve run identity and retain bounded structured launch evidence without raw PTY output, commands, or absolute repository/worktree paths. Strict handoff and human-decision records remain private local structured evidence.
 
+### Initial Slice 6 layout boundary
+
+Dock persists a deterministic, bounded workspace/pane split tree and concise labels separately from terminal runtime content. Each workspace admits at most 64 panes; dispatch checks and binds that capacity under the dispatch/close ownership transaction, returns a deterministic capacity error before receipt or launch when full, and frees a slot only through explicit close and owned-runtime reaping. Client reconnect observes live runtime state. Daemon restart restores every durable pane as `restored`, while panes created in the current daemon begin `empty`; restart clears run bindings and never searches for, attaches to, or signals former processes. Durable layout metadata contains no scrollback, transcript, commands, run identifiers, PID/process-group identifiers, or absolute repository/worktree paths.
+
 ## Approval gate
 
 This product specification authorises planning and the documentation reframe only. Runtime implementation, dependencies, external workflow creation, releases, and Git publication require an approved execution slice.

@@ -7,11 +7,12 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 use nix::{
     pty::openpty,
-    sys::signal::{Signal, killpg},
+    sys::signal::{Signal, kill, killpg},
     unistd::{Pid, setsid},
 };
 
@@ -28,6 +29,8 @@ pub struct RunBinding {
     pub worktree: PathBuf,
     pub branch: String,
     pub base_sha: String,
+    pub workspace_id: String,
+    pub pane_id: String,
 }
 
 #[derive(Debug)]
@@ -86,6 +89,15 @@ impl OwnedRuntime {
         adapter: ResolvedAdapter,
         scrollback_capacity: usize,
     ) -> Self {
+        Self::launch_with_before_lifecycle_publish(binding, adapter, scrollback_capacity, || {})
+    }
+
+    fn launch_with_before_lifecycle_publish(
+        binding: RunBinding,
+        adapter: ResolvedAdapter,
+        scrollback_capacity: usize,
+        before_lifecycle_publish: impl FnOnce() + Send + 'static,
+    ) -> Self {
         let command = adapter.command;
         let adapter_id = adapter.id;
         let adapter_capabilities = adapter.capabilities;
@@ -116,6 +128,7 @@ impl OwnedRuntime {
                                 "could not reap owned child: {error}"
                             )),
                         };
+                        before_lifecycle_publish();
                         *reaper_lifecycle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
@@ -186,6 +199,8 @@ impl OwnedRuntime {
                 worktree,
                 branch: "fixture".into(),
                 base_sha: "fixture".into(),
+                workspace_id: "workspace_fixture".into(),
+                pane_id: "pane_fixture".into(),
             },
             ResolvedAdapter {
                 id: AdapterId::Fixture,
@@ -232,8 +247,8 @@ impl OwnedRuntime {
             worktree: self.binding.worktree.display().to_string(),
             branch: self.binding.branch.clone(),
             base_sha: self.binding.base_sha.clone(),
-            workspace_id: format!("workspace-{}", self.binding.run_id),
-            pane_id: format!("pane-{}", self.binding.run_id),
+            workspace_id: self.binding.workspace_id.clone(),
+            pane_id: self.binding.pane_id.clone(),
             state: state.clone(),
             pid: self.pid,
             process_group_id: self
@@ -276,15 +291,48 @@ impl OwnedRuntime {
         self.signal(Signal::SIGINT)
     }
     pub fn stop(&self) -> Result<(), String> {
-        self.signal(Signal::SIGTERM)?;
-        // Capacity is based on terminal lifecycle state. Do not acknowledge stop while the reaper
-        // can still report Running, otherwise an immediate downstream release races admission.
-        if let Some(reaper) = self
-            .reaper
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+        if let Some(group) = self.owned_process_group.as_ref() {
+            // The leader watcher is not group authority: descendants can keep the exact owned
+            // PGID alive after the leader is terminal. Probe and retire that group independently.
+            if owned_group_exists(group) {
+                signal_owned_group_checked(group, Signal::SIGTERM)?;
+                if !wait_for_owned_group_exit(group, Duration::from_millis(1500)) {
+                    signal_owned_group_checked(group, Signal::SIGKILL)?;
+                    if !wait_for_owned_group_exit(group, Duration::from_millis(1500)) {
+                        return Err("Dock-owned process group did not exit after SIGKILL".into());
+                    }
+                }
+            }
+        } else if !self.lifecycle_is_terminal() {
+            return Err("run has no Dock-owned process group".into());
+        }
+        self.wait_for_lifecycle_and_join(Duration::from_millis(1500))?;
+        Ok(())
+    }
+    fn wait_for_lifecycle_and_join(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        while !self.lifecycle_is_terminal() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !self.lifecycle_is_terminal() {
+            return Err(
+                "Dock-owned process group is absent, but the leader reaper did not publish a terminal lifecycle within the stop timeout; runtime authority retained"
+                    .into(),
+            );
+        }
+        self.join_reaper_if_terminal()
+    }
+    fn lifecycle_is_terminal(&self) -> bool {
+        !matches!(
+            *self.lifecycle.lock().unwrap_or_else(|p| p.into_inner()),
+            LifecycleState::Running
+        )
+    }
+    fn join_reaper_if_terminal(&self) -> Result<(), String> {
+        if !self.lifecycle_is_terminal() {
+            return Ok(());
+        }
+        if let Some(reaper) = self.reaper.lock().unwrap_or_else(|p| p.into_inner()).take() {
             reaper
                 .join()
                 .map_err(|_| "owned child reaper panicked while stopping the run".to_owned())?;
@@ -307,12 +355,7 @@ impl OwnedRuntime {
             .owned_process_group
             .as_ref()
             .ok_or("run has no Dock-owned process group")?;
-        match killpg(group.0, signal) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH | nix::errno::Errno::EPERM) => Ok(()),
-            Err(error) => Err(format!(
-                "could not signal Dock-owned process group: {error}"
-            )),
-        }
+        checked_signal_result(killpg(group.0, signal), || probe_owned_group(group))
     }
 }
 
@@ -349,6 +392,55 @@ fn signal_owned_group(group: &OwnedProcessGroup, signal: Signal) {
     // Drop is best-effort and must remain panic-free; there is no durable transcript or error sink
     // in Slice 1. A future lifecycle receipt can surface errors other than an already-gone group.
     let _ = killpg(group.0, signal);
+}
+
+fn signal_owned_group_checked(group: &OwnedProcessGroup, signal: Signal) -> Result<(), String> {
+    checked_signal_result(killpg(group.0, signal), || probe_owned_group(group))
+}
+
+fn checked_signal_result(
+    result: Result<(), nix::errno::Errno>,
+    inspect_group: impl FnOnce() -> Result<(), nix::errno::Errno>,
+) -> Result<(), String> {
+    match result {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(nix::errno::Errno::EPERM) => match inspect_group() {
+            Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Ok(()) | Err(nix::errno::Errno::EPERM) => Err(
+                "could not signal Dock-owned process group: EPERM; exact group still exists".into(),
+            ),
+            Err(error) => Err(format!(
+                "could not signal Dock-owned process group: EPERM; could not inspect exact group: {error}"
+            )),
+        },
+        Err(error) => Err(format!(
+            "could not signal Dock-owned process group: {error}"
+        )),
+    }
+}
+
+fn probe_owned_group(group: &OwnedProcessGroup) -> Result<(), nix::errno::Errno> {
+    kill(Pid::from_raw(-group.0.as_raw()), None)
+}
+
+fn owned_group_exists(group: &OwnedProcessGroup) -> bool {
+    match probe_owned_group(group) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        // Unknown inspection failures cannot safely prove that the exact group is gone.
+        Err(_) => true,
+    }
+}
+
+fn wait_for_owned_group_exit(group: &OwnedProcessGroup, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !owned_group_exists(group) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    !owned_group_exists(group)
 }
 
 fn launch_child(
@@ -393,7 +485,7 @@ fn launch_child_with_before_spawn(
     process
         .arg("-c")
         .arg(
-            r#"(dock_cleanup() { trap '' TERM; kill -TERM -$$; sleep 1; kill -KILL -$$; }
+            r#"(dock_cleanup() { trap '' INT TERM; kill -TERM -$$; sleep 1; kill -KILL -$$; }
 trap dock_cleanup TERM
 trap 'exit 0' USR1
 IFS= read -r dock_guard <&3
@@ -401,9 +493,9 @@ dock_cleanup) &
 dock_watcher=$!
 "$@" 3<&- </dev/tty &
 dock_child=$!
-# The supervisor must survive a group SIGINT long enough to keep waiting for an
-# interrupt-capable worker. Install this only after spawn so the worker does not inherit it.
-trap '' INT
+# The supervisor must survive group lifecycle signals long enough to reap the worker. Install
+# these only after spawn so the worker receives SIGINT/SIGTERM with its own dispositions.
+trap '' INT TERM
 wait "$dock_child"
 dock_status=$?
 kill -USR1 "$dock_watcher" 2>/dev/null || true
@@ -496,6 +588,7 @@ fn read_pty(mut master: File, scrollback: Arc<Mutex<Scrollback>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     fn process_exists(pid: u32) -> bool {
@@ -572,6 +665,32 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_then_stop_boundedly_kills_term_ignoring_owned_group() {
+        let runtime = OwnedRuntime::launch_fixture(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "trap '' INT TERM; echo ready; while :; do sleep 1; done".into(),
+            ],
+            128,
+        );
+        let snapshot = wait_for(&runtime, |snapshot| snapshot.scrollback.contains("ready"));
+        let process_group_id = snapshot.process_group_id.expect("owned process group");
+
+        runtime.interrupt().expect("interrupt owned runtime");
+        assert!(process_group_exists(process_group_id));
+        let started = Instant::now();
+        runtime.stop().expect("bounded stop owned runtime");
+
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(!process_group_exists(process_group_id));
+        assert!(matches!(
+            runtime.snapshot().state,
+            ProcessState::Exited { .. }
+        ));
+    }
+
+    #[test]
     fn interrupt_capable_process_keeps_running_until_stop() {
         let runtime = OwnedRuntime::launch_fixture(
             vec![
@@ -593,6 +712,89 @@ mod tests {
 
         runtime.stop().expect("stop owned runtime");
         wait_for_group_exit(process_group_id);
+    }
+
+    #[test]
+    fn stop_retires_owned_descendant_after_leader_is_already_reaped() {
+        let runtime = OwnedRuntime::launch_fixture(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "trap '' HUP; sleep 30 & echo $!; exit 0".into(),
+            ],
+            128,
+        );
+        let terminal = wait_for(&runtime, |snapshot| {
+            matches!(snapshot.state, ProcessState::Exited { .. })
+                && snapshot.scrollback.contains('\n')
+        });
+        let process_group_id = terminal.process_group_id.expect("owned process group");
+        let descendant: u32 = terminal.scrollback.trim().parse().expect("descendant pid");
+        assert!(
+            process_exists(descendant),
+            "descendant must survive its leader"
+        );
+        assert!(process_group_exists(process_group_id));
+
+        runtime.stop().expect("stop terminal-leader owned group");
+
+        wait_for_group_exit(process_group_id);
+        assert!(!process_exists(descendant), "owned descendant escaped stop");
+    }
+
+    #[test]
+    fn stop_never_succeeds_while_esrch_precedes_lifecycle_publication() {
+        let worktree = std::env::current_dir().expect("fixture current directory");
+        let (reaped_tx, reaped_rx) = mpsc::channel();
+        let (publish_tx, publish_rx) = mpsc::channel();
+        let runtime = OwnedRuntime::launch_with_before_lifecycle_publish(
+            RunBinding {
+                repository_root: worktree.clone(),
+                external_task_ref: "fixture-task".into(),
+                run_id: "dock_esrch_before_lifecycle".into(),
+                worktree,
+                branch: "fixture".into(),
+                base_sha: "fixture".into(),
+                workspace_id: "workspace_fixture".into(),
+                pane_id: "pane_fixture".into(),
+            },
+            ResolvedAdapter {
+                id: AdapterId::Fixture,
+                executable: PathBuf::from("sh"),
+                command: vec!["sh".into(), "-c".into(), "exit 0".into()],
+                capabilities: AdapterCapabilities::default(),
+            },
+            64,
+            move || {
+                reaped_tx.send(()).expect("report child reaped");
+                publish_rx.recv().expect("release lifecycle publication");
+            },
+        );
+        reaped_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("leader must be reaped before the test probe");
+        let group = runtime
+            .owned_process_group
+            .as_ref()
+            .expect("owned process group");
+        assert_eq!(probe_owned_group(group), Err(nix::errno::Errno::ESRCH));
+        assert_eq!(runtime.snapshot().state, ProcessState::Running);
+
+        let error = runtime
+            .stop()
+            .expect_err("stop cannot succeed before terminal lifecycle publication");
+        assert!(error.contains("leader reaper did not publish a terminal lifecycle"));
+        assert!(error.contains("authority retained"));
+        assert_eq!(runtime.snapshot().state, ProcessState::Running);
+        assert!(runtime.reaper.lock().unwrap().is_some());
+
+        publish_tx.send(()).expect("publish terminal lifecycle");
+        runtime.stop().expect("retry reconciles and joins reaper");
+        assert!(matches!(
+            runtime.snapshot().state,
+            ProcessState::Exited { .. }
+        ));
+        assert!(runtime.reaper.lock().unwrap().is_none());
     }
 
     #[test]
@@ -734,6 +936,38 @@ mod tests {
         let output = String::from_utf8(child.output().unwrap().stdout).unwrap();
         assert!(output.contains("PATH=/usr/bin:/bin"));
         assert!(!output.contains("poison-"));
+    }
+
+    #[test]
+    fn checked_owned_group_signal_only_treats_a_definitively_absent_group_as_terminal() {
+        let permission_denied =
+            checked_signal_result(Err(nix::errno::Errno::EPERM), || Ok(())).unwrap_err();
+        assert!(permission_denied.contains("EPERM"));
+        assert!(permission_denied.contains("still exists"));
+        assert_eq!(
+            checked_signal_result(Err(nix::errno::Errno::EPERM), || {
+                Err(nix::errno::Errno::EPERM)
+            })
+            .unwrap_err(),
+            "could not signal Dock-owned process group: EPERM; exact group still exists"
+        );
+        assert_eq!(
+            checked_signal_result(Err(nix::errno::Errno::EPERM), || {
+                Err(nix::errno::Errno::ESRCH)
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            checked_signal_result(Err(nix::errno::Errno::ESRCH), || {
+                panic!("ESRCH must not require a second probe")
+            }),
+            Ok(())
+        );
+        assert!(
+            checked_signal_result(Err(nix::errno::Errno::EINVAL), || Ok(()))
+                .unwrap_err()
+                .contains("EINVAL")
+        );
     }
 
     #[test]

@@ -37,3 +37,7 @@
 {"timestamp":"2026-08-20T16:55:08.547992+10:00","action":"handoff","task_id":8,"detail":"Slice 4: explicit coding-agent adapter contract"}
 {"timestamp":"2026-08-20T16:55:08.548349+10:00","action":"release","task_id":8,"detail":"Slice 4: explicit coding-agent adapter contract"}
 {"timestamp":"2026-08-20T16:59:29.00829+10:00","action":"create","task_id":9,"detail":"Slice 5: programme capacity and dependency gates"}
+{"timestamp":"2026-08-20T21:19:32.549603+10:00","action":"move","task_id":9,"detail":"backlog -\u003e review"}
+{"timestamp":"2026-08-20T21:19:32.55055+10:00","action":"handoff","task_id":9,"detail":"Slice 5: programme capacity and dependency gates"}
+{"timestamp":"2026-08-20T21:19:32.55104+10:00","action":"release","task_id":9,"detail":"Slice 5: programme capacity and dependency gates"}
+{"timestamp":"2026-08-20T21:19:32.582198+10:00","action":"create","task_id":10,"detail":"Slice 6: daily terminal-runtime workspace and pane parity"}

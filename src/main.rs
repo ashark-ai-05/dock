@@ -1,4 +1,5 @@
 mod app;
+mod git;
 mod kanban;
 mod model;
 
@@ -22,6 +23,31 @@ use ratatui::{
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(worktree) = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--git-dir=").map(str::to_owned))
+    {
+        let base = args
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--base=").map(str::to_owned))
+            .unwrap_or_else(|| "HEAD".into());
+        let adapter = git::GitAdapter::new(worktree);
+        let facts = adapter.facts(&base).map_err(io::Error::other)?;
+        let (diff, rendered_with_delta) = adapter.render_diff(&base).map_err(io::Error::other)?;
+        println!(
+            "worktree={}\nbranch={}\nbase={}\nhead={}\nfiles={} +{} -{}\ndelta={}\n\n{}",
+            facts.worktree.display(),
+            facts.branch,
+            facts.base_sha,
+            facts.head_sha,
+            facts.changed_files,
+            facts.insertions,
+            facts.deletions,
+            rendered_with_delta,
+            diff
+        );
+        return Ok(());
+    }
     if let Some(board_dir) = args
         .iter()
         .find_map(|argument| argument.strip_prefix("--kanban-dir=").map(str::to_owned))

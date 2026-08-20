@@ -49,6 +49,14 @@ cargo run -- --kanban-dir=kanban
 cargo run -- --kanban-dir=kanban --claim=dock-worker
 ```
 
+### Inspect a real worktree and render a contextual diff
+
+```bash
+cargo run -- --git-dir=. --base=HEAD~1
+```
+
+The adapter resolves Git facts through argument-safe subprocess calls and prefers `delta` as a renderer. It falls back to raw Git diff output if delta is unavailable or fails. Dock still never stages, commits, rebases, merges, or pushes.
+
 ## Planned adapters
 
 - kanban-md CLI adapter: atomic claim/status transition

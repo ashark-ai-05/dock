@@ -25,9 +25,18 @@ Dock must never infer task completion from terminal output, control a process it
 
 ## Current status
 
-Slice 4 now provides provider-neutral agent launch and safe lifecycle control on the repository-bound runtime:
+Slice 5 adds a local programme-control layer to the Slice 4 repository-bound runtime:
 
-- `dockd` starts empty and accepts adapter-backed dispatches through protocol version 4;
+- `dockd` accepts bounded global and per-repository run capacity plus a human-review reserve; capacity refusal occurs before a receipt, pane, PTY, or process group exists;
+- `dock-programme` explicitly queues a downstream fixture dispatch against one exact upstream run id and required human route; Dock never discovers dependencies from tasks or terminal text;
+- explicit release requires that upstream run's strict valid handoff and matching human decision; blocked or capacity-refused release leaves the gate queued and starts nothing;
+- portfolio inspection reports opaque repository identities, sorted active/queued run ids, capacity, and deterministic gate state/reason without exposing repository/worktree paths;
+- queued dependency gates are atomically persisted in private local state and revalidated on daemon startup; private records omit raw output, commands, and absolute repository/worktree paths;
+- protocol version 5 keeps the forward-compatible hello and strict programme requests.
+
+Slice 4 continues to provide provider-neutral agent launch and safe lifecycle control:
+
+- `dockd` starts empty and accepts adapter-backed dispatches through protocol version 5;
 - explicit profiles discover `amp`, `claude`, `codex`, and `copilot`, plus deterministic `fixture` and explicit-executable `generic` adapters;
 - discovery and capability preflight happen before receipt, run, workspace, pane, PTY, or process-group creation, so a missing binary leaves no partial dispatch;
 - `dock-agent` provides attach/focus acknowledgements and interrupt/stop/restart controls for active Dock-owned runs; signals can target only the process-group capability minted at launch;
@@ -38,7 +47,7 @@ Slice 4 now provides provider-neutral agent launch and safe lifecycle control on
 - a versioned, user-only Unix socket accepts a forward-compatible hello and strict inspect requests;
 - `dock-dispatch` is the compact client/smoke path and `dock-inspect` reports one or all bound runs, including Git branch/base facts;
 - the daemon and fixture process continue running when inspectors disconnect and reconnect;
-- crash-safe owner-only local dispatch receipts immutably reserve run ids and record initial launch evidence across daemon restarts, but omit raw PTY scrollback and the raw command vector;
+- owner-only durable prelaunch reservations make every run id fail-closed before spawn; committed receipts record initial launch evidence, while an interrupted launch remains permanently non-retryable and its private guardian terminates the exact Dock-created process group when daemon ownership is lost;
 - malformed/mismatched requests, missing tasks, duplicate ids, and invalid bindings are rejected without process discovery, process import, Git mutation, or worktree creation.
 
 The earlier foundations remain available:
@@ -49,7 +58,25 @@ The earlier foundations remain available:
 - Git worktree/base/head/numstat facts and `delta` diff rendering;
 - explicit LazyGit launch intent.
 
-Live process handles and scrollback remain in memory and disappear when `dockd` exits. Dispatch identity/launch facts persist beneath the configured state directory, but daemon restart recovery does not reattach or import the former process. Slice 4 does **not** handle agent credentials, scrape terminal output for semantics, adopt arbitrary processes, create or mutate Git worktrees, mutate task systems, accept terminal input, or provide terminal-multiplexer/dependency-gate parity. Agent CLIs use their own existing user-authenticated setup. The supplied worktree must already exist at a Git worktree top-level beneath (or equal to) the canonical repository root and share that repository's Git common directory.
+Live process handles and scrollback remain in memory and disappear when `dockd` exits. Dispatch binding receipts and queued dependency gates persist beneath the configured state directory, but daemon restart recovery does not reattach or import former processes. A launch interrupted after spawn but before receipt commit is not recoverable or retryable: its guardian terminates the created group and the durable reservation keeps the run id sealed. Stored gates are re-canonicalized and rejected at startup if their Git binding or opaque repository identity no longer matches. Slice 5 does **not** handle agent credentials, scrape terminal output for semantics, adopt arbitrary processes, create or mutate Git worktrees, mutate task systems, infer/release dependencies automatically, accept terminal input, or provide terminal-multiplexer parity. Child processes receive only `HOME`, `LANG`, `LC_*`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `TMPDIR`, `USER`, and Dock's worktree marker; ambient API keys, tokens, and credential sockets are not inherited. Agent CLIs use their existing file-based authenticated setup. The supplied worktree must already exist at a Git worktree top-level beneath (or equal to) the canonical repository root and share that repository's Git common directory.
+
+## Slice 5 programme control
+
+```bash
+cargo run --bin dockd -- --global-run-capacity=3 \
+  --repository-run-capacity=1 --human-review-reserved=1
+cargo run --bin dock-programme                    # portfolio inspection
+cargo run --bin dock-programme -- --upstream-run-id=dock_upstream \
+  --required-route=accept-scope --repo=/canonical/repo-b --task=B-1 \
+  --run-id=dock_downstream --worktree=/canonical/repo-b
+cargo run --bin dock-programme -- --release=dock_downstream
+```
+
+The agent run limit is the global capacity minus the human-review reserve. `--global-run-capacity` and `--repository-run-capacity` must be positive; the reserve must be smaller than global capacity. Capacity refusal happens before durable receipt or process creation and leaves a ready gate queued for retry.
+
+The programme API adds strict `queue_gated`, `release_gate`, and `inspect_programme` requests in protocol v5. Queueing requires an active exact upstream run, a distinct unused downstream run id, a canonical Git binding, and an argument-free built-in adapter. The current CLI deliberately selects the fixture adapter. Generic executables and adapter arguments are rejected for durable gates because Dock does not persist raw commands or executable paths. After restart a gate remains inspectable and releasable when its persisted handoff and matching human decision exist, although former processes are not recovered. Release is explicit, one-time, and duplicate-safe.
+
+On macOS, `scripts/smoke-slice5-macos.sh` creates two clean temporary Git repositories and independently proves per-repository and global capacity refusal, queued handoff/decision blocking, one downstream release, portfolio state, and unchanged Git HEAD/status. It requires `jq` and cleans up its daemon and fixtures.
 
 ## Slice 4 agent adapters and lifecycle
 
@@ -153,7 +180,7 @@ The current prototype’s keyboard controls are `j/k` select, `a` accept an expl
 - Local-first by default; no hosted backend or telemetry is required.
 - Dock does not store API keys or agent credentials; each agent retains its normal authentication flow.
 - Raw terminal transcripts are not durable by default.
-- Raw dispatch command vectors are never written to durable receipts because arguments can contain credentials.
+- Raw dispatch command vectors and absolute repository/worktree paths are never written to durable receipts because arguments can contain credentials and local paths are private context.
 - External command inputs are structured and validated; durable packets reject unexpected schema fields.
 - Git mutation remains a deliberate human action.
 

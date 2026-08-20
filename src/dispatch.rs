@@ -1,21 +1,27 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
 };
 
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     adapter::AdapterSelection,
     git::GitAdapter,
     model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
-    protocol::{DispatchRequest, ErrorCode, LifecycleOperation, RuntimeSnapshot},
+    protocol::{
+        DependencyGateSnapshot, DispatchRequest, DurableProgrammeGate, ErrorCode, GateState,
+        LifecycleOperation, ProgrammeSnapshot, RepositoryPortfolioSnapshot, RuntimeSnapshot,
+    },
     runtime::{OwnedRuntime, RunBinding},
     storage::LocalStore,
 };
@@ -25,8 +31,20 @@ pub struct RuntimeRegistry {
     receipts: PathBuf,
     scrollback_capacity: usize,
     store: LocalStore,
+    programme: Mutex<ProgrammeState>,
+    capacity: CapacityPolicy,
     #[cfg(test)]
     restart_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    release_cleanup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    release_restore_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    after_launch_before_receipt_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    release_commit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    portfolio_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Clone)]
@@ -35,40 +53,162 @@ struct RuntimeEntry {
     selection: AdapterSelection,
 }
 
-#[derive(Debug, Serialize)]
-struct DispatchReceipt<'a> {
+#[derive(Debug, Clone, Copy)]
+pub struct CapacityPolicy {
+    pub global_run_capacity: usize,
+    pub per_repository_run_capacity: usize,
+    pub human_review_reserved: usize,
+}
+
+impl CapacityPolicy {
+    pub fn validate(self) -> Result<Self, String> {
+        if self.global_run_capacity == 0 || self.per_repository_run_capacity == 0 {
+            return Err("run capacities must be greater than zero".into());
+        }
+        if self.human_review_reserved >= self.global_run_capacity {
+            return Err("human review reserve must leave at least one global run slot".into());
+        }
+        Ok(self)
+    }
+    fn agent_capacity(self) -> usize {
+        self.global_run_capacity - self.human_review_reserved
+    }
+}
+
+impl Default for CapacityPolicy {
+    fn default() -> Self {
+        Self {
+            global_run_capacity: usize::MAX,
+            per_repository_run_capacity: usize::MAX,
+            human_review_reserved: 0,
+        }
+    }
+}
+
+type QueuedGate = DurableProgrammeGate;
+
+#[derive(Default)]
+struct ProgrammeState {
+    gates: HashMap<String, QueuedGate>,
+    releasing: HashSet<String>,
+    terminal_gates: HashSet<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchReceipt {
     protocol_version: u16,
-    repository_root: &'a str,
-    external_task_ref: &'a str,
-    run_id: &'a str,
-    worktree: &'a str,
-    branch: &'a str,
-    base_sha: &'a str,
-    workspace_id: &'a str,
-    pane_id: &'a str,
+    repository_id: String,
+    worktree_relative: String,
+    repository_root_canonical: bool,
+    worktree_canonical: bool,
+    shared_git_common_directory: bool,
+    external_task_ref: String,
+    run_id: String,
+    branch: String,
+    base_sha: String,
+    workspace_id: String,
+    pane_id: String,
     pid: Option<u32>,
     process_group_id: Option<i32>,
-    state: &'a crate::protocol::ProcessState,
-    diagnostic: &'a Option<String>,
-    adapter: &'a crate::adapter::AdapterId,
-    process_capabilities: &'a crate::adapter::ProcessCapabilities,
-    adapter_capabilities: &'a crate::adapter::AdapterCapabilities,
-    provider_state: &'a crate::protocol::ProviderState,
+    state: crate::protocol::ProcessState,
+    diagnostic: Option<String>,
+    adapter: crate::adapter::AdapterId,
+    process_capabilities: crate::adapter::ProcessCapabilities,
+    adapter_capabilities: crate::adapter::AdapterCapabilities,
+    provider_state: crate::protocol::ProviderState,
 }
 
 impl RuntimeRegistry {
     pub fn new(state_dir: impl Into<PathBuf>, scrollback_capacity: usize) -> Result<Self, String> {
+        Self::with_capacity(state_dir, scrollback_capacity, CapacityPolicy::default())
+    }
+
+    pub fn with_capacity(
+        state_dir: impl Into<PathBuf>,
+        scrollback_capacity: usize,
+        capacity: CapacityPolicy,
+    ) -> Result<Self, String> {
+        let capacity = capacity.validate()?;
         let state_dir = state_dir.into();
         ensure_private_directory(&state_dir, "state")?;
+        let state_dir = fs::canonicalize(&state_dir)
+            .map_err(|error| format!("could not canonicalize state directory: {error}"))?;
         let receipts = state_dir.join("dispatches");
         ensure_private_directory(&receipts, "dispatch receipt")?;
+        let store = LocalStore::new(&state_dir);
+        let mut programme = ProgrammeState::default();
+        let mut terminal_gates: HashSet<_> = store
+            .list_quarantined_programme_gate_ids()?
+            .into_iter()
+            .collect();
+        for stored_record in store.list_releasing_programme_gates()? {
+            let run_id = stored_record.run_id;
+            match stored_record.gate {
+                Ok(_) => {}
+                Err(_) => {
+                    store.quarantine_programme_gate("programme-releases", &run_id)?;
+                    terminal_gates.insert(run_id);
+                    continue;
+                }
+            }
+            let receipt = receipts.join(format!("{run_id}.json"));
+            if dispatch_receipt_is_committed(&receipt, &run_id) {
+                store.remove_releasing_programme_gate(&run_id)?;
+            } else if receipt.exists() {
+                // An uncommitted reservation may have crossed the spawn boundary. Its identity is
+                // terminal, and the launch guardian kills any process that was actually spawned.
+                store.remove_releasing_programme_gate(&run_id)?;
+            } else {
+                // Claiming alone cannot launch. With no reservation or receipt the exact gate is
+                // safely retryable, so put it back in the durable queue.
+                store.restore_programme_gate(&run_id)?;
+            }
+        }
+        for stored_record in store.list_programme_gates()? {
+            let run_id = stored_record.run_id;
+            let gate = match stored_record
+                .gate
+                .and_then(|gate| restore_durable_gate(&state_dir, gate))
+                .and_then(|gate| validate_durable_gate(&gate).map(|()| gate))
+                .and_then(|gate| {
+                    validate_upstream_dispatch_receipt(&receipts, &gate).map(|()| gate)
+                }) {
+                Ok(gate) => gate,
+                Err(_) => {
+                    store.quarantine_programme_gate("programme-gates", &run_id)?;
+                    terminal_gates.insert(run_id);
+                    continue;
+                }
+            };
+            if programme
+                .gates
+                .insert(gate.dispatch.run_id.clone(), gate)
+                .is_some()
+            {
+                return Err("duplicate durable programme gate run id".into());
+            }
+        }
+        programme.terminal_gates = terminal_gates;
         Ok(Self {
             runs: Mutex::new(HashMap::new()),
             receipts,
             scrollback_capacity,
-            store: LocalStore::new(state_dir),
+            store,
+            programme: Mutex::new(programme),
+            capacity,
             #[cfg(test)]
             restart_hook: Mutex::new(None),
+            #[cfg(test)]
+            release_cleanup_hook: Mutex::new(None),
+            #[cfg(test)]
+            release_restore_hook: Mutex::new(None),
+            #[cfg(test)]
+            after_launch_before_receipt_hook: Mutex::new(None),
+            #[cfg(test)]
+            release_commit_hook: Mutex::new(None),
+            #[cfg(test)]
+            portfolio_capture_hook: Mutex::new(None),
         })
     }
 
@@ -76,7 +216,25 @@ impl RuntimeRegistry {
         &self,
         request: DispatchRequest,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
+        self.dispatch_with_gate_authorization(request, false)
+    }
+
+    fn dispatch_with_gate_authorization(
+        &self,
+        request: DispatchRequest,
+        gate_release_authorized: bool,
+    ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
         let binding = validate_binding(&request).map_err(|m| (ErrorCode::InvalidBinding, m))?;
+        // Reject an already gated identity before adapter discovery. This is repeated under the
+        // run lock below so a concurrent queue cannot cross the dispatch admission boundary.
+        {
+            let programme = self.programme.lock().unwrap_or_else(|p| p.into_inner());
+            self.authorize_programme_dispatch(
+                &programme,
+                &request.run_id,
+                gate_release_authorized,
+            )?;
+        }
         // Adapter discovery is intentionally before the registry lock, receipt reservation, and
         // runtime construction: a missing binary must leave no run, pane, or durable receipt.
         let adapter = request
@@ -84,6 +242,11 @@ impl RuntimeRegistry {
             .resolve()
             .map_err(|m| (ErrorCode::AdapterUnavailable, m))?;
         let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+        // All operations needing both registries take runs before programme. Queueing uses the
+        // same order, so the identity check and subsequent run reservation cannot deadlock or be
+        // bypassed by a concurrent direct dispatch.
+        let programme = self.programme.lock().unwrap_or_else(|p| p.into_inner());
+        self.authorize_programme_dispatch(&programme, &request.run_id, gate_release_authorized)?;
         let receipt = self
             .receipt_path(&request.run_id)
             .map_err(|m| (ErrorCode::InvalidBinding, m))?;
@@ -93,22 +256,388 @@ impl RuntimeRegistry {
                 format!("run id {:?} already exists", request.run_id),
             ));
         }
+        self.check_capacity(&runs, &binding.repository_root)?;
         reserve_run_id(&receipt).map_err(|m| (ErrorCode::Internal, m))?;
+        drop(programme);
         let runtime = Arc::new(OwnedRuntime::launch(
             binding,
             adapter,
             self.scrollback_capacity,
         ));
         let snapshot = runtime.snapshot();
-        save_receipt(&receipt, &snapshot).map_err(|m| (ErrorCode::Internal, m))?;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_launch_before_receipt_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            hook();
+            return Err((
+                ErrorCode::Internal,
+                "injected crash after spawn before receipt commit".into(),
+            ));
+        }
+        if let Err(message) = save_receipt(&receipt, &snapshot) {
+            // The reservation is intentionally terminal: launch may have succeeded, so retrying
+            // this identity after any receipt failure could double-launch.
+            return Err((ErrorCode::Internal, message));
+        }
+        let run_id = snapshot.run_id.clone();
         runs.insert(
-            snapshot.run_id.clone(),
+            run_id.clone(),
             RuntimeEntry {
                 runtime,
                 selection: request.adapter,
             },
         );
+        if gate_release_authorized {
+            let mut programme = self.programme.lock().unwrap_or_else(|p| p.into_inner());
+            self.authorize_programme_dispatch(&programme, &run_id, true)?;
+            #[cfg(test)]
+            if let Some(hook) = self
+                .release_commit_hook
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                hook();
+            }
+            programme.gates.remove(&run_id);
+            programme.releasing.remove(&run_id);
+        }
         Ok(snapshot)
+    }
+
+    fn authorize_programme_dispatch(
+        &self,
+        programme: &ProgrammeState,
+        run_id: &str,
+        gate_release_authorized: bool,
+    ) -> Result<(), (ErrorCode, String)> {
+        let queued = programme.gates.contains_key(run_id);
+        let releasing = programme.releasing.contains(run_id);
+        if programme.terminal_gates.contains(run_id) {
+            return Err((
+                ErrorCode::GateBlocked,
+                format!("run id {run_id:?} is sealed by an invalid durable programme gate"),
+            ));
+        }
+        if gate_release_authorized && queued && releasing {
+            return Ok(());
+        }
+        if queued || releasing {
+            let state = if releasing { "releasing" } else { "queued" };
+            return Err((
+                ErrorCode::GateBlocked,
+                format!(
+                    "run id {run_id:?} is {state} in programme state; direct dispatch is forbidden and the dependency gate must be released explicitly"
+                ),
+            ));
+        }
+        if gate_release_authorized {
+            return Err((
+                ErrorCode::GateBlocked,
+                format!("run id {run_id:?} is not an authorized programme gate release"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn queue_gated(
+        &self,
+        request: DispatchRequest,
+        upstream_run_id: String,
+        required_route: ReviewRoute,
+    ) -> Result<DependencyGateSnapshot, (ErrorCode, String)> {
+        let binding = validate_binding(&request).map_err(|m| (ErrorCode::InvalidBinding, m))?;
+        validate_durable_adapter(&request).map_err(|m| (ErrorCode::InvalidBinding, m))?;
+        request
+            .adapter
+            .resolve()
+            .map_err(|m| (ErrorCode::AdapterUnavailable, m))?;
+        let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+        let upstream = runs.get(&upstream_run_id).ok_or_else(|| {
+            (
+                ErrorCode::RunNotFound,
+                format!("upstream run id {upstream_run_id:?} is not active in this daemon"),
+            )
+        })?;
+        let upstream_snapshot = upstream.runtime.snapshot();
+        if runs.contains_key(&request.run_id)
+            || self
+                .receipt_path(&request.run_id)
+                .map_err(|m| (ErrorCode::InvalidBinding, m))?
+                .exists()
+        {
+            return Err((
+                ErrorCode::DuplicateRunId,
+                format!("run id {:?} already exists", request.run_id),
+            ));
+        }
+        let mut programme = self.programme.lock().unwrap_or_else(|p| p.into_inner());
+        if programme.gates.contains_key(&request.run_id)
+            || programme.terminal_gates.contains(&request.run_id)
+        {
+            return Err((
+                ErrorCode::DuplicateGate,
+                format!(
+                    "a queued gate for downstream run {:?} already exists",
+                    request.run_id
+                ),
+            ));
+        }
+        let gate = QueuedGate {
+            schema_version: 2,
+            upstream_run_id,
+            upstream_repository_id: repository_id(Path::new(&upstream_snapshot.repository_root)),
+            downstream_repository_id: repository_id(&binding.repository_root),
+            dispatch: request,
+            required_route,
+        };
+        let snapshot = self.gate_snapshot(&gate);
+        let stored_gate = gate_for_storage(&self.receipts, &gate)
+            .map_err(|message| (ErrorCode::Internal, message))?;
+        self.store
+            .save_programme_gate(&stored_gate)
+            .map_err(|m| (ErrorCode::Internal, m))?;
+        programme.gates.insert(gate.dispatch.run_id.clone(), gate);
+        Ok(snapshot)
+    }
+
+    pub fn release_gate(
+        &self,
+        downstream_run_id: &str,
+    ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
+        let request = {
+            let mut programme = self.programme.lock().unwrap_or_else(|p| p.into_inner());
+            let gate = programme.gates.get(downstream_run_id).ok_or_else(|| {
+                (
+                    ErrorCode::GateNotFound,
+                    format!("no dependency gate exists for downstream run {downstream_run_id:?}"),
+                )
+            })?;
+            let status = self.gate_snapshot(gate);
+            if status.state != GateState::Ready {
+                return Err((
+                    ErrorCode::GateBlocked,
+                    status
+                        .validation_reason
+                        .unwrap_or_else(|| "dependency gate is not ready".into()),
+                ));
+            }
+            let request = gate.dispatch.clone();
+            if !programme.releasing.insert(downstream_run_id.to_owned()) {
+                return Err((
+                    ErrorCode::GateBlocked,
+                    format!("dependency gate {downstream_run_id:?} is already being released"),
+                ));
+            }
+            request
+        };
+        if let Err(message) = self.store.claim_programme_gate(downstream_run_id) {
+            self.programme
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .releasing
+                .remove(downstream_run_id);
+            return Err((ErrorCode::Internal, message));
+        }
+        match self.dispatch_with_gate_authorization(request, true) {
+            Ok(snapshot) => {
+                // Dispatch and its durable receipt are the commit point. Failure to remove this
+                // claim must not turn a launched run into a retryable release; startup reconciles
+                // a leftover claim against the receipt without launching again.
+                #[cfg(test)]
+                if let Some(hook) = self
+                    .release_cleanup_hook
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    hook();
+                }
+                let _ = self
+                    .store
+                    .remove_releasing_programme_gate(downstream_run_id);
+                Ok(snapshot)
+            }
+            Err(error) => {
+                #[cfg(test)]
+                if let Some(hook) = self
+                    .release_restore_hook
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    hook();
+                }
+                let restore = self.store.restore_programme_gate(downstream_run_id);
+                self.programme
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .releasing
+                    .remove(downstream_run_id);
+                match restore {
+                    Ok(()) => Err(error),
+                    Err(message) => Err((
+                        ErrorCode::Internal,
+                        format!(
+                            "release failed and its durable gate could not be restored: {message}"
+                        ),
+                    )),
+                }
+            }
+        }
+    }
+
+    pub fn inspect_programme(&self) -> ProgrammeSnapshot {
+        let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+        let programme = self.programme.lock().unwrap_or_else(|p| p.into_inner());
+        let runtime_snapshots: Vec<_> = runs.values().map(|run| run.runtime.snapshot()).collect();
+        #[cfg(test)]
+        if let Some(hook) = self
+            .portfolio_capture_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            hook();
+        }
+        let mut repositories: HashMap<String, RepositoryPortfolioSnapshot> = HashMap::new();
+        for snapshot in &runtime_snapshots {
+            if !is_capacity_active(snapshot) {
+                continue;
+            }
+            let id = repository_id(Path::new(&snapshot.repository_root));
+            let repo =
+                repositories
+                    .entry(id.clone())
+                    .or_insert_with(|| RepositoryPortfolioSnapshot {
+                        repository_id: id,
+                        active_run_ids: vec![],
+                        queued_run_ids: vec![],
+                        active_capacity: 0,
+                        run_capacity: self.capacity.per_repository_run_capacity,
+                    });
+            repo.active_run_ids.push(snapshot.run_id.clone());
+        }
+        for gate in programme.gates.values() {
+            let repo = repositories
+                .entry(gate.downstream_repository_id.clone())
+                .or_insert_with(|| RepositoryPortfolioSnapshot {
+                    repository_id: gate.downstream_repository_id.clone(),
+                    active_run_ids: vec![],
+                    queued_run_ids: vec![],
+                    active_capacity: 0,
+                    run_capacity: self.capacity.per_repository_run_capacity,
+                });
+            repo.queued_run_ids.push(gate.dispatch.run_id.clone());
+        }
+        for repo in repositories.values_mut() {
+            repo.active_run_ids.sort();
+            repo.queued_run_ids.sort();
+            repo.active_capacity = repo.active_run_ids.len();
+        }
+        let mut repositories: Vec<_> = repositories.into_values().collect();
+        repositories.sort_by(|a, b| a.repository_id.cmp(&b.repository_id));
+        let mut gates: Vec<_> = programme
+            .gates
+            .values()
+            .map(|g| self.gate_snapshot(g))
+            .collect();
+        gates.sort_by(|a, b| a.downstream_run_id.cmp(&b.downstream_run_id));
+        ProgrammeSnapshot {
+            global_active: runtime_snapshots
+                .iter()
+                .filter(|snapshot| is_capacity_active(snapshot))
+                .count(),
+            global_run_capacity: self.capacity.agent_capacity(),
+            human_review_reserved: self.capacity.human_review_reserved,
+            repositories,
+            gates,
+        }
+    }
+
+    fn check_capacity(
+        &self,
+        runs: &HashMap<String, RuntimeEntry>,
+        repository: &Path,
+    ) -> Result<(), (ErrorCode, String)> {
+        let active: Vec<_> = runs
+            .values()
+            .map(|r| r.runtime.snapshot())
+            .filter(is_capacity_active)
+            .collect();
+        if active.len() >= self.capacity.agent_capacity() {
+            return Err((
+                ErrorCode::CapacityExceeded,
+                format!(
+                    "global run capacity {} is in use ({} total slots, {} reserved for human review)",
+                    self.capacity.agent_capacity(),
+                    self.capacity.global_run_capacity,
+                    self.capacity.human_review_reserved
+                ),
+            ));
+        }
+        let repository = repository.display().to_string();
+        let repo_active = active
+            .iter()
+            .filter(|s| s.repository_root == repository)
+            .count();
+        if repo_active >= self.capacity.per_repository_run_capacity {
+            return Err((
+                ErrorCode::CapacityExceeded,
+                format!(
+                    "repository run capacity {} is in use; stop an active run or dispatch in another repository",
+                    self.capacity.per_repository_run_capacity
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn gate_snapshot(&self, gate: &QueuedGate) -> DependencyGateSnapshot {
+        let (state, validation_reason) = match self.store.load_handoff_record(&gate.upstream_run_id)
+        {
+            Err(_) => (
+                GateState::AwaitingHandoff,
+                Some(format!(
+                    "waiting for a valid handoff from exact upstream run {:?}",
+                    gate.upstream_run_id
+                )),
+            ),
+            Ok(record) if record.packet.run_id != gate.upstream_run_id => (
+                GateState::AwaitingHandoff,
+                Some("stored handoff does not match the exact upstream run identity".into()),
+            ),
+            Ok(_) => match self.store.load_decision(&gate.upstream_run_id) {
+                Err(_) => (
+                    GateState::AwaitingDecision,
+                    Some(format!(
+                        "waiting for an explicit human {:?} decision on upstream run {:?}",
+                        gate.required_route, gate.upstream_run_id
+                    )),
+                ),
+                Ok(decision) if decision.route != gate.required_route => (
+                    GateState::DecisionMismatch,
+                    Some(format!(
+                        "human decision {:?} does not satisfy required route {:?}",
+                        decision.route, gate.required_route
+                    )),
+                ),
+                Ok(_) => (GateState::Ready, None),
+            },
+        };
+        DependencyGateSnapshot {
+            upstream_run_id: gate.upstream_run_id.clone(),
+            downstream_run_id: gate.dispatch.run_id.clone(),
+            upstream_repository_id: gate.upstream_repository_id.clone(),
+            downstream_repository_id: gate.downstream_repository_id.clone(),
+            required_route: gate.required_route,
+            state,
+            validation_reason,
+        }
     }
 
     pub fn lifecycle(
@@ -483,6 +1012,132 @@ fn validate_binding(request: &DispatchRequest) -> Result<RunBinding, String> {
     })
 }
 
+fn validate_durable_adapter(request: &DispatchRequest) -> Result<(), String> {
+    if request.adapter.id == crate::adapter::AdapterId::Generic
+        || request.adapter.executable.is_some()
+        || !request.adapter.arguments.is_empty()
+    {
+        return Err(
+            "durable programme gates require an argument-free built-in adapter; raw commands and explicit executable paths are not persisted"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_durable_gate(gate: &DurableProgrammeGate) -> Result<(), String> {
+    if gate.schema_version != 2 {
+        return Err(format!(
+            "unsupported durable programme gate schema version {}",
+            gate.schema_version
+        ));
+    }
+    validate_run_id(&gate.upstream_run_id)?;
+    validate_durable_adapter(&gate.dispatch)?;
+    let binding = validate_binding(&gate.dispatch)?;
+    if repository_id(&binding.repository_root) != gate.downstream_repository_id {
+        return Err("durable programme gate downstream repository identity no longer matches its validated binding".into());
+    }
+    if gate.upstream_repository_id.is_empty() {
+        return Err("durable programme gate has no upstream repository identity".into());
+    }
+    gate.dispatch
+        .adapter
+        .resolve()
+        .map_err(|error| format!("durable programme gate adapter is unavailable: {error}"))?;
+    Ok(())
+}
+
+fn validate_upstream_dispatch_receipt(
+    receipts: &Path,
+    gate: &DurableProgrammeGate,
+) -> Result<(), String> {
+    let path = receipts.join(format!("{}.json", gate.upstream_run_id));
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("could not read exact upstream dispatch receipt: {error}"))?;
+    let receipt: DispatchReceipt = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("could not parse exact upstream dispatch receipt: {error}"))?;
+    if receipt.protocol_version != crate::protocol::PROTOCOL_VERSION {
+        return Err("exact upstream dispatch receipt has an invalid protocol version".into());
+    }
+    if receipt.run_id != gate.upstream_run_id {
+        return Err("exact upstream dispatch receipt does not match the gate run binding".into());
+    }
+    if receipt.repository_id != gate.upstream_repository_id {
+        return Err(
+            "exact upstream dispatch receipt does not match the gate repository identity".into(),
+        );
+    }
+    if !receipt.repository_root_canonical
+        || !receipt.worktree_canonical
+        || !receipt.shared_git_common_directory
+    {
+        return Err(
+            "exact upstream dispatch receipt does not contain validated binding authority".into(),
+        );
+    }
+    Ok(())
+}
+
+fn gate_for_storage(
+    receipts: &Path,
+    gate: &DurableProgrammeGate,
+) -> Result<DurableProgrammeGate, String> {
+    let state_dir = receipts
+        .parent()
+        .ok_or("dispatch receipt directory has no state parent")?;
+    let mut stored = gate.clone();
+    stored.dispatch.repository_root =
+        relative_path(state_dir, Path::new(&gate.dispatch.repository_root))?
+            .display()
+            .to_string();
+    stored.dispatch.worktree = relative_path(state_dir, Path::new(&gate.dispatch.worktree))?
+        .display()
+        .to_string();
+    Ok(stored)
+}
+
+fn restore_durable_gate(
+    state_dir: &Path,
+    mut gate: DurableProgrammeGate,
+) -> Result<DurableProgrammeGate, String> {
+    for value in [
+        &mut gate.dispatch.repository_root,
+        &mut gate.dispatch.worktree,
+    ] {
+        let path = Path::new(value);
+        if path.is_absolute() {
+            return Err("durable programme gates must not contain absolute local paths".into());
+        }
+        *value = fs::canonicalize(state_dir.join(path))
+            .map_err(|error| format!("could not restore durable gate path binding: {error}"))?
+            .display()
+            .to_string();
+    }
+    Ok(gate)
+}
+
+fn relative_path(from: &Path, to: &Path) -> Result<PathBuf, String> {
+    if !from.is_absolute() || !to.is_absolute() {
+        return Err("durable path binding requires canonical absolute inputs".into());
+    }
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let shared = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in shared..from.len() {
+        relative.push("..");
+    }
+    for component in &to[shared..] {
+        relative.push(component.as_os_str());
+    }
+    Ok(relative)
+}
+
 fn validate_run_id(value: &str) -> Result<(), String> {
     if !value.starts_with("dock_")
         || value.len() <= 5
@@ -550,30 +1205,66 @@ fn reserve_run_id(path: &Path) -> Result<(), String> {
         })?;
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("could not secure durable run-id reservation: {e}"))?;
-    file.write_all(b"{}\n")
-        .and_then(|_| file.sync_all())
-        .map_err(|e| format!("could not persist run-id reservation: {e}"))
+    if let Err(error) = file.write_all(b"{}\n").and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(path);
+        return Err(format!("could not persist run-id reservation: {error}"));
+    }
+    sync_parent(path)
+}
+
+fn sync_parent(path: &Path) -> Result<(), String> {
+    File::open(
+        path.parent()
+            .ok_or("durable record has no parent directory")?,
+    )
+    .and_then(|directory| directory.sync_all())
+    .map_err(|error| format!("could not sync durable record directory: {error}"))
+}
+
+fn dispatch_receipt_is_committed(path: &Path, run_id: &str) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<DispatchReceipt>(&bytes).ok())
+        .is_some_and(|receipt| {
+            receipt.run_id == run_id
+                && receipt.protocol_version == crate::protocol::PROTOCOL_VERSION
+                && receipt.repository_root_canonical
+                && receipt.worktree_canonical
+                && receipt.shared_git_common_directory
+        })
 }
 
 fn save_receipt(path: &Path, snapshot: &RuntimeSnapshot) -> Result<(), String> {
+    let repository_root = Path::new(&snapshot.repository_root);
+    let worktree = Path::new(&snapshot.worktree);
+    let relative = worktree
+        .strip_prefix(repository_root)
+        .map_err(|_| "validated worktree no longer belongs to its repository root")?;
     let receipt = DispatchReceipt {
         protocol_version: crate::protocol::PROTOCOL_VERSION,
-        repository_root: &snapshot.repository_root,
-        external_task_ref: &snapshot.external_task_ref,
-        run_id: &snapshot.run_id,
-        worktree: &snapshot.worktree,
-        branch: &snapshot.branch,
-        base_sha: &snapshot.base_sha,
-        workspace_id: &snapshot.workspace_id,
-        pane_id: &snapshot.pane_id,
+        repository_id: repository_id(repository_root),
+        worktree_relative: if relative.as_os_str().is_empty() {
+            ".".into()
+        } else {
+            relative.display().to_string()
+        },
+        repository_root_canonical: true,
+        worktree_canonical: true,
+        shared_git_common_directory: true,
+        external_task_ref: snapshot.external_task_ref.clone(),
+        run_id: snapshot.run_id.clone(),
+        branch: snapshot.branch.clone(),
+        base_sha: snapshot.base_sha.clone(),
+        workspace_id: snapshot.workspace_id.clone(),
+        pane_id: snapshot.pane_id.clone(),
         pid: snapshot.pid,
         process_group_id: snapshot.process_group_id,
-        state: &snapshot.state,
-        diagnostic: &snapshot.diagnostic,
-        adapter: &snapshot.adapter,
-        process_capabilities: &snapshot.process_capabilities,
-        adapter_capabilities: &snapshot.adapter_capabilities,
-        provider_state: &snapshot.provider_state,
+        state: snapshot.state.clone(),
+        diagnostic: snapshot.diagnostic.clone(),
+        adapter: snapshot.adapter.clone(),
+        process_capabilities: snapshot.process_capabilities.clone(),
+        adapter_capabilities: snapshot.adapter_capabilities.clone(),
+        provider_state: snapshot.provider_state,
     };
     let bytes = serde_json::to_vec_pretty(&receipt)
         .map_err(|e| format!("could not serialize dispatch receipt: {e}"))?;
@@ -606,6 +1297,21 @@ fn save_receipt(path: &Path, snapshot: &RuntimeSnapshot) -> Result<(), String> {
     result.map_err(|e| format!("could not atomically persist dispatch receipt: {e}"))
 }
 
+fn is_capacity_active(snapshot: &RuntimeSnapshot) -> bool {
+    matches!(snapshot.state, crate::protocol::ProcessState::Running)
+}
+
+fn repository_id(path: &Path) -> String {
+    // FNV-1a is specified here rather than delegated to Rust's Hash implementation, whose
+    // algorithm is intentionally not a durable-format contract.
+    let mut digest = 0xcbf29ce484222325_u64;
+    for byte in path.as_os_str().as_bytes() {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x100000001b3);
+    }
+    format!("repo-v2-{digest:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +1323,18 @@ mod tests {
         time::{Duration, Instant},
     };
     static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn wait_for_owned_group_exit(process_group_id: i32) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while unsafe { nix::libc::kill(-process_group_id, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { nix::libc::kill(-process_group_id, 0) },
+            0,
+            "retired Dock-owned group {process_group_id} survived lifecycle completion"
+        );
+    }
 
     struct Repo {
         root: PathBuf,
@@ -703,6 +1421,37 @@ mod tests {
         }
     }
 
+    fn ready_gate(
+        registry: &RuntimeRegistry,
+        upstream_repo: &Repo,
+        downstream_repo: &Repo,
+        suffix: &str,
+    ) -> String {
+        let upstream_id = format!("dock_{suffix}_upstream");
+        let downstream_id = format!("dock_{suffix}_downstream");
+        let mut upstream_request = upstream_repo.request(&upstream_id);
+        upstream_request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let upstream = registry.dispatch(upstream_request).unwrap();
+        let mut downstream = downstream_repo.request(&downstream_id);
+        downstream.adapter.arguments.clear();
+        registry
+            .queue_gated(
+                downstream,
+                upstream.run_id.clone(),
+                ReviewRoute::AcceptScope,
+            )
+            .unwrap();
+        registry.submit_handoff(packet(&upstream)).unwrap();
+        registry
+            .decide(
+                upstream.run_id,
+                ReviewRoute::AcceptScope,
+                "release the exact downstream".into(),
+            )
+            .unwrap();
+        downstream_id
+    }
+
     #[test]
     fn valid_bound_fixture_runs_only_in_the_supplied_directory_and_persists_no_output() {
         let repo = Repo::new("valid");
@@ -735,6 +1484,8 @@ mod tests {
         let receipt = fs::read_to_string(repo.state.join("dispatches/dock_valid.json")).unwrap();
         assert!(!receipt.contains("scrollback"));
         assert!(!receipt.contains("do-not-persist"));
+        assert!(!receipt.contains(&initial.repository_root));
+        assert!(!receipt.contains(&initial.worktree));
         assert!(
             serde_json::from_str::<serde_json::Value>(&receipt)
                 .unwrap()
@@ -742,6 +1493,16 @@ mod tests {
                 .is_none()
         );
         assert!(receipt.contains("TASK-42"));
+        let receipt_json: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt_json["worktree_relative"], "fixture");
+        assert_eq!(receipt_json["repository_root_canonical"], true);
+        assert_eq!(receipt_json["worktree_canonical"], true);
+        assert_eq!(receipt_json["shared_git_common_directory"], true);
+        assert!(
+            receipt_json["repository_id"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("repo-"))
+        );
         assert_eq!(fs::metadata(&repo.state).unwrap().mode() & 0o777, 0o700);
         assert_eq!(
             fs::metadata(repo.state.join("dispatches")).unwrap().mode() & 0o777,
@@ -754,6 +1515,949 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn two_repository_capacity_and_exact_human_gate_are_deterministic() {
+        let upstream_repo = Repo::new("programme-upstream");
+        let downstream_repo = Repo::new("programme-downstream");
+        let registry = RuntimeRegistry::with_capacity(
+            &upstream_repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 3,
+                per_repository_run_capacity: 1,
+                human_review_reserved: 1,
+            },
+        )
+        .unwrap();
+        let mut upstream_request = upstream_repo.request("dock_programme_upstream");
+        upstream_request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let upstream = registry.dispatch(upstream_request).unwrap();
+
+        let mut same_repo = upstream_repo.request("dock_same_repo_refused");
+        same_repo.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        assert!(matches!(
+            registry.dispatch(same_repo),
+            Err((ErrorCode::CapacityExceeded, _))
+        ));
+        assert!(
+            !upstream_repo
+                .state
+                .join("dispatches/dock_same_repo_refused.json")
+                .exists()
+        );
+
+        let mut downstream = downstream_repo.request("dock_programme_downstream");
+        downstream.adapter.arguments.clear();
+        let queued = registry
+            .queue_gated(
+                downstream.clone(),
+                upstream.run_id.clone(),
+                ReviewRoute::AcceptScope,
+            )
+            .unwrap();
+        assert_eq!(queued.state, GateState::AwaitingHandoff);
+        assert!(matches!(
+            registry.dispatch(downstream),
+            Err((ErrorCode::GateBlocked, message))
+                if message == "run id \"dock_programme_downstream\" is queued in programme state; direct dispatch is forbidden and the dependency gate must be released explicitly"
+        ));
+        assert!(
+            !upstream_repo
+                .state
+                .join("dispatches/dock_programme_downstream.json")
+                .exists()
+        );
+        registry
+            .programme
+            .lock()
+            .unwrap()
+            .releasing
+            .insert("dock_programme_downstream".into());
+        assert!(matches!(
+            registry.dispatch(downstream_repo.request("dock_programme_downstream")),
+            Err((ErrorCode::GateBlocked, message))
+                if message == "run id \"dock_programme_downstream\" is releasing in programme state; direct dispatch is forbidden and the dependency gate must be released explicitly"
+        ));
+        registry
+            .programme
+            .lock()
+            .unwrap()
+            .releasing
+            .remove("dock_programme_downstream");
+        assert!(matches!(
+            registry.release_gate("dock_programme_downstream"),
+            Err((ErrorCode::GateBlocked, _))
+        ));
+        assert!(
+            !upstream_repo
+                .state
+                .join("dispatches/dock_programme_downstream.json")
+                .exists()
+        );
+
+        let mut downstream_blocker = downstream_repo.request("dock_downstream_blocker");
+        downstream_blocker.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let blocker = registry.dispatch(downstream_blocker).unwrap();
+        let queued_portfolio = registry.inspect_programme();
+        assert_eq!(queued_portfolio.global_active, 2);
+        assert_eq!(queued_portfolio.gates.len(), 1);
+        assert_eq!(
+            queued_portfolio
+                .repositories
+                .iter()
+                .map(|repository| repository.queued_run_ids.len())
+                .sum::<usize>(),
+            1
+        );
+
+        registry.submit_handoff(packet(&upstream)).unwrap();
+        assert_eq!(
+            registry.inspect_programme().gates[0].state,
+            GateState::AwaitingDecision
+        );
+        registry
+            .decide(
+                upstream.run_id.clone(),
+                ReviewRoute::AcceptScope,
+                "release the declared downstream only".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            registry.inspect_programme().gates[0].state,
+            GateState::Ready
+        );
+        assert!(matches!(
+            registry.release_gate("dock_programme_downstream"),
+            Err((ErrorCode::CapacityExceeded, _))
+        ));
+        assert_eq!(
+            registry.inspect_programme().gates[0].state,
+            GateState::Ready
+        );
+        assert!(
+            !upstream_repo
+                .state
+                .join("dispatches/dock_programme_downstream.json")
+                .exists()
+        );
+        registry
+            .lifecycle(&blocker.run_id, LifecycleOperation::Stop)
+            .unwrap();
+        let stopped = registry.inspect_programme();
+        assert_eq!(stopped.global_active, 1);
+        assert_eq!(
+            stopped
+                .repositories
+                .iter()
+                .flat_map(|repository| repository.active_run_ids.iter())
+                .collect::<Vec<_>>(),
+            vec![&upstream.run_id]
+        );
+        assert_eq!(
+            stopped
+                .repositories
+                .iter()
+                .map(|repository| repository.active_capacity)
+                .sum::<usize>(),
+            1
+        );
+        let released = registry.release_gate("dock_programme_downstream").unwrap();
+        assert_eq!(released.run_id, "dock_programme_downstream");
+        assert!(matches!(
+            registry.release_gate("dock_programme_downstream"),
+            Err((ErrorCode::GateNotFound, _))
+        ));
+
+        let portfolio = registry.inspect_programme();
+        assert_eq!(portfolio.repositories.len(), 2);
+        assert_eq!(portfolio.global_active, 2);
+        assert_eq!(portfolio.global_run_capacity, 2);
+        assert_eq!(portfolio.human_review_reserved, 1);
+        assert!(portfolio.gates.is_empty());
+        registry
+            .lifecycle(&upstream.run_id, LifecycleOperation::Stop)
+            .unwrap();
+        registry
+            .lifecycle(&released.run_id, LifecycleOperation::Stop)
+            .unwrap();
+        let terminal = registry.inspect_programme();
+        assert_eq!(terminal.global_active, 0);
+        assert!(
+            terminal
+                .repositories
+                .iter()
+                .all(|repository| repository.active_run_ids.is_empty()
+                    && repository.active_capacity == 0)
+        );
+    }
+
+    #[test]
+    fn global_capacity_alone_refuses_a_run_in_another_repository() {
+        let first_repo = Repo::new("global-capacity-first");
+        let second_repo = Repo::new("global-capacity-second");
+        let registry = RuntimeRegistry::with_capacity(
+            &first_repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 1,
+                per_repository_run_capacity: 4,
+                human_review_reserved: 0,
+            },
+        )
+        .unwrap();
+        let mut first = first_repo.request("dock_global_first");
+        first.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        registry.dispatch(first).unwrap();
+        let second = second_repo.request("dock_global_refused");
+        assert!(matches!(
+            registry.dispatch(second),
+            Err((ErrorCode::CapacityExceeded, message)) if message.contains("global run capacity")
+        ));
+        assert!(
+            !first_repo
+                .state
+                .join("dispatches/dock_global_refused.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn duplicate_run_identity_precedes_capacity_refusal() {
+        let repo = Repo::new("duplicate-before-capacity");
+        let registry = RuntimeRegistry::with_capacity(
+            &repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 1,
+                per_repository_run_capacity: 1,
+                human_review_reserved: 0,
+            },
+        )
+        .unwrap();
+        let mut request = repo.request("dock_duplicate_at_capacity");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        registry.dispatch(request.clone()).unwrap();
+
+        assert!(matches!(
+            registry.dispatch(request),
+            Err((ErrorCode::DuplicateRunId, _))
+        ));
+    }
+
+    #[test]
+    fn durable_gate_reloads_and_revalidates_after_registry_restart() {
+        let upstream_repo = Repo::new("durable-upstream");
+        let downstream_repo = Repo::new("durable-downstream");
+        {
+            let registry = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+            let mut upstream = upstream_repo.request("dock_durable_upstream");
+            upstream.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+            registry.dispatch(upstream).unwrap();
+            let mut downstream = downstream_repo.request("dock_durable_downstream");
+            downstream.adapter.arguments.clear();
+            registry
+                .queue_gated(
+                    downstream,
+                    "dock_durable_upstream".into(),
+                    ReviewRoute::AcceptScope,
+                )
+                .unwrap();
+            let upstream = registry
+                .inspect(Some("dock_durable_upstream"))
+                .unwrap()
+                .remove(0);
+            registry.submit_handoff(packet(&upstream)).unwrap();
+            registry
+                .decide(
+                    upstream.run_id,
+                    ReviewRoute::AcceptScope,
+                    "survive daemon restart".into(),
+                )
+                .unwrap();
+            let durable = fs::read_to_string(
+                upstream_repo
+                    .state
+                    .join("programme-gates/dock_durable_downstream.json"),
+            )
+            .unwrap();
+            assert!(!durable.contains("sleep 30"));
+            assert_eq!(
+                fs::metadata(upstream_repo.state.join("programme-gates"))
+                    .unwrap()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        let restarted = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+        let portfolio = restarted.inspect_programme();
+        assert_eq!(portfolio.gates.len(), 1);
+        assert_eq!(
+            portfolio.gates[0].downstream_run_id,
+            "dock_durable_downstream"
+        );
+        assert_eq!(portfolio.gates[0].state, GateState::Ready);
+        let released = restarted.release_gate("dock_durable_downstream").unwrap();
+        assert_eq!(released.run_id, "dock_durable_downstream");
+        assert!(
+            !upstream_repo
+                .state
+                .join("programme-gates/dock_durable_downstream.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn durable_gate_reload_quarantines_unbound_upstream_receipts_and_restores_valid_gate() {
+        let upstream_repo = Repo::new("durable-receipt-upstream");
+        let downstream_repo = Repo::new("durable-receipt-downstream");
+        let cases = [
+            ("missing", "dock_receipt_missing_upstream"),
+            ("invalid", "dock_receipt_invalid_upstream"),
+            ("truncated", "dock_receipt_truncated_upstream"),
+            ("forged", "dock_receipt_forged_upstream"),
+            ("run_mismatch", "dock_receipt_run_mismatch_upstream"),
+            ("repo_mismatch", "dock_receipt_repo_mismatch_upstream"),
+            ("valid", "dock_receipt_valid_upstream"),
+        ];
+        {
+            let registry = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+            for (case, upstream_id) in cases {
+                let mut upstream_request = upstream_repo.request(upstream_id);
+                upstream_request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+                registry.dispatch(upstream_request).unwrap();
+
+                let mut downstream =
+                    downstream_repo.request(&format!("dock_receipt_{case}_downstream"));
+                downstream.adapter.arguments.clear();
+                registry
+                    .queue_gated(downstream, upstream_id.into(), ReviewRoute::AcceptScope)
+                    .unwrap();
+            }
+            let stored_valid = fs::read_to_string(
+                upstream_repo
+                    .state
+                    .join("programme-gates/dock_receipt_valid_downstream.json"),
+            )
+            .unwrap();
+            assert!(!stored_valid.contains(&downstream_repo.root.display().to_string()));
+            assert!(!stored_valid.contains("sleep 30"));
+        }
+
+        let receipts = upstream_repo.state.join("dispatches");
+        fs::remove_file(receipts.join("dock_receipt_missing_upstream.json")).unwrap();
+        fs::write(
+            receipts.join("dock_receipt_invalid_upstream.json"),
+            b"{not-json}\n",
+        )
+        .unwrap();
+        fs::write(
+            receipts.join("dock_receipt_truncated_upstream.json"),
+            br#"{"protocol_version":5,"repository_id":"repo-v2-"#,
+        )
+        .unwrap();
+        let forged_path = receipts.join("dock_receipt_forged_upstream.json");
+        let forged_receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&forged_path).unwrap()).unwrap();
+        fs::write(
+            &forged_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "protocol_version": forged_receipt["protocol_version"],
+                "run_id": forged_receipt["run_id"],
+                "repository_id": forged_receipt["repository_id"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let run_mismatch_path = receipts.join("dock_receipt_run_mismatch_upstream.json");
+        let mut run_mismatch: serde_json::Value =
+            serde_json::from_slice(&fs::read(&run_mismatch_path).unwrap()).unwrap();
+        run_mismatch["run_id"] = serde_json::json!("dock_different_upstream");
+        fs::write(
+            &run_mismatch_path,
+            serde_json::to_vec_pretty(&run_mismatch).unwrap(),
+        )
+        .unwrap();
+        let repo_mismatch_path = receipts.join("dock_receipt_repo_mismatch_upstream.json");
+        let mut repo_mismatch: serde_json::Value =
+            serde_json::from_slice(&fs::read(&repo_mismatch_path).unwrap()).unwrap();
+        repo_mismatch["repository_id"] = serde_json::json!("repo-v2-0000000000000000");
+        fs::write(
+            &repo_mismatch_path,
+            serde_json::to_vec_pretty(&repo_mismatch).unwrap(),
+        )
+        .unwrap();
+
+        let restarted = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+        let portfolio = restarted.inspect_programme();
+        assert_eq!(portfolio.gates.len(), 1);
+        assert_eq!(
+            portfolio.gates[0].downstream_run_id,
+            "dock_receipt_valid_downstream"
+        );
+        assert_eq!(
+            restarted
+                .store
+                .list_quarantined_programme_gate_ids()
+                .unwrap(),
+            vec![
+                "dock_receipt_forged_downstream",
+                "dock_receipt_invalid_downstream",
+                "dock_receipt_missing_downstream",
+                "dock_receipt_repo_mismatch_downstream",
+                "dock_receipt_run_mismatch_downstream",
+                "dock_receipt_truncated_downstream",
+            ]
+        );
+    }
+
+    #[test]
+    fn corrupt_durable_gate_is_quarantined_without_blocking_valid_gate_restore() {
+        let upstream_repo = Repo::new("durable-corrupt-upstream");
+        let downstream_repo = Repo::new("durable-corrupt-downstream");
+        {
+            let registry = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+            let mut upstream_request = upstream_repo.request("dock_quarantine_upstream");
+            upstream_request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+            let upstream = registry.dispatch(upstream_request).unwrap();
+            let mut valid = downstream_repo.request("dock_quarantine_valid");
+            valid.adapter.arguments.clear();
+            registry
+                .queue_gated(valid, upstream.run_id, ReviewRoute::AcceptScope)
+                .unwrap();
+            let gates = upstream_repo.state.join("programme-gates");
+            fs::write(gates.join("dock_quarantine_corrupt.json"), b"{not-json}\n").unwrap();
+        }
+
+        let restarted = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+        let portfolio = restarted.inspect_programme();
+        assert_eq!(portfolio.gates.len(), 1);
+        assert_eq!(
+            portfolio.gates[0].downstream_run_id,
+            "dock_quarantine_valid"
+        );
+        assert!(matches!(
+            restarted.dispatch(downstream_repo.request("dock_quarantine_corrupt")),
+            Err((ErrorCode::GateBlocked, message))
+                if message == "run id \"dock_quarantine_corrupt\" is sealed by an invalid durable programme gate"
+        ));
+        let quarantine = upstream_repo.state.join("programme-gate-quarantine");
+        assert!(quarantine.join("dock_quarantine_corrupt.json").exists());
+        assert_eq!(fs::metadata(quarantine).unwrap().mode() & 0o777, 0o700);
+
+        drop(restarted);
+        let restarted_again = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+        assert!(matches!(
+            restarted_again.dispatch(downstream_repo.request("dock_quarantine_corrupt")),
+            Err((ErrorCode::GateBlocked, _))
+        ));
+    }
+
+    #[test]
+    fn released_run_and_gate_change_atomically_for_programme_inspection() {
+        let upstream_repo = Repo::new("atomic-release-upstream");
+        let downstream_repo = Repo::new("atomic-release-downstream");
+        let registry = Arc::new(RuntimeRegistry::new(&upstream_repo.state, 64).unwrap());
+        let downstream_id = ready_gate(
+            &registry,
+            &upstream_repo,
+            &downstream_repo,
+            "atomic_inspection",
+        );
+        let commit_barrier = Arc::new(std::sync::Barrier::new(2));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        *registry.release_commit_hook.lock().unwrap() = Some(Arc::new({
+            let commit_barrier = Arc::clone(&commit_barrier);
+            move || {
+                entered_tx.send(()).unwrap();
+                commit_barrier.wait();
+            }
+        }));
+        let release = {
+            let registry = Arc::clone(&registry);
+            let downstream_id = downstream_id.clone();
+            thread::spawn(move || registry.release_gate(&downstream_id))
+        };
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+
+        let (inspection_tx, inspection_rx) = std::sync::mpsc::channel();
+        let inspector = {
+            let registry = Arc::clone(&registry);
+            thread::spawn(move || inspection_tx.send(registry.inspect_programme()).unwrap())
+        };
+        assert!(
+            inspection_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+        commit_barrier.wait();
+        release.join().unwrap().unwrap();
+        let portfolio = inspection_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        inspector.join().unwrap();
+        assert!(portfolio.gates.is_empty());
+        assert_eq!(
+            portfolio
+                .repositories
+                .iter()
+                .flat_map(|repository| repository.queued_run_ids.iter())
+                .filter(|run_id| *run_id == &downstream_id)
+                .count(),
+            0
+        );
+        assert_eq!(
+            portfolio
+                .repositories
+                .iter()
+                .flat_map(|repository| repository.active_run_ids.iter())
+                .filter(|run_id| *run_id == &downstream_id)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn portfolio_capacity_uses_one_runtime_snapshot_when_state_flips() {
+        let repo = Repo::new("portfolio-state-flip");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let mut request = repo.request("dock_portfolio_state_flip");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let snapshot = registry.dispatch(request).unwrap();
+        let runtime = registry.runs.lock().unwrap()[&snapshot.run_id]
+            .runtime
+            .clone();
+        *registry.portfolio_capture_hook.lock().unwrap() = Some(Arc::new(move || {
+            runtime.stop().unwrap();
+        }));
+
+        let portfolio = registry.inspect_programme();
+        assert_eq!(portfolio.global_active, 1);
+        assert_eq!(
+            portfolio
+                .repositories
+                .iter()
+                .map(|repository| repository.active_capacity)
+                .sum::<usize>(),
+            portfolio.global_active
+        );
+        assert_eq!(
+            portfolio
+                .repositories
+                .iter()
+                .map(|repository| repository.active_run_ids.len())
+                .sum::<usize>(),
+            portfolio.global_active
+        );
+        assert_eq!(registry.inspect_programme().global_active, 0);
+    }
+
+    #[test]
+    fn stable_repository_identifier_has_an_explicit_durable_algorithm() {
+        assert_eq!(
+            repository_id(Path::new("/canonical/repository")),
+            "repo-v2-f38d7425ff328465"
+        );
+    }
+
+    #[test]
+    fn release_claim_storage_failure_launches_nothing_and_is_retryable() {
+        let upstream_repo = Repo::new("claim-failure-upstream");
+        let downstream_repo = Repo::new("claim-failure-downstream");
+        let registry = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+        let downstream_id =
+            ready_gate(&registry, &upstream_repo, &downstream_repo, "claim_failure");
+        let obstructing_path = upstream_repo
+            .state
+            .join("programme-releases")
+            .join(format!("{downstream_id}.json"));
+        fs::create_dir_all(&obstructing_path).unwrap();
+
+        assert!(matches!(
+            registry.release_gate(&downstream_id),
+            Err((ErrorCode::Internal, message)) if message.contains("release claim")
+        ));
+        assert!(matches!(
+            registry.inspect(Some(&downstream_id)),
+            Err((ErrorCode::RunNotFound, _))
+        ));
+        assert!(
+            upstream_repo
+                .state
+                .join("programme-gates")
+                .join(format!("{downstream_id}.json"))
+                .exists()
+        );
+        fs::remove_dir(&obstructing_path).unwrap();
+        let released = registry.release_gate(&downstream_id).unwrap();
+        assert_eq!(released.run_id, downstream_id);
+    }
+
+    #[test]
+    fn release_cleanup_storage_failure_still_commits_once_without_an_orphan_gate() {
+        let upstream_repo = Repo::new("cleanup-failure-upstream");
+        let downstream_repo = Repo::new("cleanup-failure-downstream");
+        let registry = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+        let downstream_id = ready_gate(
+            &registry,
+            &upstream_repo,
+            &downstream_repo,
+            "cleanup_failure",
+        );
+        let claim = upstream_repo
+            .state
+            .join("programme-releases")
+            .join(format!("{downstream_id}.json"));
+        *registry.release_cleanup_hook.lock().unwrap() = Some(Arc::new({
+            let claim = claim.clone();
+            move || {
+                fs::remove_file(&claim).unwrap();
+                fs::create_dir(&claim).unwrap();
+            }
+        }));
+
+        let released = registry.release_gate(&downstream_id).unwrap();
+        assert_eq!(released.run_id, downstream_id);
+        assert_eq!(registry.inspect(Some(&released.run_id)).unwrap().len(), 1);
+        assert!(registry.inspect_programme().gates.is_empty());
+        assert!(matches!(
+            registry.release_gate(&released.run_id),
+            Err((ErrorCode::GateNotFound, _))
+        ));
+    }
+
+    #[test]
+    fn restart_reconciles_a_committed_release_claim_without_duplicate_launch() {
+        let upstream_repo = Repo::new("claim-recovery-upstream");
+        let downstream_repo = Repo::new("claim-recovery-downstream");
+        let downstream_id;
+        {
+            let registry = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+            downstream_id = ready_gate(
+                &registry,
+                &upstream_repo,
+                &downstream_repo,
+                "claim_recovery",
+            );
+            let request = registry
+                .programme
+                .lock()
+                .unwrap()
+                .gates
+                .get(&downstream_id)
+                .unwrap()
+                .dispatch
+                .clone();
+            registry.store.claim_programme_gate(&downstream_id).unwrap();
+            registry
+                .programme
+                .lock()
+                .unwrap()
+                .releasing
+                .insert(downstream_id.clone());
+            registry
+                .dispatch_with_gate_authorization(request, true)
+                .unwrap();
+        }
+
+        let restarted = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+        assert!(restarted.inspect_programme().gates.is_empty());
+        assert!(
+            !upstream_repo
+                .state
+                .join("programme-releases")
+                .join(format!("{downstream_id}.json"))
+                .exists()
+        );
+        assert!(matches!(
+            restarted.release_gate(&downstream_id),
+            Err((ErrorCode::GateNotFound, _))
+        ));
+    }
+
+    #[test]
+    fn restart_restores_a_claim_that_never_reserved_or_launched() {
+        let upstream_repo = Repo::new("pre-reservation-recovery-upstream");
+        let downstream_repo = Repo::new("pre-reservation-recovery-downstream");
+        let downstream_id;
+        {
+            let registry = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+            downstream_id = ready_gate(
+                &registry,
+                &upstream_repo,
+                &downstream_repo,
+                "pre_reservation_recovery",
+            );
+            registry.store.claim_programme_gate(&downstream_id).unwrap();
+        }
+
+        let restarted = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+        assert_eq!(restarted.inspect_programme().gates.len(), 1);
+        assert_eq!(
+            restarted.inspect_programme().gates[0].downstream_run_id,
+            downstream_id
+        );
+        assert!(
+            upstream_repo
+                .state
+                .join("programme-gates")
+                .join(format!("{downstream_id}.json"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn restart_recovers_a_retryable_dispatch_failure_after_restore_failed() {
+        let upstream_repo = Repo::new("failed-restore-upstream");
+        let downstream_repo = Repo::new("failed-restore-downstream");
+        let downstream_id;
+        let obstruction;
+        {
+            let registry = RuntimeRegistry::with_capacity(
+                &upstream_repo.state,
+                64,
+                CapacityPolicy {
+                    global_run_capacity: 1,
+                    per_repository_run_capacity: 1,
+                    human_review_reserved: 0,
+                },
+            )
+            .unwrap();
+            downstream_id = ready_gate(
+                &registry,
+                &upstream_repo,
+                &downstream_repo,
+                "failed_restore",
+            );
+            obstruction = upstream_repo
+                .state
+                .join("programme-gates")
+                .join(format!("{downstream_id}.json"));
+            *registry.release_restore_hook.lock().unwrap() = Some(Arc::new({
+                let obstruction = obstruction.clone();
+                move || fs::create_dir(&obstruction).unwrap()
+            }));
+            assert!(matches!(
+                registry.release_gate(&downstream_id),
+                Err((ErrorCode::Internal, message)) if message.contains("could not be restored")
+            ));
+            assert!(
+                upstream_repo
+                    .state
+                    .join("programme-releases")
+                    .join(format!("{downstream_id}.json"))
+                    .exists()
+            );
+            fs::remove_dir(&obstruction).unwrap();
+        }
+
+        let restarted = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+        assert_eq!(restarted.inspect_programme().gates.len(), 1);
+        assert_eq!(
+            restarted.inspect_programme().gates[0].downstream_run_id,
+            downstream_id
+        );
+    }
+
+    #[test]
+    fn restart_terminalizes_an_incomplete_first_release_reservation() {
+        let upstream_repo = Repo::new("reservation-recovery-upstream");
+        let downstream_repo = Repo::new("reservation-recovery-downstream");
+        let downstream_id;
+        {
+            let registry = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+            downstream_id = ready_gate(
+                &registry,
+                &upstream_repo,
+                &downstream_repo,
+                "reservation_recovery",
+            );
+            registry.store.claim_programme_gate(&downstream_id).unwrap();
+            reserve_run_id(&registry.receipt_path(&downstream_id).unwrap()).unwrap();
+        }
+
+        let restarted = RuntimeRegistry::new(&upstream_repo.state, 64).unwrap();
+        assert!(restarted.inspect_programme().gates.is_empty());
+        assert!(matches!(
+            restarted.release_gate(&downstream_id),
+            Err((ErrorCode::GateNotFound, _))
+        ));
+        assert!(
+            upstream_repo
+                .state
+                .join("dispatches")
+                .join(format!("{downstream_id}.json"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn crash_after_spawn_before_receipt_is_guarded_and_never_retried() {
+        let repo = Repo::new("after-spawn-before-receipt");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let marker = repo.root.join("guarded-pid");
+        let mut request = repo.request("dock_guarded_window");
+        request.adapter.arguments = vec![
+            "-c".into(),
+            format!("echo $$ > {}; sleep 30", marker.display()),
+        ];
+        *registry.after_launch_before_receipt_hook.lock().unwrap() = Some(Arc::new({
+            let marker = marker.clone();
+            move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !marker.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    marker.exists(),
+                    "guarded child did not reach the injected window"
+                );
+            }
+        }));
+        assert!(matches!(
+            registry.dispatch(request.clone()),
+            Err((ErrorCode::Internal, _))
+        ));
+        let pid: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while unsafe { nix::libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { nix::libc::kill(pid, 0) },
+            0,
+            "orphan survived guardian loss"
+        );
+        drop(registry);
+
+        let restarted = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        assert!(matches!(
+            restarted.dispatch(request),
+            Err((ErrorCode::DuplicateRunId, _))
+        ));
+        assert_eq!(fs::read_to_string(marker).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_release_is_duplicate_safe_and_launches_once() {
+        let upstream_repo = Repo::new("release-race-upstream");
+        let downstream_repo = Repo::new("release-race-downstream");
+        let registry = Arc::new(RuntimeRegistry::new(&upstream_repo.state, 64).unwrap());
+        let mut upstream_request = upstream_repo.request("dock_release_race_upstream");
+        upstream_request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let upstream = registry.dispatch(upstream_request).unwrap();
+        let mut downstream = downstream_repo.request("dock_release_race_downstream");
+        downstream.adapter.arguments.clear();
+        registry
+            .queue_gated(
+                downstream,
+                upstream.run_id.clone(),
+                ReviewRoute::AcceptScope,
+            )
+            .unwrap();
+        registry.submit_handoff(packet(&upstream)).unwrap();
+        registry
+            .decide(
+                upstream.run_id,
+                ReviewRoute::AcceptScope,
+                "release exactly once".into(),
+            )
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    registry.release_gate("dock_release_race_downstream")
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            registry
+                .inspect(Some("dock_release_race_downstream"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(registry.inspect_programme().gates.is_empty());
+    }
+
+    #[test]
+    fn concurrent_direct_dispatch_cannot_bypass_release_or_deadlock() {
+        let upstream_repo = Repo::new("dispatch-release-race-upstream");
+        let downstream_repo = Repo::new("dispatch-release-race-downstream");
+        let registry = Arc::new(RuntimeRegistry::new(&upstream_repo.state, 64).unwrap());
+        let downstream_id = ready_gate(
+            &registry,
+            &upstream_repo,
+            &downstream_repo,
+            "dispatch_release_race",
+        );
+        let direct_request = registry
+            .programme
+            .lock()
+            .unwrap()
+            .gates
+            .get(&downstream_id)
+            .unwrap()
+            .dispatch
+            .clone();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let release = {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            let sender = sender.clone();
+            let downstream_id = downstream_id.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                sender
+                    .send((true, registry.release_gate(&downstream_id).map(|_| ())))
+                    .unwrap();
+            })
+        };
+        let direct = {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                sender
+                    .send((false, registry.dispatch(direct_request).map(|_| ())))
+                    .unwrap();
+            })
+        };
+        barrier.wait();
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            results.push(
+                receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("dispatch/release lock ordering deadlocked"),
+            );
+        }
+        release.join().unwrap();
+        direct.join().unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|(is_release, result)| *is_release && result.is_ok())
+        );
+        assert!(results.iter().any(|(is_release, result)| {
+            !*is_release
+                && matches!(
+                    result,
+                    Err((ErrorCode::GateBlocked | ErrorCode::DuplicateRunId, _))
+                )
+        }));
+        assert_eq!(registry.inspect(Some(&downstream_id)).unwrap().len(), 1);
     }
 
     #[test]
@@ -794,6 +2498,7 @@ mod tests {
             .lifecycle("dock_lifecycle", LifecycleOperation::Restart)
             .unwrap();
         assert_ne!(first.process_group_id, restarted.process_group_id);
+        wait_for_owned_group_exit(first.process_group_id.expect("first owned group"));
         // Dispatch receipts are immutable run-id reservations and launch evidence. Restart does
         // not risk a crash-torn update of process-local facts that cannot be recovered on reboot.
         assert_eq!(fs::read(&receipt_path).unwrap(), original_receipt);
@@ -811,6 +2516,7 @@ mod tests {
         registry
             .lifecycle("dock_lifecycle", LifecycleOperation::Stop)
             .unwrap();
+        wait_for_owned_group_exit(restarted.process_group_id.expect("replacement owned group"));
         unrelated.kill().unwrap();
         unrelated.wait().unwrap();
     }

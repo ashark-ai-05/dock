@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod dispatch;
 pub mod git;
 pub mod model;

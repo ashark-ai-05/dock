@@ -15,7 +15,10 @@ use nix::{
     unistd::{Pid, setsid},
 };
 
-use crate::protocol::{ProcessState, RuntimeSnapshot};
+use crate::{
+    adapter::{AdapterCapabilities, AdapterId, ProcessCapabilities, ResolvedAdapter},
+    protocol::{ProcessState, ProviderState, RuntimeSnapshot},
+};
 
 #[derive(Debug, Clone)]
 pub struct RunBinding {
@@ -53,6 +56,8 @@ impl Scrollback {
 pub struct OwnedRuntime {
     binding: RunBinding,
     command: Vec<String>,
+    adapter: AdapterId,
+    adapter_capabilities: AdapterCapabilities,
     lifecycle: Arc<Mutex<LifecycleState>>,
     child: Arc<Mutex<Option<Child>>>,
     reaper: Mutex<Option<thread::JoinHandle<()>>>,
@@ -75,7 +80,14 @@ enum LifecycleState {
 }
 
 impl OwnedRuntime {
-    pub fn launch(binding: RunBinding, command: Vec<String>, scrollback_capacity: usize) -> Self {
+    pub fn launch(
+        binding: RunBinding,
+        adapter: ResolvedAdapter,
+        scrollback_capacity: usize,
+    ) -> Self {
+        let command = adapter.command;
+        let adapter_id = adapter.id;
+        let adapter_capabilities = adapter.capabilities;
         let scrollback = Arc::new(Mutex::new(Scrollback {
             bytes: VecDeque::with_capacity(scrollback_capacity),
             capacity: scrollback_capacity,
@@ -110,6 +122,8 @@ impl OwnedRuntime {
                     Ok(reaper) => Self {
                         binding,
                         command,
+                        adapter: adapter_id,
+                        adapter_capabilities,
                         lifecycle,
                         child,
                         reaper: Mutex::new(Some(reaper)),
@@ -124,6 +138,8 @@ impl OwnedRuntime {
                     Err(error) => Self {
                         binding,
                         command,
+                        adapter: adapter_id,
+                        adapter_capabilities,
                         lifecycle: Arc::new(Mutex::new(LifecycleState::Unavailable(format!(
                             "could not start child reaper: {error}"
                         )))),
@@ -142,6 +158,8 @@ impl OwnedRuntime {
             Err(error) => Self {
                 binding,
                 command,
+                adapter: adapter_id,
+                adapter_capabilities,
                 lifecycle: Arc::new(Mutex::new(LifecycleState::Unavailable(error.clone()))),
                 child: Arc::new(Mutex::new(None)),
                 reaper: Mutex::new(None),
@@ -165,7 +183,14 @@ impl OwnedRuntime {
                 branch: "fixture".into(),
                 base_sha: "fixture".into(),
             },
-            command,
+            ResolvedAdapter {
+                id: AdapterId::Fixture,
+                executable: PathBuf::from(&command[0]),
+                command,
+                capabilities: AdapterCapabilities {
+                    ..AdapterCapabilities::default()
+                },
+            },
             scrollback_capacity,
         )
     }
@@ -205,18 +230,71 @@ impl OwnedRuntime {
             base_sha: self.binding.base_sha.clone(),
             workspace_id: format!("workspace-{}", self.binding.run_id),
             pane_id: format!("pane-{}", self.binding.run_id),
-            state,
+            state: state.clone(),
             pid: self.pid,
             process_group_id: self
                 .owned_process_group
                 .as_ref()
                 .map(|group| group.0.as_raw()),
             command: self.command.clone(),
+            adapter: self.adapter.clone(),
+            process_capabilities: ProcessCapabilities::OWNED_RUNTIME,
+            adapter_capabilities: self.adapter_capabilities.clone(),
+            provider_state: if !self.adapter_capabilities.provider_lifecycle {
+                ProviderState::Unknown
+            } else {
+                match state {
+                    ProcessState::Running => ProviderState::Running,
+                    ProcessState::Exited { .. } => ProviderState::Exited,
+                    _ => ProviderState::Unknown,
+                }
+            },
             scrollback: String::from_utf8_lossy(&bytes).into_owned(),
             scrollback_bytes: bytes.len(),
             scrollback_capacity_bytes: scrollback.capacity,
             scrollback_truncated: scrollback.truncated,
             diagnostic: self.launch_error.clone().or(runtime_diagnostic),
+        }
+    }
+
+    pub fn binding(&self) -> RunBinding {
+        self.binding.clone()
+    }
+    pub fn resolved_adapter(&self) -> ResolvedAdapter {
+        ResolvedAdapter {
+            id: self.adapter.clone(),
+            executable: PathBuf::from(&self.command[0]),
+            command: self.command.clone(),
+            capabilities: self.adapter_capabilities.clone(),
+        }
+    }
+    pub fn interrupt(&self) -> Result<(), String> {
+        self.signal(Signal::SIGINT)
+    }
+    pub fn stop(&self) -> Result<(), String> {
+        self.signal(Signal::SIGTERM)
+    }
+    fn signal(&self, signal: Signal) -> Result<(), String> {
+        if !matches!(
+            *self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            LifecycleState::Running
+        ) {
+            // The reaper has revoked operational ownership of an exited group. In particular,
+            // never signal a stale numeric PGID which the OS could eventually reuse.
+            return Ok(());
+        }
+        let group = self
+            .owned_process_group
+            .as_ref()
+            .ok_or("run has no Dock-owned process group")?;
+        match killpg(group.0, signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH | nix::errno::Errno::EPERM) => Ok(()),
+            Err(error) => Err(format!(
+                "could not signal Dock-owned process group: {error}"
+            )),
         }
     }
 }

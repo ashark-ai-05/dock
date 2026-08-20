@@ -202,6 +202,18 @@ fn handle_connection_with_timeout(
                 Ok(snapshot) => write_response(stream, &Response::Dispatched { snapshot })?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
+            Ok(Request::Lifecycle(request)) => match runtime
+                .lifecycle(&request.run_id, request.operation)
+            {
+                Ok(snapshot) => write_response(
+                    stream,
+                    &Response::LifecycleApplied {
+                        operation: request.operation,
+                        snapshot,
+                    },
+                )?,
+                Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
+            },
             Ok(Request::SubmitHandoff(request)) => match runtime.submit_handoff(request.packet) {
                 Ok(record) => write_response(stream, &Response::HandoffSubmitted { record })?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
@@ -417,7 +429,7 @@ mod tests {
         assert!(matches!(
             exchange(
                 &[
-                    r#"{"type":"hello","version":3,"future":true}"#,
+                    r#"{"type":"hello","version":4,"future":true}"#,
                     r#"{"type":"inspect","future":true}"#
                 ],
                 &runtime
@@ -493,10 +505,14 @@ mod tests {
                 external_task_ref: "TASK-SOCKET".into(),
                 run_id: "dock_socket_reconnect".into(),
                 worktree: root,
-                command: vec!["sh".into(), "-c".into(), "sleep 2".into()],
+                adapter: crate::adapter::AdapterSelection {
+                    id: crate::adapter::AdapterId::Fixture,
+                    executable: None,
+                    arguments: vec!["-c".into(), "sleep 2".into()],
+                },
             }))
             .unwrap();
-        let hello = r#"{"type":"hello","version":3}"#;
+        let hello = r#"{"type":"hello","version":4}"#;
         let dispatched = exchange(&[hello, &dispatch], &runtime);
         let pid = match &dispatched[1] {
             Response::Dispatched { snapshot } => snapshot.pid,
@@ -548,7 +564,7 @@ mod tests {
                 ..
             }]
         ));
-        let requests = [r#"{"type":"hello","version":3}"#, r#"{"type":"inspect"}"#];
+        let requests = [r#"{"type":"hello","version":4}"#, r#"{"type":"inspect"}"#];
         let first = socket_exchange(&socket, &requests);
         let second = socket_exchange(&socket, &requests);
         let snapshot_count = |responses: &[Response]| match &responses[1] {

@@ -6,6 +6,7 @@ use std::{
 };
 
 use dock::{
+    adapter::{AdapterId, AdapterSelection},
     paths,
     protocol::{DispatchRequest, HelloRequest, PROTOCOL_VERSION, Request, Response},
 };
@@ -17,6 +18,8 @@ fn main() -> Result<(), String> {
     let mut run_id = None;
     let mut worktree = None;
     let mut command = Vec::new();
+    let mut adapter = AdapterId::Fixture;
+    let mut executable = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--" {
@@ -33,9 +36,21 @@ fn main() -> Result<(), String> {
             run_id = Some(v.to_owned());
         } else if let Some(v) = arg.strip_prefix("--worktree=") {
             worktree = Some(v.to_owned());
+        } else if let Some(v) = arg.strip_prefix("--adapter=") {
+            adapter = match v {
+                "fixture" => AdapterId::Fixture,
+                "amp" => AdapterId::Amp,
+                "claude-code" => AdapterId::ClaudeCode,
+                "codex-cli" => AdapterId::CodexCli,
+                "github-copilot-cli" => AdapterId::GithubCopilotCli,
+                "generic" => AdapterId::Generic,
+                _ => return Err(format!("unknown adapter {v:?}")),
+            };
+        } else if let Some(v) = arg.strip_prefix("--executable=") {
+            executable = Some(v.to_owned());
         } else {
             return Err(format!(
-                "unknown option {arg:?}; usage: dock-dispatch --repo=PATH --task=REF --run-id=dock_ID --worktree=PATH [--socket=PATH] -- COMMAND [ARG ...]"
+                "unknown option {arg:?}; usage: dock-dispatch --repo=PATH --task=REF --run-id=dock_ID --worktree=PATH [--adapter=fixture|amp|claude-code|codex-cli|github-copilot-cli|generic] [--executable=PATH] [--socket=PATH] -- [ARG ...]"
             ));
         }
     }
@@ -44,7 +59,11 @@ fn main() -> Result<(), String> {
         external_task_ref: task.ok_or("--task is required")?,
         run_id: run_id.unwrap_or_else(generate_run_id),
         worktree: worktree.ok_or("--worktree is required")?,
-        command,
+        adapter: AdapterSelection {
+            id: adapter,
+            executable,
+            arguments: command,
+        },
     };
     let socket = socket.map_or_else(paths::default_socket_path, Ok)?;
     let mut stream = UnixStream::connect(&socket)

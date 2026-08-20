@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute};
+use crate::{
+    adapter::{AdapterCapabilities, AdapterId, AdapterSelection, ProcessCapabilities},
+    model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
+};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +14,7 @@ pub enum Request {
     Hello(HelloRequest),
     Inspect(InspectRequest),
     Dispatch(DispatchRequest),
+    Lifecycle(LifecycleRequest),
     SubmitHandoff(SubmitHandoffRequest),
     ReviewInbox(ReviewInboxRequest),
     Decide(DecideRequest),
@@ -35,7 +39,24 @@ pub struct DispatchRequest {
     pub external_task_ref: String,
     pub run_id: String,
     pub worktree: String,
-    pub command: Vec<String>,
+    pub adapter: AdapterSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleOperation {
+    Attach,
+    Focus,
+    Interrupt,
+    Stop,
+    Restart,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleRequest {
+    pub run_id: String,
+    pub operation: LifecycleOperation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,14 +80,35 @@ pub struct DecideRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
-    Hello { version: u16 },
-    Snapshot { snapshot: RuntimeSnapshot },
-    Snapshots { snapshots: Vec<RuntimeSnapshot> },
-    Dispatched { snapshot: RuntimeSnapshot },
-    HandoffSubmitted { record: HandoffRecord },
-    ReviewInbox { items: Vec<HandoffRecord> },
-    DecisionRecorded { decision: ReviewDecision },
-    Error { code: ErrorCode, message: String },
+    Hello {
+        version: u16,
+    },
+    Snapshot {
+        snapshot: RuntimeSnapshot,
+    },
+    Snapshots {
+        snapshots: Vec<RuntimeSnapshot>,
+    },
+    Dispatched {
+        snapshot: RuntimeSnapshot,
+    },
+    LifecycleApplied {
+        operation: LifecycleOperation,
+        snapshot: RuntimeSnapshot,
+    },
+    HandoffSubmitted {
+        record: HandoffRecord,
+    },
+    ReviewInbox {
+        items: Vec<HandoffRecord>,
+    },
+    DecisionRecorded {
+        decision: ReviewDecision,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +121,8 @@ pub enum ErrorCode {
     RequestTimeout,
     ServerBusy,
     InvalidBinding,
+    AdapterUnavailable,
+    UnsupportedOperation,
     DuplicateRunId,
     RunNotFound,
     InvalidHandoff,
@@ -103,11 +147,23 @@ pub struct RuntimeSnapshot {
     pub pid: Option<u32>,
     pub process_group_id: Option<i32>,
     pub command: Vec<String>,
+    pub adapter: AdapterId,
+    pub process_capabilities: ProcessCapabilities,
+    pub adapter_capabilities: AdapterCapabilities,
+    pub provider_state: ProviderState,
     pub scrollback: String,
     pub scrollback_bytes: usize,
     pub scrollback_capacity_bytes: usize,
     pub scrollback_truncated: bool,
     pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderState {
+    Running,
+    Exited,
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,7 +182,7 @@ mod tests {
     fn strict_versioned_messages_reject_unknown_fields_and_variants() {
         assert!(serde_json::from_str::<Request>(r#"{"type":"inspect","pid":1}"#).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"type":"stop","pid":1}"#).is_err());
-        assert!(serde_json::from_str::<Request>(r#"{"type":"dispatch","repository_root":"r","external_task_ref":"t","run_id":"dock_1","worktree":"w","command":[],"pid":1}"#).is_err());
+        assert!(serde_json::from_str::<Request>(r#"{"type":"dispatch","repository_root":"r","external_task_ref":"t","run_id":"dock_1","worktree":"w","adapter":{"id":"fixture","arguments":[]},"pid":1}"#).is_err());
         assert!(
             serde_json::from_str::<Request>(r#"{"type":"review_inbox","future":true}"#).is_err()
         );
@@ -136,10 +192,10 @@ mod tests {
     fn hello_remains_forward_compatible_for_negotiation() {
         assert_eq!(
             serde_json::from_str::<Request>(
-                r#"{"type":"hello","version":3,"capabilities":["future"]}"#
+                r#"{"type":"hello","version":4,"capabilities":["future"]}"#
             )
             .unwrap(),
-            Request::Hello(HelloRequest { version: 3 })
+            Request::Hello(HelloRequest { version: 4 })
         );
     }
 }

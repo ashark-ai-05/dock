@@ -20,3 +20,7 @@
 {"timestamp":"2026-08-20T13:18:37.092713+10:00","action":"move","task_id":4,"detail":"in-progress -\u003e review"}
 {"timestamp":"2026-08-20T13:18:37.092918+10:00","action":"handoff","task_id":4,"detail":"Persist local run bindings and handoff packets"}
 {"timestamp":"2026-08-20T13:18:37.093168+10:00","action":"release","task_id":4,"detail":"Persist local run bindings and handoff packets"}
+{"timestamp":"2026-08-20T13:58:31.855913+10:00","action":"create","task_id":5,"detail":"Slice 1: owned runtime and reconnectable Control Pane"}
+{"timestamp":"2026-08-20T14:49:53.010473+10:00","action":"move","task_id":5,"detail":"backlog -\u003e review"}
+{"timestamp":"2026-08-20T14:49:53.01108+10:00","action":"handoff","task_id":5,"detail":"Slice 1: owned runtime and reconnectable Control Pane"}
+{"timestamp":"2026-08-20T14:49:53.011261+10:00","action":"release","task_id":5,"detail":"Slice 1: owned runtime and reconnectable Control Pane"}

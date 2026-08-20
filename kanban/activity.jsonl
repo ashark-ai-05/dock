@@ -36,3 +36,4 @@
 {"timestamp":"2026-08-20T16:55:08.546379+10:00","action":"move","task_id":8,"detail":"backlog -\u003e review"}
 {"timestamp":"2026-08-20T16:55:08.547992+10:00","action":"handoff","task_id":8,"detail":"Slice 4: explicit coding-agent adapter contract"}
 {"timestamp":"2026-08-20T16:55:08.548349+10:00","action":"release","task_id":8,"detail":"Slice 4: explicit coding-agent adapter contract"}
+{"timestamp":"2026-08-20T16:59:29.00829+10:00","action":"create","task_id":9,"detail":"Slice 5: programme capacity and dependency gates"}

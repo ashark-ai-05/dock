@@ -1,18 +1,17 @@
 use std::{path::PathBuf, sync::Arc};
 
-use dock::{paths, runtime::OwnedRuntime, server};
+use dock::{dispatch::RuntimeRegistry, paths, server};
 
 fn main() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
+    let args = std::env::args().skip(1);
     let mut socket: Option<PathBuf> = None;
     let mut capacity = 64 * 1024;
-    let mut command = Vec::new();
-    while let Some(argument) = args.next() {
-        if argument == "--" {
-            command.extend(args);
-            break;
-        } else if let Some(value) = argument.strip_prefix("--socket=") {
+    let mut state_dir = PathBuf::from(".dock/local");
+    for argument in args {
+        if let Some(value) = argument.strip_prefix("--socket=") {
             socket = Some(value.into());
+        } else if let Some(value) = argument.strip_prefix("--state-dir=") {
+            state_dir = value.into();
         } else if let Some(value) = argument.strip_prefix("--scrollback-bytes=") {
             capacity = value
                 .parse()
@@ -22,19 +21,16 @@ fn main() -> Result<(), String> {
             }
         } else {
             return Err(format!(
-                "unknown option {argument:?}; usage: dockd [--socket=PATH] [--scrollback-bytes=N] -- COMMAND [ARG ...]"
+                "unknown option {argument:?}; usage: dockd [--socket=PATH] [--state-dir=PATH] [--scrollback-bytes=N]"
             ));
         }
-    }
-    if command.is_empty() {
-        return Err("fixture command is required after --".into());
     }
     let socket = match socket {
         Some(socket) => socket,
         None => paths::prepare_default_socket_path()?,
     };
     let server = server::Server::bind(&socket)?;
-    let runtime = Arc::new(OwnedRuntime::launch(command, capacity));
+    let runtime = Arc::new(RuntimeRegistry::new(state_dir, capacity)?);
     eprintln!("dockd listening on {}", socket.display());
     server.serve(runtime)
 }

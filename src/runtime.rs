@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::{Error, Read},
     os::unix::process::CommandExt,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
@@ -16,8 +17,15 @@ use nix::{
 
 use crate::protocol::{ProcessState, RuntimeSnapshot};
 
-const WORKSPACE_ID: &str = "fixture-workspace";
-const PANE_ID: &str = "fixture-pane";
+#[derive(Debug, Clone)]
+pub struct RunBinding {
+    pub repository_root: PathBuf,
+    pub external_task_ref: String,
+    pub run_id: String,
+    pub worktree: PathBuf,
+    pub branch: String,
+    pub base_sha: String,
+}
 
 #[derive(Debug)]
 struct Scrollback {
@@ -43,6 +51,7 @@ impl Scrollback {
 }
 
 pub struct OwnedRuntime {
+    binding: RunBinding,
     command: Vec<String>,
     lifecycle: Arc<Mutex<LifecycleState>>,
     child: Arc<Mutex<Option<Child>>>,
@@ -66,13 +75,13 @@ enum LifecycleState {
 }
 
 impl OwnedRuntime {
-    pub fn launch(command: Vec<String>, scrollback_capacity: usize) -> Self {
+    pub fn launch(binding: RunBinding, command: Vec<String>, scrollback_capacity: usize) -> Self {
         let scrollback = Arc::new(Mutex::new(Scrollback {
             bytes: VecDeque::with_capacity(scrollback_capacity),
             capacity: scrollback_capacity,
             truncated: false,
         }));
-        match launch_child(&command, Arc::clone(&scrollback)) {
+        match launch_child(&command, &binding.worktree, Arc::clone(&scrollback)) {
             Ok((child, pid)) => {
                 let lifecycle = Arc::new(Mutex::new(LifecycleState::Running));
                 let reaper_lifecycle = Arc::clone(&lifecycle);
@@ -99,6 +108,7 @@ impl OwnedRuntime {
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
                     }) {
                     Ok(reaper) => Self {
+                        binding,
                         command,
                         lifecycle,
                         child,
@@ -112,6 +122,7 @@ impl OwnedRuntime {
                         launch_error: None,
                     },
                     Err(error) => Self {
+                        binding,
                         command,
                         lifecycle: Arc::new(Mutex::new(LifecycleState::Unavailable(format!(
                             "could not start child reaper: {error}"
@@ -129,6 +140,7 @@ impl OwnedRuntime {
                 }
             }
             Err(error) => Self {
+                binding,
                 command,
                 lifecycle: Arc::new(Mutex::new(LifecycleState::Unavailable(error.clone()))),
                 child: Arc::new(Mutex::new(None)),
@@ -139,6 +151,23 @@ impl OwnedRuntime {
                 launch_error: Some(error),
             },
         }
+    }
+
+    #[cfg(test)]
+    pub fn launch_fixture(command: Vec<String>, scrollback_capacity: usize) -> Self {
+        let worktree = std::env::current_dir().expect("fixture current directory");
+        Self::launch(
+            RunBinding {
+                repository_root: worktree.clone(),
+                external_task_ref: "fixture-task".into(),
+                run_id: "dock_fixture".into(),
+                worktree,
+                branch: "fixture".into(),
+                base_sha: "fixture".into(),
+            },
+            command,
+            scrollback_capacity,
+        )
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {
@@ -168,8 +197,14 @@ impl OwnedRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let bytes: Vec<u8> = scrollback.bytes.iter().copied().collect();
         RuntimeSnapshot {
-            workspace_id: WORKSPACE_ID.into(),
-            pane_id: PANE_ID.into(),
+            repository_root: self.binding.repository_root.display().to_string(),
+            external_task_ref: self.binding.external_task_ref.clone(),
+            run_id: self.binding.run_id.clone(),
+            worktree: self.binding.worktree.display().to_string(),
+            branch: self.binding.branch.clone(),
+            base_sha: self.binding.base_sha.clone(),
+            workspace_id: format!("workspace-{}", self.binding.run_id),
+            pane_id: format!("pane-{}", self.binding.run_id),
             state,
             pid: self.pid,
             process_group_id: self
@@ -220,6 +255,7 @@ fn signal_owned_group(group: &OwnedProcessGroup, signal: Signal) {
 
 fn launch_child(
     command: &[String],
+    worktree: &Path,
     scrollback: Arc<Mutex<Scrollback>>,
 ) -> Result<(Child, u32), String> {
     let Some(program) = command.first() else {
@@ -238,6 +274,7 @@ fn launch_child(
     let mut process = Command::new(program);
     process
         .args(&command[1..])
+        .current_dir(worktree)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(slave));
@@ -314,7 +351,7 @@ mod tests {
 
     #[test]
     fn captures_bounded_pty_output_and_exit_state() {
-        let runtime = OwnedRuntime::launch(
+        let runtime = OwnedRuntime::launch_fixture(
             vec!["sh".into(), "-c".into(), "printf 1234567890".into()],
             5,
         );
@@ -331,7 +368,7 @@ mod tests {
 
     #[test]
     fn launch_failure_is_an_actionable_runtime_receipt() {
-        let runtime = OwnedRuntime::launch(vec!["/definitely/not/a/program".into()], 64);
+        let runtime = OwnedRuntime::launch_fixture(vec!["/definitely/not/a/program".into()], 64);
         let snapshot = runtime.snapshot();
         assert_eq!(snapshot.state, ProcessState::FailedToLaunch);
         assert!(
@@ -345,7 +382,7 @@ mod tests {
 
     #[test]
     fn child_is_session_leader_with_the_pty_as_controlling_terminal() {
-        let runtime = OwnedRuntime::launch(
+        let runtime = OwnedRuntime::launch_fixture(
             vec![
                 "sh".into(),
                 "-c".into(),
@@ -373,7 +410,7 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("unrelated fixture");
-        let runtime = OwnedRuntime::launch(
+        let runtime = OwnedRuntime::launch_fixture(
             vec!["sh".into(), "-c".into(), "sleep 30 & echo $!; wait".into()],
             128,
         );
@@ -399,7 +436,8 @@ mod tests {
 
     #[test]
     fn exited_child_is_reaped_without_snapshot_polling() {
-        let runtime = OwnedRuntime::launch(vec!["sh".into(), "-c".into(), "exit 7".into()], 64);
+        let runtime =
+            OwnedRuntime::launch_fixture(vec!["sh".into(), "-c".into(), "exit 7".into()], 64);
         let pid = runtime.pid.expect("launched child") as i32;
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -427,7 +465,8 @@ mod tests {
 
     #[test]
     fn poisoned_runtime_locks_do_not_panic_in_snapshot_or_drop() {
-        let runtime = OwnedRuntime::launch(vec!["sh".into(), "-c".into(), "sleep 30".into()], 64);
+        let runtime =
+            OwnedRuntime::launch_fixture(vec!["sh".into(), "-c".into(), "sleep 30".into()], 64);
         let _ = std::panic::catch_unwind(|| {
             let _guard = runtime.lifecycle.lock().expect("lock lifecycle");
             panic!("poison lifecycle lock");

@@ -10,10 +10,14 @@ use dock::{
 };
 
 fn main() -> Result<(), String> {
-    let socket = std::env::args()
-        .skip(1)
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let socket = args
+        .iter()
         .find_map(|argument| argument.strip_prefix("--socket=").map(PathBuf::from))
         .map_or_else(paths::default_socket_path, Ok)?;
+    let run_id = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--run-id=").map(str::to_owned));
     let mut stream = UnixStream::connect(&socket)
         .map_err(|error| format!("could not connect to {}: {error}", socket.display()))?;
     let reader_stream = stream.try_clone().map_err(|error| error.to_string())?;
@@ -31,12 +35,19 @@ fn main() -> Result<(), String> {
         Response::Error { message, .. } => return Err(message),
         response => return Err(format!("unexpected handshake response: {response:?}")),
     }
-    send(&mut stream, &Request::Inspect(InspectRequest {}))?;
+    send(&mut stream, &Request::Inspect(InspectRequest { run_id }))?;
     match receive(&mut reader)? {
         Response::Snapshot { snapshot } => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&snapshot).map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
+        Response::Snapshots { snapshots } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&snapshots).map_err(|error| error.to_string())?
             );
             Ok(())
         }

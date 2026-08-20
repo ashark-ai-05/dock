@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{Error, Read},
     os::unix::process::CommandExt,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
 };
@@ -44,7 +44,9 @@ impl Scrollback {
 
 pub struct OwnedRuntime {
     command: Vec<String>,
-    child: Mutex<Option<Child>>,
+    lifecycle: Arc<Mutex<LifecycleState>>,
+    child: Arc<Mutex<Option<Child>>>,
+    reaper: Mutex<Option<thread::JoinHandle<()>>>,
     pid: Option<u32>,
     owned_process_group: Option<OwnedProcessGroup>,
     scrollback: Arc<Mutex<Scrollback>>,
@@ -56,6 +58,13 @@ pub struct OwnedRuntime {
 #[derive(Debug)]
 struct OwnedProcessGroup(Pid);
 
+#[derive(Debug)]
+enum LifecycleState {
+    Running,
+    Exited(ExitStatus),
+    Unavailable(String),
+}
+
 impl OwnedRuntime {
     pub fn launch(command: Vec<String>, scrollback_capacity: usize) -> Self {
         let scrollback = Arc::new(Mutex::new(Scrollback {
@@ -64,20 +73,66 @@ impl OwnedRuntime {
             truncated: false,
         }));
         match launch_child(&command, Arc::clone(&scrollback)) {
-            Ok((child, pid)) => Self {
-                command,
-                child: Mutex::new(Some(child)),
-                pid: Some(pid),
-                owned_process_group: i32::try_from(pid)
-                    .ok()
-                    .map(Pid::from_raw)
-                    .map(OwnedProcessGroup),
-                scrollback,
-                launch_error: None,
-            },
+            Ok((child, pid)) => {
+                let lifecycle = Arc::new(Mutex::new(LifecycleState::Running));
+                let reaper_lifecycle = Arc::clone(&lifecycle);
+                let child = Arc::new(Mutex::new(Some(child)));
+                let reaper_child = Arc::clone(&child);
+                match thread::Builder::new()
+                    .name("dock-child-reaper".into())
+                    .spawn(move || {
+                        let child = reaper_child
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take();
+                        let state = match child.map(|mut child| child.wait()) {
+                            None => LifecycleState::Unavailable(
+                                "owned child handle is unavailable".into(),
+                            ),
+                            Some(Ok(status)) => LifecycleState::Exited(status),
+                            Some(Err(error)) => LifecycleState::Unavailable(format!(
+                                "could not reap owned child: {error}"
+                            )),
+                        };
+                        *reaper_lifecycle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+                    }) {
+                    Ok(reaper) => Self {
+                        command,
+                        lifecycle,
+                        child,
+                        reaper: Mutex::new(Some(reaper)),
+                        pid: Some(pid),
+                        owned_process_group: i32::try_from(pid)
+                            .ok()
+                            .map(Pid::from_raw)
+                            .map(OwnedProcessGroup),
+                        scrollback,
+                        launch_error: None,
+                    },
+                    Err(error) => Self {
+                        command,
+                        lifecycle: Arc::new(Mutex::new(LifecycleState::Unavailable(format!(
+                            "could not start child reaper: {error}"
+                        )))),
+                        child,
+                        reaper: Mutex::new(None),
+                        pid: Some(pid),
+                        owned_process_group: i32::try_from(pid)
+                            .ok()
+                            .map(Pid::from_raw)
+                            .map(OwnedProcessGroup),
+                        scrollback,
+                        launch_error: None,
+                    },
+                }
+            }
             Err(error) => Self {
                 command,
-                child: Mutex::new(None),
+                lifecycle: Arc::new(Mutex::new(LifecycleState::Unavailable(error.clone()))),
+                child: Arc::new(Mutex::new(None)),
+                reaper: Mutex::new(None),
                 pid: None,
                 owned_process_group: None,
                 scrollback,
@@ -90,26 +145,21 @@ impl OwnedRuntime {
         let (state, runtime_diagnostic) = if self.launch_error.is_some() {
             (ProcessState::FailedToLaunch, None)
         } else {
-            let mut child = self
-                .child
+            let lifecycle = self
+                .lifecycle
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match child.as_mut().map(Child::try_wait) {
-                Some(Ok(Some(status))) => (
+            match &*lifecycle {
+                LifecycleState::Exited(status) => (
                     ProcessState::Exited {
                         code: status.code(),
                     },
                     None,
                 ),
-                Some(Ok(None)) => (ProcessState::Running, None),
-                Some(Err(error)) => (
-                    ProcessState::Unavailable,
-                    Some(format!("could not inspect owned child state: {error}")),
-                ),
-                None => (
-                    ProcessState::Unavailable,
-                    Some("owned child handle is unavailable".into()),
-                ),
+                LifecycleState::Running => (ProcessState::Running, None),
+                LifecycleState::Unavailable(error) => {
+                    (ProcessState::Unavailable, Some(error.clone()))
+                }
             }
         };
         let scrollback = self
@@ -145,6 +195,13 @@ impl Drop for OwnedRuntime {
         // group even if its leader already exited, so Dock-owned descendants cannot be orphaned.
         signal_owned_group(&group, Signal::SIGTERM);
         signal_owned_group(&group, Signal::SIGKILL);
+        let mut reaper = self
+            .reaper
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(reaper) = reaper.take() {
+            let _ = reaper.join();
+        }
         let mut child = self
             .child
             .lock()
@@ -341,11 +398,39 @@ mod tests {
     }
 
     #[test]
+    fn exited_child_is_reaped_without_snapshot_polling() {
+        let runtime = OwnedRuntime::launch(vec!["sh".into(), "-c".into(), "exit 7".into()], 64);
+        let pid = runtime.pid.expect("launched child") as i32;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if matches!(
+                *runtime
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                LifecycleState::Exited(_)
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fixture was not reaped");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let result = unsafe { nix::libc::waitpid(pid, std::ptr::null_mut(), nix::libc::WNOHANG) };
+        assert_eq!(result, -1, "fixture should already have been reaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(nix::libc::ECHILD),
+            "child waiter should own and reap the fixture"
+        );
+        drop(runtime);
+    }
+
+    #[test]
     fn poisoned_runtime_locks_do_not_panic_in_snapshot_or_drop() {
         let runtime = OwnedRuntime::launch(vec!["sh".into(), "-c".into(), "sleep 30".into()], 64);
         let _ = std::panic::catch_unwind(|| {
-            let _guard = runtime.child.lock().expect("lock child");
-            panic!("poison child lock");
+            let _guard = runtime.lifecycle.lock().expect("lock lifecycle");
+            panic!("poison lifecycle lock");
         });
         let _ = runtime.snapshot();
         drop(runtime);

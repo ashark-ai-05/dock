@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod dispatch;
 pub mod git;
+pub mod layout;
 pub mod model;
 pub mod paths;
 pub mod protocol;

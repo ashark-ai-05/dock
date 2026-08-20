@@ -17,24 +17,29 @@ use serde::{Deserialize, Serialize};
 use crate::{
     adapter::AdapterSelection,
     git::GitAdapter,
+    layout::{LayoutRegistry, LayoutSnapshot, PaneRuntime, WorkspaceLayout},
     model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
     protocol::{
         DependencyGateSnapshot, DispatchRequest, DurableProgrammeGate, ErrorCode, GateState,
         LifecycleOperation, ProgrammeSnapshot, RepositoryPortfolioSnapshot, RuntimeSnapshot,
+        WorkspaceRequest,
     },
     runtime::{OwnedRuntime, RunBinding},
     storage::LocalStore,
 };
 
 pub struct RuntimeRegistry {
-    runs: Mutex<HashMap<String, RuntimeEntry>>,
+    runs: Mutex<HashMap<String, RuntimeSlot>>,
     receipts: PathBuf,
     scrollback_capacity: usize,
     store: LocalStore,
     programme: Mutex<ProgrammeState>,
     capacity: CapacityPolicy,
+    layout: Mutex<LayoutRegistry>,
     #[cfg(test)]
     restart_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    restart_after_stop_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     release_cleanup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -42,15 +47,90 @@ pub struct RuntimeRegistry {
     #[cfg(test)]
     after_launch_before_receipt_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    before_save_receipt_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
     release_commit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     portfolio_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    workspace_stop_failure: Mutex<Option<String>>,
+    #[cfg(test)]
+    restart_stop_failure: Mutex<Option<String>>,
+    #[cfg(test)]
+    receipt_stop_failure: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
 struct RuntimeEntry {
     runtime: Arc<OwnedRuntime>,
     selection: AdapterSelection,
+}
+
+#[derive(Clone)]
+struct RuntimeSlot {
+    transition: Arc<Mutex<()>>,
+    state: RuntimeSlotState,
+}
+
+#[derive(Clone)]
+enum RuntimeSlotState {
+    /// Reserves identity, capacity, and pane ownership while launch runs without registry locks.
+    Launching {
+        repository_root: PathBuf,
+    },
+    Active(RuntimeEntry),
+    /// Keeps one capacity and identity reservation while the exact old group is retired and its
+    /// replacement is launched. The entry remains inspectable, but admission must not derive
+    /// capacity from its lifecycle after retirement.
+    Restarting {
+        repository_root: PathBuf,
+        entry: RuntimeEntry,
+    },
+    /// Receipt persistence failed, but the exact launched process group has not yet been proven
+    /// stopped. Retain every authority and reservation until a later reconciliation can stop it.
+    ReceiptRollbackStopping {
+        repository_root: PathBuf,
+        entry: RuntimeEntry,
+        layout: crate::layout::BindRollback,
+        receipt: PathBuf,
+    },
+    /// The launched process has been retired, but its exact pane binding and receipt reservation
+    /// remain authoritative until their independently tracked rollback steps are persisted.
+    RollbackPending {
+        repository_root: PathBuf,
+        layout: Option<crate::layout::BindRollback>,
+        receipt: PathBuf,
+    },
+}
+
+impl RuntimeSlot {
+    fn active(&self) -> Option<&RuntimeEntry> {
+        match &self.state {
+            RuntimeSlotState::Active(entry) => Some(entry),
+            RuntimeSlotState::Launching { .. } => None,
+            RuntimeSlotState::Restarting { entry, .. } => Some(entry),
+            RuntimeSlotState::ReceiptRollbackStopping { entry, .. } => Some(entry),
+            RuntimeSlotState::RollbackPending { .. } => None,
+        }
+    }
+
+    fn belongs_to_repository(&self, repository: &Path) -> bool {
+        match &self.state {
+            RuntimeSlotState::Launching { repository_root } => repository_root == repository,
+            RuntimeSlotState::Restarting {
+                repository_root, ..
+            } => repository_root == repository,
+            RuntimeSlotState::RollbackPending {
+                repository_root, ..
+            } => repository_root == repository,
+            RuntimeSlotState::ReceiptRollbackStopping {
+                repository_root, ..
+            } => repository_root == repository,
+            RuntimeSlotState::Active(entry) => {
+                entry.runtime.binding().repository_root == repository
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -190,6 +270,7 @@ impl RuntimeRegistry {
             }
         }
         programme.terminal_gates = terminal_gates;
+        let layout = LayoutRegistry::load(&state_dir)?;
         Ok(Self {
             runs: Mutex::new(HashMap::new()),
             receipts,
@@ -197,8 +278,11 @@ impl RuntimeRegistry {
             store,
             programme: Mutex::new(programme),
             capacity,
+            layout: Mutex::new(layout),
             #[cfg(test)]
             restart_hook: Mutex::new(None),
+            #[cfg(test)]
+            restart_after_stop_hook: Mutex::new(None),
             #[cfg(test)]
             release_cleanup_hook: Mutex::new(None),
             #[cfg(test)]
@@ -206,9 +290,17 @@ impl RuntimeRegistry {
             #[cfg(test)]
             after_launch_before_receipt_hook: Mutex::new(None),
             #[cfg(test)]
+            before_save_receipt_hook: Mutex::new(None),
+            #[cfg(test)]
             release_commit_hook: Mutex::new(None),
             #[cfg(test)]
             portfolio_capture_hook: Mutex::new(None),
+            #[cfg(test)]
+            workspace_stop_failure: Mutex::new(None),
+            #[cfg(test)]
+            restart_stop_failure: Mutex::new(None),
+            #[cfg(test)]
+            receipt_stop_failure: Mutex::new(None),
         })
     }
 
@@ -219,11 +311,287 @@ impl RuntimeRegistry {
         self.dispatch_with_gate_authorization(request, false)
     }
 
+    pub fn layout(&self) -> LayoutSnapshot {
+        self.reconcile_failed_dispatches();
+        let states: Vec<_> = self
+            .runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(|(id, slot)| {
+                let entry = slot.active()?;
+                let state = if matches!(
+                    entry.runtime.snapshot().state,
+                    crate::protocol::ProcessState::Running
+                ) {
+                    PaneRuntime::Running
+                } else {
+                    PaneRuntime::Exited
+                };
+                Some((id.clone(), state))
+            })
+            .collect();
+        let mut layout = self.layout.lock().unwrap_or_else(|p| p.into_inner());
+        for (run_id, state) in states {
+            layout.set_runtime(&run_id, state);
+        }
+        layout.snapshot()
+    }
+
+    /// Retry terminal dispatch rollback without ever reviving process authority. The exact slot
+    /// remains reserved until both durable cleanup operations have succeeded.
+    fn reconcile_failed_dispatches(&self) {
+        let stopping: Vec<_> = self
+            .runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(|(run_id, slot)| match &slot.state {
+                RuntimeSlotState::ReceiptRollbackStopping {
+                    entry,
+                    layout,
+                    receipt,
+                    repository_root,
+                } => Some((
+                    run_id.clone(),
+                    Arc::clone(&slot.transition),
+                    entry.clone(),
+                    layout.clone(),
+                    receipt.clone(),
+                    repository_root.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        for (run_id, transition, entry, layout, receipt, repository_root) in stopping {
+            // Never block in process shutdown while holding a registry or layout lock.
+            let _transition = transition.lock().unwrap_or_else(|p| p.into_inner());
+            if entry.runtime.stop().is_err() {
+                continue;
+            }
+            let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+            let exact = runs.get(&run_id).is_some_and(|slot| {
+                Arc::ptr_eq(&slot.transition, &transition)
+                    && matches!(
+                        &slot.state,
+                        RuntimeSlotState::ReceiptRollbackStopping { entry: current, .. }
+                            if Arc::ptr_eq(&current.runtime, &entry.runtime)
+                    )
+            });
+            if exact {
+                runs.insert(
+                    run_id,
+                    RuntimeSlot {
+                        transition: Arc::clone(&transition),
+                        state: RuntimeSlotState::RollbackPending {
+                            repository_root,
+                            layout: Some(layout),
+                            receipt,
+                        },
+                    },
+                );
+            }
+        }
+        let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+        let pending: Vec<_> = runs
+            .iter()
+            .filter_map(|(run_id, slot)| match &slot.state {
+                RuntimeSlotState::RollbackPending {
+                    layout, receipt, ..
+                } => Some((run_id.clone(), layout.clone(), receipt.clone())),
+                _ => None,
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let mut layout_registry = self.layout.lock().unwrap_or_else(|p| p.into_inner());
+        for (run_id, rollback, receipt) in pending {
+            if let Some(rollback) = rollback {
+                if layout_registry.rollback_bound_pane(rollback).is_err() {
+                    continue;
+                }
+                if let Some(RuntimeSlot {
+                    state: RuntimeSlotState::RollbackPending { layout, .. },
+                    ..
+                }) = runs.get_mut(&run_id)
+                {
+                    // Advance this state before attempting the independent receipt cleanup. A
+                    // later retry must never reapply an already durable layout inverse.
+                    *layout = None;
+                }
+            }
+            if rollback_run_id_reservation(&receipt).is_ok() {
+                runs.remove(&run_id);
+            }
+        }
+    }
+
+    pub fn workspace(
+        &self,
+        request: WorkspaceRequest,
+    ) -> Result<Option<WorkspaceLayout>, (ErrorCode, String)> {
+        if let WorkspaceRequest::Close {
+            workspace_id,
+            pane_id,
+        } = &request
+        {
+            let run_id = self
+                .layout
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pane_run(workspace_id, pane_id);
+            let slot = run_id.as_ref().and_then(|run_id| {
+                self.runs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(run_id)
+                    .cloned()
+            });
+            // The identity-scoped transition lock can wait, but no registry or layout lock is
+            // held. Once acquired, revalidate both the pane binding and exact runtime capability.
+            let _transition = slot
+                .as_ref()
+                .map(|slot| slot.transition.lock().unwrap_or_else(|p| p.into_inner()));
+            let entry = match (&run_id, &slot) {
+                (Some(run_id), Some(slot)) => {
+                    let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+                    let current = runs
+                        .get(run_id)
+                        .filter(|current| Arc::ptr_eq(&current.transition, &slot.transition));
+                    current.and_then(RuntimeSlot::active).cloned()
+                }
+                _ => None,
+            };
+            if run_id.is_some() && slot.is_some() && entry.is_none() {
+                return Err((
+                    ErrorCode::Internal,
+                    "pane run is transitioning; retry close".into(),
+                ));
+            }
+            if self
+                .layout
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pane_run(workspace_id, pane_id)
+                != run_id
+            {
+                return Err((
+                    ErrorCode::InvalidLayout,
+                    "pane binding changed during close".into(),
+                ));
+            }
+
+            let stop_result = if let Some(entry) = &entry {
+                #[cfg(test)]
+                if let Some(message) = self
+                    .workspace_stop_failure
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                {
+                    Err(message)
+                } else {
+                    entry.runtime.stop()
+                }
+                #[cfg(not(test))]
+                {
+                    entry.runtime.stop()
+                }
+            } else {
+                Ok(())
+            };
+
+            if let Err(message) = stop_result {
+                return Err((ErrorCode::Internal, message));
+            }
+            let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+            let mut layout = self.layout.lock().unwrap_or_else(|p| p.into_inner());
+            if layout.pane_run(workspace_id, pane_id) != run_id {
+                return Err((
+                    ErrorCode::InvalidLayout,
+                    "pane binding changed during close".into(),
+                ));
+            }
+            if let (Some(run_id), Some(slot), Some(entry)) = (&run_id, &slot, &entry) {
+                let exact = runs.get(run_id).is_some_and(|current| {
+                    Arc::ptr_eq(&current.transition, &slot.transition)
+                        && current
+                            .active()
+                            .is_some_and(|current| Arc::ptr_eq(&current.runtime, &entry.runtime))
+                });
+                if !exact {
+                    return Err((
+                        ErrorCode::Internal,
+                        "run identity changed during close".into(),
+                    ));
+                }
+            }
+            let result = layout.close(workspace_id, pane_id);
+            if let Some(run_id) = &run_id {
+                // Stop irrevocably retired this capability. A persistence failure retains an
+                // Exited pane marker for a safe Close retry, but never dead Active authority.
+                runs.remove(run_id);
+                if result.is_err() {
+                    layout.set_runtime(run_id, PaneRuntime::Exited);
+                }
+            }
+            return result.map_err(layout_error);
+        }
+        let mut layout = self.layout.lock().unwrap_or_else(|p| p.into_inner());
+        let result = match request {
+            WorkspaceRequest::Inspect => {
+                return Err((
+                    ErrorCode::UnsupportedOperation,
+                    "inspect returns the complete layout".into(),
+                ));
+            }
+            WorkspaceRequest::Create {
+                workspace_id,
+                name,
+                pane_id,
+            } => layout
+                .create_workspace(workspace_id, name, pane_id)
+                .map(Some),
+            WorkspaceRequest::Split {
+                workspace_id,
+                pane_id,
+                new_pane_id,
+                axis,
+            } => layout
+                .split(&workspace_id, &pane_id, new_pane_id, axis)
+                .map(Some),
+            WorkspaceRequest::Focus {
+                workspace_id,
+                pane_id,
+            } => layout.focus(&workspace_id, &pane_id).map(Some),
+            WorkspaceRequest::Resize {
+                workspace_id,
+                pane_id,
+                ratio_milli,
+            } => layout
+                .resize(&workspace_id, &pane_id, ratio_milli)
+                .map(Some),
+            WorkspaceRequest::Rename {
+                workspace_id,
+                pane_id,
+                name,
+            } => layout
+                .rename(&workspace_id, pane_id.as_deref(), name)
+                .map(Some),
+            WorkspaceRequest::Close { .. } => {
+                unreachable!("close requests are handled by the ownership-safe path above")
+            }
+        };
+        result.map_err(layout_error)
+    }
+
     fn dispatch_with_gate_authorization(
         &self,
         request: DispatchRequest,
         gate_release_authorized: bool,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
+        self.reconcile_failed_dispatches();
         let binding = validate_binding(&request).map_err(|m| (ErrorCode::InvalidBinding, m))?;
         // Reject an already gated identity before adapter discovery. This is repeated under the
         // run lock below so a concurrent queue cannot cross the dispatch admission boundary.
@@ -257,8 +625,43 @@ impl RuntimeRegistry {
             ));
         }
         self.check_capacity(&runs, &binding.repository_root)?;
+        let mut layout = self.layout.lock().unwrap_or_else(|p| p.into_inner());
+        layout
+            .check_bind_capacity(&binding.workspace_id, &binding.pane_id)
+            .map_err(|message| (ErrorCode::CapacityExceeded, message))?;
         reserve_run_id(&receipt).map_err(|m| (ErrorCode::Internal, m))?;
+        let transition = Arc::new(Mutex::new(()));
+        let transition_guard = transition.lock().unwrap_or_else(|p| p.into_inner());
+        runs.insert(
+            request.run_id.clone(),
+            RuntimeSlot {
+                transition: Arc::clone(&transition),
+                state: RuntimeSlotState::Launching {
+                    repository_root: binding.repository_root.clone(),
+                },
+            },
+        );
+        let layout_rollback = match layout.ensure_bound_pane(
+            binding.workspace_id.clone(),
+            binding.pane_id.clone(),
+            binding.run_id.clone(),
+        ) {
+            Ok(rollback) => rollback,
+            Err(message) => {
+                runs.remove(&request.run_id);
+                drop(transition_guard);
+                rollback_run_id_reservation(&receipt).map_err(|rollback| {
+                    (
+                        ErrorCode::Internal,
+                        format!("{message}; could not roll back dispatch reservation: {rollback}"),
+                    )
+                })?;
+                return Err((ErrorCode::InvalidLayout, message));
+            }
+        };
         drop(programme);
+        drop(layout);
+        drop(runs);
         let runtime = Arc::new(OwnedRuntime::launch(
             binding,
             adapter,
@@ -278,17 +681,130 @@ impl RuntimeRegistry {
                 "injected crash after spawn before receipt commit".into(),
             ));
         }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .before_save_receipt_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            hook();
+        }
         if let Err(message) = save_receipt(&receipt, &snapshot) {
-            // The reservation is intentionally terminal: launch may have succeeded, so retrying
-            // this identity after any receipt failure could double-launch.
-            return Err((ErrorCode::Internal, message));
+            #[cfg(test)]
+            let stop = if let Some(message) = self
+                .receipt_stop_failure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                Err(message)
+            } else {
+                runtime.stop()
+            };
+            #[cfg(not(test))]
+            let stop = runtime.stop();
+            let mut failures = Vec::new();
+            let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+            let reserved = runs.get(&request.run_id).is_some_and(|slot| {
+                Arc::ptr_eq(&slot.transition, &transition)
+                    && matches!(slot.state, RuntimeSlotState::Launching { .. })
+            });
+            if reserved {
+                if let Err(error) = stop {
+                    runs.insert(
+                        request.run_id.clone(),
+                        RuntimeSlot {
+                            transition: Arc::clone(&transition),
+                            state: RuntimeSlotState::ReceiptRollbackStopping {
+                                repository_root: runtime.binding().repository_root.clone(),
+                                entry: RuntimeEntry {
+                                    runtime,
+                                    selection: request.adapter,
+                                },
+                                layout: layout_rollback,
+                                receipt,
+                            },
+                        },
+                    );
+                    drop(runs);
+                    drop(transition_guard);
+                    return Err((
+                        ErrorCode::Internal,
+                        format!("{message}; could not stop rolled-back launch: {error}"),
+                    ));
+                }
+                let layout_restore = self
+                    .layout
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .rollback_bound_pane(layout_rollback.clone());
+                if let Err(error) = layout_restore {
+                    failures.push(format!("could not restore dispatch layout: {error}"));
+                    // Runtime display state is process-local and safe to retire even when the
+                    // durable topology inverse cannot yet be written.
+                    self.layout
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .set_runtime(&request.run_id, PaneRuntime::Exited);
+                    runs.insert(
+                        request.run_id.clone(),
+                        RuntimeSlot {
+                            transition: Arc::clone(&transition),
+                            state: RuntimeSlotState::RollbackPending {
+                                repository_root: runtime.binding().repository_root.clone(),
+                                layout: Some(layout_rollback),
+                                receipt: receipt.clone(),
+                            },
+                        },
+                    );
+                } else if let Err(error) = rollback_run_id_reservation(&receipt) {
+                    failures.push(format!("could not roll back dispatch reservation: {error}"));
+                    runs.insert(
+                        request.run_id.clone(),
+                        RuntimeSlot {
+                            transition: Arc::clone(&transition),
+                            state: RuntimeSlotState::RollbackPending {
+                                repository_root: runtime.binding().repository_root.clone(),
+                                layout: None,
+                                receipt: receipt.clone(),
+                            },
+                        },
+                    );
+                } else {
+                    runs.remove(&request.run_id);
+                }
+            }
+            drop(runs);
+            drop(transition_guard);
+            if !reserved {
+                failures.push("exact launch reservation changed during rollback".into());
+            }
+            let detail = if failures.is_empty() {
+                message
+            } else {
+                format!("{message}; {}", failures.join("; "))
+            };
+            return Err((ErrorCode::Internal, detail));
         }
         let run_id = snapshot.run_id.clone();
+        let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+        let reserved = runs.get(&run_id).is_some_and(|slot| {
+            Arc::ptr_eq(&slot.transition, &transition)
+                && matches!(slot.state, RuntimeSlotState::Launching { .. })
+        });
+        if !reserved {
+            return Err((ErrorCode::Internal, "run launch reservation changed".into()));
+        }
+        drop(transition_guard);
         runs.insert(
             run_id.clone(),
-            RuntimeEntry {
-                runtime,
-                selection: request.adapter,
+            RuntimeSlot {
+                transition: Arc::clone(&transition),
+                state: RuntimeSlotState::Active(RuntimeEntry {
+                    runtime,
+                    selection: request.adapter,
+                }),
             },
         );
         if gate_release_authorized {
@@ -363,7 +879,16 @@ impl RuntimeRegistry {
                 format!("upstream run id {upstream_run_id:?} is not active in this daemon"),
             )
         })?;
-        let upstream_snapshot = upstream.runtime.snapshot();
+        let upstream_snapshot = upstream
+            .active()
+            .ok_or_else(|| {
+                (
+                    ErrorCode::RunNotFound,
+                    "upstream run is still launching".into(),
+                )
+            })?
+            .runtime
+            .snapshot();
         if runs.contains_key(&request.run_id)
             || self
                 .receipt_path(&request.run_id)
@@ -494,7 +1019,33 @@ impl RuntimeRegistry {
     pub fn inspect_programme(&self) -> ProgrammeSnapshot {
         let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
         let programme = self.programme.lock().unwrap_or_else(|p| p.into_inner());
-        let runtime_snapshots: Vec<_> = runs.values().map(|run| run.runtime.snapshot()).collect();
+        let capacity_snapshots: Vec<_> = runs
+            .iter()
+            .map(|(run_id, slot)| {
+                let (repository_root, reported_run_id) = match &slot.state {
+                    RuntimeSlotState::Launching { repository_root } => {
+                        (repository_root.clone(), Some(run_id.clone()))
+                    }
+                    RuntimeSlotState::RollbackPending {
+                        repository_root, ..
+                    } => (repository_root.clone(), None),
+                    RuntimeSlotState::Active(entry)
+                    | RuntimeSlotState::Restarting { entry, .. }
+                    | RuntimeSlotState::ReceiptRollbackStopping { entry, .. } => {
+                        let snapshot = entry.runtime.snapshot();
+                        (
+                            PathBuf::from(snapshot.repository_root),
+                            Some(snapshot.run_id),
+                        )
+                    }
+                };
+                (
+                    reported_run_id,
+                    repository_root,
+                    slot_reserves_capacity(slot),
+                )
+            })
+            .collect();
         #[cfg(test)]
         if let Some(hook) = self
             .portfolio_capture_hook
@@ -505,11 +1056,11 @@ impl RuntimeRegistry {
             hook();
         }
         let mut repositories: HashMap<String, RepositoryPortfolioSnapshot> = HashMap::new();
-        for snapshot in &runtime_snapshots {
-            if !is_capacity_active(snapshot) {
+        for (run_id, repository_root, reserves_capacity) in &capacity_snapshots {
+            if !reserves_capacity {
                 continue;
             }
-            let id = repository_id(Path::new(&snapshot.repository_root));
+            let id = repository_id(repository_root);
             let repo =
                 repositories
                     .entry(id.clone())
@@ -520,7 +1071,9 @@ impl RuntimeRegistry {
                         active_capacity: 0,
                         run_capacity: self.capacity.per_repository_run_capacity,
                     });
-            repo.active_run_ids.push(snapshot.run_id.clone());
+            if let Some(run_id) = run_id {
+                repo.active_run_ids.push(run_id.clone());
+            }
         }
         for gate in programme.gates.values() {
             let repo = repositories
@@ -548,9 +1101,9 @@ impl RuntimeRegistry {
             .collect();
         gates.sort_by(|a, b| a.downstream_run_id.cmp(&b.downstream_run_id));
         ProgrammeSnapshot {
-            global_active: runtime_snapshots
+            global_active: capacity_snapshots
                 .iter()
-                .filter(|snapshot| is_capacity_active(snapshot))
+                .filter(|(_, _, reserves_capacity)| *reserves_capacity)
                 .count(),
             global_run_capacity: self.capacity.agent_capacity(),
             human_review_reserved: self.capacity.human_review_reserved,
@@ -561,15 +1114,14 @@ impl RuntimeRegistry {
 
     fn check_capacity(
         &self,
-        runs: &HashMap<String, RuntimeEntry>,
+        runs: &HashMap<String, RuntimeSlot>,
         repository: &Path,
     ) -> Result<(), (ErrorCode, String)> {
-        let active: Vec<_> = runs
+        let active = runs
             .values()
-            .map(|r| r.runtime.snapshot())
-            .filter(is_capacity_active)
-            .collect();
-        if active.len() >= self.capacity.agent_capacity() {
+            .filter(|slot| slot_reserves_capacity(slot))
+            .count();
+        if active >= self.capacity.agent_capacity() {
             return Err((
                 ErrorCode::CapacityExceeded,
                 format!(
@@ -580,10 +1132,10 @@ impl RuntimeRegistry {
                 ),
             ));
         }
-        let repository = repository.display().to_string();
-        let repo_active = active
-            .iter()
-            .filter(|s| s.repository_root == repository)
+        let repo_active = runs
+            .values()
+            .filter(|slot| slot.belongs_to_repository(repository))
+            .filter(|slot| slot_reserves_capacity(slot))
             .count();
         if repo_active >= self.capacity.per_repository_run_capacity {
             return Err((
@@ -645,7 +1197,7 @@ impl RuntimeRegistry {
         run_id: &str,
         operation: LifecycleOperation,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
-        let entry = self
+        let slot = self
             .runs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -657,7 +1209,29 @@ impl RuntimeRegistry {
                     format!("run id {run_id:?} is not active in this daemon"),
                 )
             })?;
-        let runtime = entry.runtime;
+        let _transition = slot.transition.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = {
+            let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+            let current = runs.get(run_id).ok_or_else(|| {
+                (
+                    ErrorCode::RunNotFound,
+                    format!("run id {run_id:?} disappeared"),
+                )
+            })?;
+            if !Arc::ptr_eq(&current.transition, &slot.transition) {
+                return Err((
+                    ErrorCode::Internal,
+                    "run identity changed during lifecycle operation".into(),
+                ));
+            }
+            current.active().cloned().ok_or_else(|| {
+                (
+                    ErrorCode::RunNotFound,
+                    format!("run id {run_id:?} is still launching"),
+                )
+            })?
+        };
+        let runtime = Arc::clone(&entry.runtime);
         let capabilities = &runtime.snapshot().process_capabilities;
         let supported = match operation {
             LifecycleOperation::Attach => capabilities.attach,
@@ -683,8 +1257,10 @@ impl RuntimeRegistry {
                 Ok(runtime.snapshot())
             }
             LifecycleOperation::Restart => {
-                // Rediscovery and launch can block. Keep the prior owned runtime untouched and do
-                // all preparation outside the registry lock.
+                // Rediscovery can block without changing authority. Once it succeeds, retire and
+                // reap the exact registered group before any replacement is spawned. Thus a stop
+                // failure leaves the old capability solely registered, and no failed retire can
+                // ever leave two live Dock-owned groups for one run.
                 let adapter = entry
                     .selection
                     .resolve()
@@ -698,6 +1274,91 @@ impl RuntimeRegistry {
                 {
                     hook();
                 }
+                let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+                let current = runs
+                    .get(run_id)
+                    .and_then(RuntimeSlot::active)
+                    .ok_or_else(|| {
+                        (
+                            ErrorCode::RunNotFound,
+                            format!("run id {run_id:?} disappeared during restart"),
+                        )
+                    })?;
+                if !Arc::ptr_eq(&current.runtime, &runtime) {
+                    return Err((
+                        ErrorCode::Internal,
+                        "run changed during concurrent restart; retry against the current runtime"
+                            .into(),
+                    ));
+                }
+                drop(runs);
+                {
+                    let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+                    let current = runs.get(run_id).and_then(RuntimeSlot::active);
+                    if !current.is_some_and(|current| Arc::ptr_eq(&current.runtime, &runtime)) {
+                        return Err((
+                            ErrorCode::Internal,
+                            "run identity changed during restart".into(),
+                        ));
+                    }
+                    runs.insert(
+                        run_id.to_owned(),
+                        RuntimeSlot {
+                            transition: Arc::clone(&slot.transition),
+                            state: RuntimeSlotState::Restarting {
+                                repository_root: runtime.binding().repository_root,
+                                entry: entry.clone(),
+                            },
+                        },
+                    );
+                }
+                #[cfg(test)]
+                if let Some(message) = self
+                    .restart_stop_failure
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                {
+                    let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+                    if runs.get(run_id).is_some_and(|current| {
+                        Arc::ptr_eq(&current.transition, &slot.transition)
+                            && matches!(current.state, RuntimeSlotState::Restarting { .. })
+                    }) {
+                        runs.insert(
+                            run_id.to_owned(),
+                            RuntimeSlot {
+                                transition: Arc::clone(&slot.transition),
+                                state: RuntimeSlotState::Active(entry.clone()),
+                            },
+                        );
+                    }
+                    return Err((ErrorCode::Internal, message));
+                }
+                if let Err(message) = runtime.stop() {
+                    let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+                    if runs.get(run_id).is_some_and(|current| {
+                        Arc::ptr_eq(&current.transition, &slot.transition)
+                            && matches!(current.state, RuntimeSlotState::Restarting { .. })
+                    }) {
+                        runs.insert(
+                            run_id.to_owned(),
+                            RuntimeSlot {
+                                transition: Arc::clone(&slot.transition),
+                                state: RuntimeSlotState::Active(entry.clone()),
+                            },
+                        );
+                    }
+                    return Err((ErrorCode::Internal, message));
+                }
+                #[cfg(test)]
+                if let Some(hook) = self
+                    .restart_after_stop_hook
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                {
+                    hook();
+                }
                 let replacement = Arc::new(OwnedRuntime::launch(
                     runtime.binding(),
                     adapter,
@@ -705,6 +1366,19 @@ impl RuntimeRegistry {
                 ));
                 let snapshot = replacement.snapshot();
                 if snapshot.pid.is_none() {
+                    let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+                    let reserved = runs.get(run_id).is_some_and(|current| {
+                        Arc::ptr_eq(&current.transition, &slot.transition)
+                            && matches!(current.state, RuntimeSlotState::Restarting { .. })
+                    });
+                    if reserved {
+                        let binding = runtime.binding();
+                        self.layout
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .unbind_run(&binding.workspace_id, &binding.pane_id, run_id);
+                        runs.remove(run_id);
+                    }
                     return Err((
                         ErrorCode::AdapterUnavailable,
                         snapshot
@@ -713,32 +1387,27 @@ impl RuntimeRegistry {
                             .unwrap_or_else(|| "replacement adapter failed to launch".into()),
                     ));
                 }
-
                 let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
-                let current = runs.get(run_id).ok_or_else(|| {
-                    (
-                        ErrorCode::RunNotFound,
-                        format!("run id {run_id:?} disappeared during restart"),
-                    )
-                })?;
-                if !Arc::ptr_eq(&current.runtime, &runtime) {
+                let current = runs.get(run_id);
+                if !current.is_some_and(|current| {
+                    Arc::ptr_eq(&current.transition, &slot.transition)
+                        && matches!(current.state, RuntimeSlotState::Restarting { .. })
+                }) {
                     return Err((
                         ErrorCode::Internal,
-                        "run changed during concurrent restart; retry against the current runtime"
-                            .into(),
+                        "run identity changed during restart".into(),
                     ));
                 }
                 runs.insert(
                     run_id.to_owned(),
-                    RuntimeEntry {
-                        runtime: Arc::clone(&replacement),
-                        selection: entry.selection,
+                    RuntimeSlot {
+                        transition: Arc::clone(&slot.transition),
+                        state: RuntimeSlotState::Active(RuntimeEntry {
+                            runtime: Arc::clone(&replacement),
+                            selection: entry.selection,
+                        }),
                     },
                 );
-                drop(runs);
-                // The replacement is now the sole registered capability. Only then retire the
-                // exact prior group whose Arc identity won the compare-and-swap above.
-                runtime.stop().map_err(|m| (ErrorCode::Internal, m))?;
                 Ok(snapshot)
             }
         }
@@ -750,15 +1419,22 @@ impl RuntimeRegistry {
     ) -> Result<Vec<RuntimeSnapshot>, (ErrorCode, String)> {
         let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(run_id) = run_id {
-            let run = runs.get(run_id).ok_or_else(|| {
-                (
-                    ErrorCode::RunNotFound,
-                    format!("run id {run_id:?} is not active in this daemon"),
-                )
-            })?;
+            let run = runs
+                .get(run_id)
+                .and_then(RuntimeSlot::active)
+                .ok_or_else(|| {
+                    (
+                        ErrorCode::RunNotFound,
+                        format!("run id {run_id:?} is not active in this daemon"),
+                    )
+                })?;
             return Ok(vec![run.runtime.snapshot()]);
         }
-        let mut snapshots: Vec<_> = runs.values().map(|run| run.runtime.snapshot()).collect();
+        let mut snapshots: Vec<_> = runs
+            .values()
+            .filter_map(RuntimeSlot::active)
+            .map(|run| run.runtime.snapshot())
+            .collect();
         snapshots.sort_by(|a, b| a.run_id.cmp(&b.run_id));
         Ok(snapshots)
     }
@@ -958,6 +1634,17 @@ fn ensure_private_directory(path: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn layout_error(message: String) -> (ErrorCode, String) {
+    let code = if message == "workspace not found" {
+        ErrorCode::WorkspaceNotFound
+    } else if message.contains("pane not found") {
+        ErrorCode::PaneNotFound
+    } else {
+        ErrorCode::InvalidLayout
+    };
+    (code, message)
+}
+
 fn validate_binding(request: &DispatchRequest) -> Result<RunBinding, String> {
     validate_run_id(&request.run_id)?;
     if request.external_task_ref.trim().is_empty() {
@@ -1002,6 +1689,7 @@ fn validate_binding(request: &DispatchRequest) -> Result<RunBinding, String> {
         branch
     };
     let base_sha = git(&worktree, &["rev-parse", "HEAD"])?;
+    let workspace_id = format!("workspace_{}", repository_id(&repository_root));
     Ok(RunBinding {
         repository_root,
         external_task_ref: request.external_task_ref.clone(),
@@ -1009,6 +1697,8 @@ fn validate_binding(request: &DispatchRequest) -> Result<RunBinding, String> {
         worktree,
         branch,
         base_sha,
+        workspace_id,
+        pane_id: format!("pane_{}", request.run_id),
     })
 }
 
@@ -1212,6 +1902,33 @@ fn reserve_run_id(path: &Path) -> Result<(), String> {
     sync_parent(path)
 }
 
+fn rollback_run_id_reservation(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not remove durable run-id reservation at {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(test)]
+    if let Some(hook) = ROLLBACK_AFTER_UNLINK_HOOK.with(|hook| hook.borrow_mut().take()) {
+        hook()?;
+    }
+    sync_parent(path)
+}
+
+#[cfg(test)]
+type RollbackAfterUnlinkHook = Box<dyn FnOnce() -> Result<(), String>>;
+
+#[cfg(test)]
+thread_local! {
+    static ROLLBACK_AFTER_UNLINK_HOOK: std::cell::RefCell<Option<RollbackAfterUnlinkHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn sync_parent(path: &Path) -> Result<(), String> {
     File::open(
         path.parent()
@@ -1299,6 +2016,16 @@ fn save_receipt(path: &Path, snapshot: &RuntimeSnapshot) -> Result<(), String> {
 
 fn is_capacity_active(snapshot: &RuntimeSnapshot) -> bool {
     matches!(snapshot.state, crate::protocol::ProcessState::Running)
+}
+
+fn slot_reserves_capacity(slot: &RuntimeSlot) -> bool {
+    match &slot.state {
+        RuntimeSlotState::Launching { .. }
+        | RuntimeSlotState::Restarting { .. }
+        | RuntimeSlotState::ReceiptRollbackStopping { .. } => true,
+        RuntimeSlotState::RollbackPending { layout, .. } => layout.is_some(),
+        RuntimeSlotState::Active(entry) => is_capacity_active(&entry.runtime.snapshot()),
+    }
 }
 
 fn repository_id(path: &Path) -> String {
@@ -1515,6 +2242,344 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn invalid_layout_does_not_block_dispatch_or_programme_inspection() {
+        for (label, bytes) in [
+            ("corrupt-layout", b"{not-json}".as_slice()),
+            (
+                "unsupported-layout",
+                br#"{"schema_version":99,"workspaces":[]}"#.as_slice(),
+            ),
+        ] {
+            let repo = Repo::new(label);
+            fs::create_dir_all(&repo.state).unwrap();
+            fs::set_permissions(&repo.state, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(repo.state.join("layout.json"), bytes).unwrap();
+
+            let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+            assert!(registry.inspect_programme().gates.is_empty());
+            let snapshot = registry
+                .dispatch(repo.request(&format!("dock_{label}")))
+                .unwrap();
+            assert_eq!(registry.inspect(Some(&snapshot.run_id)).unwrap().len(), 1);
+            assert_eq!(
+                fs::read_dir(repo.state.join("layout-quarantine"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_layout_persistence_failure_rolls_back_all_reservations() {
+        let repo = Repo::new("dispatch-layout-rollback");
+        let registry = RuntimeRegistry::with_capacity(
+            &repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 1,
+                per_repository_run_capacity: 1,
+                human_review_reserved: 0,
+            },
+        )
+        .unwrap();
+        registry
+            .layout
+            .lock()
+            .unwrap()
+            .inject_persistence_failure(true);
+        let launch_marker = repo.root.join("layout-failure-launched");
+        let mut request = repo.request("dock_layout_rollback");
+        request.adapter.arguments = vec![
+            "-c".into(),
+            format!("touch {}; sleep 30", launch_marker.display()),
+        ];
+
+        assert!(matches!(
+            registry.dispatch(request.clone()),
+            Err((ErrorCode::InvalidLayout, message))
+                if message == "injected layout persistence failure"
+        ));
+        assert!(registry.runs.lock().unwrap().is_empty());
+        assert!(registry.layout().workspaces.is_empty());
+        assert!(!launch_marker.exists());
+        assert!(!repo.state.join("layout.json").exists());
+        assert!(
+            !repo
+                .state
+                .join("dispatches/dock_layout_rollback.json")
+                .exists()
+        );
+
+        registry
+            .layout
+            .lock()
+            .unwrap()
+            .inject_persistence_failure(false);
+        let snapshot = registry.dispatch(request).unwrap();
+        assert_eq!(snapshot.run_id, "dock_layout_rollback");
+    }
+
+    #[test]
+    fn workspace_close_stop_failure_keeps_binding_and_capacity_for_retry() {
+        let repo = Repo::new("workspace-close-stop-failure");
+        let registry = RuntimeRegistry::with_capacity(
+            &repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 1,
+                per_repository_run_capacity: 1,
+                human_review_reserved: 0,
+            },
+        )
+        .unwrap();
+        let mut request = repo.request("dock_close_stop_failure");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let snapshot = registry.dispatch(request).unwrap();
+        *registry.workspace_stop_failure.lock().unwrap() =
+            Some("deterministic owned runtime stop failure".into());
+
+        assert!(matches!(
+            registry.workspace(WorkspaceRequest::Close {
+                workspace_id: snapshot.workspace_id.clone(),
+                pane_id: snapshot.pane_id.clone(),
+            }),
+            Err((ErrorCode::Internal, message))
+                if message == "deterministic owned runtime stop failure"
+        ));
+        let layout = registry.layout();
+        assert_eq!(layout.workspaces.len(), 1);
+        assert_eq!(layout.workspaces[0].panes.len(), 1);
+        assert_eq!(
+            layout.workspaces[0].panes[&snapshot.pane_id]
+                .run_id
+                .as_deref(),
+            Some(snapshot.run_id.as_str())
+        );
+        let still_owned = registry.inspect(Some(&snapshot.run_id)).unwrap().remove(0);
+        assert!(matches!(
+            still_owned.state,
+            crate::protocol::ProcessState::Running
+        ));
+        assert!(matches!(
+            registry.dispatch(repo.request("dock_close_capacity_probe")),
+            Err((ErrorCode::CapacityExceeded, _))
+        ));
+
+        assert!(
+            registry
+                .workspace(WorkspaceRequest::Close {
+                    workspace_id: snapshot.workspace_id.clone(),
+                    pane_id: snapshot.pane_id.clone(),
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(registry.layout().workspaces.is_empty());
+        assert!(matches!(
+            registry.inspect(Some(&snapshot.run_id)),
+            Err((ErrorCode::RunNotFound, _))
+        ));
+    }
+
+    #[test]
+    fn workspace_close_persistence_failure_retires_authority_and_retries() {
+        let repo = Repo::new("workspace-close-persistence-failure");
+        let registry = RuntimeRegistry::with_capacity(
+            &repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 1,
+                per_repository_run_capacity: 1,
+                human_review_reserved: 0,
+            },
+        )
+        .unwrap();
+        let mut request = repo.request("dock_close_persist_failure");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let snapshot = registry.dispatch(request).unwrap();
+        let process_group_id = snapshot.process_group_id.expect("owned process group");
+        registry
+            .layout
+            .lock()
+            .unwrap()
+            .inject_persistence_failure(true);
+
+        assert!(matches!(
+            registry.workspace(WorkspaceRequest::Close {
+                workspace_id: snapshot.workspace_id.clone(),
+                pane_id: snapshot.pane_id.clone(),
+            }),
+            Err((ErrorCode::InvalidLayout, message))
+                if message == "injected layout persistence failure"
+        ));
+        wait_for_owned_group_exit(process_group_id);
+        assert!(matches!(
+            registry.inspect(Some(&snapshot.run_id)),
+            Err((ErrorCode::RunNotFound, _))
+        ));
+        let failed = registry.layout();
+        let pane = &failed.workspaces[0].panes[&snapshot.pane_id];
+        assert_eq!(pane.run_id.as_deref(), Some(snapshot.run_id.as_str()));
+        assert_eq!(pane.runtime, PaneRuntime::Exited);
+        assert_eq!(
+            registry
+                .inspect_programme()
+                .repositories
+                .iter()
+                .map(|repository| repository.active_capacity)
+                .sum::<usize>(),
+            0
+        );
+
+        registry
+            .layout
+            .lock()
+            .unwrap()
+            .inject_persistence_failure(false);
+        assert!(
+            registry
+                .workspace(WorkspaceRequest::Close {
+                    workspace_id: snapshot.workspace_id,
+                    pane_id: snapshot.pane_id,
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(registry.layout().workspaces.is_empty());
+    }
+
+    #[test]
+    fn restart_stop_failure_never_spawns_replacement_and_retains_capacity() {
+        let repo = Repo::new("restart-stop-failure");
+        let registry = RuntimeRegistry::with_capacity(
+            &repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 1,
+                per_repository_run_capacity: 1,
+                human_review_reserved: 0,
+            },
+        )
+        .unwrap();
+        let mut request = repo.request("dock_restart_stop_failure");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let first = registry.dispatch(request).unwrap();
+        *registry.restart_stop_failure.lock().unwrap() =
+            Some("deterministic restart retire failure".into());
+
+        assert!(matches!(
+            registry.lifecycle(&first.run_id, LifecycleOperation::Restart),
+            Err((ErrorCode::Internal, message))
+                if message == "deterministic restart retire failure"
+        ));
+        let retained = registry.inspect(Some(&first.run_id)).unwrap().remove(0);
+        assert_eq!(retained.pid, first.pid);
+        assert_eq!(retained.process_group_id, first.process_group_id);
+        assert_eq!(retained.state, crate::protocol::ProcessState::Running);
+        assert!(matches!(
+            registry.dispatch(repo.request("dock_restart_capacity_probe")),
+            Err((ErrorCode::CapacityExceeded, _))
+        ));
+
+        let replacement = registry
+            .lifecycle(&first.run_id, LifecycleOperation::Restart)
+            .unwrap();
+        assert_ne!(replacement.process_group_id, first.process_group_id);
+        wait_for_owned_group_exit(first.process_group_id.unwrap());
+        assert_eq!(registry.inspect(None).unwrap().len(), 1);
+        registry
+            .lifecycle(&first.run_id, LifecycleOperation::Stop)
+            .unwrap();
+    }
+
+    #[test]
+    fn restart_reserves_global_and_repository_capacity_then_terminalizes_launch_failure() {
+        use std::sync::Barrier;
+
+        let first_repo = Repo::new("restart-reservation-first");
+        let second_repo = Repo::new("restart-reservation-second");
+        let third_repo = Repo::new("restart-reservation-third");
+        let registry = Arc::new(
+            RuntimeRegistry::with_capacity(
+                &first_repo.state,
+                64,
+                CapacityPolicy {
+                    global_run_capacity: 2,
+                    per_repository_run_capacity: 1,
+                    human_review_reserved: 0,
+                },
+            )
+            .unwrap(),
+        );
+        let executable = first_repo.root.join("one-shot-agent");
+        fs::write(&executable, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut first_request = first_repo.request("dock_restart_launch_failure");
+        first_request.adapter = AdapterSelection {
+            id: crate::adapter::AdapterId::Generic,
+            executable: Some(executable.display().to_string()),
+            arguments: vec![],
+        };
+        let first = registry.dispatch(first_request).unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *registry.restart_after_stop_hook.lock().unwrap() = Some(Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let executable = executable.clone();
+            move || {
+                fs::remove_file(&executable).unwrap();
+                entered.wait();
+                release.wait();
+            }
+        }));
+        let restarting = {
+            let registry = Arc::clone(&registry);
+            let run_id = first.run_id.clone();
+            thread::spawn(move || registry.lifecycle(&run_id, LifecycleOperation::Restart))
+        };
+        entered.wait();
+        assert!(matches!(
+            registry.dispatch(first_repo.request("dock_restart_same_repo_probe")),
+            Err((ErrorCode::CapacityExceeded, message)) if message.contains("repository run capacity")
+        ));
+        let mut second_request = second_repo.request("dock_restart_capacity_other");
+        second_request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let second = registry.dispatch(second_request).unwrap();
+        assert!(matches!(
+            registry.dispatch(third_repo.request("dock_restart_global_probe")),
+            Err((ErrorCode::CapacityExceeded, message)) if message.contains("global run capacity")
+        ));
+        release.wait();
+        assert!(matches!(
+            restarting.join().unwrap(),
+            Err((ErrorCode::AdapterUnavailable, _))
+        ));
+        assert!(matches!(
+            registry.inspect(Some(&first.run_id)),
+            Err((ErrorCode::RunNotFound, _))
+        ));
+        let layout = registry.layout();
+        let pane = layout
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.panes.get(&first.pane_id))
+            .unwrap();
+        assert_eq!(pane.run_id, None);
+        assert_eq!(pane.runtime, PaneRuntime::Empty);
+        let replacement_capacity = registry
+            .dispatch(first_repo.request("dock_restart_after_terminal"))
+            .unwrap();
+        registry
+            .lifecycle(&replacement_capacity.run_id, LifecycleOperation::Stop)
+            .unwrap();
+        registry
+            .lifecycle(&second.run_id, LifecycleOperation::Stop)
+            .unwrap();
     }
 
     #[test]
@@ -1855,7 +2920,7 @@ mod tests {
         .unwrap();
         fs::write(
             receipts.join("dock_receipt_truncated_upstream.json"),
-            br#"{"protocol_version":5,"repository_id":"repo-v2-"#,
+            br#"{"protocol_version":6,"repository_id":"repo-v2-"#,
         )
         .unwrap();
         let forged_path = receipts.join("dock_receipt_forged_upstream.json");
@@ -2025,6 +3090,8 @@ mod tests {
         request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
         let snapshot = registry.dispatch(request).unwrap();
         let runtime = registry.runs.lock().unwrap()[&snapshot.run_id]
+            .active()
+            .unwrap()
             .runtime
             .clone();
         *registry.portfolio_capture_hook.lock().unwrap() = Some(Arc::new(move || {
@@ -2050,6 +3117,57 @@ mod tests {
             portfolio.global_active
         );
         assert_eq!(registry.inspect_programme().global_active, 0);
+    }
+
+    #[test]
+    fn portfolio_counts_launching_reservation_in_the_same_transition_snapshot_as_admission() {
+        let repo = Repo::new("portfolio-launching");
+        let registry = Arc::new(
+            RuntimeRegistry::with_capacity(
+                &repo.state,
+                64,
+                CapacityPolicy {
+                    global_run_capacity: 1,
+                    per_repository_run_capacity: 1,
+                    human_review_reserved: 0,
+                },
+            )
+            .unwrap(),
+        );
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *registry.after_launch_before_receipt_hook.lock().unwrap() = Some(Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+            }
+        }));
+        let request = repo.request("dock_launching_snapshot");
+        let dispatch = {
+            let registry = Arc::clone(&registry);
+            thread::spawn(move || registry.dispatch(request))
+        };
+        entered.wait();
+
+        let portfolio = registry.inspect_programme();
+        assert_eq!(portfolio.global_active, 1);
+        assert_eq!(portfolio.repositories.len(), 1);
+        assert_eq!(portfolio.repositories[0].active_capacity, 1);
+        assert_eq!(
+            portfolio.repositories[0].active_run_ids,
+            ["dock_launching_snapshot".to_owned()]
+        );
+        assert!(matches!(
+            registry.dispatch(repo.request("dock_capacity_refused")),
+            Err((ErrorCode::CapacityExceeded, _))
+        ));
+        release.wait();
+        assert!(matches!(
+            dispatch.join().unwrap(),
+            Err((ErrorCode::Internal, _))
+        ));
     }
 
     #[test]
@@ -2339,6 +3457,387 @@ mod tests {
     }
 
     #[test]
+    fn receipt_failure_after_launch_rolls_back_exact_runtime_binding_and_capacity() {
+        let repo = Repo::new("receipt-rollback");
+        let registry = RuntimeRegistry::with_capacity(
+            &repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 1,
+                per_repository_run_capacity: 1,
+                human_review_reserved: 0,
+            },
+        )
+        .unwrap();
+        let marker = repo.root.join("receipt-rollback-pid");
+        let mut request = repo.request("dock_receipt_rollback");
+        request.adapter.arguments = vec![
+            "-c".into(),
+            format!("echo $$ > {}; sleep 30", marker.display()),
+        ];
+        let binding = validate_binding(&request).unwrap();
+        let receipt = registry.receipt_path(&request.run_id).unwrap();
+        let temporary = receipt.with_file_name(format!(
+            ".{}.tmp-{}",
+            receipt.file_name().unwrap().to_str().unwrap(),
+            std::process::id()
+        ));
+        *registry.before_save_receipt_hook.lock().unwrap() = Some(Arc::new({
+            let marker = marker.clone();
+            let temporary = temporary.clone();
+            move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !marker.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    marker.exists(),
+                    "child did not reach receipt failure window"
+                );
+                fs::create_dir(&temporary).unwrap();
+            }
+        }));
+
+        assert!(matches!(
+            registry.dispatch(request.clone()),
+            Err((ErrorCode::Internal, _))
+        ));
+        assert!(registry.runs.lock().unwrap().is_empty());
+        assert_eq!(registry.inspect_programme().global_active, 0);
+        assert_eq!(
+            registry
+                .layout
+                .lock()
+                .unwrap()
+                .pane_run(&binding.workspace_id, &binding.pane_id),
+            None
+        );
+        assert!(!receipt.exists());
+        let pid: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while unsafe { nix::libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { nix::libc::kill(pid, 0) },
+            0,
+            "rolled-back child survived"
+        );
+
+        fs::remove_dir(&temporary).unwrap();
+        drop(registry);
+        let restarted = RuntimeRegistry::with_capacity(
+            &repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 1,
+                per_repository_run_capacity: 1,
+                human_review_reserved: 0,
+            },
+        )
+        .unwrap();
+        assert!(restarted.layout().workspaces.is_empty());
+        assert!(restarted.runs.lock().unwrap().is_empty());
+        assert_eq!(restarted.inspect_programme().global_active, 0);
+        assert!(!receipt.exists());
+        let retry = restarted.dispatch(request).unwrap();
+        assert_eq!(retry.run_id, "dock_receipt_rollback");
+    }
+
+    #[test]
+    fn receipt_failure_stop_error_retains_authority_and_retry_completes_cleanup() {
+        let repo = Repo::new("receipt-stop-failure");
+        let registry = RuntimeRegistry::with_capacity(
+            &repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 1,
+                per_repository_run_capacity: 1,
+                human_review_reserved: 0,
+            },
+        )
+        .unwrap();
+        let mut request = repo.request("dock_receipt_stop_failure");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let binding = validate_binding(&request).unwrap();
+        let receipt = registry.receipt_path(&request.run_id).unwrap();
+        let temporary = receipt.with_file_name(format!(
+            ".{}.tmp-{}",
+            receipt.file_name().unwrap().to_str().unwrap(),
+            std::process::id()
+        ));
+        *registry.before_save_receipt_hook.lock().unwrap() = Some(Arc::new({
+            let temporary = temporary.clone();
+            move || fs::create_dir(&temporary).unwrap()
+        }));
+        *registry.receipt_stop_failure.lock().unwrap() = Some(
+            "could not signal Dock-owned process group: EPERM; exact group still exists".into(),
+        );
+
+        let error = registry.dispatch(request.clone()).unwrap_err();
+        assert!(error.1.contains("EPERM"));
+        assert!(receipt.exists(), "receipt reservation authority was lost");
+        assert_eq!(
+            registry
+                .layout
+                .lock()
+                .unwrap()
+                .pane_run(&binding.workspace_id, &binding.pane_id),
+            Some(request.run_id.clone())
+        );
+        let process_group_id = {
+            let runs = registry.runs.lock().unwrap();
+            let slot = runs
+                .get(&request.run_id)
+                .expect("retryable stop transition");
+            assert!(matches!(
+                slot.state,
+                RuntimeSlotState::ReceiptRollbackStopping { .. }
+            ));
+            slot.active()
+                .unwrap()
+                .runtime
+                .snapshot()
+                .process_group_id
+                .unwrap()
+        };
+        assert_eq!(unsafe { nix::libc::kill(-process_group_id, 0) }, 0);
+        assert_eq!(registry.inspect_programme().global_active, 1);
+
+        fs::remove_dir(&temporary).unwrap();
+        let retried = registry.dispatch(request).unwrap();
+        assert_eq!(retried.run_id, "dock_receipt_stop_failure");
+        assert_ne!(unsafe { nix::libc::kill(-process_group_id, 0) }, 0);
+        registry
+            .lifecycle(&retried.run_id, LifecycleOperation::Stop)
+            .unwrap();
+    }
+
+    #[test]
+    fn unlink_then_directory_sync_failure_advances_layout_and_retries_absent_receipt() {
+        let repo = Repo::new("receipt-unlink-sync-retry");
+        let registry = RuntimeRegistry::with_capacity(
+            &repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 1,
+                per_repository_run_capacity: 1,
+                human_review_reserved: 0,
+            },
+        )
+        .unwrap();
+        let mut request = repo.request("dock_receipt_unlink_sync_retry");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let receipt = registry.receipt_path(&request.run_id).unwrap();
+        let temporary = receipt.with_file_name(format!(
+            ".{}.tmp-{}",
+            receipt.file_name().unwrap().to_str().unwrap(),
+            std::process::id()
+        ));
+        *registry.before_save_receipt_hook.lock().unwrap() = Some(Arc::new({
+            let temporary = temporary.clone();
+            move || fs::create_dir(&temporary).unwrap()
+        }));
+        ROLLBACK_AFTER_UNLINK_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err("could not sync durable record directory: injected failure".into())
+            }));
+        });
+
+        let error = registry.dispatch(request.clone()).unwrap_err();
+        assert!(error.1.contains("could not sync durable record directory"));
+        assert!(
+            !receipt.exists(),
+            "unlink completed before directory sync failed"
+        );
+        {
+            let runs = registry.runs.lock().unwrap();
+            let slot = runs.get(&request.run_id).expect("pending receipt cleanup");
+            assert!(matches!(
+                &slot.state,
+                RuntimeSlotState::RollbackPending { layout: None, .. }
+            ));
+            assert!(
+                !slot_reserves_capacity(slot),
+                "durably restored layout must release capacity"
+            );
+        }
+        assert!(
+            registry
+                .layout
+                .lock()
+                .unwrap()
+                .snapshot()
+                .workspaces
+                .is_empty()
+        );
+
+        fs::remove_dir(&temporary).unwrap();
+        let retried = registry.dispatch(request).unwrap();
+        assert_eq!(retried.run_id, "dock_receipt_unlink_sync_retry");
+        assert!(
+            registry
+                .runs
+                .lock()
+                .unwrap()
+                .get(&retried.run_id)
+                .unwrap()
+                .active()
+                .is_some()
+        );
+        registry
+            .lifecycle(&retried.run_id, LifecycleOperation::Stop)
+            .unwrap();
+    }
+
+    #[test]
+    fn receipt_and_layout_rollback_double_fault_reconciles_on_retry() {
+        let repo = Repo::new("receipt-layout-double-fault");
+        let registry = Arc::new(
+            RuntimeRegistry::with_capacity(
+                &repo.state,
+                64,
+                CapacityPolicy {
+                    global_run_capacity: 1,
+                    per_repository_run_capacity: 1,
+                    human_review_reserved: 0,
+                },
+            )
+            .unwrap(),
+        );
+        let mut request = repo.request("dock_receipt_layout_double_fault");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let receipt = registry.receipt_path(&request.run_id).unwrap();
+        let temporary = receipt.with_file_name(format!(
+            ".{}.tmp-{}",
+            receipt.file_name().unwrap().to_str().unwrap(),
+            std::process::id()
+        ));
+        let weak = Arc::downgrade(&registry);
+        *registry.before_save_receipt_hook.lock().unwrap() = Some(Arc::new({
+            let temporary = temporary.clone();
+            move || {
+                fs::create_dir(&temporary).unwrap();
+                weak.upgrade()
+                    .unwrap()
+                    .layout
+                    .lock()
+                    .unwrap()
+                    .inject_persistence_failure(true);
+            }
+        }));
+
+        let error = registry.dispatch(request.clone()).unwrap_err();
+        assert!(error.1.contains("could not restore dispatch layout"));
+        assert!(
+            receipt.exists(),
+            "identity reservation must survive the double fault"
+        );
+        let runs = registry.runs.lock().unwrap();
+        let slot = runs.get(&request.run_id).expect("terminal retry authority");
+        assert!(
+            slot.active().is_none(),
+            "retired process must not remain active"
+        );
+        assert!(matches!(
+            slot.state,
+            RuntimeSlotState::RollbackPending { .. }
+        ));
+        drop(runs);
+        let portfolio = registry.inspect_programme();
+        assert_eq!(portfolio.global_active, 1, "capacity remains reserved");
+        assert!(portfolio.repositories[0].active_run_ids.is_empty());
+        let failed_refresh = registry.layout();
+        assert_eq!(
+            failed_refresh.workspaces[0]
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .runtime,
+            PaneRuntime::Exited
+        );
+
+        registry
+            .layout
+            .lock()
+            .unwrap()
+            .inject_persistence_failure(false);
+        fs::remove_dir(&temporary).unwrap();
+        assert!(registry.layout().workspaces.is_empty());
+        assert!(registry.runs.lock().unwrap().is_empty());
+        assert_eq!(registry.inspect_programme().global_active, 0);
+        assert!(!receipt.exists());
+        assert_eq!(
+            registry.dispatch(request).unwrap().run_id,
+            "dock_receipt_layout_double_fault"
+        );
+    }
+
+    #[test]
+    fn receipt_failure_restores_existing_pane_across_reload() {
+        let repo = Repo::new("receipt-existing-pane-rollback");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let mut request = repo.request("dock_receipt_existing_pane_rollback");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let binding = validate_binding(&request).unwrap();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: binding.workspace_id.clone(),
+                name: "kept workspace".into(),
+                pane_id: binding.pane_id.clone(),
+            })
+            .unwrap();
+        registry
+            .workspace(WorkspaceRequest::Rename {
+                workspace_id: binding.workspace_id.clone(),
+                pane_id: Some(binding.pane_id.clone()),
+                name: "kept pane".into(),
+            })
+            .unwrap();
+        let before = registry.layout();
+        let receipt = registry.receipt_path(&request.run_id).unwrap();
+        let temporary = receipt.with_file_name(format!(
+            ".{}.tmp-{}",
+            receipt.file_name().unwrap().to_str().unwrap(),
+            std::process::id()
+        ));
+        *registry.before_save_receipt_hook.lock().unwrap() = Some(Arc::new({
+            let temporary = temporary.clone();
+            move || fs::create_dir(&temporary).unwrap()
+        }));
+
+        assert!(matches!(
+            registry.dispatch(request),
+            Err((ErrorCode::Internal, _))
+        ));
+        assert_eq!(registry.layout(), before);
+        assert!(registry.runs.lock().unwrap().is_empty());
+        assert!(!receipt.exists());
+        fs::remove_dir(&temporary).unwrap();
+        drop(registry);
+
+        let restarted = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let mut restored_before = before;
+        restored_before.workspaces[0]
+            .panes
+            .get_mut(&binding.pane_id)
+            .unwrap()
+            .runtime = PaneRuntime::Restored;
+        assert_eq!(restarted.layout(), restored_before);
+        assert_eq!(
+            restarted
+                .layout
+                .lock()
+                .unwrap()
+                .pane_run(&binding.workspace_id, &binding.pane_id),
+            None
+        );
+        assert!(restarted.runs.lock().unwrap().is_empty());
+        assert_eq!(restarted.inspect_programme().global_active, 0);
+    }
+
+    #[test]
     fn concurrent_release_is_duplicate_safe_and_launches_once() {
         let upstream_repo = Repo::new("release-race-upstream");
         let downstream_repo = Repo::new("release-race-downstream");
@@ -2482,6 +3981,59 @@ mod tests {
     }
 
     #[test]
+    fn full_deterministic_workspace_refuses_before_launch_and_close_releases_capacity() {
+        let repo = Repo::new("pane-capacity");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let mut first = None;
+        for index in 0..crate::layout::MAX_PANES_PER_WORKSPACE {
+            let snapshot = registry
+                .dispatch(repo.request(&format!("dock_capacity_{index}")))
+                .unwrap();
+            first.get_or_insert(snapshot);
+        }
+        assert_eq!(registry.layout().workspaces[0].panes.len(), 64);
+
+        let refused_id = "dock_capacity_refused";
+        let mut refused = repo.request(refused_id);
+        refused.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        assert!(matches!(
+            registry.dispatch(refused),
+            Err((ErrorCode::CapacityExceeded, message)) if message.contains("workspace pane capacity 64")
+        ));
+        assert!(
+            !repo
+                .state
+                .join(format!("dispatches/{refused_id}.json"))
+                .exists()
+        );
+        assert!(matches!(
+            registry.inspect(Some(refused_id)),
+            Err((ErrorCode::RunNotFound, _))
+        ));
+        assert!(
+            !registry.layout().workspaces[0]
+                .panes
+                .contains_key(&format!("pane_{refused_id}"))
+        );
+
+        let first = first.unwrap();
+        registry
+            .workspace(WorkspaceRequest::Close {
+                workspace_id: first.workspace_id,
+                pane_id: first.pane_id,
+            })
+            .unwrap();
+        assert_eq!(
+            registry
+                .dispatch(repo.request("dock_capacity_after_close"))
+                .unwrap()
+                .run_id,
+            "dock_capacity_after_close"
+        );
+        assert_eq!(registry.layout().workspaces[0].panes.len(), 64);
+    }
+
+    #[test]
     fn lifecycle_signals_only_the_registered_owned_group_and_restart_replaces_it() {
         let repo = Repo::new("lifecycle");
         let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
@@ -2592,6 +4144,214 @@ mod tests {
         registry
             .lifecycle("dock_nonblocking", LifecycleOperation::Stop)
             .unwrap();
+    }
+
+    #[test]
+    fn blocked_restart_reap_does_not_block_unrelated_registry_or_layout_work() {
+        use std::sync::mpsc;
+
+        let repo = Repo::new("restart-blocked-reap");
+        let registry = Arc::new(RuntimeRegistry::new(&repo.state, 64).unwrap());
+        let term_seen = repo.root.join("term-seen");
+        let ready = repo.root.join("ready");
+        let mut blocked = repo.request("dock_blocked_restart");
+        blocked.adapter.arguments = vec![
+            "-c".into(),
+            format!(
+                "trap 'touch {}' TERM; touch {}; while :; do :; done",
+                term_seen.display(),
+                ready.display()
+            ),
+        ];
+        let first = registry.dispatch(blocked).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "TERM-ignoring fixture did not become ready");
+
+        let restarting = {
+            let registry = Arc::clone(&registry);
+            thread::spawn(move || {
+                registry.lifecycle("dock_blocked_restart", LifecycleOperation::Restart)
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !term_seen.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            term_seen.exists(),
+            "restart did not reach its blocking reap"
+        );
+
+        let (sent, received) = mpsc::channel();
+        let worker = {
+            let registry = Arc::clone(&registry);
+            let mut request = repo.request("dock_unrelated_while_reaping");
+            request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+            thread::spawn(move || {
+                let inspected = registry.inspect(Some("dock_blocked_restart")).unwrap();
+                let unrelated = registry.dispatch(request).unwrap();
+                registry
+                    .lifecycle(&unrelated.run_id, LifecycleOperation::Interrupt)
+                    .unwrap();
+                registry
+                    .workspace(WorkspaceRequest::Create {
+                        workspace_id: "work_unrelated_manual".into(),
+                        name: "unrelated".into(),
+                        pane_id: "pane_unrelated_manual".into(),
+                    })
+                    .unwrap();
+                sent.send((inspected.len(), unrelated.run_id)).unwrap();
+            })
+        };
+        let (inspected, unrelated_id) = received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("unrelated inspect/dispatch/lifecycle/layout blocked behind restart reap");
+        assert_eq!(inspected, 1);
+
+        let old_group = first.process_group_id.unwrap();
+        assert_eq!(
+            unsafe { nix::libc::kill(-old_group, nix::libc::SIGKILL) },
+            0
+        );
+        let replacement = restarting.join().unwrap().unwrap();
+        worker.join().unwrap();
+        registry
+            .lifecycle(&replacement.run_id, LifecycleOperation::Stop)
+            .unwrap();
+        registry
+            .lifecycle(&unrelated_id, LifecycleOperation::Stop)
+            .unwrap();
+    }
+
+    #[test]
+    fn blocked_close_reap_does_not_hold_runs_or_layout_mutexes() {
+        use std::sync::mpsc;
+
+        let repo = Repo::new("close-blocked-reap");
+        let registry = Arc::new(RuntimeRegistry::new(&repo.state, 64).unwrap());
+        let term_seen = repo.root.join("close-term-seen");
+        let ready = repo.root.join("close-ready");
+        let mut blocked = repo.request("dock_blocked_close");
+        blocked.adapter.arguments = vec![
+            "-c".into(),
+            format!(
+                "trap 'touch {}' TERM; touch {}; while :; do :; done",
+                term_seen.display(),
+                ready.display()
+            ),
+        ];
+        let first = registry.dispatch(blocked).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists());
+        let closing = {
+            let registry = Arc::clone(&registry);
+            let workspace_id = first.workspace_id.clone();
+            let pane_id = first.pane_id.clone();
+            thread::spawn(move || {
+                registry.workspace(WorkspaceRequest::Close {
+                    workspace_id,
+                    pane_id,
+                })
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !term_seen.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(term_seen.exists(), "close did not reach its blocking reap");
+
+        let (sent, received) = mpsc::channel();
+        let worker = {
+            let registry = Arc::clone(&registry);
+            let mut request = repo.request("dock_unrelated_while_closing");
+            request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+            thread::spawn(move || {
+                assert_eq!(registry.inspect(None).unwrap().len(), 1);
+                let unrelated = registry.dispatch(request).unwrap();
+                registry
+                    .lifecycle(&unrelated.run_id, LifecycleOperation::Interrupt)
+                    .unwrap();
+                let layout = registry.layout();
+                sent.send((unrelated.run_id, layout.workspaces.len()))
+                    .unwrap();
+            })
+        };
+        let (unrelated_id, workspace_count) = received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("unrelated registry/layout work blocked behind close reap");
+        assert!(!closing.is_finished());
+        assert!(!registry.layout().workspaces.is_empty());
+        assert!(workspace_count >= 1);
+
+        let old_group = first.process_group_id.unwrap();
+        assert_eq!(
+            unsafe { nix::libc::kill(-old_group, nix::libc::SIGKILL) },
+            0
+        );
+        closing.join().unwrap().unwrap();
+        worker.join().unwrap();
+        registry
+            .lifecycle(&unrelated_id, LifecycleOperation::Stop)
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_close_stops_the_exact_restarted_owned_run_before_removing_pane() {
+        use std::sync::Barrier;
+
+        let repo = Repo::new("restart-close-ownership");
+        let registry = Arc::new(RuntimeRegistry::new(&repo.state, 64).unwrap());
+        let mut request = repo.request("dock_restart_close");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let first = registry.dispatch(request).unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *registry.restart_hook.lock().unwrap() = Some(Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+            }
+        }));
+
+        let restarting = {
+            let registry = Arc::clone(&registry);
+            thread::spawn(move || {
+                registry.lifecycle("dock_restart_close", LifecycleOperation::Restart)
+            })
+        };
+        entered.wait();
+        let closing = {
+            let registry = Arc::clone(&registry);
+            let workspace_id = first.workspace_id.clone();
+            let pane_id = first.pane_id.clone();
+            thread::spawn(move || {
+                registry.workspace(WorkspaceRequest::Close {
+                    workspace_id,
+                    pane_id,
+                })
+            })
+        };
+        release.wait();
+        let replacement = restarting.join().unwrap().unwrap();
+        assert!(closing.join().unwrap().unwrap().is_none());
+        wait_for_owned_group_exit(
+            replacement
+                .process_group_id
+                .expect("replacement owned group"),
+        );
+        assert!(registry.layout().workspaces.is_empty());
+        assert!(matches!(
+            registry.inspect(Some("dock_restart_close")),
+            Err((ErrorCode::RunNotFound, _))
+        ));
     }
 
     #[test]

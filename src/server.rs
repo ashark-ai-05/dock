@@ -252,6 +252,16 @@ fn handle_connection_with_timeout(
                     portfolio: runtime.inspect_programme(),
                 },
             )?,
+            Ok(Request::Workspace(crate::protocol::WorkspaceRequest::Inspect)) => write_response(
+                stream,
+                &Response::Layout {
+                    layout: runtime.layout(),
+                },
+            )?,
+            Ok(Request::Workspace(request)) => match runtime.workspace(request) {
+                Ok(workspace) => write_response(stream, &Response::WorkspaceChanged { workspace })?,
+                Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
+            },
             Ok(Request::Hello(_)) => {
                 write_response(
                     stream,
@@ -449,7 +459,7 @@ mod tests {
         assert!(matches!(
             exchange(
                 &[
-                    r#"{"type":"hello","version":5,"future":true}"#,
+                    r#"{"type":"hello","version":6,"future":true}"#,
                     r#"{"type":"inspect","future":true}"#
                 ],
                 &runtime
@@ -532,7 +542,7 @@ mod tests {
                 },
             }))
             .unwrap();
-        let hello = r#"{"type":"hello","version":5}"#;
+        let hello = r#"{"type":"hello","version":6}"#;
         let dispatched = exchange(&[hello, &dispatch], &runtime);
         let pid = match &dispatched[1] {
             Response::Dispatched { snapshot } => snapshot.pid,
@@ -584,7 +594,7 @@ mod tests {
                 ..
             }]
         ));
-        let requests = [r#"{"type":"hello","version":5}"#, r#"{"type":"inspect"}"#];
+        let requests = [r#"{"type":"hello","version":6}"#, r#"{"type":"inspect"}"#];
         let first = socket_exchange(&socket, &requests);
         let second = socket_exchange(&socket, &requests);
         let snapshot_count = |responses: &[Response]| match &responses[1] {
@@ -600,5 +610,29 @@ mod tests {
             "socket must be removed when listener drops"
         );
         drop(runtime);
+    }
+
+    #[test]
+    fn workspace_socket_lifecycle_is_end_to_end() {
+        let runtime = registry();
+        let responses = exchange(
+            &[
+                r#"{"type":"hello","version":6}"#,
+                r#"{"type":"workspace","operation":"create","workspace_id":"daily","name":"Daily","pane_id":"pane_one"}"#,
+                r#"{"type":"workspace","operation":"split","workspace_id":"daily","pane_id":"pane_one","new_pane_id":"pane_two","axis":"vertical"}"#,
+                r#"{"type":"workspace","operation":"focus","workspace_id":"daily","pane_id":"pane_one"}"#,
+                r#"{"type":"workspace","operation":"inspect"}"#,
+            ],
+            &runtime,
+        );
+        assert!(
+            matches!(&responses[1], Response::WorkspaceChanged { workspace: Some(workspace) } if workspace.panes.len()==1)
+        );
+        assert!(
+            matches!(&responses[2], Response::WorkspaceChanged { workspace: Some(workspace) } if workspace.panes.len()==2)
+        );
+        assert!(
+            matches!(&responses[4], Response::Layout { layout } if layout.workspaces[0].focused_pane_id=="pane_one")
+        );
     }
 }

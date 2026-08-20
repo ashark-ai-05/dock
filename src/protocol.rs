@@ -2,10 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     adapter::{AdapterCapabilities, AdapterId, AdapterSelection, ProcessCapabilities},
+    layout::{LayoutSnapshot, SplitAxis, WorkspaceLayout},
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +22,7 @@ pub enum Request {
     QueueGated(QueueGatedRequest),
     ReleaseGate(ReleaseGateRequest),
     InspectProgramme(InspectProgrammeRequest),
+    Workspace(WorkspaceRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +101,42 @@ pub struct ReleaseGateRequest {
 pub struct InspectProgrammeRequest {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkspaceRequest {
+    Inspect,
+    Create {
+        workspace_id: String,
+        name: String,
+        pane_id: String,
+    },
+    Split {
+        workspace_id: String,
+        pane_id: String,
+        new_pane_id: String,
+        axis: SplitAxis,
+    },
+    Focus {
+        workspace_id: String,
+        pane_id: String,
+    },
+    Resize {
+        workspace_id: String,
+        pane_id: String,
+        ratio_milli: u16,
+    },
+    Rename {
+        workspace_id: String,
+        #[serde(default)]
+        pane_id: Option<String>,
+        name: String,
+    },
+    Close {
+        workspace_id: String,
+        pane_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableProgrammeGate {
     pub schema_version: u16,
@@ -146,6 +184,12 @@ pub enum Response {
     Programme {
         portfolio: ProgrammeSnapshot,
     },
+    Layout {
+        layout: LayoutSnapshot,
+    },
+    WorkspaceChanged {
+        workspace: Option<WorkspaceLayout>,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -174,6 +218,9 @@ pub enum ErrorCode {
     GateNotFound,
     GateBlocked,
     DuplicateGate,
+    InvalidLayout,
+    WorkspaceNotFound,
+    PaneNotFound,
     Internal,
 }
 
@@ -289,10 +336,35 @@ mod tests {
     fn hello_remains_forward_compatible_for_negotiation() {
         assert_eq!(
             serde_json::from_str::<Request>(
-                r#"{"type":"hello","version":5,"capabilities":["future"]}"#
+                r#"{"type":"hello","version":6,"capabilities":["future"]}"#
             )
             .unwrap(),
-            Request::Hello(HelloRequest { version: 5 })
+            Request::Hello(HelloRequest { version: 6 })
+        );
+    }
+    #[test]
+    fn workspace_contract_is_strict_and_typed() {
+        let request: Request = serde_json::from_str(r#"{"type":"workspace","operation":"split","workspace_id":"work_1","pane_id":"pane_1","new_pane_id":"pane_2","axis":"vertical"}"#).unwrap();
+        assert!(matches!(
+            request,
+            Request::Workspace(WorkspaceRequest::Split {
+                axis: SplitAxis::Vertical,
+                ..
+            })
+        ));
+        assert!(serde_json::from_str::<Request>(r#"{"type":"workspace","operation":"focus","workspace_id":"work_1","pane_id":"pane_1","pid":42}"#).is_err());
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"type":"workspace","operation":"rename","workspace_id":"work_1","name":"renamed"}"#).unwrap(),
+            Request::Workspace(WorkspaceRequest::Rename {
+                workspace_id: "work_1".into(),
+                pane_id: None,
+                name: "renamed".into(),
+            })
+        );
+        assert!(serde_json::from_str::<Request>(r#"{"type":"workspace","operation":"rename","workspace_id":"work_1","name":"renamed","future":true}"#).is_err());
+        assert!(
+            serde_json::from_str::<Request>(r#"{"type":"workspace","operation":"adopt","pid":42}"#)
+                .is_err()
         );
     }
 }

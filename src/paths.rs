@@ -156,14 +156,13 @@ mod tests {
     }
 
     fn test_runtime() -> (PathBuf, PathBuf, u32) {
-        let base = std::env::current_dir()
-            .expect("current directory")
-            .join("target")
-            .join(format!(
-                "dock-stale-socket-test-{}-{}",
-                std::process::id(),
-                SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
+        // Keep this below macOS's short sockaddr_un.sun_path limit even when the checkout path is
+        // long; PID + sequence retain deterministic per-process isolation.
+        let base = std::env::temp_dir().join(format!(
+            "dock-sock-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&base).expect("test base");
         let uid = unsafe { nix::libc::geteuid() };
         let socket = socket_path_in(&base, "runtime", uid).expect("runtime socket path");

@@ -64,6 +64,59 @@ pub struct HandoffPacket {
     pub checks: Vec<Check>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffEvidence {
+    pub branch: String,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub status_entries: usize,
+    pub changed_files: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffRecord {
+    pub packet: HandoffPacket,
+    pub evidence: HandoffEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRoute {
+    AcceptScope,
+    RequestChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewDecision {
+    pub run_id: String,
+    pub route: ReviewRoute,
+    pub note: String,
+    /// This invariant is durable and deliberately prevents a review route from being read as
+    /// external task completion or authority to mutate Git.
+    pub external_task_completed: bool,
+    pub git_mutated: bool,
+}
+
+impl ReviewDecision {
+    pub fn new(run_id: String, route: ReviewRoute, note: String) -> Result<Self, &'static str> {
+        if note.trim().is_empty() {
+            return Err("an explicit review decision note is required");
+        }
+        Ok(Self {
+            run_id,
+            route,
+            note,
+            external_task_completed: false,
+            git_mutated: false,
+        })
+    }
+}
+
 impl HandoffPacket {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.schema_version != 1 {

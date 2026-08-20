@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+use crate::model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute};
+
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9,6 +11,9 @@ pub enum Request {
     Hello(HelloRequest),
     Inspect(InspectRequest),
     Dispatch(DispatchRequest),
+    SubmitHandoff(SubmitHandoffRequest),
+    ReviewInbox(ReviewInboxRequest),
+    Decide(DecideRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,12 +39,33 @@ pub struct DispatchRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitHandoffRequest {
+    pub packet: HandoffPacket,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewInboxRequest {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecideRequest {
+    pub run_id: String,
+    pub route: ReviewRoute,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
     Hello { version: u16 },
     Snapshot { snapshot: RuntimeSnapshot },
     Snapshots { snapshots: Vec<RuntimeSnapshot> },
     Dispatched { snapshot: RuntimeSnapshot },
+    HandoffSubmitted { record: HandoffRecord },
+    ReviewInbox { items: Vec<HandoffRecord> },
+    DecisionRecorded { decision: ReviewDecision },
     Error { code: ErrorCode, message: String },
 }
 
@@ -55,6 +81,10 @@ pub enum ErrorCode {
     InvalidBinding,
     DuplicateRunId,
     RunNotFound,
+    InvalidHandoff,
+    DuplicateHandoff,
+    HandoffNotFound,
+    DecisionAlreadyRecorded,
     Internal,
 }
 
@@ -97,6 +127,10 @@ mod tests {
         assert!(serde_json::from_str::<Request>(r#"{"type":"inspect","pid":1}"#).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"type":"stop","pid":1}"#).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"type":"dispatch","repository_root":"r","external_task_ref":"t","run_id":"dock_1","worktree":"w","command":[],"pid":1}"#).is_err());
+        assert!(
+            serde_json::from_str::<Request>(r#"{"type":"review_inbox","future":true}"#).is_err()
+        );
+        assert!(serde_json::from_str::<Request>(r#"{"type":"decide","run_id":"dock_1","route":"accept_scope","note":"ok","completed":true}"#).is_err());
     }
     #[test]
     fn hello_remains_forward_compatible_for_negotiation() {

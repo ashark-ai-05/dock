@@ -1,8 +1,5 @@
 mod app;
-mod git;
 mod kanban;
-mod model;
-mod storage;
 
 use std::{error::Error, fs, io};
 
@@ -12,7 +9,11 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use model::{BoardFixture, Task, TaskState};
+use dock::{
+    git::GitAdapter,
+    model::{BoardFixture, Task, TaskState},
+    storage::LocalStore,
+};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -32,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .iter()
         .find_map(|argument| argument.strip_prefix("--load-handoff=").map(str::to_owned))
     {
-        let packet = storage::LocalStore::new(dock_dir)
+        let packet = LocalStore::new(dock_dir)
             .load_handoff(&run_id)
             .map_err(io::Error::other)?;
         println!("{}", serde_json::to_string_pretty(&packet)?);
@@ -44,7 +45,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         let json = fs::read(packet_path)?;
         let packet = serde_json::from_slice(&json)?;
-        let location = storage::LocalStore::new(dock_dir)
+        let location = LocalStore::new(dock_dir)
             .save_handoff(&packet)
             .map_err(io::Error::other)?;
         println!("saved {}", location.display());
@@ -58,15 +59,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             .iter()
             .find_map(|argument| argument.strip_prefix("--base=").map(str::to_owned))
             .unwrap_or_else(|| "HEAD".into());
-        let adapter = git::GitAdapter::new(worktree);
+        let adapter = GitAdapter::new(worktree);
         let facts = adapter.facts(&base).map_err(io::Error::other)?;
         let (diff, rendered_with_delta) = adapter.render_diff(&base).map_err(io::Error::other)?;
         println!(
-            "worktree={}\nbranch={}\nbase={}\nhead={}\nfiles={} +{} -{}\ndelta={}\n\n{}",
+            "worktree={}\nbranch={}\nbase={}\nhead={}\nstatus={} files={} +{} -{}\ndelta={}\n\n{}",
             facts.worktree.display(),
             facts.branch,
             facts.base_sha,
             facts.head_sha,
+            facts.status_entries,
             facts.changed_files,
             facts.insertions,
             facts.deletions,

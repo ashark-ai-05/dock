@@ -27,7 +27,7 @@ Dock must never infer task completion from terminal output, control a process it
 
 Slice 2 now provides one explicitly bound, fixture-only repository runtime:
 
-- `dockd` starts empty and accepts deterministic fixture dispatches through protocol version 2;
+- `dockd` starts empty and accepts deterministic fixture dispatches through protocol version 3;
 - each run is bound before launch to a canonical Git repository root, non-empty external task reference, Dock run id, and supplied existing worktree path;
 - worktree paths are canonicalized, kept beneath the repository root, checked against Git's top-level, and rejected on traversal, symlink escape, or repository mismatch;
 - each accepted run receives its own Dock-owned pane, PTY, and process group;
@@ -46,6 +46,18 @@ The earlier foundations remain available:
 - explicit LazyGit launch intent.
 
 Live process handles and scrollback remain in memory and disappear when `dockd` exits. Dispatch identity/launch facts persist beneath the configured state directory, but daemon restart recovery does not reattach or import the former process. Slice 2 does **not** create or mutate Git worktrees, claim tasks in a remote provider, launch real agents, accept terminal input, or provide terminal-multiplexer/dependency-gate parity. The supplied fixture worktree must already exist at a Git worktree top-level beneath (or equal to) the canonical repository root and share that repository's Git common directory.
+
+## Slice 3 handoff and review
+
+Protocol version 3 adds strict handoff submission for an existing daemon-bound run, a pending-review inbox, and explicit `accept-scope` / `request-change` routes. The daemon reconciles the existing `HandoffPacket` schema with the active binding, captures current branch/base/head and concise numstat evidence from Git, and stores only structured local records. Decisions explicitly record that Git was not mutated and the external task was not completed.
+
+On macOS, the compact dispatch → handoff → review → route smoke is:
+
+```bash
+scripts/smoke-slice3-macos.sh
+```
+
+It uses a short `/tmp` socket path for macOS, requires `jq`, cleans up its temporary daemon state, and does not commit, stage, or otherwise mutate Git. Sandboxed environments can select another short writable directory with `DOCK_SMOKE_PARENT=target`. For individual operations use `dock-handoff --submit=packet.json`, `dock-handoff --inbox`, or `dock-handoff --run-id=dock_ID --route=accept-scope|request-change --note=TEXT` with an optional `--socket=PATH`.
 
 ## Slice 2 fixture dispatch smoke
 

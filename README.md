@@ -37,6 +37,18 @@ cargo run
 
 Controls: `j/k` select, `a` accept an explicit scope decision, `r` request changes, `l` show the bound LazyGit command, `q` quit.
 
+### Read and atomically claim kanban-md tasks
+
+Dock delegates task mutation to `kanban-md`; it never edits task Markdown directly.
+
+```bash
+# list durable task contracts
+cargo run -- --kanban-dir=kanban
+
+# atomically claim the highest-priority available backlog task and move it in progress
+cargo run -- --kanban-dir=kanban --claim=dock-worker
+```
+
 ## Planned adapters
 
 - kanban-md CLI adapter: atomic claim/status transition

@@ -1,0 +1,10 @@
+{"timestamp":"2026-08-20T12:52:11.859974+10:00","action":"create","task_id":1,"detail":"Implement kanban-md task-board adapter"}
+{"timestamp":"2026-08-20T12:52:11.89232+10:00","action":"claim","task_id":1,"detail":"dock-bootstrap"}
+{"timestamp":"2026-08-20T12:52:11.892584+10:00","action":"move","task_id":1,"detail":"backlog -\u003e in-progress"}
+{"timestamp":"2026-08-20T12:54:00.29334+10:00","action":"create","task_id":2,"detail":"Validate Dock atomic claim adapter"}
+{"timestamp":"2026-08-20T12:54:00.743897+10:00","action":"claim","task_id":2,"detail":"dock-live-smoke"}
+{"timestamp":"2026-08-20T12:54:00.744078+10:00","action":"move","task_id":2,"detail":"backlog -\u003e in-progress"}
+{"timestamp":"2026-08-20T12:54:23.014975+10:00","action":"move","task_id":1,"detail":"in-progress -\u003e review"}
+{"timestamp":"2026-08-20T12:54:23.015222+10:00","action":"handoff","task_id":1,"detail":"Implement kanban-md task-board adapter"}
+{"timestamp":"2026-08-20T12:54:23.015634+10:00","action":"release","task_id":1,"detail":"Implement kanban-md task-board adapter"}
+{"timestamp":"2026-08-20T12:54:30.833539+10:00","action":"move","task_id":2,"detail":"in-progress -\u003e done"}

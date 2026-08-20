@@ -1,4 +1,5 @@
 mod app;
+mod kanban;
 mod model;
 
 use std::{error::Error, io};
@@ -20,6 +21,34 @@ use ratatui::{
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(board_dir) = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--kanban-dir=").map(str::to_owned))
+    {
+        let adapter = kanban::KanbanMdAdapter::new(board_dir);
+        if let Some(claim) = args
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--claim=").map(str::to_owned))
+        {
+            let task = adapter
+                .pick(&claim, "backlog", "in-progress")
+                .map_err(io::Error::other)?;
+            println!("claimed {}\t{}\t{}", task.id, task.status, task.title);
+            return Ok(());
+        }
+        let tasks = adapter.list().map_err(io::Error::other)?;
+        for task in tasks {
+            println!(
+                "{}\t{}\t{}\t{}",
+                task.id,
+                task.status,
+                task.claimed_by.unwrap_or_else(|| "unclaimed".into()),
+                task.title
+            );
+        }
+        return Ok(());
+    }
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;

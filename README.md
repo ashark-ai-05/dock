@@ -1,75 +1,105 @@
 # Dock
 
-**The handoff desk for coding-agent runtimes.**
+**The local control plane for coding-agent delivery.**
 
-Dock makes an agent stop legible: what task it owned, what changed, what proof exists, what it needs, and who should act next.
+Dock is a provider-neutral runtime for coding agents. It is being built to replace the combined daily workflow of a terminal multiplexer, agent runner, task board, Git review surface, and handoff desk—without taking ownership away from Git or a repository’s task source.
 
-## Product boundary
+> One repository works immediately. Open more repositories when you need a local delivery programme with explicit dependencies and shared agent capacity.
 
-Dock coordinates existing local-first tools; it does not replace them.
+## Product direction
 
-| Tool | Owns |
+Dock will own its workspaces, panes, PTYs, process groups, agent runs, runtime recovery, and local control API. It will support first-class agent adapters for tools such as Amp, Claude Code, Codex CLI, and GitHub Copilot CLI, plus a safe generic process fallback.
+
+Its Control Pane brings together runtime state, task/run/worktree bindings, Git evidence, explicit handoffs, dependency gates, and human delivery decisions.
+
+| Domain | Authority |
 |---|---|
-| kanban-md | Markdown task contracts, claims, task status |
-| Herdr | managed agent panes, runtime state, agent messaging |
-| Git | worktrees, branches, diffs, commits and merge facts |
-| delta | high-quality diff presentation |
-| LazyGit | human Git operations |
-| Dock | task ↔ run ↔ worktree binding, handoff inbox, evidence context, review routing |
+| Workspaces, panes, PTYs, process groups, runtime recovery | Dock |
+| Programme graph, capacity, bindings, handoffs, dependency gates | Dock |
+| Task cards, claims, repository task state | configured source, initially `kanban-md` |
+| Worktree, branch, commit, merge facts | Git |
+| Colour diff and review context | Dock, compatible with `delta` presentation |
+| Advanced interactive Git mutation | human through LazyGit or another explicit client |
 
-V0.1 excludes terminal multiplexing, Kanban/Git-client replacement, transcript surveillance, automatic merge/deploy, cloud backend, and model/vendor lock-in.
+Dock must never infer task completion from terminal output, control a process it does not own without explicit import, or stage/commit/rebase/merge/push/deploy automatically.
 
-## First vertical slice
+## Current prototype status
 
-The initial fixture-backed Ratatui application demonstrates the human handoff loop:
+This repository currently contains **foundations**, not the Dock runtime described above:
 
-1. show a bound task/run/worktree;
-2. display an explicit agent handoff, Git facts, and declared check evidence;
-3. accept a human scope decision or route changes back;
-4. show the exact LazyGit command that would open the bound worktree;
-5. never infer that a task is complete or merge code automatically.
+- Ratatui fixture Control-Pane prototype;
+- strict, versioned handoff packets and atomic local-only packet storage;
+- `kanban-md` task intake and atomic claim adapter;
+- Git worktree/base/head/numstat facts and `delta` diff rendering;
+- explicit LazyGit launch intent.
 
-Run it:
+It does **not yet** own PTYs, launch/manage Amp/Claude/Codex/Copilot, provide terminal-multiplexer parity, or run cross-repository dependency gates. The [runtime product spec](docs/dock-runtime-product-spec.md) distinguishes target behaviour from shipped capability.
+
+## The daily control loop
+
+```text
+open repository
+  → Dock-owned workspace, worktree, and agent pane
+  → bind external task ↔ run ↔ worktree ↔ Git base
+  → agent emits explicit handoff
+  → Control Pane shows evidence, checks, and question
+  → human routes decision or opens bound worktree in LazyGit
+  → optional dependency gate releases downstream work
+```
+
+The same loop works for a single repository. With multiple repositories open, Dock adds isolation, a portfolio view, capacity limits, and explicit cross-repository dependency edges.
+
+## Runtime feature contract
+
+Dock’s release bar is not “a dashboard with agent labels.” It must reach the daily-workflow capabilities needed to replace a Herdr-style terminal runtime:
+
+- workspaces, tabs, panes, splits, swaps, focus, resize, zoom, layout persistence;
+- owned PTYs/process groups, bounded scrollback, detach/reattach, and recovery;
+- local CLI and versioned Unix-socket API;
+- agent launch, attach, focus, interrupt, stop, restart, and explicit lifecycle state;
+- themes, configuration, notifications, and safe local extensions;
+- native task/run/worktree/handoff/evidence control;
+- single- and multi-repository operation;
+- `delta`-quality colour Git review and explicit LazyGit access.
+
+See the [vertical-slice plan](docs/implementation-breakdown.md) for the delivery sequence and acceptance evidence.
+
+## Existing foundation commands
 
 ```bash
+# fixture-backed Control Pane prototype
 cargo run
-```
 
-Controls: `j/k` select, `a` accept an explicit scope decision, `r` request changes, `l` show the bound LazyGit command, `q` quit.
-
-### Read and atomically claim kanban-md tasks
-
-Dock delegates task mutation to `kanban-md`; it never edits task Markdown directly.
-
-```bash
-# list durable task contracts
+# inspect a configured kanban-md board; optionally atomically claim a task
 cargo run -- --kanban-dir=kanban
-
-# atomically claim the highest-priority available backlog task and move it in progress
 cargo run -- --kanban-dir=kanban --claim=dock-worker
-```
 
-### Inspect a real worktree and render a contextual diff
-
-```bash
+# inspect real Git facts and a delta-rendered comparison
 cargo run -- --git-dir=. --base=HEAD~1
-```
 
-The adapter resolves Git facts through argument-safe subprocess calls and prefers `delta` as a renderer. It falls back to raw Git diff output if delta is unavailable or fails. Dock still never stages, commits, rebases, merges, or pushes.
-
-### Save a local-only explicit handoff
-
-```bash
+# save and load a strict local-only handoff packet
 cargo run -- --save-handoff=fixtures/demo-handoff.json
 cargo run -- --load-handoff=fixture_DOCK7
 ```
 
-By default, Dock writes to `.dock/local/handoffs/`, which is Git-ignored. Each save is atomic, each load validates the strict packet schema, and run IDs cannot escape the storage directory.
+The current prototype’s keyboard controls are `j/k` select, `a` accept an explicit scope decision, `r` request changes, `l` show a bound LazyGit command, and `q` quit.
 
-## Planned adapters
+## Safety and privacy
 
-- kanban-md CLI adapter: atomic claim/status transition
-- Herdr adapter: deterministic managed-pane binding through supported CLI/socket surface
-- Git adapter: worktree, branch, base/head and changed-file facts
-- delta adapter: external renderer with basic fallback
-- LazyGit launcher: opens at the exact bound worktree; Dock does not control it
+- Local-first by default; no hosted backend or telemetry is required.
+- Dock does not store API keys or agent credentials; each agent retains its normal authentication flow.
+- Raw terminal transcripts are not durable by default.
+- External command inputs are structured and validated; durable packets reject unexpected schema fields.
+- Git mutation remains a deliberate human action.
+
+## Development
+
+```bash
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+## Licence
+
+MIT

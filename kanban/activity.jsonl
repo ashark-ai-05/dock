@@ -32,3 +32,4 @@
 {"timestamp":"2026-08-20T16:06:10.143731+10:00","action":"move","task_id":7,"detail":"backlog -\u003e review"}
 {"timestamp":"2026-08-20T16:06:10.144372+10:00","action":"handoff","task_id":7,"detail":"Slice 3: structured handoff and evidence loop"}
 {"timestamp":"2026-08-20T16:06:10.144815+10:00","action":"release","task_id":7,"detail":"Slice 3: structured handoff and evidence loop"}
+{"timestamp":"2026-08-20T16:06:26.331418+10:00","action":"create","task_id":8,"detail":"Slice 4: explicit coding-agent adapter contract"}

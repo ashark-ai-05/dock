@@ -5,7 +5,7 @@ use crate::{
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +18,9 @@ pub enum Request {
     SubmitHandoff(SubmitHandoffRequest),
     ReviewInbox(ReviewInboxRequest),
     Decide(DecideRequest),
+    QueueGated(QueueGatedRequest),
+    ReleaseGate(ReleaseGateRequest),
+    InspectProgramme(InspectProgrammeRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +81,35 @@ pub struct DecideRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueGatedRequest {
+    pub dispatch: DispatchRequest,
+    pub upstream_run_id: String,
+    pub required_route: ReviewRoute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseGateRequest {
+    pub downstream_run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InspectProgrammeRequest {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableProgrammeGate {
+    pub schema_version: u16,
+    pub dispatch: DispatchRequest,
+    pub upstream_run_id: String,
+    pub upstream_repository_id: String,
+    pub downstream_repository_id: String,
+    pub required_route: ReviewRoute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
     Hello {
@@ -105,6 +137,15 @@ pub enum Response {
     DecisionRecorded {
         decision: ReviewDecision,
     },
+    GateQueued {
+        gate: DependencyGateSnapshot,
+    },
+    GateReleased {
+        snapshot: RuntimeSnapshot,
+    },
+    Programme {
+        portfolio: ProgrammeSnapshot,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -129,7 +170,52 @@ pub enum ErrorCode {
     DuplicateHandoff,
     HandoffNotFound,
     DecisionAlreadyRecorded,
+    CapacityExceeded,
+    GateNotFound,
+    GateBlocked,
+    DuplicateGate,
     Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateState {
+    AwaitingHandoff,
+    AwaitingDecision,
+    DecisionMismatch,
+    Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyGateSnapshot {
+    pub upstream_run_id: String,
+    pub downstream_run_id: String,
+    pub upstream_repository_id: String,
+    pub downstream_repository_id: String,
+    pub required_route: ReviewRoute,
+    pub state: GateState,
+    pub validation_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryPortfolioSnapshot {
+    pub repository_id: String,
+    pub active_run_ids: Vec<String>,
+    pub queued_run_ids: Vec<String>,
+    pub active_capacity: usize,
+    pub run_capacity: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgrammeSnapshot {
+    pub global_active: usize,
+    pub global_run_capacity: usize,
+    pub human_review_reserved: usize,
+    pub repositories: Vec<RepositoryPortfolioSnapshot>,
+    pub gates: Vec<DependencyGateSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,15 +273,26 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"type":"review_inbox","future":true}"#).is_err()
         );
         assert!(serde_json::from_str::<Request>(r#"{"type":"decide","run_id":"dock_1","route":"accept_scope","note":"ok","completed":true}"#).is_err());
+        assert!(
+            serde_json::from_str::<Request>(r#"{"type":"inspect_programme","future":true}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<Request>(r#"{"type":"queue_gated","dispatch":{"repository_root":"r","external_task_ref":"t","run_id":"dock_1","worktree":"w","adapter":{"id":"fixture","arguments":[]}},"upstream_run_id":"dock_0","required_route":"accept_scope","future":true}"#).is_err());
+        assert!(
+            serde_json::from_str::<Request>(
+                r#"{"type":"release_gate","downstream_run_id":"dock_1","future":true}"#
+            )
+            .is_err()
+        );
     }
     #[test]
     fn hello_remains_forward_compatible_for_negotiation() {
         assert_eq!(
             serde_json::from_str::<Request>(
-                r#"{"type":"hello","version":4,"capabilities":["future"]}"#
+                r#"{"type":"hello","version":5,"capabilities":["future"]}"#
             )
             .unwrap(),
-            Request::Hello(HelloRequest { version: 4 })
+            Request::Hello(HelloRequest { version: 5 })
         );
     }
 }

@@ -232,6 +232,26 @@ fn handle_connection_with_timeout(
                     }
                 }
             }
+            Ok(Request::QueueGated(request)) => match runtime.queue_gated(
+                request.dispatch,
+                request.upstream_run_id,
+                request.required_route,
+            ) {
+                Ok(gate) => write_response(stream, &Response::GateQueued { gate })?,
+                Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
+            },
+            Ok(Request::ReleaseGate(request)) => match runtime
+                .release_gate(&request.downstream_run_id)
+            {
+                Ok(snapshot) => write_response(stream, &Response::GateReleased { snapshot })?,
+                Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
+            },
+            Ok(Request::InspectProgramme(_)) => write_response(
+                stream,
+                &Response::Programme {
+                    portfolio: runtime.inspect_programme(),
+                },
+            )?,
             Ok(Request::Hello(_)) => {
                 write_response(
                     stream,
@@ -429,7 +449,7 @@ mod tests {
         assert!(matches!(
             exchange(
                 &[
-                    r#"{"type":"hello","version":4,"future":true}"#,
+                    r#"{"type":"hello","version":5,"future":true}"#,
                     r#"{"type":"inspect","future":true}"#
                 ],
                 &runtime
@@ -512,7 +532,7 @@ mod tests {
                 },
             }))
             .unwrap();
-        let hello = r#"{"type":"hello","version":4}"#;
+        let hello = r#"{"type":"hello","version":5}"#;
         let dispatched = exchange(&[hello, &dispatch], &runtime);
         let pid = match &dispatched[1] {
             Response::Dispatched { snapshot } => snapshot.pid,
@@ -564,7 +584,7 @@ mod tests {
                 ..
             }]
         ));
-        let requests = [r#"{"type":"hello","version":4}"#, r#"{"type":"inspect"}"#];
+        let requests = [r#"{"type":"hello","version":5}"#, r#"{"type":"inspect"}"#];
         let first = socket_exchange(&socket, &requests);
         let second = socket_exchange(&socket, &requests);
         let snapshot_count = |responses: &[Response]| match &responses[1] {

@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     fs::File,
     io::{Error, Read},
-    os::unix::process::CommandExt,
+    os::unix::{io::AsRawFd, net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -63,6 +63,7 @@ pub struct OwnedRuntime {
     reaper: Mutex<Option<thread::JoinHandle<()>>>,
     pid: Option<u32>,
     owned_process_group: Option<OwnedProcessGroup>,
+    guardian_control: Option<UnixStream>,
     scrollback: Arc<Mutex<Scrollback>>,
     launch_error: Option<String>,
 }
@@ -94,7 +95,7 @@ impl OwnedRuntime {
             truncated: false,
         }));
         match launch_child(&command, &binding.worktree, Arc::clone(&scrollback)) {
-            Ok((child, pid)) => {
+            Ok((child, pid, guardian_control)) => {
                 let lifecycle = Arc::new(Mutex::new(LifecycleState::Running));
                 let reaper_lifecycle = Arc::clone(&lifecycle);
                 let child = Arc::new(Mutex::new(Some(child)));
@@ -132,6 +133,7 @@ impl OwnedRuntime {
                             .ok()
                             .map(Pid::from_raw)
                             .map(OwnedProcessGroup),
+                        guardian_control: Some(guardian_control),
                         scrollback,
                         launch_error: None,
                     },
@@ -150,6 +152,7 @@ impl OwnedRuntime {
                             .ok()
                             .map(Pid::from_raw)
                             .map(OwnedProcessGroup),
+                        guardian_control: Some(guardian_control),
                         scrollback,
                         launch_error: None,
                     },
@@ -165,6 +168,7 @@ impl OwnedRuntime {
                 reaper: Mutex::new(None),
                 pid: None,
                 owned_process_group: None,
+                guardian_control: None,
                 scrollback,
                 launch_error: Some(error),
             },
@@ -272,7 +276,20 @@ impl OwnedRuntime {
         self.signal(Signal::SIGINT)
     }
     pub fn stop(&self) -> Result<(), String> {
-        self.signal(Signal::SIGTERM)
+        self.signal(Signal::SIGTERM)?;
+        // Capacity is based on terminal lifecycle state. Do not acknowledge stop while the reaper
+        // can still report Running, otherwise an immediate downstream release races admission.
+        if let Some(reaper) = self
+            .reaper
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            reaper
+                .join()
+                .map_err(|_| "owned child reaper panicked while stopping the run".to_owned())?;
+        }
+        Ok(())
     }
     fn signal(&self, signal: Signal) -> Result<(), String> {
         if !matches!(
@@ -301,6 +318,9 @@ impl OwnedRuntime {
 
 impl Drop for OwnedRuntime {
     fn drop(&mut self) {
+        // Closing this private channel makes the separately executing guardian terminate the
+        // exact session/process group it created, including when dockd itself dies abruptly.
+        self.guardian_control.take();
         let Some(group) = self.owned_process_group.take() else {
             return;
         };
@@ -335,7 +355,16 @@ fn launch_child(
     command: &[String],
     worktree: &Path,
     scrollback: Arc<Mutex<Scrollback>>,
-) -> Result<(Child, u32), String> {
+) -> Result<(Child, u32, UnixStream), String> {
+    launch_child_with_before_spawn(command, worktree, scrollback, || {})
+}
+
+fn launch_child_with_before_spawn(
+    command: &[String],
+    worktree: &Path,
+    scrollback: Arc<Mutex<Scrollback>>,
+    before_spawn: impl FnOnce(),
+) -> Result<(Child, u32, UnixStream), String> {
     let Some(program) = command.first() else {
         return Err("fixture command is required".into());
     };
@@ -349,18 +378,57 @@ fn launch_child(
     let stdout = slave
         .try_clone()
         .map_err(|error| format!("could not clone PTY slave: {error}"))?;
-    let mut process = Command::new(program);
+    if program.contains('/') && !Path::new(program).exists() {
+        return Err(format!(
+            "could not launch fixture command {program:?}: executable does not exist"
+        ));
+    }
+    let (guardian_control, guardian_end) = UnixStream::pair()
+        .map_err(|error| format!("could not create launch guardian channel: {error}"))?;
+    let guardian_fd = guardian_end.as_raw_fd();
+    // Keep CLOEXEC set in the multi-threaded parent. Only the post-fork child makes fd 3
+    // inheritable, so an unrelated concurrent child cannot retain this live control endpoint.
+    let mut process = Command::new("/bin/sh");
+    apply_child_environment(&mut process, std::env::vars_os());
     process
-        .args(&command[1..])
+        .arg("-c")
+        .arg(
+            r#"(dock_cleanup() { trap '' TERM; kill -TERM -$$; sleep 1; kill -KILL -$$; }
+trap dock_cleanup TERM
+trap 'exit 0' USR1
+IFS= read -r dock_guard <&3
+dock_cleanup) &
+dock_watcher=$!
+"$@" 3<&- </dev/tty &
+dock_child=$!
+# The supervisor must survive a group SIGINT long enough to keep waiting for an
+# interrupt-capable worker. Install this only after spawn so the worker does not inherit it.
+trap '' INT
+wait "$dock_child"
+dock_status=$?
+kill -USR1 "$dock_watcher" 2>/dev/null || true
+wait "$dock_watcher" 2>/dev/null || true
+exit "$dock_status""#,
+        )
+        .arg("dock-launch-guardian")
+        .args(command)
         .current_dir(worktree)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(slave));
+    process.env("DOCK_WORKTREE", worktree);
     // SAFETY: setsid(2) and ioctl(2) are async-signal-safe syscalls here. The PTY slave is already
     // fd 0, so the new session leader can safely make it its controlling terminal before exec.
     unsafe {
-        process.pre_exec(|| {
+        process.pre_exec(move || {
             setsid().map_err(Error::other)?;
+            if guardian_fd == 3 {
+                if nix::libc::fcntl(guardian_fd, nix::libc::F_SETFD, 0) == -1 {
+                    return Err(Error::last_os_error());
+                }
+            } else if nix::libc::dup2(guardian_fd, 3) == -1 {
+                return Err(Error::last_os_error());
+            }
             if nix::libc::ioctl(
                 nix::libc::STDIN_FILENO,
                 nix::libc::TIOCSCTTY as nix::libc::c_ulong,
@@ -372,9 +440,11 @@ fn launch_child(
             Ok(())
         });
     }
+    before_spawn();
     let mut child = process
         .spawn()
-        .map_err(|error| format!("could not launch fixture command {program:?}: {error}"))?;
+        .map_err(|error| format!("could not launch guardian for {program:?}: {error}"))?;
+    drop(guardian_end);
     let pid = child.id();
     if let Err(error) = thread::Builder::new()
         .name("dock-pty-reader".into())
@@ -386,7 +456,27 @@ fn launch_child(
         let _ = child.wait();
         return Err(format!("could not start PTY reader: {error}"));
     }
-    Ok((child, pid))
+    Ok((child, pid, guardian_control))
+}
+
+fn apply_child_environment(
+    process: &mut Command,
+    variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) {
+    process.env_clear();
+    process.envs(
+        variables
+            .into_iter()
+            .filter(|(key, _)| environment_is_allowed(key)),
+    );
+}
+
+fn environment_is_allowed(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy();
+    matches!(
+        key.as_ref(),
+        "HOME" | "LANG" | "LOGNAME" | "PATH" | "SHELL" | "TERM" | "TMPDIR" | "USER"
+    ) || key.starts_with("LC_")
 }
 
 fn read_pty(mut master: File, scrollback: Arc<Mutex<Scrollback>>) {
@@ -411,6 +501,21 @@ mod tests {
     fn process_exists(pid: u32) -> bool {
         // Signal 0 performs no mutation and is used only by tests to observe a known fixture PID.
         unsafe { nix::libc::kill(pid as i32, 0) == 0 }
+    }
+
+    fn process_group_exists(process_group_id: i32) -> bool {
+        unsafe { nix::libc::kill(-process_group_id, 0) == 0 }
+    }
+
+    fn wait_for_group_exit(process_group_id: i32) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_group_exists(process_group_id) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_group_exists(process_group_id),
+            "Dock-owned process group {process_group_id} survived lifecycle completion"
+        );
     }
 
     fn wait_for(
@@ -442,6 +547,52 @@ mod tests {
             snapshot.pid.map(|pid| pid as i32),
             snapshot.process_group_id
         );
+        wait_for_group_exit(snapshot.process_group_id.expect("owned process group"));
+    }
+
+    #[test]
+    fn stop_cleans_term_ignoring_owned_group_and_guardian() {
+        let runtime = OwnedRuntime::launch_fixture(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "trap '' TERM; echo ready; while :; do sleep 1; done".into(),
+            ],
+            128,
+        );
+        let snapshot = wait_for(&runtime, |snapshot| snapshot.scrollback.contains("ready"));
+        let process_group_id = snapshot.process_group_id.expect("owned process group");
+
+        runtime.stop().expect("stop owned runtime");
+        wait_for_group_exit(process_group_id);
+        let snapshot = wait_for(&runtime, |snapshot| {
+            matches!(snapshot.state, ProcessState::Exited { .. })
+        });
+        assert!(matches!(snapshot.state, ProcessState::Exited { .. }));
+    }
+
+    #[test]
+    fn interrupt_capable_process_keeps_running_until_stop() {
+        let runtime = OwnedRuntime::launch_fixture(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "trap 'echo interrupted' INT; echo ready; while :; do sleep 1; done".into(),
+            ],
+            128,
+        );
+        let ready = wait_for(&runtime, |snapshot| snapshot.scrollback.contains("ready"));
+        let process_group_id = ready.process_group_id.expect("owned process group");
+
+        runtime.interrupt().expect("interrupt owned runtime");
+        let interrupted = wait_for(&runtime, |snapshot| {
+            snapshot.scrollback.contains("interrupted")
+        });
+        assert_eq!(interrupted.state, ProcessState::Running);
+        assert!(process_group_exists(process_group_id));
+
+        runtime.stop().expect("stop owned runtime");
+        wait_for_group_exit(process_group_id);
     }
 
     #[test]
@@ -493,9 +644,11 @@ mod tests {
             128,
         );
         let snapshot = wait_for(&runtime, |snapshot| snapshot.scrollback.contains('\n'));
+        let process_group_id = snapshot.process_group_id.expect("owned process group");
         let descendant: u32 = snapshot.scrollback.trim().parse().expect("descendant pid");
         assert!(process_exists(descendant));
         drop(runtime);
+        wait_for_group_exit(process_group_id);
         let deadline = Instant::now() + Duration::from_secs(2);
         while process_exists(descendant) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -551,5 +704,63 @@ mod tests {
         });
         let _ = runtime.snapshot();
         drop(runtime);
+    }
+
+    #[test]
+    fn child_environment_allowlist_excludes_credential_shaped_ambient_values() {
+        for poisoned in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+            "CODEX_API_KEY",
+        ] {
+            assert!(!environment_is_allowed(std::ffi::OsStr::new(poisoned)));
+        }
+        for safe in ["HOME", "LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"] {
+            assert!(environment_is_allowed(std::ffi::OsStr::new(safe)));
+        }
+        let mut child = Command::new("env");
+        apply_child_environment(
+            &mut child,
+            [
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("OPENAI_API_KEY".into(), "poison-openai".into()),
+                ("ANTHROPIC_API_KEY".into(), "poison-anthropic".into()),
+                ("GITHUB_TOKEN".into(), "poison-github".into()),
+            ],
+        );
+        let output = String::from_utf8(child.output().unwrap().stdout).unwrap();
+        assert!(output.contains("PATH=/usr/bin:/bin"));
+        assert!(!output.contains("poison-"));
+    }
+
+    #[test]
+    fn unrelated_concurrent_exec_cannot_inherit_guardian_control() {
+        let scrollback = Arc::new(Mutex::new(Scrollback {
+            bytes: VecDeque::with_capacity(128),
+            capacity: 128,
+            truncated: false,
+        }));
+        let unrelated = Mutex::new(None);
+        let (mut guardian, pid, control) = launch_child_with_before_spawn(
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            &std::env::current_dir().unwrap(),
+            scrollback,
+            || {
+                *unrelated.lock().unwrap() =
+                    Some(Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap());
+            },
+        )
+        .unwrap();
+        drop(control);
+        wait_for_group_exit(pid as i32);
+        let _ = guardian.wait();
+
+        let mut unrelated = unrelated.into_inner().unwrap().unwrap();
+        assert!(unrelated.try_wait().unwrap().is_none());
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
     }
 }

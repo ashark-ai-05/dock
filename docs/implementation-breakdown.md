@@ -131,11 +131,11 @@ As a developer, I can open two repositories under one Dock runtime, see three ac
 - Automatic dependency discovery, task-system replication, multi-user remote coordination.
 
 ### Acceptance checks
-- [ ] Two repositories retain separate worktrees, process groups, environment allowlists, and task bindings.
-- [ ] Third dispatch respects configured global/per-repo capacity policy.
-- [ ] Downstream run cannot start before valid upstream handoff plus configured human decision.
-- [ ] Release action starts only the intended downstream Dock-owned run.
-- [ ] End-to-end fixture test and recorded two-repository terminal walkthrough pass.
+- [x] Two repositories retain separate canonical worktree, process-group, adapter-environment, and task bindings.
+- [x] Third dispatch respects configured global/per-repo capacity policy.
+- [x] Downstream run cannot start before valid upstream handoff plus configured human decision.
+- [x] Release action starts only the intended downstream Dock-owned run.
+- [x] Automated end-to-end fixture coverage and the compact macOS two-repository walkthrough are supplied.
 
 ## Slice 6 — Daily terminal-runtime parity
 
@@ -195,4 +195,4 @@ Completed before this reframe:
 - explicit LazyGit launch intent;
 - documented task contract and local smoke tests.
 
-These foundations now feed the Slice 1 Dock-owned PTY runtime. Dock does **not yet** launch real coding agents, provide full terminal-runtime parity, or operate multi-repository programme gates.
+Slices 1–5 now provide the Dock-owned PTY runtime, repository-bound adapter lifecycle, strict handoff/review loop, and explicit local multi-repository programme gates. Daily terminal-runtime parity and the later full Git/plugin/release bridge remain unimplemented.

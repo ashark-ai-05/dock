@@ -6,8 +6,16 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::model::{HandoffPacket, HandoffRecord, ReviewDecision};
+use crate::{
+    model::{HandoffPacket, HandoffRecord, ReviewDecision},
+    protocol::DurableProgrammeGate,
+};
 use serde::Serialize;
+
+pub struct ProgrammeRecord {
+    pub run_id: String,
+    pub gate: Result<DurableProgrammeGate, String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalStore {
@@ -101,6 +109,172 @@ impl LocalStore {
             .exists())
     }
 
+    pub fn load_decision(&self, run_id: &str) -> Result<ReviewDecision, String> {
+        let decision: ReviewDecision = self.load("decisions", run_id)?;
+        if decision.run_id != run_id || decision.external_task_completed || decision.git_mutated {
+            return Err(
+                "stored decision violates its exact run binding or authority boundary".into(),
+            );
+        }
+        Ok(decision)
+    }
+
+    pub fn save_programme_gate(&self, gate: &DurableProgrammeGate) -> Result<PathBuf, String> {
+        self.atomic_save(
+            "programme-gates",
+            &gate.dispatch.run_id,
+            gate,
+            CreateKind::ProgrammeGate,
+        )
+    }
+
+    pub fn list_programme_gates(&self) -> Result<Vec<ProgrammeRecord>, String> {
+        self.list_programme_records("programme-gates")
+    }
+
+    pub fn list_releasing_programme_gates(&self) -> Result<Vec<ProgrammeRecord>, String> {
+        self.list_programme_records("programme-releases")
+    }
+
+    fn list_programme_records(&self, directory_name: &str) -> Result<Vec<ProgrammeRecord>, String> {
+        let directory = self.root.join(directory_name);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("could not read programme gates: {error}")),
+        };
+        let mut gates = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("could not read programme gates: {error}"))?;
+            let Some(run_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let gate = self
+                .load(directory_name, &run_id)
+                .and_then(|gate: DurableProgrammeGate| {
+                    if gate.dispatch.run_id != run_id {
+                        Err("stored programme gate run_id does not match its filename".into())
+                    } else {
+                        Ok(gate)
+                    }
+                });
+            gates.push(ProgrammeRecord { run_id, gate });
+        }
+        gates.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+        Ok(gates)
+    }
+
+    pub fn quarantine_programme_gate(
+        &self,
+        source_directory: &str,
+        run_id: &str,
+    ) -> Result<(), String> {
+        if run_id.is_empty() || run_id.contains('/') || run_id.contains('\\') {
+            return Err("invalid programme gate quarantine identity".into());
+        }
+        let source_directory = self.root.join(source_directory);
+        let destination_directory = self.root.join("programme-gate-quarantine");
+        fs::create_dir_all(&destination_directory)
+            .map_err(|error| format!("could not create programme gate quarantine: {error}"))?;
+        fs::set_permissions(&destination_directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("could not secure programme gate quarantine: {error}"))?;
+        let filename = format!("{run_id}.json");
+        let source = source_directory.join(&filename);
+        let destination = destination_directory.join(filename);
+        if destination.exists() {
+            fs::remove_file(&source).map_err(|error| {
+                format!("could not terminalize duplicate invalid gate: {error}")
+            })?;
+        } else {
+            fs::rename(&source, &destination)
+                .map_err(|error| format!("could not quarantine invalid programme gate: {error}"))?;
+        }
+        sync_directory(&source_directory)?;
+        sync_directory(&destination_directory)
+    }
+
+    pub fn list_quarantined_programme_gate_ids(&self) -> Result<Vec<String>, String> {
+        let directory = self.root.join("programme-gate-quarantine");
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("could not read programme gate quarantine: {error}")),
+        };
+        let mut run_ids = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| format!("could not read programme gate quarantine: {error}"))?;
+            if let Some(run_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+            {
+                run_ids.push(run_id.to_owned());
+            }
+        }
+        run_ids.sort();
+        Ok(run_ids)
+    }
+
+    pub fn claim_programme_gate(&self, run_id: &str) -> Result<(), String> {
+        self.move_programme_gate(run_id, "programme-gates", "programme-releases", false)
+    }
+
+    pub fn restore_programme_gate(&self, run_id: &str) -> Result<(), String> {
+        self.move_programme_gate(run_id, "programme-releases", "programme-gates", true)
+    }
+
+    fn move_programme_gate(
+        &self,
+        run_id: &str,
+        source_directory: &str,
+        destination_directory: &str,
+        destination_must_be_absent: bool,
+    ) -> Result<(), String> {
+        let filename = packet_filename(run_id)?;
+        let source_directory = self.root.join(source_directory);
+        let destination_directory = self.root.join(destination_directory);
+        fs::create_dir_all(&destination_directory)
+            .map_err(|error| format!("could not create programme release storage: {error}"))?;
+        fs::set_permissions(&destination_directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("could not secure programme release storage: {error}"))?;
+        let source = source_directory.join(&filename);
+        let destination = destination_directory.join(filename);
+        if destination_must_be_absent && destination.exists() {
+            return Err(format!(
+                "could not restore programme gate {run_id:?}: queued destination already exists"
+            ));
+        }
+        fs::rename(&source, &destination)
+            .map_err(|error| format!("could not persist programme gate release claim: {error}"))?;
+        sync_directory(&source_directory)?;
+        sync_directory(&destination_directory)
+    }
+
+    pub fn remove_programme_gate(&self, run_id: &str) -> Result<(), String> {
+        self.remove_programme_record("programme-gates", run_id)
+    }
+
+    pub fn remove_releasing_programme_gate(&self, run_id: &str) -> Result<(), String> {
+        self.remove_programme_record("programme-releases", run_id)
+    }
+
+    fn remove_programme_record(&self, directory: &str, run_id: &str) -> Result<(), String> {
+        let destination = self.root.join(directory).join(packet_filename(run_id)?);
+        fs::remove_file(&destination)
+            .map_err(|error| format!("could not remove released programme gate: {error}"))?;
+        let directory = destination
+            .parent()
+            .ok_or("programme gate has no parent directory")?;
+        sync_directory(directory)
+    }
+
     fn load<T: serde::de::DeserializeOwned>(
         &self,
         directory: &str,
@@ -159,14 +333,24 @@ impl LocalStore {
         }
         fs::remove_file(&temporary)
             .map_err(|error| format!("could not remove temporary local record: {error}"))?;
+        fs::File::open(&directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("could not sync local record directory: {error}"))?;
         Ok(destination)
     }
+}
+
+fn sync_directory(directory: &std::path::Path) -> Result<(), String> {
+    fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("could not sync programme gate storage: {error}"))
 }
 
 #[derive(Clone, Copy)]
 enum CreateKind {
     Handoff,
     Decision,
+    ProgrammeGate,
 }
 
 impl CreateKind {
@@ -174,6 +358,7 @@ impl CreateKind {
         match self {
             Self::Handoff => "handoff",
             Self::Decision => "decision",
+            Self::ProgrammeGate => "programme gate",
         }
     }
 }

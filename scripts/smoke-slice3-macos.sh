@@ -32,7 +32,7 @@ root=$(cd "$root" && pwd -P)
 branch=$(git -C "$root" branch --show-current)
 base=$(git -C "$root" rev-parse HEAD)
 target/debug/dock-dispatch --socket="$socket" --repo="$root" --task=SMOKE-3 \
-    --run-id=dock_smoke3 --worktree="$root" -- sh -c 'sleep 30' >/dev/null
+    --run-id=dock_smoke3 --worktree="$root" --adapter=fixture -- -c 'sleep 30' >/dev/null
 jq -n --arg root "$root" --arg branch "$branch" --arg base "$base" '{
   schema_version: 1, run_id: "dock_smoke3", task_id: "SMOKE-3",
   workspace_id: "workspace-dock_smoke3", pane_id: "pane-dock_smoke3",

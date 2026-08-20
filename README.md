@@ -25,16 +25,20 @@ Dock must never infer task completion from terminal output, control a process it
 
 ## Current status
 
-Slice 2 now provides one explicitly bound, fixture-only repository runtime:
+Slice 4 now provides provider-neutral agent launch and safe lifecycle control on the repository-bound runtime:
 
-- `dockd` starts empty and accepts deterministic fixture dispatches through protocol version 3;
+- `dockd` starts empty and accepts adapter-backed dispatches through protocol version 4;
+- explicit profiles discover `amp`, `claude`, `codex`, and `copilot`, plus deterministic `fixture` and explicit-executable `generic` adapters;
+- discovery and capability preflight happen before receipt, run, workspace, pane, PTY, or process-group creation, so a missing binary leaves no partial dispatch;
+- `dock-agent` provides attach/focus acknowledgements and interrupt/stop/restart controls for active Dock-owned runs; signals can target only the process-group capability minted at launch;
+- snapshots report Dock-owned process controls separately from explicit provider-adapter capabilities, adapter identity, observable process state, and a separate provider state; no current adapter claims unverified provider-native features, and generic/fixture provider state remains `unknown` rather than inferred from terminal output;
 - each run is bound before launch to a canonical Git repository root, non-empty external task reference, Dock run id, and supplied existing worktree path;
 - worktree paths are canonicalized, kept beneath the repository root, checked against Git's top-level, and rejected on traversal, symlink escape, or repository mismatch;
 - each accepted run receives its own Dock-owned pane, PTY, and process group;
 - a versioned, user-only Unix socket accepts a forward-compatible hello and strict inspect requests;
 - `dock-dispatch` is the compact client/smoke path and `dock-inspect` reports one or all bound runs, including Git branch/base facts;
 - the daemon and fixture process continue running when inspectors disconnect and reconnect;
-- owner-only local dispatch receipts reserve run ids across daemon restarts but omit raw PTY scrollback and the raw command vector;
+- crash-safe owner-only local dispatch receipts immutably reserve run ids and record initial launch evidence across daemon restarts, but omit raw PTY scrollback and the raw command vector;
 - malformed/mismatched requests, missing tasks, duplicate ids, and invalid bindings are rejected without process discovery, process import, Git mutation, or worktree creation.
 
 The earlier foundations remain available:
@@ -45,7 +49,22 @@ The earlier foundations remain available:
 - Git worktree/base/head/numstat facts and `delta` diff rendering;
 - explicit LazyGit launch intent.
 
-Live process handles and scrollback remain in memory and disappear when `dockd` exits. Dispatch identity/launch facts persist beneath the configured state directory, but daemon restart recovery does not reattach or import the former process. Slice 2 does **not** create or mutate Git worktrees, claim tasks in a remote provider, launch real agents, accept terminal input, or provide terminal-multiplexer/dependency-gate parity. The supplied fixture worktree must already exist at a Git worktree top-level beneath (or equal to) the canonical repository root and share that repository's Git common directory.
+Live process handles and scrollback remain in memory and disappear when `dockd` exits. Dispatch identity/launch facts persist beneath the configured state directory, but daemon restart recovery does not reattach or import the former process. Slice 4 does **not** handle agent credentials, scrape terminal output for semantics, adopt arbitrary processes, create or mutate Git worktrees, mutate task systems, accept terminal input, or provide terminal-multiplexer/dependency-gate parity. Agent CLIs use their own existing user-authenticated setup. The supplied worktree must already exist at a Git worktree top-level beneath (or equal to) the canonical repository root and share that repository's Git common directory.
+
+## Slice 4 agent adapters and lifecycle
+
+Use `--adapter=amp|claude-code|codex-cli|github-copilot-cli` followed by `--` and provider arguments. Dock validates the profile binary before creating anything. For an unsupported command, use `--adapter=generic --executable=/absolute/or/PATH/name`; Dock reports only process facts and keeps provider state `unknown`. The fixture profile runs `sh` for deterministic tests.
+
+```bash
+cargo run --bin dock-dispatch -- --repo="$(pwd)" --task=FIXTURE-4 \
+  --run-id=dock_slice4 --worktree="$(pwd)" --adapter=fixture -- -c 'sleep 30'
+cargo run --bin dock-agent -- --run-id=dock_slice4 --operation=focus
+cargo run --bin dock-agent -- --run-id=dock_slice4 --operation=interrupt
+cargo run --bin dock-agent -- --run-id=dock_slice4 --operation=restart
+cargo run --bin dock-agent -- --run-id=dock_slice4 --operation=stop
+```
+
+On macOS, `scripts/smoke-slice4-macos.sh` exercises missing-binary atomicity and the deterministic fixture lifecycle. A real-agent smoke intentionally requires the user to complete that CLI’s own authentication first; Dock neither reads nor stores credentials.
 
 ## Slice 3 handoff and review
 
@@ -72,13 +91,13 @@ From another terminal, dispatch a fixture into this existing repository worktree
 ```bash
 cargo run --bin dock-dispatch -- \
   --repo="$(pwd)" --task=FIXTURE-1 --run-id=dock_smoke \
-  --worktree="$(pwd)" -- sh -c 'pwd; git rev-parse --show-toplevel'
+  --worktree="$(pwd)" --adapter=fixture -- -c 'pwd; git rev-parse --show-toplevel'
 cargo run --bin dock-inspect -- --run-id=dock_smoke
 ```
 
 Use a fresh run id for each accepted dispatch; ids remain reserved in `.dock/local/dispatches`. Dock requires its state and dispatch directories to be owned by the current user and inaccessible to group/other users (mode `0700` or stricter); receipt files are mode `0600`. Run `dock-inspect` without `--run-id` to list all runs. The explicit `--socket=PATH` option remains available on all three commands.
 
-Stop the foreground daemon with `Ctrl-C`. Slice 2 still has no remote stop/import request: no API accepts a PID or discovers an external process. Existing Slice 1 socket recovery, finite client deadlines, bounded clients, bounded scrollback, and Dock-owned process-group cleanup remain in force.
+Stop the foreground daemon with `Ctrl-C`. No API accepts a PID, discovers an external process, or imports one. Existing Slice 1 socket recovery, finite client deadlines, bounded clients, bounded scrollback, child reaping, and Dock-owned process-group cleanup remain in force.
 
 ## The daily control loop
 

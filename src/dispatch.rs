@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
@@ -12,18 +12,27 @@ use regex::Regex;
 use serde::Serialize;
 
 use crate::{
+    adapter::AdapterSelection,
     git::GitAdapter,
     model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
-    protocol::{DispatchRequest, ErrorCode, RuntimeSnapshot},
+    protocol::{DispatchRequest, ErrorCode, LifecycleOperation, RuntimeSnapshot},
     runtime::{OwnedRuntime, RunBinding},
     storage::LocalStore,
 };
 
 pub struct RuntimeRegistry {
-    runs: Mutex<HashMap<String, Arc<OwnedRuntime>>>,
+    runs: Mutex<HashMap<String, RuntimeEntry>>,
     receipts: PathBuf,
     scrollback_capacity: usize,
     store: LocalStore,
+    #[cfg(test)]
+    restart_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+#[derive(Clone)]
+struct RuntimeEntry {
+    runtime: Arc<OwnedRuntime>,
+    selection: AdapterSelection,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,6 +50,10 @@ struct DispatchReceipt<'a> {
     process_group_id: Option<i32>,
     state: &'a crate::protocol::ProcessState,
     diagnostic: &'a Option<String>,
+    adapter: &'a crate::adapter::AdapterId,
+    process_capabilities: &'a crate::adapter::ProcessCapabilities,
+    adapter_capabilities: &'a crate::adapter::AdapterCapabilities,
+    provider_state: &'a crate::protocol::ProviderState,
 }
 
 impl RuntimeRegistry {
@@ -54,6 +67,8 @@ impl RuntimeRegistry {
             receipts,
             scrollback_capacity,
             store: LocalStore::new(state_dir),
+            #[cfg(test)]
+            restart_hook: Mutex::new(None),
         })
     }
 
@@ -62,6 +77,12 @@ impl RuntimeRegistry {
         request: DispatchRequest,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
         let binding = validate_binding(&request).map_err(|m| (ErrorCode::InvalidBinding, m))?;
+        // Adapter discovery is intentionally before the registry lock, receipt reservation, and
+        // runtime construction: a missing binary must leave no run, pane, or durable receipt.
+        let adapter = request
+            .adapter
+            .resolve()
+            .map_err(|m| (ErrorCode::AdapterUnavailable, m))?;
         let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
         let receipt = self
             .receipt_path(&request.run_id)
@@ -75,13 +96,123 @@ impl RuntimeRegistry {
         reserve_run_id(&receipt).map_err(|m| (ErrorCode::Internal, m))?;
         let runtime = Arc::new(OwnedRuntime::launch(
             binding,
-            request.command,
+            adapter,
             self.scrollback_capacity,
         ));
         let snapshot = runtime.snapshot();
         save_receipt(&receipt, &snapshot).map_err(|m| (ErrorCode::Internal, m))?;
-        runs.insert(snapshot.run_id.clone(), runtime);
+        runs.insert(
+            snapshot.run_id.clone(),
+            RuntimeEntry {
+                runtime,
+                selection: request.adapter,
+            },
+        );
         Ok(snapshot)
+    }
+
+    pub fn lifecycle(
+        &self,
+        run_id: &str,
+        operation: LifecycleOperation,
+    ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
+        let entry = self
+            .runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    ErrorCode::RunNotFound,
+                    format!("run id {run_id:?} is not active in this daemon"),
+                )
+            })?;
+        let runtime = entry.runtime;
+        let capabilities = &runtime.snapshot().process_capabilities;
+        let supported = match operation {
+            LifecycleOperation::Attach => capabilities.attach,
+            LifecycleOperation::Focus => capabilities.focus,
+            LifecycleOperation::Interrupt => capabilities.interrupt,
+            LifecycleOperation::Stop => capabilities.stop,
+            LifecycleOperation::Restart => capabilities.restart,
+        };
+        if !supported {
+            return Err((
+                ErrorCode::UnsupportedOperation,
+                format!("adapter does not support {operation:?}"),
+            ));
+        }
+        match operation {
+            LifecycleOperation::Attach | LifecycleOperation::Focus => Ok(runtime.snapshot()),
+            LifecycleOperation::Interrupt => {
+                runtime.interrupt().map_err(|m| (ErrorCode::Internal, m))?;
+                Ok(runtime.snapshot())
+            }
+            LifecycleOperation::Stop => {
+                runtime.stop().map_err(|m| (ErrorCode::Internal, m))?;
+                Ok(runtime.snapshot())
+            }
+            LifecycleOperation::Restart => {
+                // Rediscovery and launch can block. Keep the prior owned runtime untouched and do
+                // all preparation outside the registry lock.
+                let adapter = entry
+                    .selection
+                    .resolve()
+                    .map_err(|m| (ErrorCode::AdapterUnavailable, m))?;
+                #[cfg(test)]
+                if let Some(hook) = self
+                    .restart_hook
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                {
+                    hook();
+                }
+                let replacement = Arc::new(OwnedRuntime::launch(
+                    runtime.binding(),
+                    adapter,
+                    self.scrollback_capacity,
+                ));
+                let snapshot = replacement.snapshot();
+                if snapshot.pid.is_none() {
+                    return Err((
+                        ErrorCode::AdapterUnavailable,
+                        snapshot
+                            .diagnostic
+                            .clone()
+                            .unwrap_or_else(|| "replacement adapter failed to launch".into()),
+                    ));
+                }
+
+                let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+                let current = runs.get(run_id).ok_or_else(|| {
+                    (
+                        ErrorCode::RunNotFound,
+                        format!("run id {run_id:?} disappeared during restart"),
+                    )
+                })?;
+                if !Arc::ptr_eq(&current.runtime, &runtime) {
+                    return Err((
+                        ErrorCode::Internal,
+                        "run changed during concurrent restart; retry against the current runtime"
+                            .into(),
+                    ));
+                }
+                runs.insert(
+                    run_id.to_owned(),
+                    RuntimeEntry {
+                        runtime: Arc::clone(&replacement),
+                        selection: entry.selection,
+                    },
+                );
+                drop(runs);
+                // The replacement is now the sole registered capability. Only then retire the
+                // exact prior group whose Arc identity won the compare-and-swap above.
+                runtime.stop().map_err(|m| (ErrorCode::Internal, m))?;
+                Ok(snapshot)
+            }
+        }
     }
 
     pub fn inspect(
@@ -96,9 +227,9 @@ impl RuntimeRegistry {
                     format!("run id {run_id:?} is not active in this daemon"),
                 )
             })?;
-            return Ok(vec![run.snapshot()]);
+            return Ok(vec![run.runtime.snapshot()]);
         }
-        let mut snapshots: Vec<_> = runs.values().map(|run| run.snapshot()).collect();
+        let mut snapshots: Vec<_> = runs.values().map(|run| run.runtime.snapshot()).collect();
         snapshots.sort_by(|a, b| a.run_id.cmp(&b.run_id));
         Ok(snapshots)
     }
@@ -303,9 +434,6 @@ fn validate_binding(request: &DispatchRequest) -> Result<RunBinding, String> {
     if request.external_task_ref.trim().is_empty() {
         return Err("external_task_ref is required".into());
     }
-    if request.command.is_empty() || request.command[0].trim().is_empty() {
-        return Err("fixture command is required".into());
-    }
     reject_parent_components(Path::new(&request.repository_root), "repository_root")?;
     reject_parent_components(Path::new(&request.worktree), "worktree")?;
     let repository_root = fs::canonicalize(&request.repository_root)
@@ -442,17 +570,40 @@ fn save_receipt(path: &Path, snapshot: &RuntimeSnapshot) -> Result<(), String> {
         process_group_id: snapshot.process_group_id,
         state: &snapshot.state,
         diagnostic: &snapshot.diagnostic,
+        adapter: &snapshot.adapter,
+        process_capabilities: &snapshot.process_capabilities,
+        adapter_capabilities: &snapshot.adapter_capabilities,
+        provider_state: &snapshot.provider_state,
     };
     let bytes = serde_json::to_vec_pretty(&receipt)
         .map_err(|e| format!("could not serialize dispatch receipt: {e}"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid dispatch receipt path {}", path.display()))?;
+    let temporary = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
     let mut file = OpenOptions::new()
         .write(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|e| format!("could not open dispatch receipt {}: {e}", path.display()))?;
-    file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|e| format!("could not persist dispatch receipt: {e}"))
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|e| format!("could not create private dispatch receipt: {e}"))?;
+    let result = (|| {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        File::open(
+            path.parent()
+                .ok_or_else(|| std::io::Error::other("dispatch receipt has no parent directory"))?,
+        )?
+        .sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|e| format!("could not atomically persist dispatch receipt: {e}"))
 }
 
 #[cfg(test)]
@@ -508,7 +659,11 @@ mod tests {
                 external_task_ref: "TASK-42".into(),
                 run_id: id.into(),
                 worktree: self.root.join("fixture").display().to_string(),
-                command: vec!["sh".into(), "-c".into(), "pwd".into()],
+                adapter: crate::adapter::AdapterSelection {
+                    id: crate::adapter::AdapterId::Fixture,
+                    executable: None,
+                    arguments: vec!["-c".into(), "pwd".into()],
+                },
             }
         }
     }
@@ -553,7 +708,10 @@ mod tests {
         let repo = Repo::new("valid");
         let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
         let mut request = repo.request("dock_valid");
-        request.command.push("credential=do-not-persist".into());
+        request
+            .adapter
+            .arguments
+            .push("credential=do-not-persist".into());
         let initial = registry.dispatch(request).unwrap();
         assert_eq!(
             initial.repository_root,
@@ -596,6 +754,138 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn missing_adapter_binary_creates_no_receipt_run_or_pane() {
+        let repo = Repo::new("missing-adapter");
+        let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
+        let mut request = repo.request("dock_missing_adapter");
+        request.adapter = crate::adapter::AdapterSelection {
+            id: crate::adapter::AdapterId::Generic,
+            executable: Some("/definitely/not/a/dock-agent".into()),
+            arguments: vec![],
+        };
+        let error = registry.dispatch(request).unwrap_err();
+        assert_eq!(error.0, ErrorCode::AdapterUnavailable);
+        assert!(
+            !repo
+                .state
+                .join("dispatches/dock_missing_adapter.json")
+                .exists()
+        );
+        assert!(registry.inspect(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lifecycle_signals_only_the_registered_owned_group_and_restart_replaces_it() {
+        let repo = Repo::new("lifecycle");
+        let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
+        let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut request = repo.request("dock_lifecycle");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        let first = registry.dispatch(request).unwrap();
+        let receipt_path = repo.state.join("dispatches/dock_lifecycle.json");
+        let original_receipt = fs::read(&receipt_path).unwrap();
+        registry
+            .lifecycle("dock_lifecycle", LifecycleOperation::Interrupt)
+            .unwrap();
+        let restarted = registry
+            .lifecycle("dock_lifecycle", LifecycleOperation::Restart)
+            .unwrap();
+        assert_ne!(first.process_group_id, restarted.process_group_id);
+        // Dispatch receipts are immutable run-id reservations and launch evidence. Restart does
+        // not risk a crash-torn update of process-local facts that cannot be recovered on reboot.
+        assert_eq!(fs::read(&receipt_path).unwrap(), original_receipt);
+        assert_eq!(fs::metadata(&receipt_path).unwrap().mode() & 0o777, 0o600);
+        assert!(
+            fs::read_dir(repo.state.join("dispatches"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp-"))
+        );
+        assert_eq!(unsafe { nix::libc::kill(unrelated.id() as i32, 0) }, 0);
+        registry
+            .lifecycle("dock_lifecycle", LifecycleOperation::Stop)
+            .unwrap();
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+    }
+
+    #[test]
+    fn restart_rediscovery_failure_keeps_the_prior_owned_runtime_retryable() {
+        let repo = Repo::new("restart-binary-disappears");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let executable = repo.root.join("ephemeral-agent");
+        fs::write(&executable, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut request = repo.request("dock_disappearing");
+        request.adapter = AdapterSelection {
+            id: crate::adapter::AdapterId::Generic,
+            executable: Some(executable.display().to_string()),
+            arguments: vec!["-c".into(), "sleep 30".into()],
+        };
+        let first = registry.dispatch(request).unwrap();
+        fs::remove_file(executable).unwrap();
+
+        let error = registry
+            .lifecycle("dock_disappearing", LifecycleOperation::Restart)
+            .unwrap_err();
+        assert_eq!(error.0, ErrorCode::AdapterUnavailable);
+        let still_owned = registry
+            .inspect(Some("dock_disappearing"))
+            .unwrap()
+            .remove(0);
+        assert_eq!(still_owned.pid, first.pid);
+        assert_eq!(still_owned.process_group_id, first.process_group_id);
+        assert_eq!(still_owned.state, crate::protocol::ProcessState::Running);
+        registry
+            .lifecycle("dock_disappearing", LifecycleOperation::Stop)
+            .unwrap();
+    }
+
+    #[test]
+    fn restart_preparation_does_not_block_registry_inspection() {
+        use std::sync::Barrier;
+
+        let repo = Repo::new("restart-nonblocking");
+        let registry = Arc::new(RuntimeRegistry::new(&repo.state, 64).unwrap());
+        let mut request = repo.request("dock_nonblocking");
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        registry.dispatch(request).unwrap();
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *registry
+            .restart_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+            }
+        }));
+        let restarting = {
+            let registry = Arc::clone(&registry);
+            thread::spawn(move || {
+                registry.lifecycle("dock_nonblocking", LifecycleOperation::Restart)
+            })
+        };
+        entered.wait();
+        let started = Instant::now();
+        let during = registry.inspect(Some("dock_nonblocking")).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(during.len(), 1);
+        release.wait();
+        restarting.join().unwrap().unwrap();
+        registry
+            .lifecycle("dock_nonblocking", LifecycleOperation::Stop)
+            .unwrap();
     }
 
     #[test]

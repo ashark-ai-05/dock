@@ -1,4 +1,4 @@
-use crate::model::{BoardFixture, Task, TaskState};
+use dock::model::{BoardFixture, Task, TaskState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {

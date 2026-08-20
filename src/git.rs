@@ -9,6 +9,7 @@ pub struct GitFacts {
     pub branch: String,
     pub base_sha: String,
     pub head_sha: String,
+    pub status_entries: usize,
     pub changed_files: usize,
     pub insertions: usize,
     pub deletions: usize,
@@ -28,19 +29,29 @@ impl GitAdapter {
 
     pub fn facts(&self, base: &str) -> Result<GitFacts, String> {
         let worktree = PathBuf::from(self.git(["rev-parse", "--show-toplevel"])?);
+        let worktree = std::fs::canonicalize(&worktree)
+            .map_err(|error| format!("could not canonicalize live Git worktree: {error}"))?;
         let head_sha = self.git(["rev-parse", "HEAD"])?;
         let branch = self
             .git(["branch", "--show-current"])?
             .if_empty("DETACHED")
             .to_owned();
         let base_sha = self.git(["rev-parse", base])?;
-        let numstat = self.git(["diff", "--numstat", &format!("{base_sha}...{head_sha}")])?;
+        let status = self.git(["status", "--porcelain=v1", "--untracked-files=normal"])?;
+        if status.lines().any(|line| line.starts_with("?? ")) {
+            return Err(
+                "handoff Git evidence does not accept untracked files; track or remove them first"
+                    .into(),
+            );
+        }
+        let numstat = self.git(["diff", "--numstat", &base_sha])?;
         let (changed_files, insertions, deletions) = parse_numstat(&numstat);
         Ok(GitFacts {
             worktree,
             branch,
             base_sha,
             head_sha,
+            status_entries: changed_files,
             changed_files,
             insertions,
             deletions,
@@ -48,9 +59,8 @@ impl GitAdapter {
     }
 
     pub fn render_diff(&self, base: &str) -> Result<(String, bool), String> {
-        let head_sha = self.git(["rev-parse", "HEAD"])?;
         let base_sha = self.git(["rev-parse", base])?;
-        let raw = self.git(["diff", "--no-ext-diff", &format!("{base_sha}...{head_sha}")])?;
+        let raw = self.git(["diff", "--no-ext-diff", &base_sha])?;
         if raw.is_empty() {
             return Ok((raw, false));
         }
@@ -117,10 +127,13 @@ fn parse_numstat(numstat: &str) -> (usize, usize, usize) {
         .lines()
         .filter_map(|line| {
             let mut fields = line.splitn(3, '\t');
-            let additions = fields.next()?.parse::<usize>().ok()?;
-            let deletions = fields.next()?.parse::<usize>().ok()?;
+            let additions = fields.next()?;
+            let deletions = fields.next()?;
             fields.next()?;
-            Some((additions, deletions))
+            Some((
+                additions.parse::<usize>().unwrap_or(0),
+                deletions.parse::<usize>().unwrap_or(0),
+            ))
         })
         .fold(
             (0, 0, 0),
@@ -135,9 +148,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn numstat_counts_text_files_and_ignores_binary_rows() {
+    fn numstat_counts_binary_rows_with_zero_line_counts() {
         let numstat = "12\t3\tsrc/main.rs\n-\t-\tassets/logo.png\n1\t0\tREADME.md\n";
-        assert_eq!(parse_numstat(numstat), (2, 13, 3));
+        assert_eq!(parse_numstat(numstat), (3, 13, 3));
     }
 
     #[test]

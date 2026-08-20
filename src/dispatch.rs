@@ -8,17 +8,22 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use regex::Regex;
 use serde::Serialize;
 
 use crate::{
+    git::GitAdapter,
+    model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
     protocol::{DispatchRequest, ErrorCode, RuntimeSnapshot},
     runtime::{OwnedRuntime, RunBinding},
+    storage::LocalStore,
 };
 
 pub struct RuntimeRegistry {
     runs: Mutex<HashMap<String, Arc<OwnedRuntime>>>,
     receipts: PathBuf,
     scrollback_capacity: usize,
+    store: LocalStore,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,6 +53,7 @@ impl RuntimeRegistry {
             runs: Mutex::new(HashMap::new()),
             receipts,
             scrollback_capacity,
+            store: LocalStore::new(state_dir),
         })
     }
 
@@ -97,10 +103,170 @@ impl RuntimeRegistry {
         Ok(snapshots)
     }
 
+    pub fn submit_handoff(
+        &self,
+        packet: HandoffPacket,
+    ) -> Result<HandoffRecord, (ErrorCode, String)> {
+        packet
+            .validate()
+            .map_err(|message| (ErrorCode::InvalidHandoff, message.into()))?;
+        validate_concise_safe_packet(&packet)
+            .map_err(|message| (ErrorCode::InvalidHandoff, message))?;
+        let snapshot = self.inspect(Some(&packet.run_id))?.remove(0);
+        let expected = (
+            snapshot.external_task_ref.as_str(),
+            snapshot.workspace_id.as_str(),
+            snapshot.pane_id.as_str(),
+            snapshot.worktree.as_str(),
+            snapshot.branch.as_str(),
+            snapshot.base_sha.as_str(),
+        );
+        let supplied = (
+            packet.task_id.as_str(),
+            packet.workspace_id.as_str(),
+            packet.pane_id.as_str(),
+            packet.worktree.as_str(),
+            packet.branch.as_str(),
+            packet.base_sha.as_str(),
+        );
+        if supplied != expected {
+            return Err((
+                ErrorCode::InvalidHandoff,
+                "handoff binding does not exactly match the active bound run".into(),
+            ));
+        }
+        let facts = GitAdapter::new(&snapshot.worktree)
+            .facts(&snapshot.base_sha)
+            .map_err(|message| (ErrorCode::InvalidHandoff, message))?;
+        let live_worktree = facts.worktree.display().to_string();
+        if live_worktree != snapshot.worktree
+            || facts.branch != snapshot.branch
+            || facts.base_sha != snapshot.base_sha
+        {
+            return Err((
+                ErrorCode::InvalidHandoff,
+                format!(
+                    "live Git binding no longer agrees with the bound run (worktree {live_worktree:?}, branch {:?}, base {:?})",
+                    facts.branch, facts.base_sha
+                ),
+            ));
+        }
+        let record = HandoffRecord {
+            packet,
+            evidence: HandoffEvidence {
+                branch: facts.branch,
+                base_sha: facts.base_sha,
+                head_sha: facts.head_sha,
+                status_entries: facts.status_entries,
+                changed_files: facts.changed_files,
+                insertions: facts.insertions,
+                deletions: facts.deletions,
+            },
+        };
+        self.store.save_handoff_record(&record).map_err(|message| {
+            let code = if message.contains("handoff") && message.contains("already exists") {
+                ErrorCode::DuplicateHandoff
+            } else {
+                ErrorCode::Internal
+            };
+            (code, message)
+        })?;
+        Ok(record)
+    }
+
+    pub fn review_inbox(&self) -> Result<Vec<HandoffRecord>, (ErrorCode, String)> {
+        let records = self
+            .store
+            .list_handoff_records()
+            .map_err(|message| (ErrorCode::Internal, message))?;
+        let mut pending = Vec::new();
+        for record in records {
+            if !self
+                .store
+                .decision_exists(&record.packet.run_id)
+                .map_err(|message| (ErrorCode::Internal, message))?
+            {
+                pending.push(record);
+            }
+        }
+        Ok(pending)
+    }
+
+    pub fn decide(
+        &self,
+        run_id: String,
+        route: ReviewRoute,
+        note: String,
+    ) -> Result<ReviewDecision, (ErrorCode, String)> {
+        self.store.load_handoff_record(&run_id).map_err(|_| {
+            (
+                ErrorCode::HandoffNotFound,
+                format!("no handoff exists for run {run_id:?}"),
+            )
+        })?;
+        let decision = ReviewDecision::new(run_id, route, note)
+            .map_err(|message| (ErrorCode::InvalidHandoff, message.into()))?;
+        self.store.save_decision(&decision).map_err(|message| {
+            let code = if message.contains("already exists") {
+                ErrorCode::DecisionAlreadyRecorded
+            } else {
+                ErrorCode::Internal
+            };
+            (code, message)
+        })?;
+        Ok(decision)
+    }
+
     fn receipt_path(&self, run_id: &str) -> Result<PathBuf, String> {
         validate_run_id(run_id)?;
         Ok(self.receipts.join(format!("{run_id}.json")))
     }
+}
+
+fn validate_concise_safe_packet(packet: &HandoffPacket) -> Result<(), String> {
+    if packet.summary.len() > 2_000
+        || packet
+            .question
+            .as_ref()
+            .is_some_and(|value| value.len() > 1_000)
+        || packet.checks.len() > 64
+        || packet.checks.iter().any(|check| check.name.len() > 200)
+    {
+        return Err("handoff evidence exceeds concise local record limits".into());
+    }
+    let contains_secret_marker = |value: &str| likely_contains_secret(value);
+    if contains_secret_marker(&packet.summary)
+        || packet
+            .question
+            .as_deref()
+            .is_some_and(contains_secret_marker)
+        || packet
+            .checks
+            .iter()
+            .any(|check| contains_secret_marker(&check.name))
+    {
+        return Err("handoff evidence contains a prohibited secret marker".into());
+    }
+    Ok(())
+}
+
+fn likely_contains_secret(value: &str) -> bool {
+    // These deliberately favor rejection: handoff prose and check labels have no reason to
+    // contain credential-shaped values, and the record is durable human-review evidence.
+    const PATTERNS: &[&str] = &[
+        r#"(?i)authorization\s*['"]?\s*[:=]\s*['"]?\s*(?:bearer|basic)\s+[a-z0-9+/_.=-]{8,}"#,
+        r"(?i)\b(?:bearer|basic)\s+[a-z0-9+/_.=-]{16,}",
+        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+        r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b",
+        r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+        r#"(?i)\b(?:aws_?secret_?access_?key|secret_?access_?key|api_?key|apikey|access_?token|auth_?token|token|password)\b\s*["']?\s*[:=]\s*["']?[^\s"',}]{8,}"#,
+        r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    ];
+    PATTERNS.iter().any(|pattern| {
+        Regex::new(pattern)
+            .expect("static secret pattern must compile")
+            .is_match(value)
+    })
 }
 
 fn ensure_private_directory(path: &Path, label: &str) -> Result<(), String> {
@@ -292,6 +458,7 @@ fn save_receipt(path: &Path, snapshot: &RuntimeSnapshot) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Check;
     use std::{
         os::unix::fs::symlink,
         sync::atomic::{AtomicU64, Ordering},
@@ -360,6 +527,25 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    fn packet(snapshot: &RuntimeSnapshot) -> HandoffPacket {
+        HandoffPacket {
+            schema_version: 1,
+            run_id: snapshot.run_id.clone(),
+            task_id: snapshot.external_task_ref.clone(),
+            workspace_id: snapshot.workspace_id.clone(),
+            pane_id: snapshot.pane_id.clone(),
+            worktree: snapshot.worktree.clone(),
+            branch: snapshot.branch.clone(),
+            base_sha: snapshot.base_sha.clone(),
+            summary: "Implemented the bounded fixture change.".into(),
+            question: Some("Accept this scope?".into()),
+            checks: vec![Check {
+                name: "cargo test".into(),
+                passed: true,
+            }],
+        }
     }
 
     #[test]
@@ -495,5 +681,193 @@ mod tests {
         ));
         assert!(!repo.state.join("dispatches/dock_missing.json").exists());
         assert!(!repo.state.join("dispatches/dock_mismatch.json").exists());
+    }
+
+    #[test]
+    fn strict_handoff_attaches_current_git_evidence_and_routes_explicit_decisions() {
+        let repo = Repo::new("handoff");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let first = registry
+            .dispatch(repo.request("dock_handoff_accept"))
+            .unwrap();
+        fs::write(
+            repo.root.join("fixture/tracked"),
+            "fixture\nreview change\n",
+        )
+        .unwrap();
+
+        let record = registry.submit_handoff(packet(&first)).unwrap();
+        assert_eq!(record.evidence.branch, first.branch);
+        assert_eq!(record.evidence.base_sha, first.base_sha);
+        assert_eq!(record.evidence.head_sha, first.base_sha);
+        assert_eq!(record.evidence.status_entries, 1);
+        assert_eq!(
+            (
+                record.evidence.changed_files,
+                record.evidence.insertions,
+                record.evidence.deletions
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(registry.review_inbox().unwrap(), vec![record.clone()]);
+
+        let persisted =
+            fs::read_to_string(repo.state.join("handoffs/dock_handoff_accept.json")).unwrap();
+        assert!(!persisted.contains("scrollback"));
+        assert!(!persisted.contains("command"));
+        let decision = registry
+            .decide(
+                first.run_id.clone(),
+                ReviewRoute::AcceptScope,
+                "Scope accepted for review routing only.".into(),
+            )
+            .unwrap();
+        assert!(!decision.git_mutated);
+        assert!(!decision.external_task_completed);
+        assert!(registry.review_inbox().unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(repo.root.join("fixture/tracked")).unwrap(),
+            "fixture\nreview change\n"
+        );
+
+        let second = registry
+            .dispatch(repo.request("dock_handoff_change"))
+            .unwrap();
+        registry.submit_handoff(packet(&second)).unwrap();
+        let requested = registry
+            .decide(
+                second.run_id,
+                ReviewRoute::RequestChange,
+                "Please add the missing boundary test.".into(),
+            )
+            .unwrap();
+        assert_eq!(requested.route, ReviewRoute::RequestChange);
+        assert!(!requested.git_mutated && !requested.external_task_completed);
+    }
+
+    #[test]
+    fn handoff_rejects_unknown_runs_binding_mismatch_future_schema_and_secret_markers() {
+        let repo = Repo::new("handoff-reject");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let snapshot = registry
+            .dispatch(repo.request("dock_handoff_reject"))
+            .unwrap();
+        let mut unknown = packet(&snapshot);
+        unknown.run_id = "dock_unknown".into();
+        assert!(matches!(
+            registry.submit_handoff(unknown),
+            Err((ErrorCode::RunNotFound, _))
+        ));
+        let mut mismatch = packet(&snapshot);
+        mismatch.base_sha = "deadbeef".into();
+        assert!(matches!(
+            registry.submit_handoff(mismatch),
+            Err((ErrorCode::InvalidHandoff, _))
+        ));
+        let mut future = packet(&snapshot);
+        future.schema_version = 2;
+        assert!(matches!(
+            registry.submit_handoff(future),
+            Err((ErrorCode::InvalidHandoff, _))
+        ));
+        let mut secret = packet(&snapshot);
+        secret.summary = "token=do-not-store".into();
+        assert!(matches!(
+            registry.submit_handoff(secret),
+            Err((ErrorCode::InvalidHandoff, _))
+        ));
+        assert!(
+            !repo
+                .state
+                .join("handoffs/dock_handoff_reject.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn duplicate_handoff_is_explicit_and_preserves_first_evidence() {
+        let repo = Repo::new("handoff-duplicate");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let snapshot = registry
+            .dispatch(repo.request("dock_handoff_duplicate"))
+            .unwrap();
+        let first = registry.submit_handoff(packet(&snapshot)).unwrap();
+        let mut second = packet(&snapshot);
+        second.summary = "Attempted replacement".into();
+
+        assert!(matches!(
+            registry.submit_handoff(second),
+            Err((ErrorCode::DuplicateHandoff, message)) if message.contains("already exists")
+        ));
+        assert_eq!(
+            registry
+                .store
+                .load_handoff_record(&snapshot.run_id)
+                .unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn handoff_rejects_live_branch_drift_and_untracked_files() {
+        let repo = Repo::new("handoff-live-git");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let first = registry
+            .dispatch(repo.request("dock_handoff_branch_drift"))
+            .unwrap();
+        run(
+            &repo.root.join("fixture"),
+            &["checkout", "-qb", "unexpected-branch"],
+        );
+        assert!(matches!(
+            registry.submit_handoff(packet(&first)),
+            Err((ErrorCode::InvalidHandoff, message)) if message.contains("live Git binding")
+        ));
+
+        let second = registry
+            .dispatch(repo.request("dock_handoff_untracked"))
+            .unwrap();
+        fs::write(repo.root.join("fixture/untracked-secret.txt"), "local\n").unwrap();
+        assert!(matches!(
+            registry.submit_handoff(packet(&second)),
+            Err((ErrorCode::InvalidHandoff, message)) if message.contains("untracked files")
+        ));
+    }
+
+    #[test]
+    fn rejects_common_secret_shapes_in_every_free_text_field() {
+        let cases = [
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+            "authorization = Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+            "token=abcdefghijk123456789",
+            r#"{\"api_key\":\"sk-proj-abcdefghijklmnopqrstuvwxyz\"}"#,
+            "github_token: ghp_abcdefghijklmnopqrstuvwxyz123456",
+            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+            "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        ];
+        for value in cases {
+            assert!(
+                likely_contains_secret(value),
+                "secret was accepted: {value}"
+            );
+        }
+
+        let repo = Repo::new("handoff-secret-fields");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let snapshot = registry
+            .dispatch(repo.request("dock_handoff_secret_fields"))
+            .unwrap();
+        for (field, secret) in cases.iter().take(3).enumerate() {
+            let mut candidate = packet(&snapshot);
+            match field {
+                0 => candidate.summary = (*secret).into(),
+                1 => candidate.question = Some((*secret).into()),
+                _ => candidate.checks[0].name = (*secret).into(),
+            }
+            assert!(matches!(
+                registry.submit_handoff(candidate),
+                Err((ErrorCode::InvalidHandoff, _))
+            ));
+        }
     }
 }

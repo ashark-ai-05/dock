@@ -28,3 +28,4 @@
 {"timestamp":"2026-08-20T15:20:59.593583+10:00","action":"move","task_id":6,"detail":"backlog -\u003e review"}
 {"timestamp":"2026-08-20T15:20:59.594446+10:00","action":"handoff","task_id":6,"detail":"Slice 2: repository-bound fixture dispatch"}
 {"timestamp":"2026-08-20T15:20:59.594776+10:00","action":"release","task_id":6,"detail":"Slice 2: repository-bound fixture dispatch"}
+{"timestamp":"2026-08-20T15:21:17.259796+10:00","action":"create","task_id":7,"detail":"Slice 3: structured handoff and evidence loop"}

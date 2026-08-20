@@ -1,0 +1,57 @@
+{
+  "project": "ashark / dock",
+  "herdr_status": "connected · 4 managed panes",
+  "tasks": [
+    {
+      "id": "DOCK-7",
+      "title": "Dispatch-to-handoff fixture slice",
+      "state": "NeedsInput",
+      "agent": "ledger-agent",
+      "worktree": "../dock-ledger",
+      "branch": "dock/fixture-handoff",
+      "base_sha": "3fa91c2",
+      "changed_files": 5,
+      "insertions": 184,
+      "deletions": 29,
+      "handoff_summary": "Implementation is complete. Token headers are redacted; opaque JSON strings remain outside the V0.1 scope.",
+      "question": "Accept the bounded V0.1 scope, or request nested-string redaction?",
+      "checks": [
+        {"name": "cargo fmt --check", "passed": true},
+        {"name": "cargo test handoff::", "passed": true},
+        {"name": "cargo clippy -- -D warnings", "passed": false}
+      ]
+    },
+    {
+      "id": "DOCK-8",
+      "title": "Attention inbox and handoff detail",
+      "state": "Running",
+      "agent": "ui-agent",
+      "worktree": "../dock-ui",
+      "branch": "dock/inbox",
+      "base_sha": "3fa91c2",
+      "changed_files": 2,
+      "insertions": 71,
+      "deletions": 4,
+      "handoff_summary": "Agent is actively implementing the keyboard navigation state.",
+      "question": null,
+      "checks": []
+    },
+    {
+      "id": "DOCK-3",
+      "title": "kanban-md atomic task adapter",
+      "state": "NeedsReview",
+      "agent": "board-agent",
+      "worktree": "../dock-kanban",
+      "branch": "dock/kanban-adapter",
+      "base_sha": "3fa91c2",
+      "changed_files": 3,
+      "insertions": 114,
+      "deletions": 16,
+      "handoff_summary": "Ready for review. Claim expiry is represented in the adapter contract.",
+      "question": null,
+      "checks": [
+        {"name": "go test ./...", "passed": true}
+      ]
+    }
+  ]
+}

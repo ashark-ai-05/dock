@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8,6 +8,7 @@ pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 pub enum Request {
     Hello(HelloRequest),
     Inspect(InspectRequest),
+    Dispatch(DispatchRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,13 +18,28 @@ pub struct HelloRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct InspectRequest {}
+pub struct InspectRequest {
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchRequest {
+    pub repository_root: String,
+    pub external_task_ref: String,
+    pub run_id: String,
+    pub worktree: String,
+    pub command: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
     Hello { version: u16 },
     Snapshot { snapshot: RuntimeSnapshot },
+    Snapshots { snapshots: Vec<RuntimeSnapshot> },
+    Dispatched { snapshot: RuntimeSnapshot },
     Error { code: ErrorCode, message: String },
 }
 
@@ -36,12 +52,21 @@ pub enum ErrorCode {
     RequestTooLarge,
     RequestTimeout,
     ServerBusy,
+    InvalidBinding,
+    DuplicateRunId,
+    RunNotFound,
     Internal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSnapshot {
+    pub repository_root: String,
+    pub external_task_ref: String,
+    pub run_id: String,
+    pub worktree: String,
+    pub branch: String,
+    pub base_sha: String,
     pub workspace_id: String,
     pub pane_id: String,
     pub state: ProcessState,
@@ -67,21 +92,20 @@ pub enum ProcessState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn inspect_rejects_unknown_fields_and_requests_reject_unknown_variants() {
+    fn strict_versioned_messages_reject_unknown_fields_and_variants() {
         assert!(serde_json::from_str::<Request>(r#"{"type":"inspect","pid":1}"#).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"type":"stop","pid":1}"#).is_err());
+        assert!(serde_json::from_str::<Request>(r#"{"type":"dispatch","repository_root":"r","external_task_ref":"t","run_id":"dock_1","worktree":"w","command":[],"pid":1}"#).is_err());
     }
-
     #[test]
-    fn hello_accepts_fields_added_by_newer_clients() {
+    fn hello_remains_forward_compatible_for_negotiation() {
         assert_eq!(
             serde_json::from_str::<Request>(
-                r#"{"type":"hello","version":2,"capabilities":["future"]}"#
+                r#"{"type":"hello","version":3,"capabilities":["future"]}"#
             )
-            .expect("forward-compatible hello"),
-            Request::Hello(HelloRequest { version: 2 })
+            .unwrap(),
+            Request::Hello(HelloRequest { version: 3 })
         );
     }
 }

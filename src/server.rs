@@ -49,8 +49,8 @@ impl Drop for ClientPermit {
 }
 
 use crate::{
+    dispatch::RuntimeRegistry,
     protocol::{ErrorCode, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, Request, Response},
-    runtime::OwnedRuntime,
 };
 
 pub struct Server {
@@ -79,13 +79,13 @@ impl Server {
         })
     }
 
-    pub fn serve(self, runtime: Arc<OwnedRuntime>) -> Result<(), String> {
+    pub fn serve(self, runtime: Arc<RuntimeRegistry>) -> Result<(), String> {
         self.serve_connections(runtime, None)
     }
 
     fn serve_connections(
         self,
-        runtime: Arc<OwnedRuntime>,
+        runtime: Arc<RuntimeRegistry>,
         connection_limit: Option<usize>,
     ) -> Result<(), String> {
         let mut accepted = 0;
@@ -135,13 +135,13 @@ impl Drop for Server {
     }
 }
 
-fn handle_connection(mut stream: UnixStream, runtime: &OwnedRuntime) -> Result<(), String> {
+fn handle_connection(mut stream: UnixStream, runtime: &RuntimeRegistry) -> Result<(), String> {
     handle_connection_with_timeout(&mut stream, runtime, CLIENT_READ_TIMEOUT)
 }
 
 fn handle_connection_with_timeout(
     stream: &mut UnixStream,
-    runtime: &OwnedRuntime,
+    runtime: &RuntimeRegistry,
     read_timeout: Duration,
 ) -> Result<(), String> {
     stream
@@ -188,12 +188,20 @@ fn handle_connection_with_timeout(
     }
     loop {
         match read_request(&mut reader, stream) {
-            Ok(Request::Inspect(_)) => write_response(
-                stream,
-                &Response::Snapshot {
-                    snapshot: runtime.snapshot(),
-                },
-            )?,
+            Ok(Request::Inspect(request)) => match runtime.inspect(request.run_id.as_deref()) {
+                Ok(mut snapshots) if request.run_id.is_some() => write_response(
+                    stream,
+                    &Response::Snapshot {
+                        snapshot: snapshots.remove(0),
+                    },
+                )?,
+                Ok(snapshots) => write_response(stream, &Response::Snapshots { snapshots })?,
+                Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
+            },
+            Ok(Request::Dispatch(request)) => match runtime.dispatch(request) {
+                Ok(snapshot) => write_response(stream, &Response::Dispatched { snapshot })?,
+                Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
+            },
             Ok(Request::Hello(_)) => {
                 write_response(
                     stream,
@@ -277,6 +285,21 @@ mod tests {
 
     static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+    fn registry() -> RuntimeRegistry {
+        RuntimeRegistry::new(
+            std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!(
+                    "dock-registry-test-{}-{}",
+                    std::process::id(),
+                    SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                )),
+            64,
+        )
+        .expect("test registry")
+    }
+
     fn socket_path() -> PathBuf {
         std::env::current_dir()
             .expect("current directory")
@@ -318,7 +341,7 @@ mod tests {
             .collect()
     }
 
-    fn exchange(lines: &[&str], runtime: &OwnedRuntime) -> Vec<Response> {
+    fn exchange(lines: &[&str], runtime: &RuntimeRegistry) -> Vec<Response> {
         let (mut client, server) = UnixStream::pair().expect("socket pair");
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -342,7 +365,7 @@ mod tests {
 
     #[test]
     fn version_mismatch_and_malformed_input_fail_safely() {
-        let runtime = OwnedRuntime::launch(vec!["sh".into(), "-c".into(), "sleep 1".into()], 64);
+        let runtime = registry();
         assert!(matches!(
             exchange(&[r#"{"type":"hello","version":999}"#], &runtime).as_slice(),
             [Response::Error {
@@ -361,7 +384,7 @@ mod tests {
 
     #[test]
     fn newer_hello_fields_reach_version_negotiation_while_inspect_stays_strict() {
-        let runtime = OwnedRuntime::launch(vec!["sh".into(), "-c".into(), "sleep 1".into()], 64);
+        let runtime = registry();
         assert!(matches!(
             exchange(
                 &[r#"{"type":"hello","version":999,"future":true}"#],
@@ -376,7 +399,7 @@ mod tests {
         assert!(matches!(
             exchange(
                 &[
-                    r#"{"type":"hello","version":1,"future":true}"#,
+                    r#"{"type":"hello","version":2,"future":true}"#,
                     r#"{"type":"inspect","future":true}"#
                 ],
                 &runtime
@@ -396,7 +419,7 @@ mod tests {
 
     #[test]
     fn incomplete_request_times_out_with_a_protocol_error() {
-        let runtime = OwnedRuntime::launch(vec!["sh".into(), "-c".into(), "sleep 1".into()], 64);
+        let runtime = registry();
         let (mut client, mut server) = UnixStream::pair().expect("socket pair");
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -444,16 +467,33 @@ mod tests {
 
     #[test]
     fn reconnecting_clients_observe_the_same_owned_process() {
-        let runtime = OwnedRuntime::launch(vec!["sh".into(), "-c".into(), "sleep 2".into()], 64);
-        let requests = [r#"{"type":"hello","version":1}"#, r#"{"type":"inspect"}"#];
-        let first = exchange(&requests, &runtime);
-        let second = exchange(&requests, &runtime);
-        let pid = |responses: &[Response]| match &responses[1] {
+        let runtime = registry();
+        let root = std::env::current_dir().unwrap().display().to_string();
+        let dispatch =
+            serde_json::to_string(&Request::Dispatch(crate::protocol::DispatchRequest {
+                repository_root: root.clone(),
+                external_task_ref: "TASK-SOCKET".into(),
+                run_id: "dock_socket_reconnect".into(),
+                worktree: root,
+                command: vec!["sh".into(), "-c".into(), "sleep 2".into()],
+            }))
+            .unwrap();
+        let hello = r#"{"type":"hello","version":2}"#;
+        let dispatched = exchange(&[hello, &dispatch], &runtime);
+        let pid = match &dispatched[1] {
+            Response::Dispatched { snapshot } => snapshot.pid,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        assert!(pid.is_some());
+        let inspect = r#"{"type":"inspect","run_id":"dock_socket_reconnect"}"#;
+        let first = exchange(&[hello, inspect], &runtime);
+        let second = exchange(&[hello, inspect], &runtime);
+        let inspected_pid = |responses: &[Response]| match &responses[1] {
             Response::Snapshot { snapshot } => snapshot.pid,
             response => panic!("unexpected response: {response:?}"),
         };
-        assert!(pid(&first).is_some());
-        assert_eq!(pid(&first), pid(&second));
+        assert_eq!(inspected_pid(&first), pid);
+        assert_eq!(inspected_pid(&first), inspected_pid(&second));
     }
 
     #[test]
@@ -475,10 +515,7 @@ mod tests {
                 & 0o777,
             0o600
         );
-        let runtime = Arc::new(OwnedRuntime::launch(
-            vec!["sh".into(), "-c".into(), "sleep 30".into()],
-            64,
-        ));
+        let runtime = Arc::new(registry());
         let server_runtime = Arc::clone(&runtime);
         let server_thread = std::thread::spawn(move || {
             server
@@ -493,15 +530,15 @@ mod tests {
                 ..
             }]
         ));
-        let requests = [r#"{"type":"hello","version":1}"#, r#"{"type":"inspect"}"#];
+        let requests = [r#"{"type":"hello","version":2}"#, r#"{"type":"inspect"}"#];
         let first = socket_exchange(&socket, &requests);
         let second = socket_exchange(&socket, &requests);
-        let pid = |responses: &[Response]| match &responses[1] {
-            Response::Snapshot { snapshot } => snapshot.pid,
+        let snapshot_count = |responses: &[Response]| match &responses[1] {
+            Response::Snapshots { snapshots } => snapshots.len(),
             response => panic!("unexpected response: {response:?}"),
         };
-        assert!(pid(&first).is_some());
-        assert_eq!(pid(&first), pid(&second));
+        assert_eq!(snapshot_count(&first), 0);
+        assert_eq!(snapshot_count(&first), snapshot_count(&second));
 
         server_thread.join().expect("listener thread");
         assert!(

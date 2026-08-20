@@ -25,13 +25,17 @@ Dock must never infer task completion from terminal output, control a process it
 
 ## Current status
 
-Slice 1 now provides the smallest local Dock-owned runtime:
+Slice 2 now provides one explicitly bound, fixture-only repository runtime:
 
-- `dockd` owns exactly one explicitly supplied fixture command in a PTY and its own process group;
+- `dockd` starts empty and accepts deterministic fixture dispatches through protocol version 2;
+- each run is bound before launch to a canonical Git repository root, non-empty external task reference, Dock run id, and supplied existing worktree path;
+- worktree paths are canonicalized, kept beneath the repository root, checked against Git's top-level, and rejected on traversal, symlink escape, or repository mismatch;
+- each accepted run receives its own Dock-owned pane, PTY, and process group;
 - a versioned, user-only Unix socket accepts a forward-compatible hello and strict inspect requests;
-- `dock-inspect` reports owned process state and bounded in-memory scrollback;
+- `dock-dispatch` is the compact client/smoke path and `dock-inspect` reports one or all bound runs, including Git branch/base facts;
 - the daemon and fixture process continue running when inspectors disconnect and reconnect;
-- malformed and mismatched protocol requests are rejected without process discovery or control.
+- owner-only local dispatch receipts reserve run ids across daemon restarts but omit raw PTY scrollback and the raw command vector;
+- malformed/mismatched requests, missing tasks, duplicate ids, and invalid bindings are rejected without process discovery, process import, Git mutation, or worktree creation.
 
 The earlier foundations remain available:
 
@@ -41,33 +45,28 @@ The earlier foundations remain available:
 - Git worktree/base/head/numstat facts and `delta` diff rendering;
 - explicit LazyGit launch intent.
 
-Runtime process state, launch diagnostics, and scrollback are in memory only and disappear when `dockd` exits. The earlier handoff-packet foundation has separate durable local storage, but Slice 1 does not persist launch receipts or runtime recovery. It also does **not yet** launch/manage Amp/Claude/Codex/Copilot, accept terminal input, provide terminal-multiplexer parity, or run cross-repository dependency gates. The [runtime product spec](docs/dock-runtime-product-spec.md) distinguishes target behaviour from shipped capability.
+Live process handles and scrollback remain in memory and disappear when `dockd` exits. Dispatch identity/launch facts persist beneath the configured state directory, but daemon restart recovery does not reattach or import the former process. Slice 2 does **not** create or mutate Git worktrees, claim tasks in a remote provider, launch real agents, accept terminal input, or provide terminal-multiplexer/dependency-gate parity. The supplied fixture worktree must already exist at a Git worktree top-level beneath (or equal to) the canonical repository root and share that repository's Git common directory.
 
-## Slice 1 runtime
+## Slice 2 fixture dispatch smoke
 
-Start the daemon with one explicit fixture command. By default, both commands use `dockd.sock` beneath an owner-only per-user runtime directory (`$XDG_RUNTIME_DIR/dock` on Linux when available, otherwise a per-user temporary directory on Linux/macOS):
-
-```bash
-cargo run --bin dockd -- --scrollback-bytes=65536 -- \
-  sh -c 'i=0; while :; do i=$((i+1)); echo "fixture tick $i"; sleep 1; done'
-cargo run --bin dock-inspect
-```
-
-The explicit `--socket` override remains available:
+Start the empty daemon. By default clients use `dockd.sock` beneath an owner-only per-user runtime directory (`$XDG_RUNTIME_DIR/dock` on Linux when available, otherwise a per-user temporary directory on Linux/macOS):
 
 ```bash
-mkdir -p .dock/run
-cargo run --bin dockd -- --socket=.dock/run/dockd.sock --scrollback-bytes=65536 -- \
-  sh -c 'i=0; while :; do i=$((i+1)); echo "fixture tick $i"; sleep 1; done'
+cargo run --bin dockd -- --scrollback-bytes=65536
 ```
 
-From another terminal, inspect it non-interactively. Run this command repeatedly to demonstrate detach/reconnect without restarting the fixture:
+From another terminal, dispatch a fixture into this existing repository worktree. The client generates a `dock_…` run id unless `--run-id=dock_smoke` is supplied for a deterministic smoke:
 
 ```bash
-cargo run --bin dock-inspect -- --socket=.dock/run/dockd.sock
+cargo run --bin dock-dispatch -- \
+  --repo="$(pwd)" --task=FIXTURE-1 --run-id=dock_smoke \
+  --worktree="$(pwd)" -- sh -c 'pwd; git rev-parse --show-toplevel'
+cargo run --bin dock-inspect -- --run-id=dock_smoke
 ```
 
-Stop the foreground daemon with `Ctrl-C`. Slice 1 has no remote stop request by design: there is no API that accepts a PID or discovers an external process. After a forced termination, startup automatically removes a stale default socket only when it is a Unix socket owned by the effective user, remains inside Dock's owner-only runtime directory, and refuses a connection probe. Startup never stale-recovers a live socket, an untrusted path, or an explicit `--socket` override. Client reads have a finite deadline and concurrent clients are bounded; a stalled or excess inspector is rejected without stopping the daemon.
+Use a fresh run id for each accepted dispatch; ids remain reserved in `.dock/local/dispatches`. Dock requires its state and dispatch directories to be owned by the current user and inaccessible to group/other users (mode `0700` or stricter); receipt files are mode `0600`. Run `dock-inspect` without `--run-id` to list all runs. The explicit `--socket=PATH` option remains available on all three commands.
+
+Stop the foreground daemon with `Ctrl-C`. Slice 2 still has no remote stop/import request: no API accepts a PID or discovers an external process. Existing Slice 1 socket recovery, finite client deadlines, bounded clients, bounded scrollback, and Dock-owned process-group cleanup remain in force.
 
 ## The daily control loop
 
@@ -123,6 +122,7 @@ The current prototype’s keyboard controls are `j/k` select, `a` accept an expl
 - Local-first by default; no hosted backend or telemetry is required.
 - Dock does not store API keys or agent credentials; each agent retains its normal authentication flow.
 - Raw terminal transcripts are not durable by default.
+- Raw dispatch command vectors are never written to durable receipts because arguments can contain credentials.
 - External command inputs are structured and validated; durable packets reject unexpected schema fields.
 - Git mutation remains a deliberate human action.
 

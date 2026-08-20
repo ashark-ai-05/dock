@@ -19,12 +19,18 @@ pub struct App {
 
 impl App {
     pub fn new(board: BoardFixture) -> Self {
+        let contract_state = if board.handoff_packet_for(0).validate().is_ok() {
+            "Fixture handoff packet validated."
+        } else {
+            "Fixture handoff packet is invalid."
+        };
         Self {
             board,
             selected: 0,
-            notice:
-                "Select a handoff. Dock records explicit decisions; it never infers completion."
-                    .into(),
+            notice: format!(
+                "{} Dock records explicit decisions; it never infers completion.",
+                contract_state
+            ),
             should_quit: false,
         }
     }

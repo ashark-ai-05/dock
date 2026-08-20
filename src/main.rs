@@ -170,7 +170,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw(format!(
             " {}  ·  {}",
-            app.board.project, app.board.herdr_status
+            app.board.project, app.board.runtime_status
         )),
         Span::styled(
             "     [j/k] select  [a] accept scope  [r] request changes  [l] LazyGit  [q] quit",

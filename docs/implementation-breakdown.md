@@ -15,20 +15,20 @@ The outcome contract is [`dock-runtime-product-spec.md`](dock-runtime-product-sp
 ## Slice 0 — Product reframe and parity contract
 
 ### User outcome
-A potential user can understand exactly why Dock replaces the combined Herdr + task + Git workflow instead of being another dashboard.
+A potential user can understand exactly why Dock unifies the terminal-runtime + task + Git workflow instead of being another dashboard.
 
 ### Scope
 - Rewrite product positioning, source-of-truth boundaries, safety model, and roadmap.
-- Maintain a feature-parity matrix for Herdr daily-workflow capability.
+- Maintain a feature-parity matrix for daily terminal-runtime capability.
 - Link the runtime product spec and testable acceptance evidence.
 
 ### Out of scope
 - Runtime code or dependency changes.
 
 ### Acceptance checks
-- [ ] README does not describe Dock as a narrow handoff desk or deny terminal-runtime ownership.
+- [ ] README does not describe Dock as a narrow coordination tool or deny terminal-runtime ownership.
 - [ ] Product spec distinguishes current capability from target capability.
-- [ ] Herdr parity claims are not presented as implemented until verified.
+- [ ] Terminal-runtime parity claims are not presented as implemented until verified.
 - [ ] Documentation review checks no promise requires terminal-text inference or automatic Git mutation.
 
 ### Definition of done
@@ -52,7 +52,7 @@ As a developer, I can start `dockd`, create a Dock-owned workspace and pane runn
 - [ ] Fixture process remains live through client reconnect.
 - [ ] `dockd` never identifies or stops a non-Dock process.
 - [ ] CLI/TUI demo shows running, stopped, and failed owned-process state.
-- [ ] Failure path leaves an actionable persisted receipt without raw transcript capture.
+- [ ] Failure path exposes an actionable in-memory diagnostic without raw transcript capture; durable launch/dispatch receipts are deferred to Slice 2, where repository/task/run identity exists.
 
 ### Risks / dependencies
 PTY and process-group semantics must work on macOS and Linux. Start with an implementation spike bounded to one platform CI fixture plus documented portability checks.
@@ -137,10 +137,10 @@ As a developer, I can open two repositories under one Dock runtime, see three ac
 - [ ] Release action starts only the intended downstream Dock-owned run.
 - [ ] End-to-end fixture test and recorded two-repository terminal walkthrough pass.
 
-## Slice 6 — Herdr daily-workflow parity
+## Slice 6 — Daily terminal-runtime parity
 
 ### User outcome
-As a former Herdr user, I can use Dock as my daily runtime without losing essential workspace/pane/session ergonomics.
+As a developer, I can use Dock as my daily runtime without losing essential workspace/pane/session ergonomics.
 
 ### Scope
 - Workspace/tab/pane split, swap, focus, resize, rename, close, layout persistence, zoom.
@@ -152,10 +152,10 @@ As a former Herdr user, I can use Dock as my daily runtime without losing essent
 - Unbounded terminal-emulator feature parity or features not proven valuable in the controlled Dock workflow.
 
 ### Acceptance checks
-- [ ] Published parity matrix marks every daily-required Herdr capability as shipped, intentionally different, or deferred.
+- [ ] Published parity matrix marks every daily-required terminal capability as shipped, intentionally different, or deferred.
 - [ ] Layout/session recovery manual demo passes after client restart and daemon restart where supported.
 - [ ] API and CLI contract tests cover workspace/pane lifecycle.
-- [ ] No legacy Herdr runtime is required for the Dock end-to-end demo.
+- [ ] No legacy external runtime is required for the Dock end-to-end demo.
 
 ## Slice 7 — Full Git workflow bridge, plugins, and release gate
 
@@ -195,4 +195,4 @@ Completed before this reframe:
 - explicit LazyGit launch intent;
 - documented task contract and local smoke tests.
 
-These are foundations only. Dock does **not yet** own a PTY runtime, launch real coding agents, provide Herdr parity, or operate multi-repository programme gates.
+These foundations now feed the Slice 1 Dock-owned PTY runtime. Dock does **not yet** launch real coding agents, provide full terminal-runtime parity, or operate multi-repository programme gates.

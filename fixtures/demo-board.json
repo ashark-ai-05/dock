@@ -1,6 +1,6 @@
 {
   "project": "ashark / dock",
-  "herdr_status": "connected · 4 managed panes",
+  "runtime_status": "Dock connected · 4 owned panes",
   "tasks": [
     {
       "id": "DOCK-7",

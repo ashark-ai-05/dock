@@ -2,7 +2,7 @@
 
 ## Decision
 
-Dock is a local-first, provider-neutral coding-agent runtime and control plane. It replaces the runtime role of Herdr while integrating the daily workflow strengths of `kanban-md`, Git, `delta`, and LazyGit.
+Dock is a local-first, provider-neutral coding-agent runtime and control plane. It owns the runtime role while integrating the daily workflow strengths of `kanban-md`, Git, `delta`, and LazyGit.
 
 Dock works naturally for one repository. A multi-repository programme is the same model with more than one repository binding; users do not create a separate “programme mode” for ordinary single-repository work.
 
@@ -12,7 +12,7 @@ Dock is better than a terminal multiplexer only when it makes explicit delivery 
 
 ### Current workflow
 
-A developer opens several terminals and worktrees, starts agent CLIs manually, watches terminal text, switches among Herdr/kanban-md/Git/delta/LazyGit, and manually remembers which upstream work unblocks downstream work.
+A developer opens several terminals and worktrees, starts agent CLIs manually, watches terminal text, switches among disconnected task/runtime/Git tools, and manually remembers which upstream work unblocks downstream work.
 
 ### Target workflow
 
@@ -134,11 +134,15 @@ Dock may stop or restart only a process group it owns. Uncertain runtime state r
 - **Working assumption:** first-class adapters will launch Amp, Claude Code, Codex CLI, and GitHub Copilot CLI, subject to each CLI’s stable local launch/resume behaviour.
 - **Open:** exact terminal emulation/rendering library and daemon packaging approach; decide after a bounded PTY/reconnect spike.
 - **Open:** whether LazyGit appears as a child/embedded terminal surface or is launched as a focused Dock pane first; initial implementation should preserve the explicit human-action boundary either way.
-- **Open:** release definition for full Herdr parity; maintain a visible parity matrix before making replacement claims publicly.
+- **Open:** release definition for full terminal-runtime parity; maintain a visible capability matrix before making replacement claims publicly.
 
 ## First vertical slice
 
 A developer starts `dockd`, opens two repositories, and connects one Control Pane. Dock creates three owned agent panes across those repositories. One explicit upstream handoff from Repository A is a declared prerequisite for a Repository B task; until a human records the configured decision, Dock visibly blocks downstream dispatch. The same daemon supports opening only one repository without programme setup.
+
+### Current Slice 1 persistence boundary
+
+The shipped one-fixture runtime keeps owned process state, bounded scrollback, and launch diagnostics in daemon memory only. Reconnect works while the same daemon remains alive; daemon restart recovery and durable launch/dispatch receipts are later-slice target behaviour. Separately, the pre-runtime handoff-packet prototype can persist explicitly saved packets locally. Nothing in Slice 1 persists raw PTY output.
 
 ## Approval gate
 

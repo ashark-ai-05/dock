@@ -2,7 +2,7 @@
 
 **The local control plane for coding-agent delivery.**
 
-Dock is a provider-neutral runtime for coding agents. It is being built to replace the combined daily workflow of a terminal multiplexer, agent runner, task board, Git review surface, and handoff desk—without taking ownership away from Git or a repository’s task source.
+Dock is a provider-neutral runtime for coding agents. It is being built to unify the daily workflow of a terminal multiplexer, agent runner, task board, Git review surface, and local delivery control plane—without taking ownership away from Git or a repository’s task source.
 
 > One repository works immediately. Open more repositories when you need a local delivery programme with explicit dependencies and shared agent capacity.
 
@@ -23,9 +23,17 @@ Its Control Pane brings together runtime state, task/run/worktree bindings, Git 
 
 Dock must never infer task completion from terminal output, control a process it does not own without explicit import, or stage/commit/rebase/merge/push/deploy automatically.
 
-## Current prototype status
+## Current status
 
-This repository currently contains **foundations**, not the Dock runtime described above:
+Slice 1 now provides the smallest local Dock-owned runtime:
+
+- `dockd` owns exactly one explicitly supplied fixture command in a PTY and its own process group;
+- a versioned, user-only Unix socket accepts a forward-compatible hello and strict inspect requests;
+- `dock-inspect` reports owned process state and bounded in-memory scrollback;
+- the daemon and fixture process continue running when inspectors disconnect and reconnect;
+- malformed and mismatched protocol requests are rejected without process discovery or control.
+
+The earlier foundations remain available:
 
 - Ratatui fixture Control-Pane prototype;
 - strict, versioned handoff packets and atomic local-only packet storage;
@@ -33,7 +41,33 @@ This repository currently contains **foundations**, not the Dock runtime describ
 - Git worktree/base/head/numstat facts and `delta` diff rendering;
 - explicit LazyGit launch intent.
 
-It does **not yet** own PTYs, launch/manage Amp/Claude/Codex/Copilot, provide terminal-multiplexer parity, or run cross-repository dependency gates. The [runtime product spec](docs/dock-runtime-product-spec.md) distinguishes target behaviour from shipped capability.
+Runtime process state, launch diagnostics, and scrollback are in memory only and disappear when `dockd` exits. The earlier handoff-packet foundation has separate durable local storage, but Slice 1 does not persist launch receipts or runtime recovery. It also does **not yet** launch/manage Amp/Claude/Codex/Copilot, accept terminal input, provide terminal-multiplexer parity, or run cross-repository dependency gates. The [runtime product spec](docs/dock-runtime-product-spec.md) distinguishes target behaviour from shipped capability.
+
+## Slice 1 runtime
+
+Start the daemon with one explicit fixture command. By default, both commands use `dockd.sock` beneath an owner-only per-user runtime directory (`$XDG_RUNTIME_DIR/dock` on Linux when available, otherwise a per-user temporary directory on Linux/macOS):
+
+```bash
+cargo run --bin dockd -- --scrollback-bytes=65536 -- \
+  sh -c 'i=0; while :; do i=$((i+1)); echo "fixture tick $i"; sleep 1; done'
+cargo run --bin dock-inspect
+```
+
+The explicit `--socket` override remains available:
+
+```bash
+mkdir -p .dock/run
+cargo run --bin dockd -- --socket=.dock/run/dockd.sock --scrollback-bytes=65536 -- \
+  sh -c 'i=0; while :; do i=$((i+1)); echo "fixture tick $i"; sleep 1; done'
+```
+
+From another terminal, inspect it non-interactively. Run this command repeatedly to demonstrate detach/reconnect without restarting the fixture:
+
+```bash
+cargo run --bin dock-inspect -- --socket=.dock/run/dockd.sock
+```
+
+Stop the foreground daemon with `Ctrl-C`. Slice 1 has no remote stop request by design: there is no API that accepts a PID or discovers an external process. After a forced termination, startup automatically removes a stale default socket only when it is a Unix socket owned by the effective user, remains inside Dock's owner-only runtime directory, and refuses a connection probe. Startup never stale-recovers a live socket, an untrusted path, or an explicit `--socket` override. Client reads have a finite deadline and concurrent clients are bounded; a stalled or excess inspector is rejected without stopping the daemon.
 
 ## The daily control loop
 
@@ -51,7 +85,7 @@ The same loop works for a single repository. With multiple repositories open, Do
 
 ## Runtime feature contract
 
-Dock’s release bar is not “a dashboard with agent labels.” It must reach the daily-workflow capabilities needed to replace a Herdr-style terminal runtime:
+Dock’s release bar is not “a dashboard with agent labels.” It must reach the daily-workflow capabilities expected from a complete coding-agent terminal runtime:
 
 - workspaces, tabs, panes, splits, swaps, focus, resize, zoom, layout persistence;
 - owned PTYs/process groups, bounded scrollback, detach/reattach, and recovery;

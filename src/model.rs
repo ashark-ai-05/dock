@@ -73,7 +73,7 @@ impl HandoffPacket {
             return Err("run_id and task_id are required");
         }
         if self.workspace_id.trim().is_empty() || self.pane_id.trim().is_empty() {
-            return Err("a managed Herdr workspace and pane binding are required");
+            return Err("a Dock-owned workspace and pane binding are required");
         }
         if self.worktree.trim().is_empty()
             || self.branch.trim().is_empty()
@@ -91,7 +91,7 @@ impl HandoffPacket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardFixture {
     pub project: String,
-    pub herdr_status: String,
+    pub runtime_status: String,
     pub tasks: Vec<Task>,
 }
 

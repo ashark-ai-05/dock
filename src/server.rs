@@ -17,9 +17,53 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a request that has *already started arriving* may take to finish.
+///
+/// Short on purpose: once the first byte is in, the rest of a line is microseconds away on a
+/// local socket, so a message that stalls half-sent is a fault and must not pin a connection
+/// or the admission slot behind it.
+const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a client may sit *between* requests without sending anything.
+///
+/// This is not a protocol deadline. A dashboard holds its request connection open across
+/// every pause its user takes, and that connection has no reconnect path, so closing it under
+/// an idle client ends the session — which is exactly what a five-second bound did. The only
+/// job left for a bound here is to stop a *wedged* client (alive, but never sending again)
+/// from holding two of the 32 admission slots for the daemon's entire lifetime; a client that
+/// dies is reclaimed immediately by EOF, not by this. So it is set far past any plausible
+/// unattended session — a long weekend away from the machine included — while still
+/// guaranteeing the slots come back without operator action.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_CLIENTS: usize = 32;
+
+/// The two deadlines a client read is subject to.
+///
+/// They are separate because waiting for the first byte of a new request and waiting for the
+/// rest of a message already in flight are different conditions: only the second is a fault.
+/// Conflating them is what made an idle dashboard look like a protocol violation.
+#[derive(Clone, Copy)]
+struct ReadTimeouts {
+    idle: Duration,
+    in_flight: Duration,
+}
+
+impl ReadTimeouts {
+    const PRODUCTION: Self = Self {
+        idle: CLIENT_IDLE_TIMEOUT,
+        in_flight: CLIENT_REQUEST_TIMEOUT,
+    };
+
+    /// The handshake is not an idle wait: a client that has just connected is expected to say
+    /// hello at once, so a connection that never speaks at all gives its slot back in seconds
+    /// rather than days.
+    fn handshake(self) -> Self {
+        Self {
+            idle: self.in_flight,
+            in_flight: self.in_flight,
+        }
+    }
+}
 
 struct ClientAdmission {
     active: AtomicUsize,
@@ -151,24 +195,23 @@ impl Drop for Server {
 fn handle_connection(mut stream: UnixStream, runtime: &RuntimeRegistry) -> Result<(), String> {
     // `None`: a real subscriber streams until it disconnects. A deadline here would silently
     // stop the push loop and freeze the dashboard with no error to explain it.
-    handle_connection_with_timeout(&mut stream, runtime, CLIENT_READ_TIMEOUT, None)
+    handle_connection_with_timeout(&mut stream, runtime, ReadTimeouts::PRODUCTION, None)
 }
 
 fn handle_connection_with_timeout(
     stream: &mut UnixStream,
     runtime: &RuntimeRegistry,
-    read_timeout: Duration,
+    timeouts: ReadTimeouts,
     stream_deadline: Option<Instant>,
 ) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(read_timeout))
-        .map_err(|error| format!("could not set client read timeout: {error}"))?;
+    // No read timeout is set here: `read_request` chooses one per read, because which bound
+    // applies depends on whether a message has started arriving.
     stream
         .set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))
         .map_err(|error| format!("could not set client write timeout: {error}"))?;
     let reader_stream = stream.try_clone().map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(reader_stream);
-    let hello = read_request(&mut reader, stream)?;
+    let hello = read_request(&mut reader, stream, timeouts.handshake())?;
     match hello {
         Request::Hello(hello) if hello.version == PROTOCOL_VERSION => {
             write_response(
@@ -203,7 +246,7 @@ fn handle_connection_with_timeout(
         }
     }
     loop {
-        match read_request(&mut reader, stream) {
+        match read_request(&mut reader, stream, timeouts) {
             Ok(Request::Inspect(request)) => match runtime.inspect(request.run_id.as_deref()) {
                 Ok(mut snapshots) if request.run_id.is_some() => write_response(
                     stream,
@@ -477,28 +520,79 @@ impl SubscriberView {
     }
 }
 
-fn read_request(reader: &mut impl BufRead, stream: &mut UnixStream) -> Result<Request, String> {
+/// Blocks until the first byte of a request has been buffered, under the idle bound.
+///
+/// Buffering the byte here rather than peeking is what makes the split work: everything the
+/// caller reads afterwards is either already in hand or part of a message the client has
+/// demonstrably begun sending, so the short in-flight bound can apply to all of it.
+fn await_request_start(
+    reader: &mut impl BufRead,
+    stream: &mut UnixStream,
+    timeouts: ReadTimeouts,
+) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(timeouts.idle))
+        .map_err(|error| format!("could not set client idle timeout: {error}"))?;
+    loop {
+        match reader.fill_buf() {
+            // The peer is gone: reclaiming the connection here is what keeps an abandoned
+            // client cheap without any help from a deadline.
+            Ok([]) => return Err("connection closed".into()),
+            Ok(_) => return Ok(()),
+            // `BufReader` surfaces `Interrupted` instead of retrying it, and a signal
+            // delivered to the daemon must not be mistaken for a silent client.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(report_read_failure(
+                    stream,
+                    error,
+                    "client sent nothing for the idle timeout",
+                ));
+            }
+        }
+    }
+}
+
+/// Turns a failed client read into the error the connection loop ends on, answering a timeout
+/// with the protocol's own `RequestTimeout` first so the client learns why it was dropped.
+fn report_read_failure(stream: &mut UnixStream, error: std::io::Error, message: &str) -> String {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
+        let _ = write_response(
+            stream,
+            &Response::Error {
+                code: ErrorCode::RequestTimeout,
+                message: message.into(),
+            },
+        );
+        "request timed out".into()
+    } else {
+        format!("could not read request: {error}")
+    }
+}
+
+fn read_request(
+    reader: &mut impl BufRead,
+    stream: &mut UnixStream,
+    timeouts: ReadTimeouts,
+) -> Result<Request, String> {
+    await_request_start(reader, stream, timeouts)?;
+    // A message is now in flight, so the short bound takes over for the rest of the line.
+    stream
+        .set_read_timeout(Some(timeouts.in_flight))
+        .map_err(|error| format!("could not set client read timeout: {error}"))?;
     let mut bytes = Vec::new();
     let count = (&mut *reader)
         .take(MAX_MESSAGE_BYTES + 1)
         .read_until(b'\n', &mut bytes)
         .map_err(|error| {
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-            ) {
-                let _ = write_response(
-                    stream,
-                    &Response::Error {
-                        code: ErrorCode::RequestTimeout,
-                        message: "client did not complete a request before the read deadline"
-                            .into(),
-                    },
-                );
-                "request timed out".into()
-            } else {
-                format!("could not read request: {error}")
-            }
+            report_read_failure(
+                stream,
+                error,
+                "client did not complete a request before the read deadline",
+            )
         })?;
     if count == 0 {
         return Err("connection closed".into());
@@ -653,7 +747,7 @@ mod tests {
                 handle_connection_with_timeout(
                     &mut server,
                     runtime,
-                    CLIENT_READ_TIMEOUT,
+                    ReadTimeouts::PRODUCTION,
                     Some(Instant::now() + window),
                 )
                 .ok();
@@ -741,7 +835,10 @@ mod tests {
                     handle_connection_with_timeout(
                         &mut server,
                         &runtime,
-                        Duration::from_millis(25),
+                        ReadTimeouts {
+                            idle: Duration::from_millis(25),
+                            in_flight: Duration::from_millis(25),
+                        },
                         None
                     ),
                     Err("request timed out".into())
@@ -764,6 +861,169 @@ mod tests {
                 }
             ));
         });
+    }
+
+    /// The bound the old conflated timeout applied to *every* read, idle ones included. The
+    /// idle test below has to exceed it by a margin no scheduling hiccup could explain away,
+    /// or it would pass without ever having idled.
+    const OLD_CONFLATED_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn send_line(stream: &mut UnixStream, line: &str) {
+        stream.write_all(line.as_bytes()).expect("write request");
+        stream.write_all(b"\n").expect("write newline");
+    }
+
+    fn next_response(reader: &mut impl BufRead) -> Response {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).expect("read response") > 0,
+            "daemon closed the connection instead of answering"
+        );
+        serde_json::from_str(&line).expect("response")
+    }
+
+    #[test]
+    fn an_idle_connection_outlives_the_old_deadline_and_still_serves_the_next_request() {
+        // The shipped defect: a dashboard that reads output or simply thinks for five seconds
+        // had its request connection closed underneath it, and that connection has no
+        // reconnect path. Production timeouts are used deliberately — the point is that the
+        // real configuration tolerates a real human pause.
+        let runtime = registry();
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        let idle = OLD_CONFLATED_TIMEOUT + Duration::from_secs(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                handle_connection_with_timeout(
+                    &mut server,
+                    &runtime,
+                    ReadTimeouts::PRODUCTION,
+                    None,
+                )
+                .expect("an idle client is not a protocol fault");
+            });
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut reader = BufReader::new(client.try_clone().expect("clone client"));
+            send_line(&mut client, &hello());
+            assert!(matches!(
+                next_response(&mut reader),
+                Response::Hello {
+                    version: PROTOCOL_VERSION
+                }
+            ));
+
+            let start = Instant::now();
+            thread::sleep(idle);
+            send_line(&mut client, r#"{"type":"inspect"}"#);
+            // Any unsolicited `RequestTimeout` written during the pause would be read here
+            // ahead of this reply, so a `Snapshots` answer also proves nothing was sent.
+            let response = next_response(&mut reader);
+            let idled = start.elapsed();
+            assert!(
+                matches!(response, Response::Snapshots { .. }),
+                "a connection idle for {idled:?} must still serve requests, got {response:?}"
+            );
+            assert!(
+                idled > OLD_CONFLATED_TIMEOUT,
+                "the pause was only {idled:?}, which never reached the old {OLD_CONFLATED_TIMEOUT:?} bound"
+            );
+            client.shutdown(Shutdown::Write).expect("finish requests");
+        });
+    }
+
+    #[test]
+    fn a_half_sent_request_is_still_timed_out_however_long_idling_is_allowed() {
+        // The protection the old timeout really provided: a message that starts and never
+        // finishes must not pin the connection, and lengthening the *idle* bound must not
+        // lengthen this one.
+        let runtime = registry();
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        let timeouts = ReadTimeouts {
+            idle: Duration::from_secs(600),
+            in_flight: Duration::from_millis(50),
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert_eq!(
+                    handle_connection_with_timeout(&mut server, &runtime, timeouts, None),
+                    Err("request timed out".into())
+                );
+            });
+            // Ten minutes of idle tolerance against two seconds of patience here: only the
+            // in-flight bound can produce an answer inside this test.
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut reader = BufReader::new(client.try_clone().expect("clone client"));
+            send_line(&mut client, &hello());
+            assert!(matches!(
+                next_response(&mut reader),
+                Response::Hello {
+                    version: PROTOCOL_VERSION
+                }
+            ));
+            client
+                .write_all(br#"{"type":"inspect""#)
+                .expect("partial request");
+            assert!(matches!(
+                next_response(&mut reader),
+                Response::Error {
+                    code: ErrorCode::RequestTimeout,
+                    ..
+                }
+            ));
+        });
+    }
+
+    #[test]
+    fn a_client_that_closes_releases_its_admission_slot_without_waiting_for_a_deadline() {
+        // Nothing about the long idle bound may delay reclamation of a connection whose peer
+        // has gone: a closed socket reads as EOF, which ends the loop on its own.
+        let runtime = registry();
+        let admission = Arc::new(ClientAdmission::new(2));
+        let permit = admission.try_acquire().expect("permit");
+        assert_eq!(admission.active.load(Ordering::Acquire), 1);
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        let shared = runtime.shared();
+        let handler = std::thread::spawn(move || {
+            let _permit = permit;
+            handle_connection_with_timeout(
+                &mut server,
+                &shared,
+                ReadTimeouts {
+                    idle: Duration::from_secs(600),
+                    in_flight: Duration::from_secs(600),
+                },
+                None,
+            )
+        });
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut reader = BufReader::new(client.try_clone().expect("clone client"));
+        send_line(&mut client, &hello());
+        assert!(matches!(
+            next_response(&mut reader),
+            Response::Hello {
+                version: PROTOCOL_VERSION
+            }
+        ));
+        drop(reader);
+        drop(client);
+
+        let start = Instant::now();
+        assert_eq!(handler.join().expect("handler thread"), Ok(()));
+        let reclaimed = start.elapsed();
+        assert!(
+            reclaimed < Duration::from_secs(5),
+            "a departed client waited {reclaimed:?} to be noticed, so a deadline reclaimed it rather than its EOF"
+        );
+        assert_eq!(
+            admission.active.load(Ordering::Acquire),
+            0,
+            "the handler's permit must be released when the connection ends"
+        );
     }
 
     #[test]
@@ -1158,7 +1418,7 @@ mod tests {
                 handle_connection_with_timeout(
                     &mut server,
                     &shared,
-                    CLIENT_READ_TIMEOUT,
+                    ReadTimeouts::PRODUCTION,
                     Some(deadline),
                 )
                 .ok();

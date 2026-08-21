@@ -22,7 +22,25 @@ pub enum Request {
     QueueGated(QueueGatedRequest),
     ReleaseGate(ReleaseGateRequest),
     InspectProgramme(InspectProgrammeRequest),
+    LaunchIntoPane(LaunchIntoPaneRequest),
     Workspace(WorkspaceRequest),
+    PaneInput(PaneInputRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchIntoPaneRequest {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub dispatch: DispatchRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaneInputRequest {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub input: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +207,11 @@ pub enum Response {
     },
     WorkspaceChanged {
         workspace: Option<WorkspaceLayout>,
+    },
+    PaneInputAccepted {
+        workspace_id: String,
+        pane_id: String,
+        bytes: usize,
     },
     Error {
         code: ErrorCode,
@@ -365,6 +388,24 @@ mod tests {
         assert!(
             serde_json::from_str::<Request>(r#"{"type":"workspace","operation":"adopt","pid":42}"#)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn pane_input_has_no_pid_or_external_authority_shape() {
+        let request: Request = serde_json::from_str(
+            r#"{"type":"pane_input","workspace_id":"w","pane_id":"p","input":"hello\\n"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::PaneInput(PaneInputRequest { .. })
+        ));
+        assert!(
+            serde_json::from_str::<Request>(
+                r#"{"type":"pane_input","workspace_id":"w","pane_id":"p","input":"x","pid":42}"#
+            )
+            .is_err()
         );
     }
 }

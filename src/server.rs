@@ -202,6 +202,14 @@ fn handle_connection_with_timeout(
                 Ok(snapshot) => write_response(stream, &Response::Dispatched { snapshot })?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
+            Ok(Request::LaunchIntoPane(request)) => match runtime.launch_into_pane(
+                request.dispatch,
+                request.workspace_id,
+                request.pane_id,
+            ) {
+                Ok(snapshot) => write_response(stream, &Response::Dispatched { snapshot })?,
+                Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
+            },
             Ok(Request::Lifecycle(request)) => match runtime
                 .lifecycle(&request.run_id, request.operation)
             {
@@ -260,6 +268,21 @@ fn handle_connection_with_timeout(
             )?,
             Ok(Request::Workspace(request)) => match runtime.workspace(request) {
                 Ok(workspace) => write_response(stream, &Response::WorkspaceChanged { workspace })?,
+                Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
+            },
+            Ok(Request::PaneInput(request)) => match runtime.pane_input(
+                &request.workspace_id,
+                &request.pane_id,
+                request.input.as_bytes(),
+            ) {
+                Ok(bytes) => write_response(
+                    stream,
+                    &Response::PaneInputAccepted {
+                        workspace_id: request.workspace_id,
+                        pane_id: request.pane_id,
+                        bytes,
+                    },
+                )?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
             Ok(Request::Hello(_)) => {

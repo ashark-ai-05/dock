@@ -1,10 +1,10 @@
 ---
 id: 11
 title: 'Slice 6.1: one-command interactive Dock TUI'
-status: ready
+status: done
 priority: high
 created: 2026-08-21T08:04:40+10:00
-updated: 2026-08-21T08:04:40+10:00
+updated: 2026-08-21T02:32:41Z
 tags:
     - runtime
     - tui

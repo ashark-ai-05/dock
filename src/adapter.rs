@@ -156,6 +156,11 @@ fn executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+pub fn builtin_available(id: &AdapterId) -> bool {
+    id.default_executable()
+        .is_some_and(|name| find_executable(name).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

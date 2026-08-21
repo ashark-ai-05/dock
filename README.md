@@ -8,8 +8,8 @@ Dock gives coding-agent work a safe local home: owned workspaces and panes, prov
 
 ### 1. Start Dock
 
-From a repository, launch the foreground dashboard; it reconnects to the private daemon or starts
-one automatically:
+From any directory, including outside Git, launch the foreground dashboard; it reconnects to that
+directory's private daemon or starts one automatically:
 
 ```bash
 cargo run --bin dock
@@ -19,9 +19,19 @@ The separate `cargo run --bin dockd` command remains supported for explicit daem
 
 ### 2. Create a workspace and owned run in the dashboard
 
-Press `n` to create a workspace, then `l` to launch the explicit Dock-owned fixture path. The pane
-shows the authoritative repository, task, run, workspace, and pane binding returned by the runtime;
-an empty pane labels each fact as unbound. Press `i` to send input to a selected owned run.
+Press `n` to create a workspace, then `l` for the compact fixed-provider picker. Type to filter,
+use arrows or `j`/`k`, press `Enter` to review the exact pane and terminal-unbound versus optional
+repository-bound mode, then `Enter` again to launch. Safe provider/mode choices are retained for
+the current dashboard runtime. Missing fixed executables are labelled and cannot launch.
+
+The daily mnemonic map is `n` workspace, `h`/`v` split, `Tab`/arrows focus, `r` rename, `x` close,
+`l` launch, `i` terminal input, `q` quit, and `?` contextual help. `+`/`-` resize the focused
+split. Every form uses `Esc` to cancel. Input mode is visibly labelled; `Esc` exits it locally and
+is never sent to the process. Pane commands with no valid target show an inline reason.
+
+The pane shows authoritative run, workspace, pane, and optional repository/task binding facts; an
+unbound terminal never invents Git or task facts. Repository/task/worktree catalog discovery starts
+only when launch is opened and does not delay the initial dashboard.
 
 Discovered existing agent processes are display-only and say `external/read-only`. Press `d` or
 click `dismiss all` to remove those candidates from the view. Launching never adopts a discovered

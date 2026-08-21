@@ -21,11 +21,12 @@ use nix::{
 
 use crate::{
     adapter::{AdapterCapabilities, AdapterId, ProcessCapabilities, ResolvedAdapter},
-    protocol::{ProcessState, ProviderState, RuntimeSnapshot},
+    protocol::{BindingKind, ProcessState, ProviderState, RuntimeSnapshot},
 };
 
 #[derive(Debug, Clone)]
 pub struct RunBinding {
+    pub binding_kind: BindingKind,
     pub repository_root: PathBuf,
     pub external_task_ref: String,
     pub run_id: String,
@@ -202,6 +203,7 @@ impl OwnedRuntime {
         let worktree = std::env::current_dir().expect("fixture current directory");
         Self::launch(
             RunBinding {
+                binding_kind: BindingKind::Repository,
                 repository_root: worktree.clone(),
                 external_task_ref: "fixture-task".into(),
                 run_id: "dock_fixture".into(),
@@ -250,6 +252,7 @@ impl OwnedRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let bytes: Vec<u8> = scrollback.bytes.iter().copied().collect();
         RuntimeSnapshot {
+            binding_kind: self.binding.binding_kind,
             repository_root: self.binding.repository_root.display().to_string(),
             external_task_ref: self.binding.external_task_ref.clone(),
             run_id: self.binding.run_id.clone(),
@@ -823,6 +826,7 @@ mod tests {
         let (publish_tx, publish_rx) = mpsc::channel();
         let runtime = OwnedRuntime::launch_with_before_lifecycle_publish(
             RunBinding {
+                binding_kind: BindingKind::Repository,
                 repository_root: worktree.clone(),
                 external_task_ref: "fixture-task".into(),
                 run_id: "dock_esrch_before_lifecycle".into(),

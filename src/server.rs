@@ -210,6 +210,16 @@ fn handle_connection_with_timeout(
                 Ok(snapshot) => write_response(stream, &Response::Dispatched { snapshot })?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
+            Ok(Request::TerminalLaunch(request)) => match runtime.terminal_launch(
+                request.workspace_id,
+                request.pane_id,
+                request.run_id,
+                request.profile,
+                request.runtime_directory,
+            ) {
+                Ok(snapshot) => write_response(stream, &Response::Dispatched { snapshot })?,
+                Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
+            },
             Ok(Request::Lifecycle(request)) => match runtime
                 .lifecycle(&request.run_id, request.operation)
             {

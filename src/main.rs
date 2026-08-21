@@ -12,12 +12,13 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -27,7 +28,7 @@ use dock::{
     discovery::{AgentDiscovery, ProcessNameDiscovery},
     git::GitAdapter,
     paths,
-    protocol::{InspectRequest, Request, Response, WorkspaceRequest},
+    protocol::{InspectRequest, ProcessState, Request, Response, WorkspaceRequest},
     storage::LocalStore,
 };
 use nix::libc;
@@ -38,14 +39,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     if run_noninteractive_legacy(&args)? {
         return Ok(());
     }
+    let runtime_directory = std::env::current_dir()?;
+    let (default_socket, default_state) = paths::runtime_paths_for(&runtime_directory)?;
     let socket = args
         .iter()
         .find_map(|arg| arg.strip_prefix("--socket=").map(PathBuf::from))
-        .map_or_else(paths::default_socket_path, Ok)?;
+        .unwrap_or(default_socket);
     let state_dir = args
         .iter()
         .find_map(|arg| arg.strip_prefix("--state-dir=").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(".dock/local"));
+        .unwrap_or(default_state);
     let mut daemon = connect_or_start(&socket, &state_dir)?;
     let mut client = Client::connect(&socket)?;
     if args.iter().any(|arg| arg == "--headless-bootstrap") {
@@ -68,12 +71,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
-    let repository = std::env::current_dir()?;
-    let external = ProcessNameDiscovery.discover(&repository);
+    let external = ProcessNameDiscovery.discover(&runtime_directory);
     run_dashboard(
         &mut client,
         external,
-        repository.to_string_lossy().into_owned(),
+        runtime_directory.to_string_lossy().into_owned(),
     )?;
     // A daemon started by Dock is intentionally left running for reconnect. This explicit policy
     // is observable through --headless-bootstrap; startup failures kill and reap it via Drop.
@@ -431,17 +433,23 @@ impl Drop for TerminalGuard {
 fn run_dashboard(
     client: &mut Client,
     external: Vec<dock::discovery::ExternalAgentCandidate>,
-    repository_root: String,
+    runtime_directory: String,
 ) -> Result<(), String> {
     let mut guard = TerminalGuard::enter().map_err(|e| e.to_string())?;
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).map_err(|e| e.to_string())?;
     let mut dashboard = Dashboard::default();
     dashboard.external = external;
-    dashboard.repository_root = repository_root;
+    dashboard.runtime_directory = runtime_directory.clone();
+    let (catalog_tx, catalog_rx) = mpsc::channel();
+    let mut catalog_loading = false;
     let mut test_events = test_events()?;
     refresh(client, &mut dashboard)?;
     loop {
+        if let Ok((root, launches)) = catalog_rx.try_recv() {
+            dashboard.set_repository_catalog(root, launches);
+            catalog_loading = false;
+        }
         terminal
             .draw(|frame| dashboard.render(frame))
             .map_err(|e| e.to_string())?;
@@ -466,13 +474,53 @@ fn run_dashboard(
                 break;
             }
             UiCommand::Request(request) => {
+                let test_launch = !test_events.is_empty()
+                    && matches!(
+                        request.as_ref(),
+                        Request::TerminalLaunch(_) | Request::LaunchIntoPane(_)
+                    );
+                // Dashboard commands optimistically update focus, geometry, and form state.
+                // Paint that local result before the bounded authority request so keyboard and
+                // pointer interaction never waits for the daemon to become visible.
+                terminal
+                    .draw(|frame| dashboard.render(frame))
+                    .map_err(|e| e.to_string())?;
                 match client.request(&request)? {
                     Response::Error { message, .. } => dashboard.error = Some(message),
                     _ => dashboard.error = None,
                 }
                 refresh(client, &mut dashboard)?;
+                if test_launch {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !dashboard
+                        .runs
+                        .iter()
+                        .any(|run| run.state == ProcessState::Running)
+                    {
+                        if Instant::now() >= deadline {
+                            return Err(
+                                "deterministic launch did not become visibly running".into()
+                            );
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                        refresh(client, &mut dashboard)?;
+                    }
+                    terminal
+                        .draw(|frame| dashboard.render(frame))
+                        .map_err(|e| e.to_string())?;
+                }
             }
             UiCommand::Refresh => refresh(client, &mut dashboard)?,
+            UiCommand::LoadCatalog => {
+                if !catalog_loading {
+                    catalog_loading = true;
+                    let directory = PathBuf::from(runtime_directory.clone());
+                    let sender = catalog_tx.clone();
+                    thread::spawn(move || {
+                        let _ = sender.send(repository_catalog(&directory));
+                    });
+                }
+            }
             UiCommand::None => {}
         }
     }
@@ -480,6 +528,65 @@ fn run_dashboard(
     drop(terminal);
     guard.restore().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn repository_catalog(directory: &Path) -> (String, Vec<dock::dashboard::RepositoryLaunchOption>) {
+    let marker = directory
+        .ancestors()
+        .find(|candidate| candidate.join(".git").exists());
+    let Some(marker) = marker else {
+        return (String::new(), vec![]);
+    };
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &marker.to_string_lossy(),
+            "rev-parse",
+            "--show-toplevel",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return (String::new(), vec![]);
+    };
+    if !output.status.success() {
+        return (String::new(), vec![]);
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let tasks = Path::new(&root).join("kanban/tasks");
+    let task_ref = fs::read_dir(tasks)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .flat_map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+        .find_map(|line| {
+            line.strip_prefix("id:")
+                .map(|id| id.trim().trim_matches('\'').to_owned())
+        });
+    let Some(task_ref) = task_ref else {
+        return (root, vec![]);
+    };
+    let worktrees = Command::new("git")
+        .args(["-C", &root, "worktree", "list", "--porcelain"])
+        .output();
+    let launches = worktrees
+        .ok()
+        .filter(|o| o.status.success())
+        .into_iter()
+        .flat_map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|line| line.strip_prefix("worktree ").map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .map(|worktree| dock::dashboard::RepositoryLaunchOption {
+            task_ref: task_ref.clone(),
+            worktree,
+        })
+        .collect();
+    (root, launches)
 }
 
 fn test_events() -> Result<VecDeque<Event>, String> {
@@ -492,15 +599,48 @@ fn test_events() -> Result<VecDeque<Event>, String> {
     let value = value
         .into_string()
         .map_err(|_| "DOCK_TEST_KEY_EVENTS must be UTF-8".to_string())?;
+    parse_test_events(&value)
+}
+
+fn parse_test_events(value: &str) -> Result<VecDeque<Event>, String> {
     let mut events = VecDeque::new();
-    for key in value.chars() {
-        if key.is_control() {
-            return Err("DOCK_TEST_KEY_EVENTS accepts printable keys only".into());
-        }
+    let mut input = value;
+    while !input.is_empty() {
+        let (code, consumed) = if input.starts_with('<') {
+            let end = input.find('>').ok_or_else(|| {
+                "DOCK_TEST_KEY_EVENTS contains an unterminated named key".to_string()
+            })?;
+            let name = &input[1..end];
+            let code = match name {
+                "Enter" => KeyCode::Enter,
+                "Tab" => KeyCode::Tab,
+                "Esc" => KeyCode::Esc,
+                "Up" => KeyCode::Up,
+                "Down" => KeyCode::Down,
+                "Left" => KeyCode::Left,
+                "Right" => KeyCode::Right,
+                "Backspace" => KeyCode::Backspace,
+                _ => {
+                    return Err(format!(
+                        "DOCK_TEST_KEY_EVENTS contains unknown named key <{name}>"
+                    ));
+                }
+            };
+            (code, end + 1)
+        } else {
+            let character = input.chars().next().expect("non-empty event input");
+            if character.is_control() {
+                return Err(
+                    "DOCK_TEST_KEY_EVENTS accepts printable characters and named keys only".into(),
+                );
+            }
+            (KeyCode::Char(character), character.len_utf8())
+        };
         events.push_back(Event::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char(key),
+            code,
             crossterm::event::KeyModifiers::NONE,
         )));
+        input = &input[consumed..];
     }
     Ok(events)
 }
@@ -530,6 +670,33 @@ fn refresh(client: &mut Client, dashboard: &mut Dashboard) -> Result<(), String>
 mod terminal_tests {
     use super::*;
     use nix::pty::openpty;
+
+    #[test]
+    fn deterministic_events_represent_real_printable_and_named_keys() {
+        let events = parse_test_events("nlfix<Enter><Enter>q").unwrap();
+        let codes = events
+            .into_iter()
+            .map(|event| match event {
+                Event::Key(key) => key.code,
+                _ => panic!("expected a key event"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            vec![
+                KeyCode::Char('n'),
+                KeyCode::Char('l'),
+                KeyCode::Char('f'),
+                KeyCode::Char('i'),
+                KeyCode::Char('x'),
+                KeyCode::Enter,
+                KeyCode::Enter,
+                KeyCode::Char('q'),
+            ]
+        );
+        assert!(parse_test_events("n<Return>").is_err());
+        assert!(parse_test_events("n<Enter").is_err());
+    }
 
     #[test]
     fn terminal_state_restores_all_captured_termios_fields() {

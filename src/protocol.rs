@@ -23,8 +23,43 @@ pub enum Request {
     ReleaseGate(ReleaseGateRequest),
     InspectProgramme(InspectProgrammeRequest),
     LaunchIntoPane(LaunchIntoPaneRequest),
+    TerminalLaunch(TerminalLaunchRequest),
     Workspace(WorkspaceRequest),
     PaneInput(PaneInputRequest),
+}
+
+/// Dashboard-safe launch authority.  Its closed shape deliberately cannot carry repository,
+/// task, worktree, executable, argument, environment, or shell data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalLaunchRequest {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub run_id: String,
+    pub profile: DashboardProfile,
+    pub runtime_directory: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DashboardProfile {
+    Fixture,
+    Amp,
+    ClaudeCode,
+    CodexCli,
+    GithubCopilotCli,
+}
+
+impl From<DashboardProfile> for AdapterId {
+    fn from(value: DashboardProfile) -> Self {
+        match value {
+            DashboardProfile::Fixture => Self::Fixture,
+            DashboardProfile::Amp => Self::Amp,
+            DashboardProfile::ClaudeCode => Self::ClaudeCode,
+            DashboardProfile::CodexCli => Self::CodexCli,
+            DashboardProfile::GithubCopilotCli => Self::GithubCopilotCli,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +326,7 @@ pub struct ProgrammeSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSnapshot {
+    pub binding_kind: BindingKind,
     pub repository_root: String,
     pub external_task_ref: String,
     pub run_id: String,
@@ -312,6 +348,13 @@ pub struct RuntimeSnapshot {
     pub scrollback_capacity_bytes: usize,
     pub scrollback_truncated: bool,
     pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingKind {
+    Terminal,
+    Repository,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,5 +450,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn terminal_launch_is_strict_and_cannot_carry_control_plane_or_command_fields() {
+        let json = r#"{"type":"terminal_launch","workspace_id":"w","pane_id":"p","run_id":"dock_12","profile":"fixture","runtime_directory":"/tmp"}"#;
+        assert!(matches!(
+            serde_json::from_str::<Request>(json).unwrap(),
+            Request::TerminalLaunch(_)
+        ));
+        for forbidden in [
+            "repository_root",
+            "external_task_ref",
+            "worktree",
+            "executable",
+            "arguments",
+            "environment",
+            "shell",
+        ] {
+            let malicious =
+                json.strip_suffix('}').unwrap().to_owned() + &format!(r#", "{forbidden}":"x"}}"#);
+            assert!(
+                serde_json::from_str::<Request>(&malicious).is_err(),
+                "accepted {forbidden}"
+            );
+        }
+        assert!(serde_json::from_str::<Request>(&json.replace("fixture", "generic")).is_err());
     }
 }

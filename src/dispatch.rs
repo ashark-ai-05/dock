@@ -22,9 +22,9 @@ use crate::{
     layout::{LayoutRegistry, LayoutSnapshot, PaneRuntime, WorkspaceLayout},
     model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
     protocol::{
-        DependencyGateSnapshot, DispatchRequest, DurableProgrammeGate, ErrorCode, GateState,
-        LifecycleOperation, ProgrammeSnapshot, RepositoryPortfolioSnapshot, RuntimeSnapshot,
-        WorkspaceRequest,
+        BindingKind, DashboardProfile, DependencyGateSnapshot, DispatchRequest,
+        DurableProgrammeGate, ErrorCode, GateState, LifecycleOperation, ProgrammeSnapshot,
+        RepositoryPortfolioSnapshot, RuntimeSnapshot, WorkspaceRequest,
     },
     runtime::{OwnedRuntime, RunBinding},
     storage::LocalStore,
@@ -330,6 +330,51 @@ impl RuntimeRegistry {
         self.dispatch_with_gate_authorization(request, false, Some((workspace_id, pane_id)))
     }
 
+    pub fn terminal_launch(
+        &self,
+        workspace_id: String,
+        pane_id: String,
+        run_id: String,
+        profile: DashboardProfile,
+        runtime_directory: String,
+    ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
+        validate_run_id(&run_id).map_err(|m| (ErrorCode::InvalidBinding, m))?;
+        let directory = canonical_terminal_directory(Path::new(&runtime_directory))
+            .map_err(|m| (ErrorCode::InvalidBinding, m))?;
+        let adapter_id = crate::adapter::AdapterId::from(profile);
+        let arguments = if adapter_id == crate::adapter::AdapterId::Fixture {
+            vec![
+                "-c".into(),
+                "printf 'Dock-owned fixture ready\\n'; sleep 30".into(),
+            ]
+        } else {
+            vec![]
+        };
+        let request = DispatchRequest {
+            repository_root: directory.display().to_string(),
+            external_task_ref: String::new(),
+            run_id,
+            worktree: directory.display().to_string(),
+            adapter: AdapterSelection {
+                id: adapter_id,
+                executable: None,
+                arguments,
+            },
+        };
+        let binding = RunBinding {
+            binding_kind: BindingKind::Terminal,
+            repository_root: directory.clone(),
+            external_task_ref: String::new(),
+            run_id: request.run_id.clone(),
+            worktree: directory,
+            branch: String::new(),
+            base_sha: String::new(),
+            workspace_id: workspace_id.clone(),
+            pane_id: pane_id.clone(),
+        };
+        self.dispatch_with_binding(request, false, Some((workspace_id, pane_id)), Some(binding))
+    }
+
     pub fn layout(&self) -> LayoutSnapshot {
         self.reconcile_failed_dispatches();
         let states: Vec<_> = self
@@ -611,8 +656,21 @@ impl RuntimeRegistry {
         gate_release_authorized: bool,
         launch_target: Option<(String, String)>,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
+        self.dispatch_with_binding(request, gate_release_authorized, launch_target, None)
+    }
+
+    fn dispatch_with_binding(
+        &self,
+        request: DispatchRequest,
+        gate_release_authorized: bool,
+        launch_target: Option<(String, String)>,
+        binding: Option<RunBinding>,
+    ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
         self.reconcile_failed_dispatches();
-        let mut binding = validate_binding(&request).map_err(|m| (ErrorCode::InvalidBinding, m))?;
+        let mut binding = match binding {
+            Some(binding) => binding,
+            None => validate_binding(&request).map_err(|m| (ErrorCode::InvalidBinding, m))?,
+        };
         if let Some((workspace_id, pane_id)) = &launch_target {
             binding.workspace_id = workspace_id.clone();
             binding.pane_id = pane_id.clone();
@@ -1929,6 +1987,7 @@ fn validate_binding(request: &DispatchRequest) -> Result<RunBinding, String> {
     let base_sha = git(&worktree, &["rev-parse", "HEAD"])?;
     let workspace_id = format!("workspace_{}", repository_id(&repository_root));
     Ok(RunBinding {
+        binding_kind: BindingKind::Repository,
         repository_root,
         external_task_ref: request.external_task_ref.clone(),
         run_id: request.run_id.clone(),
@@ -1938,6 +1997,16 @@ fn validate_binding(request: &DispatchRequest) -> Result<RunBinding, String> {
         workspace_id,
         pane_id: format!("pane_{}", request.run_id),
     })
+}
+
+fn canonical_terminal_directory(path: &Path) -> Result<PathBuf, String> {
+    reject_parent_components(path, "runtime_directory")?;
+    let path = fs::canonicalize(path)
+        .map_err(|error| format!("could not canonicalize runtime_directory: {error}"))?;
+    if !path.is_dir() {
+        return Err("runtime_directory must be an existing directory".into());
+    }
+    Ok(path)
 }
 
 fn validate_durable_adapter(request: &DispatchRequest) -> Result<(), String> {
@@ -2288,6 +2357,55 @@ mod tests {
         time::{Duration, Instant},
     };
     static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn terminal_launch_uses_exact_non_git_directory_and_pane_without_control_plane_facts() {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "dock-terminal-{}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let runtime_dir = base.join("plain");
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::create_dir(base.join("state")).unwrap();
+        fs::set_permissions(base.join("state"), fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = RuntimeRegistry::new(base.join("state"), 4096).unwrap();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w".into(),
+                name: "plain".into(),
+                pane_id: "p".into(),
+            })
+            .unwrap();
+        let snapshot = registry
+            .terminal_launch(
+                "w".into(),
+                "p".into(),
+                "dock_terminal_1".into(),
+                DashboardProfile::Fixture,
+                runtime_dir.display().to_string(),
+            )
+            .unwrap();
+        assert_eq!(snapshot.binding_kind, BindingKind::Terminal);
+        assert_eq!(snapshot.external_task_ref, "");
+        assert_eq!(snapshot.branch, "");
+        assert_eq!(snapshot.base_sha, "");
+        assert_eq!(snapshot.workspace_id, "w");
+        assert_eq!(snapshot.pane_id, "p");
+        assert!(!runtime_dir.join(".git").exists());
+        assert!(!runtime_dir.join(".dock").exists());
+        registry
+            .lifecycle("dock_terminal_1", LifecycleOperation::Stop)
+            .unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
 
     fn wait_for_owned_group_exit(process_group_id: i32) {
         let deadline = Instant::now() + Duration::from_secs(3);

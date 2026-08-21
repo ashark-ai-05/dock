@@ -72,6 +72,31 @@ pub struct ResolvedAdapter {
 
 impl AdapterSelection {
     pub fn resolve(&self) -> Result<ResolvedAdapter, String> {
+        // The override guard runs first so it applies uniformly to every built-in adapter,
+        // including Shell below: a caller cannot pair `id: Shell` with `executable: Some(..)`
+        // to smuggle an arbitrary binary past this check.
+        if self.id != AdapterId::Generic && self.executable.is_some() {
+            return Err("built-in adapter executables cannot be overridden; use generic for an explicit process".into());
+        }
+        if self.id == AdapterId::Shell {
+            // The brief's snippet only falls back on a missing SHELL (env::var Err); the stated
+            // requirement also covers SHELL being set but empty, so an empty value is treated
+            // the same as absent here.
+            let shell = env::var("SHELL")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "/bin/sh".into());
+            let executable = find_executable(&shell)
+                .ok_or_else(|| format!("shell {shell:?} was not found or is not executable"))?;
+            let mut command = vec![executable.display().to_string()];
+            command.extend(self.arguments.clone());
+            return Ok(ResolvedAdapter {
+                id: AdapterId::Shell,
+                executable,
+                command,
+                capabilities: AdapterCapabilities::NONE,
+            });
+        }
         let name = match self.id.default_executable() {
             Some(name) => name,
             None => self
@@ -79,9 +104,6 @@ impl AdapterSelection {
                 .as_deref()
                 .ok_or("generic adapter requires an explicit executable")?,
         };
-        if self.id != AdapterId::Generic && self.executable.is_some() {
-            return Err("built-in adapter executables cannot be overridden; use generic for an explicit process".into());
-        }
         if name.trim().is_empty() {
             return Err("adapter executable cannot be empty".into());
         }
@@ -226,5 +248,23 @@ mod tests {
         ] {
             assert_eq!(id.declared_capabilities(), AdapterCapabilities::default());
         }
+    }
+
+    #[test]
+    fn shell_adapter_resolves_a_login_shell() {
+        let resolved = AdapterSelection {
+            id: AdapterId::Shell,
+            executable: None,
+            arguments: vec!["-l".into()],
+        }
+        .resolve()
+        .expect("shell must resolve on any supported platform");
+        assert_eq!(resolved.id, AdapterId::Shell);
+        assert_eq!(resolved.command.last().map(String::as_str), Some("-l"));
+    }
+
+    #[test]
+    fn shell_adapter_declares_no_provider_lifecycle() {
+        assert!(!AdapterId::Shell.declared_capabilities().provider_lifecycle);
     }
 }

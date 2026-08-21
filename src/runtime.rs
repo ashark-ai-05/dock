@@ -690,7 +690,7 @@ fn environment_is_allowed(key: &std::ffi::OsStr) -> bool {
     let key = key.to_string_lossy();
     matches!(
         key.as_ref(),
-        "HOME" | "LANG" | "LOGNAME" | "PATH" | "SHELL" | "TERM" | "TMPDIR" | "USER"
+        "COLORTERM" | "HOME" | "LANG" | "LOGNAME" | "PATH" | "SHELL" | "TERM" | "TMPDIR" | "USER"
     ) || key.starts_with("LC_")
 }
 
@@ -818,14 +818,17 @@ mod tests {
                 cols: 100,
             },
         );
-        wait_for_screen_text(&runtime, "30 100", Duration::from_secs(3));
+        // Widened per Ruling R19: under full parallel load, subprocess spawn/scheduling latency
+        // can exceed 3s even though the resize mechanism itself is correct (observed flaking
+        // once and passing on rerun). Matches the precedent set in dispatch.rs.
+        wait_for_screen_text(&runtime, "30 100", Duration::from_secs(15));
         runtime
             .resize(PtySize {
                 rows: 42,
                 cols: 120,
             })
             .expect("resize owned pty");
-        wait_for_screen_text(&runtime, "42 120", Duration::from_secs(3));
+        wait_for_screen_text(&runtime, "42 120", Duration::from_secs(15));
         let _ = runtime.stop();
     }
 
@@ -1214,6 +1217,15 @@ mod tests {
         let output = String::from_utf8(child.output().unwrap().stdout).unwrap();
         assert!(output.contains("PATH=/usr/bin:/bin"));
         assert!(!output.contains("poison-"));
+    }
+
+    #[test]
+    fn child_environment_allows_colour_capability_variables() {
+        assert!(environment_is_allowed(std::ffi::OsStr::new("COLORTERM")));
+        assert!(environment_is_allowed(std::ffi::OsStr::new("TERM")));
+        assert!(!environment_is_allowed(std::ffi::OsStr::new(
+            "AWS_SECRET_ACCESS_KEY"
+        )));
     }
 
     #[test]

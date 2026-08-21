@@ -7,13 +7,17 @@ use crate::detect::{AgentKind, AgentState};
 /// Screen-tail rules. This is the zero-configuration tier: it works for every agent on
 /// first run with nothing installed. P1 replaces the producer with exact hook-reported
 /// state for agents that support it, leaving `AgentState` itself unchanged.
+// `^`/`$` anchor to the whole haystack, not per-line, unless `(?m)` is set. `text_tail` is
+// always multi-line, so any pattern anchoring within a line (not just at the very start of
+// the tail) must carry `(?m)`. Audited every pattern below: only the numbered-choice
+// pattern used `^` without it.
 const BLOCKED_PATTERNS: &[&str] = &[
     r"(?i)do you want to (proceed|continue)",
     r"(?i)\[y/n\]",
     r"(?i)press enter to continue",
     r"(?i)waiting for (your )?(input|approval)",
     r"(?i)allow this (tool|command)",
-    r"(?i)^\s*[1-9]\.\s+(yes|no)\b",
+    r"(?mi)^\s*[1-9]\.\s+(yes|no)\b",
 ];
 
 const WORKING_PATTERNS: &[&str] = &[
@@ -22,9 +26,14 @@ const WORKING_PATTERNS: &[&str] = &[
     r"(?i)tokens?\s*·",
 ];
 
+// Deliberately conservative: `Done` and `Idle` are adjacent low-attention ranks, so missing
+// a completion costs the user almost nothing, while a false `Done` on a busy pane (e.g. any
+// screen containing the word "done", such as `cargo` output or a commit message) is constant
+// visible noise. Only match structured completion statements, never a bare substring.
 const DONE_PATTERNS: &[&str] = &[
-    r"(?i)\b(done|completed|finished)\b",
-    r"(?i)all tests passed",
+    r"(?mi)^\s*[✓✔√]\s",
+    r"(?mi)^\s*(all\s+)?(tasks?|tests?|builds?|checks?)\s+(have\s+)?(passed|completed|succeeded)\b",
+    r"(?mi)^\s*(task|work)\s+(is\s+)?(complete|completed|finished)\b",
 ];
 
 fn set(patterns: &[&str], cell: &'static OnceLock<RegexSet>) -> &'static RegexSet {

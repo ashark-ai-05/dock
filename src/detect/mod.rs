@@ -25,6 +25,7 @@ pub enum AgentKind {
     Antigravity,
     Vibe,
     Omp,
+    Aider,
 }
 
 impl AgentKind {
@@ -46,6 +47,7 @@ impl AgentKind {
             "antigravity" => Self::Antigravity,
             "vibe" => Self::Vibe,
             "omp" => Self::Omp,
+            "aider" => Self::Aider,
             _ => return None,
         })
     }
@@ -68,6 +70,7 @@ impl AgentKind {
             Self::Antigravity => "antigravity",
             Self::Vibe => "vibe",
             Self::Omp => "omp",
+            Self::Aider => "aider",
         }
     }
 }
@@ -122,6 +125,7 @@ mod tests {
             AgentKind::from_executable("github-copilot-cli"),
             Some(AgentKind::Copilot)
         );
+        assert_eq!(AgentKind::from_executable("aider"), Some(AgentKind::Aider));
         assert_eq!(AgentKind::from_executable("zsh"), None);
     }
 
@@ -161,6 +165,47 @@ mod tests {
             AgentState::Working
         );
         assert_eq!(classify_screen(AgentKind::Claude, "› "), AgentState::Idle);
+    }
+
+    #[test]
+    fn classifies_a_numbered_yes_no_prompt_on_a_later_line_as_blocked() {
+        // Regression for the `^` anchor missing `(?m)`: without multiline mode this list,
+        // sitting one line below the header, would never match and the pane would read Idle.
+        let tail = "Select an option:\n  1. Yes\n  2. No\n";
+        assert_eq!(
+            classify_screen(AgentKind::Claude, tail),
+            AgentState::Blocked
+        );
+    }
+
+    #[test]
+    fn does_not_misclassify_ordinary_terminal_output_containing_done_as_done() {
+        assert_eq!(
+            classify_screen(
+                AgentKind::Claude,
+                "Finished dev profile [unoptimized] target(s) in 2.3s"
+            ),
+            AgentState::Idle
+        );
+        assert_eq!(
+            classify_screen(AgentKind::Claude, "npm WARN deprecated foo@1.0.0 ... done"),
+            AgentState::Idle
+        );
+        assert_eq!(
+            classify_screen(
+                AgentKind::Claude,
+                "commit 3fa91c2  fix: done with the parser refactor"
+            ),
+            AgentState::Idle
+        );
+    }
+
+    #[test]
+    fn classifies_a_genuine_completion_marker_as_done() {
+        assert_eq!(
+            classify_screen(AgentKind::Claude, "✓ All tests passed"),
+            AgentState::Done
+        );
     }
 
     #[test]

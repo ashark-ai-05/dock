@@ -287,6 +287,12 @@ impl OwnedRuntime {
             },
             rows,
             cols,
+            // Agent detection and title/cwd reporting land in Task 9's registry wiring; Task 7
+            // only needs the struct to compile with placeholder values here.
+            agent: None,
+            agent_state: crate::detect::AgentState::Idle,
+            title: None,
+            cwd: None,
             diagnostic: self.launch_error.clone().or(runtime_diagnostic),
         }
     }

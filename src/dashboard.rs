@@ -1323,6 +1323,10 @@ mod tests {
             provider_state: ProviderState::Running,
             rows: 24,
             cols: 80,
+            agent: None,
+            agent_state: crate::detect::AgentState::Idle,
+            title: None,
+            cwd: None,
             diagnostic: None,
         }
     }

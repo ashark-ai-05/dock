@@ -295,6 +295,22 @@ fn handle_connection_with_timeout(
                 )?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
+            // PaneResize and Subscribe routing land in Task 10 (server stream mode and
+            // resize routing); Task 7 only needs the match to stay exhaustive.
+            Ok(Request::PaneResize(_)) => write_response(
+                stream,
+                &Response::Error {
+                    code: ErrorCode::UnsupportedOperation,
+                    message: "pane resize is not yet supported".into(),
+                },
+            )?,
+            Ok(Request::Subscribe(_)) => write_response(
+                stream,
+                &Response::Error {
+                    code: ErrorCode::UnsupportedOperation,
+                    message: "subscribe is not yet supported".into(),
+                },
+            )?,
             Ok(Request::Hello(_)) => {
                 write_response(
                     stream,
@@ -492,7 +508,7 @@ mod tests {
         assert!(matches!(
             exchange(
                 &[
-                    r#"{"type":"hello","version":6,"future":true}"#,
+                    r#"{"type":"hello","version":7,"future":true}"#,
                     r#"{"type":"inspect","future":true}"#
                 ],
                 &runtime
@@ -575,7 +591,7 @@ mod tests {
                 },
             }))
             .unwrap();
-        let hello = r#"{"type":"hello","version":6}"#;
+        let hello = r#"{"type":"hello","version":7}"#;
         let dispatched = exchange(&[hello, &dispatch], &runtime);
         let pid = match &dispatched[1] {
             Response::Dispatched { snapshot } => snapshot.pid,
@@ -627,7 +643,7 @@ mod tests {
                 ..
             }]
         ));
-        let requests = [r#"{"type":"hello","version":6}"#, r#"{"type":"inspect"}"#];
+        let requests = [r#"{"type":"hello","version":7}"#, r#"{"type":"inspect"}"#];
         let first = socket_exchange(&socket, &requests);
         let second = socket_exchange(&socket, &requests);
         let snapshot_count = |responses: &[Response]| match &responses[1] {
@@ -650,7 +666,7 @@ mod tests {
         let runtime = registry();
         let responses = exchange(
             &[
-                r#"{"type":"hello","version":6}"#,
+                r#"{"type":"hello","version":7}"#,
                 r#"{"type":"workspace","operation":"create","workspace_id":"daily","name":"Daily","pane_id":"pane_one"}"#,
                 r#"{"type":"workspace","operation":"split","workspace_id":"daily","pane_id":"pane_one","new_pane_id":"pane_two","axis":"vertical"}"#,
                 r#"{"type":"workspace","operation":"focus","workspace_id":"daily","pane_id":"pane_one"}"#,

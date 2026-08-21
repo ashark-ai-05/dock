@@ -14,6 +14,9 @@ pub enum AdapterId {
     CodexCli,
     GithubCopilotCli,
     Generic,
+    /// Added minimally by Task 7 so `protocol::DashboardProfile::Shell` compiles; Task 8 fills
+    /// in its `resolve()` and `declared_capabilities()` behavior.
+    Shell,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +109,7 @@ impl AdapterId {
             Self::CodexCli => Some("codex"),
             Self::GithubCopilotCli => Some("copilot"),
             Self::Generic => None,
+            Self::Shell => None,
         }
     }
 
@@ -119,6 +123,7 @@ impl AdapterId {
             Self::CodexCli => AdapterCapabilities::NONE,
             Self::GithubCopilotCli => AdapterCapabilities::NONE,
             Self::Generic => AdapterCapabilities::NONE,
+            Self::Shell => AdapterCapabilities::NONE,
         }
     }
 }

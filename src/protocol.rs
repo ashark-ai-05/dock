@@ -1,12 +1,14 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     adapter::{AdapterCapabilities, AdapterId, AdapterSelection, ProcessCapabilities},
+    detect::{AgentKind, AgentState},
     layout::{LayoutSnapshot, SplitAxis, WorkspaceLayout},
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +28,8 @@ pub enum Request {
     TerminalLaunch(TerminalLaunchRequest),
     Workspace(WorkspaceRequest),
     PaneInput(PaneInputRequest),
+    PaneResize(PaneResizeRequest),
+    Subscribe(SubscribeRequest),
 }
 
 /// Dashboard-safe launch authority.  Its closed shape deliberately cannot carry repository,
@@ -48,6 +52,7 @@ pub enum DashboardProfile {
     ClaudeCode,
     CodexCli,
     GithubCopilotCli,
+    Shell,
 }
 
 impl From<DashboardProfile> for AdapterId {
@@ -58,6 +63,7 @@ impl From<DashboardProfile> for AdapterId {
             DashboardProfile::ClaudeCode => Self::ClaudeCode,
             DashboardProfile::CodexCli => Self::CodexCli,
             DashboardProfile::GithubCopilotCli => Self::GithubCopilotCli,
+            DashboardProfile::Shell => Self::Shell,
         }
     }
 }
@@ -76,6 +82,60 @@ pub struct PaneInputRequest {
     pub workspace_id: String,
     pub pane_id: String,
     pub input: String,
+}
+
+impl PaneInputRequest {
+    /// Key bytes are base64 so raw control sequences survive JSON transport intact.
+    pub fn encode(bytes: &[u8]) -> String {
+        STANDARD.encode(bytes)
+    }
+
+    pub fn decode(&self) -> Result<Vec<u8>, String> {
+        STANDARD
+            .decode(&self.input)
+            .map_err(|error| format!("pane input is not valid base64: {error}"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaneResizeRequest {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscribeRequest {}
+
+/// Pushed by the daemon to subscribed clients. Replaces polling entirely: an unchanged
+/// pane produces no event at all, where the previous protocol re-sent full scrollback
+/// for every run five times a second regardless of activity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Event {
+    PaneAttached {
+        run_id: String,
+        revision: u64,
+        screen: String,
+    },
+    PaneDelta {
+        run_id: String,
+        revision: u64,
+        bytes: String,
+    },
+    PaneState {
+        run_id: String,
+        state: ProcessState,
+    },
+    AgentStateChanged {
+        run_id: String,
+        agent: Option<AgentKind>,
+        state: AgentState,
+    },
+    LayoutChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +308,13 @@ pub enum Response {
         pane_id: String,
         bytes: usize,
     },
+    /// One pushed event on a subscribed connection. The connection stays newline-delimited
+    /// `Response` frames throughout, so a subscriber never needs a second parser.
+    Stream {
+        event: Event,
+    },
+    /// Acknowledges a request that has no payload of its own to report, such as a resize.
+    Ack,
     Error {
         code: ErrorCode,
         message: String,
@@ -345,6 +412,10 @@ pub struct RuntimeSnapshot {
     pub provider_state: ProviderState,
     pub rows: u16,
     pub cols: u16,
+    pub agent: Option<AgentKind>,
+    pub agent_state: AgentState,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
     pub diagnostic: Option<String>,
 }
 
@@ -375,6 +446,78 @@ pub enum ProcessState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_fixture() -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            binding_kind: BindingKind::Repository,
+            repository_root: "/repo/real".into(),
+            external_task_ref: "TASK-61".into(),
+            run_id: "dock_real".into(),
+            worktree: "/repo/real".into(),
+            branch: "main".into(),
+            base_sha: "abc".into(),
+            workspace_id: "w".into(),
+            pane_id: "a".into(),
+            state: ProcessState::Running,
+            pid: Some(1),
+            process_group_id: Some(1),
+            command: vec!["sh".into()],
+            adapter: AdapterId::Fixture,
+            process_capabilities: ProcessCapabilities::OWNED_RUNTIME,
+            adapter_capabilities: AdapterCapabilities::NONE,
+            provider_state: ProviderState::Running,
+            rows: 24,
+            cols: 80,
+            agent: Some(AgentKind::Claude),
+            agent_state: AgentState::Idle,
+            title: Some("dock".into()),
+            cwd: Some("/repo/real".into()),
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn protocol_version_is_seven() {
+        assert_eq!(PROTOCOL_VERSION, 7);
+    }
+
+    #[test]
+    fn pane_input_round_trips_arbitrary_key_bytes() {
+        let raw = vec![0x1b, b'[', b'A', 0x00, 0xff];
+        let request = PaneInputRequest {
+            workspace_id: "w".into(),
+            pane_id: "p".into(),
+            input: PaneInputRequest::encode(&raw),
+        };
+        assert_eq!(request.decode().expect("decodes"), raw);
+    }
+
+    #[test]
+    fn snapshot_no_longer_carries_scrollback_and_reports_geometry() {
+        let encoded = serde_json::to_string(&snapshot_fixture()).expect("serialize");
+        assert!(!encoded.contains("scrollback"));
+        assert!(encoded.contains("\"rows\":24"));
+        assert!(encoded.contains("\"cols\":80"));
+    }
+
+    #[test]
+    fn events_round_trip_losslessly() {
+        let event = Event::PaneDelta {
+            run_id: "dock_1".into(),
+            revision: 7,
+            bytes: "aGk=".into(),
+        };
+        let encoded = serde_json::to_string(&event).expect("serialize");
+        let decoded: Event = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn resize_request_rejects_unknown_fields() {
+        let json = r#"{"workspace_id":"w","pane_id":"p","rows":24,"cols":80,"extra":1}"#;
+        assert!(serde_json::from_str::<PaneResizeRequest>(json).is_err());
+    }
+
     #[test]
     fn strict_versioned_messages_reject_unknown_fields_and_variants() {
         assert!(serde_json::from_str::<Request>(r#"{"type":"inspect","pid":1}"#).is_err());

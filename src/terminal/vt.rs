@@ -82,16 +82,36 @@ impl VtTerminal {
         self.parser.screen().state_formatted()
     }
 
-    /// The last `rows` lines of output ending at the cursor, not the bottom of the
-    /// configured screen size — a freshly opened pane has not scrolled the cursor to the
-    /// last row yet, so anchoring on screen height would return blank lines instead of
-    /// the output that was actually just written.
+    /// The last `rows` lines of output that actually contain content, not the bottom of
+    /// the configured screen size and not necessarily the cursor's row. Two situations
+    /// make a naive anchor wrong: a freshly opened pane has not scrolled the cursor to
+    /// the last row yet (anchoring on screen height returns blank lines), and a write
+    /// ending in `\r\n` leaves the cursor on the next, still-blank row (anchoring on the
+    /// cursor returns a blank tail). So walk up from the cursor past any trailing blank
+    /// rows to the last row with real content, then take `rows` lines ending there.
     pub fn text_tail(&self, rows: u16) -> String {
         let (_, width) = self.size();
         let (cursor_row, _) = self.cursor();
-        let end = cursor_row + 1;
+        let screen = self.parser.screen();
+        let is_blank = |row: u16| {
+            screen
+                .contents_between(row, 0, row + 1, width)
+                .trim()
+                .is_empty()
+        };
+
+        let mut end_row = cursor_row;
+        while is_blank(end_row) && end_row > 0 {
+            end_row -= 1;
+        }
+        if is_blank(end_row) {
+            // Nothing has been written to this screen at all.
+            return String::new();
+        }
+
+        let end = end_row + 1;
         let start = end.saturating_sub(rows);
-        self.parser.screen().contents_between(start, 0, end, width)
+        screen.contents_between(start, 0, end, width)
     }
 
     pub fn title(&self) -> Option<String> {
@@ -134,6 +154,34 @@ mod tests {
         assert_eq!(term.size(), (24, 80));
         assert!(!term.alternate_screen());
         assert!(term.text_tail(1).contains("green plain"));
+    }
+
+    #[test]
+    fn text_tail_skips_the_blank_row_left_by_a_trailing_newline() {
+        let mut term = VtTerminal::new(24, 80, 100);
+        term.feed(b"hello\r\n");
+        // The cursor now sits on row 1, which is still blank; the tail must walk back
+        // up to row 0, which actually holds "hello".
+        assert_eq!(term.cursor().0, 1);
+        assert_eq!(term.text_tail(1).trim(), "hello");
+    }
+
+    #[test]
+    fn text_tail_finds_recent_content_after_scrolling_past_screen_height() {
+        let mut term = VtTerminal::new(24, 80, 100);
+        for line in 0..40 {
+            term.feed(format!("line{line}\r\n").as_bytes());
+        }
+        let tail = term.text_tail(3);
+        assert!(tail.contains("line39"));
+        assert!(!tail.contains("line36"));
+    }
+
+    #[test]
+    fn text_tail_on_an_entirely_blank_screen_is_empty_and_does_not_panic() {
+        let term = VtTerminal::new(24, 80, 100);
+        assert!(term.text_tail(1).trim().is_empty());
+        assert!(term.text_tail(24).trim().is_empty());
     }
 
     #[test]

@@ -28,16 +28,22 @@ export TMPDIR="$runtime"
 export PATH="$tmp/trap-bin:$PATH"
 
 run() {
-    session=$1 keys=$2 result=$3 prior=${4:-}
+    session=$1 keys=$2 result=$3 prior=${4:-} assert_shell=${5:-}
     set -- --dock "$dock" --keys "$keys" --transcript "$tmp/$session.typescript" \
         --error-log "$tmp/$session.stderr" --result "$result" --session "$session"
     [ -z "$prior" ] || set -- "$@" --prior-result "$prior"
+    [ -z "$assert_shell" ] || set -- "$@" --assert-shell-pane
     python3 "$root/scripts/smoke-slice61-pty.py" "$@"
 }
 
 cd "$plain"
-run first 'nhvlfix<Enter><Enter>q' "$tmp/first.json"
-run second 'xq' "$tmp/second.json" "$tmp/first.json"
+# `Ctrl+B` is the command prefix; unprefixed keys reach the focused pane's shell directly.
+# `Ctrl+B n` creates the workspace, whose one pane auto-launches a shell with no explicit
+# launch action; `--assert-shell-pane` proves that shell is genuinely running (not just the
+# pre-attach placeholder). `Ctrl+B h`/`Ctrl+B v` split, `Ctrl+B l` opens the launch form on the
+# newly focused split pane, and the fixture type-ahead/confirm/quit sequence matches Slice 6.1.
+run first '<C-b>n<C-b>h<C-b>v<C-b>lfix<Enter><Enter><C-b>q' "$tmp/first.json" "" assert-shell
+run second '<C-b>x<C-b>q' "$tmp/second.json" "$tmp/first.json"
 [ ! -e "$git_log" ]
 [ -z "$(find "$plain" -mindepth 1 -print -quit)" ]
 socket=$(find "$runtime" -name dockd.sock -type s | head -1)

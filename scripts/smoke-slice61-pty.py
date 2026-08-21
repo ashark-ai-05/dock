@@ -133,51 +133,70 @@ def rendered_screens(data, rows=30, columns=100):
 
 
 def running_pane_evidence(screens):
-    """Find one selected running pane and validate all facts inside its own border."""
+    """Find one selected running pane and validate its exact Dock-owned run identity.
+
+    The real-terminal rewrite moved the binding facts a pane used to print in its body
+    (`mode:`/`repository:`/`task:`/`binding:` lines) into the pane's own border title, since
+    the body is now the live emulated screen and has no room for them (see
+    `binding_facts_move_into_the_pane_title_and_never_replace_the_screen` in dashboard.rs).
+    The title is now ` <state-glyph> <label> · <run-id> ` inside a rounded border, so the
+    evidence this can still assert from rendered bytes alone is: the pane's own exact
+    Dock-owned run id, and that run's real stdout appearing inside that same bordered pane.
+    """
+    title_pattern = re.compile(r"╭( [●◍○] terminal · (dock_ui_[0-9]+) )─*╮")
     for screen in screens:
         workspace_match = re.search(r"\bworkspace ([0-9]+)\b", "\n".join(screen))
+        if not workspace_match:
+            continue
         for title_row, line in enumerate(screen):
-            title = re.search(r"┌ terminal · running\s+─+┐", line)
-            if not title or not workspace_match:
+            title = title_pattern.search(line)
+            if not title:
                 continue
-            left = title.start()
-            right = title.end() - 1
-            body = [pane_line[left + 1 : right].strip() for pane_line in screen[title_row + 1 :]]
-            facts = {}
-            for pane_line in body:
-                if pane_line.startswith("└"):
-                    break
-                if ": " in pane_line:
-                    name, value = pane_line.split(": ", 1)
-                    facts[name] = value.strip()
-            binding = re.fullmatch(r"workspace_([0-9]+)/pane_([0-9]+)", facts.get("binding", ""))
-            run = re.fullmatch(r"dock_ui_[0-9]+", facts.get("run", ""))
-            if (
-                facts.get("mode") == "unbound terminal"
-                and facts.get("repository") == "unbound"
-                and facts.get("task") == "unbound"
-                and binding
-                and binding.group(1) == workspace_match.group(1)
-                and run
-                and "Dock-owned fixture ready" in body
-            ):
+            left, right = title.start(), title.end() - 1
+            body = [pane_line[left + 1 : right] for pane_line in screen[title_row + 1 :]]
+            if any("Dock-owned fixture ready" in pane_line for pane_line in body):
                 return {
                     "workspace": workspace_match.group(1),
                     "selected_pane_status": "running",
-                    "mode": facts["mode"],
-                    "repository": facts["repository"],
-                    "task": facts["task"],
-                    "run": run.group(0),
-                    "binding": binding.group(0),
+                    "run": title.group(2),
                     "lifecycle_output": "Dock-owned fixture ready",
                 }
     raise RuntimeError(
-        "rendered output did not show one running unbound terminal pane with its exact "
-        "Dock-owned run, binding, lifecycle output, and unbound repository/task facts"
+        "rendered output did not show one running Dock-owned fixture pane with its exact "
+        "run identity and lifecycle output inside its own border title"
     )
 
 
-def semantic_evidence(transcript, session, prior_result):
+def shell_pane_evidence(screens):
+    """Find a pane that was never explicitly launched into and confirm its auto-launched
+    shell is genuinely running (attached, not the pre-attach placeholder).
+
+    Every Dock pane auto-launches `$SHELL` the moment it exists (`launch_pane_shell` in
+    dispatch.rs), bound under the synthetic run id `dock_sh_<workspace_id>_<pane_id>`. A pane
+    that this session never targets with an explicit launch keeps that ambient shell for the
+    whole session, so its border title still carries that exact run id in the final frame.
+    """
+    title_pattern = re.compile(r"╭( [●◍○] terminal · (dock_sh_workspace_\d+_pane_\d+) )─*╮")
+    for screen in screens:
+        for title_row, line in enumerate(screen):
+            title = title_pattern.search(line)
+            if not title:
+                continue
+            left, right = title.start(), title.end() - 1
+            body = [pane_line[left + 1 : right] for pane_line in screen[title_row + 1 :]]
+            placeholder = any(
+                "starting…" in pane_line or "launches an agent here" in pane_line
+                for pane_line in body
+            )
+            if not placeholder:
+                return {"shell_run": title.group(2)}
+    raise RuntimeError(
+        "rendered output did not show a freshly created pane running its auto-launched "
+        "shell with no explicit launch"
+    )
+
+
+def semantic_evidence(transcript, session, prior_result, assert_shell_pane=False):
     """Assert UI semantics from the bytes Dock actually rendered on its PTY."""
     data = open(transcript, "rb").read()
     if ALT_ENTER not in data or ALT_LEAVE not in data:
@@ -185,18 +204,21 @@ def semantic_evidence(transcript, session, prior_result):
             "rendered output did not contain alternate-screen enter and leave bytes"
         )
 
+    screens = rendered_screens(data)
     evidence = {
         "session": session,
         "source": "pty-rendered-output",
         "alternate_screen": {"enter": True, "leave": True},
-        "visible": running_pane_evidence(rendered_screens(data)),
+        "visible": running_pane_evidence(screens),
     }
+    if assert_shell_pane:
+        evidence["shell_without_launch"] = shell_pane_evidence(screens)
     if session == "second":
         if not prior_result:
             raise RuntimeError("second session requires first-session semantic evidence")
         with open(prior_result, encoding="utf-8") as source:
             prior = json.load(source)
-        for name in ("workspace", "run", "binding"):
+        for name in ("workspace", "run"):
             if evidence["visible"][name] != prior["visible"][name]:
                 raise RuntimeError(
                     f"reconnect did not visibly preserve {name}: "
@@ -214,6 +236,11 @@ def main():
     parser.add_argument("--result", required=True)
     parser.add_argument("--session", choices=("first", "second"), required=True)
     parser.add_argument("--prior-result")
+    parser.add_argument(
+        "--assert-shell-pane",
+        action="store_true",
+        help="also assert a freshly created pane is running its auto-launched shell",
+    )
     args = parser.parse_args()
 
     master_fd, slave_fd = pty.openpty()
@@ -292,7 +319,9 @@ def main():
         with open(args.transcript, "ab") as transcript:
             transcript.write(b"\nTERMINAL_RESTORED\n")
         stage = "validating rendered UI evidence"
-        evidence = semantic_evidence(args.transcript, args.session, args.prior_result)
+        evidence = semantic_evidence(
+            args.transcript, args.session, args.prior_result, args.assert_shell_pane
+        )
         with open(args.result, "w", encoding="utf-8") as result:
             json.dump(evidence, result, indent=2, sort_keys=True)
             result.write("\n")

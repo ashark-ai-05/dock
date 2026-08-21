@@ -8,7 +8,7 @@ use dock::{
 fn main() -> Result<(), String> {
     let args = std::env::args().skip(1);
     let mut socket: Option<PathBuf> = None;
-    let mut capacity = 64 * 1024;
+    let mut capacity = 2000;
     let mut state_dir = PathBuf::from(".dock/local");
     let mut global_run_capacity = usize::MAX;
     let mut repository_run_capacity = usize::MAX;
@@ -18,12 +18,12 @@ fn main() -> Result<(), String> {
             socket = Some(value.into());
         } else if let Some(value) = argument.strip_prefix("--state-dir=") {
             state_dir = value.into();
-        } else if let Some(value) = argument.strip_prefix("--scrollback-bytes=") {
+        } else if let Some(value) = argument.strip_prefix("--scrollback-rows=") {
             capacity = value
                 .parse()
-                .map_err(|_| "--scrollback-bytes must be a positive integer")?;
+                .map_err(|_| "--scrollback-rows must be a positive integer")?;
             if capacity == 0 {
-                return Err("--scrollback-bytes must be greater than zero".into());
+                return Err("--scrollback-rows must be greater than zero".into());
             }
         } else if let Some(value) = argument.strip_prefix("--global-run-capacity=") {
             global_run_capacity = value
@@ -39,7 +39,7 @@ fn main() -> Result<(), String> {
                 .map_err(|_| "--human-review-reserved must be a non-negative integer")?;
         } else {
             return Err(format!(
-                "unknown option {argument:?}; usage: dockd [--socket=PATH] [--state-dir=PATH] [--scrollback-bytes=N] [--global-run-capacity=N] [--repository-run-capacity=N] [--human-review-reserved=N]"
+                "unknown option {argument:?}; usage: dockd [--socket=PATH] [--state-dir=PATH] [--scrollback-rows=N] [--global-run-capacity=N] [--repository-run-capacity=N] [--human-review-reserved=N]"
             ));
         }
     }

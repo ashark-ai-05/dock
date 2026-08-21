@@ -16,26 +16,48 @@ cargo run --bin dock
 ```
 
 The separate `cargo run --bin dockd` command remains supported for explicit daemon operation.
+Dock speaks protocol v7; a v6 daemon must be stopped before this client can connect to it.
 
 ### 2. Create a workspace and owned run in the dashboard
 
-Press `n` to create a workspace, then `l` for the compact fixed-provider picker. Type to filter,
-use arrows or `j`/`k`, press `Enter` to review the exact pane and terminal-unbound versus optional
-repository-bound mode, then `Enter` again to launch. Safe provider/mode choices are retained for
-the current dashboard runtime. Missing fixed executables are labelled and cannot launch.
+Every Dock pane is a real terminal from the moment it exists: it auto-launches `$SHELL` (falling
+back to `/bin/sh`) immediately, so a pane is never inert, and full VT emulation (via `vt100`,
+rendered through `tui-term`) means `vim`, agent CLIs, and anything else that uses the alternate
+screen or redraws in place work correctly.
 
-The daily mnemonic map is `n` workspace, `h`/`v` split, `Tab`/arrows focus, `r` rename, `x` close,
-`l` launch, `i` terminal input, `q` quit, and `?` contextual help. `+`/`-` resize the focused
-split. Every form uses `Esc` to cancel. Input mode is visibly labelled; `Esc` exits it locally and
-is never sent to the process. Pane commands with no valid target show an inline reason.
+`Ctrl+B` is Dock's command prefix, chosen to match tmux. Unprefixed keystrokes go straight to the
+focused pane; `Esc` is always forwarded to the pane and never intercepted; `Ctrl+B` pressed twice
+sends a literal `Ctrl+B` (`0x02`) to the pane instead of opening a command.
 
-The pane shows authoritative run, workspace, pane, and optional repository/task binding facts; an
-unbound terminal never invents Git or task facts. Repository/task/worktree catalog discovery starts
-only when launch is opened and does not delay the initial dashboard.
+| Key (after `Ctrl+B`) | Action |
+|---|---|
+| `n` | new workspace |
+| `[` / `]` | switch workspace |
+| `h` / `v` | split horizontal / vertical |
+| arrows, `Tab` / `Shift+Tab` | focus |
+| `+` / `-` | resize the focused split |
+| `z` | zoom (toggle full-area view of the focused pane) |
+| `r` | rename |
+| `x` | close |
+| `l` | launch |
+| `d` | leave — runs keep running |
+| `?` | help |
+| `q` | quit |
 
-Discovered existing agent processes are display-only and say `external/read-only`. Press `d` or
-click `dismiss all` to remove those candidates from the view. Launching never adopts a discovered
-process.
+Press `Ctrl+B l` for the compact fixed-provider picker. Type to filter, use arrows or `j`/`k`,
+press `Enter` to review the exact pane and terminal-unbound versus optional repository-bound mode,
+then `Enter` again to launch. Safe provider/mode choices are retained for the current dashboard
+runtime. Missing fixed executables are labelled and cannot launch. Every form uses `Esc` to cancel.
+Pane commands with no valid target show an inline reason.
+
+The pane's own bound run identity is shown in its border title (the body is the live emulated
+screen and has no room for it); an unbound terminal never invents Git or task facts.
+Repository/task/worktree catalog discovery starts only when launch is opened and does not delay
+the initial dashboard.
+
+Discovered existing agent processes are display-only and say `external/read-only`. Click
+`dismiss all` in the sidebar to remove those candidates from the view — there is no keyboard
+binding for this action. Launching never adopts a discovered process.
 
 The direct noninteractive workspace commands remain available for scripts and compatibility, but
 they are not the normal user or Slice 6.1 smoke path:
@@ -53,6 +75,21 @@ cargo run --bin dock-workspace -- focus daily agent
 cargo run --bin dock-workspace -- resize daily agent 650
 cargo run --bin dock-workspace -- rename-pane daily agent "Coding agent"
 ```
+
+## Agent awareness
+
+Dock classifies each of its own runs into one of four states, from the screen content it renders,
+and sorts the sidebar blocked-first so whichever runs are costing the most attention surface at
+the top:
+
+- **blocked** — waiting on you
+- **working** — actively producing output
+- **done** — finished and idle
+- **idle** — no run bound, or nothing happening yet
+
+This is heuristic, not a protocol the agent speaks to Dock. Detection of processes Dock did not
+launch is display-only: they appear labelled `external/read-only` and are never adopted,
+controlled, or classified into these four states.
 
 ### 3. Use direct runtime commands when scripting
 
@@ -119,7 +156,18 @@ cargo run --bin dock-programme
 
 ## What is not here yet
 
-Dock is not yet a full terminal multiplexer. Themes, zoom, notifications, and durable transcript replay are deferred. Bounded live scrollback is shipped: each daemon-owned runtime retains only its configured byte limit in memory for reconnects to that same daemon, truncating the oldest bytes as new output arrives; it is never written to layout or restored after daemon restart. See the [terminal-runtime parity matrix](docs/terminal-runtime-parity.md) for the exact status.
+Dock is not yet a full terminal multiplexer. Pane swap, loading alternative theme palettes, and
+notifications are deferred, and durable transcript replay across a daemon restart is out of scope.
+Bounded live scrollback is shipped: each pane retains only its configured row budget (default
+2000, `dockd --scrollback-rows`) in memory for reconnects to that same daemon, discarding the
+oldest rows as new output arrives; it is never written to layout or restored after daemon restart.
+
+**`Ctrl+C` does not currently interrupt a running pane child.** The launch guardian backgrounds
+the worker shell, and POSIX sets `SIGINT`/`SIGQUIT` to ignore for a non-interactive shell's
+background jobs — a disposition that survives `exec`. `stop` and daemon/guardian cleanup (which
+use `SIGTERM`) are unaffected. This is a known defect with a dedicated follow-up task, not a
+silent gap; see the [terminal-runtime parity matrix](docs/terminal-runtime-parity.md) for the
+exact status of every capability, including this one.
 
 ## Verify a change
 
@@ -130,6 +178,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 scripts/smoke-slice5-macos.sh
 scripts/smoke-slice6-macos.sh
 scripts/smoke-slice61-macos.sh
+scripts/smoke-slice62-nongit-macos.sh
 ```
 
 See the [implementation breakdown](docs/implementation-breakdown.md) for planned work and acceptance evidence.

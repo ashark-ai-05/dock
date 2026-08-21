@@ -667,27 +667,34 @@ fn parse_test_events(value: &str) -> Result<VecDeque<Event>, String> {
     let mut events = VecDeque::new();
     let mut input = value;
     while !input.is_empty() {
-        let (code, consumed) = if input.starts_with('<') {
+        let (code, modifiers, consumed) = if input.starts_with('<') {
             let end = input.find('>').ok_or_else(|| {
                 "DOCK_TEST_KEY_EVENTS contains an unterminated named key".to_string()
             })?;
             let name = &input[1..end];
-            let code = match name {
-                "Enter" => KeyCode::Enter,
-                "Tab" => KeyCode::Tab,
-                "Esc" => KeyCode::Esc,
-                "Up" => KeyCode::Up,
-                "Down" => KeyCode::Down,
-                "Left" => KeyCode::Left,
-                "Right" => KeyCode::Right,
-                "Backspace" => KeyCode::Backspace,
+            let (code, modifiers) = match name {
+                "Enter" => (KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+                "Tab" => (KeyCode::Tab, crossterm::event::KeyModifiers::NONE),
+                "Esc" => (KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+                "Up" => (KeyCode::Up, crossterm::event::KeyModifiers::NONE),
+                "Down" => (KeyCode::Down, crossterm::event::KeyModifiers::NONE),
+                "Left" => (KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+                "Right" => (KeyCode::Right, crossterm::event::KeyModifiers::NONE),
+                "Backspace" => (KeyCode::Backspace, crossterm::event::KeyModifiers::NONE),
+                // `<C-b>` sends the Dock prefix (Ctrl+B) as a real Ctrl-modified key event,
+                // the same shape crossterm hands the dashboard from a live terminal — plain
+                // `b` in DOCK_TEST_KEY_EVENTS cannot express a held modifier.
+                _ if name.len() == 3 && name.starts_with("C-") => (
+                    KeyCode::Char(name[2..].chars().next().expect("one char after C-")),
+                    crossterm::event::KeyModifiers::CONTROL,
+                ),
                 _ => {
                     return Err(format!(
                         "DOCK_TEST_KEY_EVENTS contains unknown named key <{name}>"
                     ));
                 }
             };
-            (code, end + 1)
+            (code, modifiers, end + 1)
         } else {
             let character = input.chars().next().expect("non-empty event input");
             if character.is_control() {
@@ -695,12 +702,13 @@ fn parse_test_events(value: &str) -> Result<VecDeque<Event>, String> {
                     "DOCK_TEST_KEY_EVENTS accepts printable characters and named keys only".into(),
                 );
             }
-            (KeyCode::Char(character), character.len_utf8())
+            (
+                KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+                character.len_utf8(),
+            )
         };
-        events.push_back(Event::Key(crossterm::event::KeyEvent::new(
-            code,
-            crossterm::event::KeyModifiers::NONE,
-        )));
+        events.push_back(Event::Key(crossterm::event::KeyEvent::new(code, modifiers)));
         input = &input[consumed..];
     }
     Ok(events)
@@ -757,6 +765,23 @@ mod terminal_tests {
         );
         assert!(parse_test_events("n<Return>").is_err());
         assert!(parse_test_events("n<Enter").is_err());
+    }
+
+    #[test]
+    fn named_control_key_carries_the_control_modifier() {
+        let events = parse_test_events("<C-b>q").unwrap();
+        let keys = events
+            .into_iter()
+            .map(|event| match event {
+                Event::Key(key) => key,
+                _ => panic!("expected a key event"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys[0].code, KeyCode::Char('b'));
+        assert_eq!(keys[0].modifiers, crossterm::event::KeyModifiers::CONTROL);
+        assert_eq!(keys[1].code, KeyCode::Char('q'));
+        assert_eq!(keys[1].modifiers, crossterm::event::KeyModifiers::NONE);
+        assert!(parse_test_events("<C-bb>").is_err());
     }
 
     #[test]

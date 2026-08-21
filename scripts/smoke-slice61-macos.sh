@@ -101,9 +101,11 @@ run_pty() {
 # `dock` is the only product command. It bootstraps dockd, enters the foreground dashboard,
 # creates a workspace, and launches a Dock-owned fixture via the same UI actions a user sees.
 cd "$repo"
-# Type-ahead selects Fixture in the bounded launch form; the first Enter reviews the
-# exact mode/profile/target and the second explicitly confirms that visible choice.
-run_pty "$first_log" "$first_error" 'nlfix<Enter><Enter>q' first "$first_result"
+# `Ctrl+B` is the command prefix; unprefixed keys go straight to the focused pane's shell.
+# `Ctrl+B n` creates the workspace and `Ctrl+B l` opens the bounded launch form; type-ahead
+# inside that form selects Fixture, the first Enter reviews the exact mode/profile/target, and
+# the second explicitly confirms that visible choice. `Ctrl+B q` quits.
+run_pty "$first_log" "$first_error" '<C-b>n<C-b>lfix<Enter><Enter><C-b>q' first "$first_result"
 socket=$(find "$runtime_base" -name dockd.sock -type s | head -1)
 [ -n "$socket" ]
 [ "$(stat -f '%Lp' "$socket")" = 600 ]
@@ -114,7 +116,7 @@ state="$(dirname "$socket")/state"
 daemon_pid=$(lsof -t "$socket" | head -1)
 
 # Reconnect through the dashboard again; the persisted workspace must be visible there.
-run_pty "$second_log" "$second_error" q second "$second_result" "$first_result"
+run_pty "$second_log" "$second_error" '<C-b>q' second "$second_result" "$first_result"
 
 for log in "$first_log" "$second_log"; do
     grep -Fq 'TERMINAL_RESTORED' "$log"

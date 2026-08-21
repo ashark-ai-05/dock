@@ -1,25 +1,28 @@
 use std::collections::HashMap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::{
     adapter::{AdapterId, AdapterSelection},
     detect::{AgentKind, AgentState},
     discovery::ExternalAgentCandidate,
+    keymap::{FocusDirection, KeyOutcome, Keymap, PaneCommand},
     layout::{LayoutNode, LayoutSnapshot, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout},
     protocol::{
         BindingKind, DashboardProfile, DispatchRequest, Event, LaunchIntoPaneRequest,
-        PaneInputRequest, Request, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
+        PROTOCOL_VERSION, Request, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
     },
-    terminal::PaneScreen,
+    terminal::{KeyEncoding, PaneScreen},
+    theme::Theme,
 };
 
 const MIN_PANE_WIDTH: u16 = 8;
@@ -48,7 +51,6 @@ pub struct Dashboard {
     pub repository_launches: Vec<RepositoryLaunchOption>,
     pub workspace_index: usize,
     pub error: Option<String>,
-    pub input_mode: bool,
     /// This client's own emulator for each run, advanced by pushed deltas. The daemon holds the
     /// authoritative screen; this is the local replica the dashboard actually paints from.
     pub screens: HashMap<String, PaneScreen>,
@@ -57,6 +59,14 @@ pub struct Dashboard {
     revisions: HashMap<String, u64>,
     needs_refresh: bool,
     pending_resizes: Vec<(String, String, u16, u16)>,
+    /// The run and inner geometry last announced for each pane, so an unchanged frame
+    /// announces nothing.
+    pane_geometry: HashMap<String, (String, u16, u16)>,
+    keymap: Keymap,
+    theme: Theme,
+    /// Pane rendered alone at full size, if any. Purely local: the daemon's layout tree is
+    /// untouched, so zooming costs no request.
+    zoomed: Option<String>,
     pane_areas: HashMap<String, Rect>,
     dividers: Vec<Divider>,
     dragging: Option<DragTarget>,
@@ -193,9 +203,15 @@ impl Dashboard {
     }
 
     /// Pane geometry changes the render pass discovered, as `(workspace_id, pane_id, rows, cols)`.
-    /// Rendering is Task 12's, so nothing queues into this yet and the queue is always empty.
+    /// Only genuinely changed geometry lands here: a resize per pane per frame would be a
+    /// request storm on an otherwise idle socket.
     pub fn take_pending_resizes(&mut self) -> Vec<(String, String, u16, u16)> {
         std::mem::take(&mut self.pending_resizes)
+    }
+
+    /// True while `Ctrl+B` has been pressed and the dashboard is waiting for the command key.
+    pub fn prefix_pending(&self) -> bool {
+        self.keymap.is_pending()
     }
 
     /// The visible text of a run's replicated screen, sized from the parser's own geometry so a
@@ -219,6 +235,12 @@ impl Dashboard {
         self.launch_confirm_area = None;
         self.launch_mode_area = None;
         let area = frame.area();
+        // Painted first so every widget that leaves cells untouched still sits on the theme's
+        // surface rather than whatever the host terminal happens to use.
+        frame.render_widget(
+            Block::default().style(Style::default().bg(self.theme.surface).fg(self.theme.text)),
+            area,
+        );
         if area.width < 52 || area.height < 14 {
             self.dragging = None;
             self.render_narrow(frame, area);
@@ -243,11 +265,27 @@ impl Dashboard {
         self.render_header(frame, header);
         self.render_sidebar(frame, sidebar);
         if let Some(workspace) = self.workspace().cloned() {
-            self.render_node(frame, panes, &workspace, &workspace.root);
+            let zoomed = self
+                .zoomed
+                .clone()
+                .filter(|pane_id| workspace.panes.contains_key(pane_id));
+            match zoomed {
+                Some(pane_id) => {
+                    self.render_node(frame, panes, &workspace, &LayoutNode::Pane { pane_id })
+                }
+                None => self.render_node(frame, panes, &workspace, &workspace.root),
+            }
         } else {
             frame.render_widget(
-                Paragraph::new("No workspace yet. Press n to create one.")
-                    .block(Block::default().borders(Borders::ALL).title(" RUNTIME ")),
+                Paragraph::new("No workspace yet. Press Ctrl+B n to create one.")
+                    .style(Style::default().fg(self.theme.muted))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(Theme::border_type())
+                            .border_style(Style::default().fg(self.theme.border))
+                            .title(" RUNTIME "),
+                    ),
                 panes,
             );
         }
@@ -268,23 +306,49 @@ impl Dashboard {
         if self.rename_form.is_some() {
             self.render_rename(frame, area);
         }
-        let notice = self.error.as_deref().unwrap_or(if self.input_mode {
-            "INPUT MODE · bytes go only to focused Dock-owned run · Esc exits (not forwarded)"
-        } else if self.help_open {
-            "HELP · Esc/? closes"
-        } else if self.rename_form.is_some() {
-            "RENAME · type a pane name · Enter saves · Esc cancels"
-        } else {
-            "[n] workspace [h/v] split [Tab/←↑→↓] focus [r] rename [x] close [l] launch [i] input [?] help [q] quit"
-        });
         frame.render_widget(
-            Paragraph::new(notice).style(Style::default().fg(if self.error.is_some() {
-                Color::Red
-            } else {
-                Color::DarkGray
-            })),
+            Paragraph::new(self.footer_line()).wrap(Wrap { trim: true }),
             footer,
         );
+    }
+
+    /// The single footer line. While the prefix is pending it becomes a which-key bar, which
+    /// is the only place the binding table is ever published without the user asking for help.
+    fn footer_line(&self) -> Line<'static> {
+        if let Some(error) = self.error.as_deref() {
+            return Line::styled(error.to_owned(), Style::default().fg(self.theme.blocked));
+        }
+        if self.keymap.is_pending() {
+            return Line::from(
+                Keymap::hints()
+                    .iter()
+                    .flat_map(|(key, action)| {
+                        [
+                            Span::styled(
+                                format!(" {key} "),
+                                Style::default()
+                                    .fg(self.theme.accent)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("{action} "),
+                                Style::default().fg(self.theme.text),
+                            ),
+                        ]
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let summary = if self.help_open {
+            "HELP · Esc or ? closes"
+        } else if self.rename_form.is_some() {
+            "RENAME · type a pane name · Enter saves · Esc cancels"
+        } else if self.launch_form.is_some() {
+            "LAUNCH · type to filter · Enter reviews · Esc cancels"
+        } else {
+            "keys go to the focused pane · Ctrl+B ? help"
+        };
+        Line::styled(summary, Style::default().fg(self.theme.muted))
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -294,21 +358,28 @@ impl Dashboard {
                 Span::styled(
                     " d·ock ",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(self.theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!(" runtime · {workspace} · protocol v6")),
+                Span::styled(
+                    format!(" runtime · {workspace} · protocol v{PROTOCOL_VERSION}"),
+                    Style::default().fg(self.theme.text),
+                ),
             ]))
-            .block(Block::default().borders(Borders::BOTTOM)),
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(self.theme.border)),
+            ),
             area,
         );
     }
 
     fn render_sidebar(&mut self, frame: &mut Frame, area: Rect) {
-        let mut lines = vec![Line::styled(
-            "WORKSPACES",
-            Style::default().add_modifier(Modifier::BOLD),
-        )];
+        let heading = Style::default()
+            .fg(self.theme.text)
+            .add_modifier(Modifier::BOLD);
+        let mut lines = vec![Line::styled("WORKSPACES", heading)];
         for (index, workspace) in self.layout.workspaces.iter().enumerate() {
             lines.push(Line::styled(
                 format!(
@@ -321,53 +392,95 @@ impl Dashboard {
                     workspace.name
                 ),
                 Style::default().fg(if index == self.workspace_index {
-                    Color::Cyan
+                    self.theme.accent
                 } else {
-                    Color::Gray
+                    self.theme.muted
                 }),
             ));
         }
         lines.push(Line::from(""));
-        lines.push(Line::styled(
-            "EXISTING AGENTS",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        lines.push(Line::styled("AGENTS", heading));
+        // An undetected agent falls back to its run id, which is long enough to wrap onto a
+        // second sidebar line and destroy the one-line-per-agent reading the roster exists for.
+        let label_width = usize::from(area.width).saturating_sub(4);
+        for (state, label) in self.agent_roster() {
+            lines.push(Line::styled(
+                format!(" {} {}", state.glyph(), ellipsise(label, label_width)),
+                Style::default().fg(self.theme.agent(state)),
+            ));
+        }
+        if self.agents.is_empty() {
+            lines.push(Line::styled(
+                " none running",
+                Style::default().fg(self.theme.muted),
+            ));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled("EXISTING AGENTS", heading));
         if self.external.is_empty() {
             lines.push(Line::styled(
                 " none discovered",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(self.theme.muted),
             ));
         }
         for candidate in &self.external {
-            lines.push(Line::from(candidate.provider.as_str()));
+            lines.push(Line::styled(
+                candidate.provider.as_str(),
+                Style::default().fg(self.theme.text),
+            ));
             lines.push(Line::styled(
                 candidate.status(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(self.theme.working),
             ));
         }
         if !self.external.is_empty() {
             lines.push(Line::styled(
-                " [d] dismiss all",
-                Style::default().fg(Color::Cyan),
+                " click to dismiss all",
+                Style::default().fg(self.theme.accent),
             ));
             let row = area.y + u16::try_from(lines.len()).unwrap_or(u16::MAX) - 1;
             self.dismiss_external_area = Some(Rect::new(area.x, row, area.width, 1));
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            "[l] LAUNCH DOCK AGENT",
+            "Ctrl+B l LAUNCH AGENT",
             Style::default()
-                .fg(Color::Green)
+                .fg(self.theme.accent)
                 .add_modifier(Modifier::BOLD),
         ));
         let row = area.y + u16::try_from(lines.len()).unwrap_or(u16::MAX) - 1;
         self.launch_area = Some(Rect::new(area.x, row, area.width, 1));
         frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::RIGHT)),
+            Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+                Block::default()
+                    .borders(Borders::RIGHT)
+                    .border_style(Style::default().fg(self.theme.border)),
+            ),
             area,
         );
+    }
+
+    /// Live agents ordered by how much they are costing the user: blocked first, then by
+    /// label so the list does not reshuffle between frames for equally urgent agents.
+    fn agent_roster(&self) -> Vec<(AgentState, &str)> {
+        let mut roster: Vec<(AgentState, &str)> = self
+            .agents
+            .iter()
+            .map(|(run_id, (kind, state))| {
+                let label = match kind {
+                    Some(kind) => kind.label(),
+                    None => run_id.as_str(),
+                };
+                (*state, label)
+            })
+            .collect();
+        roster.sort_by(|left, right| {
+            left.0
+                .attention_rank()
+                .cmp(&right.0.attention_rank())
+                .then_with(|| left.1.cmp(right.1))
+        });
+        roster
     }
 
     fn render_node(
@@ -382,57 +495,61 @@ impl Dashboard {
                 self.pane_areas.insert(pane_id.clone(), area);
                 let pane = &workspace.panes[pane_id];
                 let focused = workspace.focused_pane_id == *pane_id;
-                let run = pane
-                    .run_id
+                let run_id = pane.run_id.clone();
+                let (agent, state) = run_id
                     .as_deref()
-                    .and_then(|id| self.runs.iter().find(|run| run.run_id == id));
-                let output = match run {
-                    Some(run) => format!(
-                        // The snapshot no longer carries pane text; emulated screens reach the
-                        // dashboard over pane subscriptions instead of being re-sent by polling.
-                        "mode: {}\nrepository: {}\ntask: {}\nrun: {}\nbinding: {}/{}\nsize: {}x{}",
-                        if run.binding_kind == BindingKind::Terminal { "unbound terminal" } else { "repository dispatch" },
-                        if run.binding_kind == BindingKind::Terminal { "unbound" } else { &run.repository_root },
-                        if run.binding_kind == BindingKind::Terminal { "unbound" } else { &run.external_task_ref },
-                        run.run_id,
-                        run.workspace_id,
-                        run.pane_id,
-                        run.cols,
-                        run.rows
-                    ),
-                    None if pane.run_id.is_some() => format!(
-                        "repository: unavailable\ntask: unavailable\nrun: {}\nbinding: {}/{}\n\nDock-owned run facts are unavailable.",
-                        pane.run_id.as_deref().unwrap_or_default(),
-                        workspace.workspace_id,
-                        pane.pane_id
-                    ),
-                    None => "repository: unbound\ntask: unbound\nrun: unbound\nbinding: unbound\n\nNo Dock-owned run bound.".into(),
-                };
-                let title = format!(" {} · {} ", pane.name, runtime_label(pane.runtime));
-                frame.render_widget(
-                    Paragraph::new(output)
-                        .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(runtime_color(pane.runtime)))
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title(title)
-                                .border_style(
-                                    Style::default()
-                                        .fg(if focused {
-                                            Color::Cyan
-                                        } else {
-                                            Color::DarkGray
-                                        })
-                                        .add_modifier(if focused {
-                                            Modifier::BOLD
-                                        } else {
-                                            Modifier::empty()
-                                        }),
-                                ),
-                        ),
-                    area,
+                    .and_then(|id| self.agents.get(id).copied())
+                    .unwrap_or((None, AgentState::Idle));
+                let label = agent.map_or_else(|| pane.name.clone(), |kind| kind.label().to_owned());
+                let title = format!(
+                    " {} {} · {} ",
+                    state.glyph(),
+                    label,
+                    self.pane_location(pane)
                 );
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(Theme::border_type())
+                    .title(title)
+                    .title_style(Style::default().fg(self.theme.agent(state)))
+                    .border_style(Style::default().fg(if focused {
+                        self.theme.border_focused
+                    } else {
+                        self.theme.border
+                    }));
+                let inner = block.inner(area);
+                self.queue_resize(&workspace.workspace_id, pane_id, run_id.as_deref(), inner);
+                frame.render_widget(block, area);
+                match run_id.as_deref().and_then(|id| self.screens.get(id)) {
+                    Some(screen) => {
+                        // The cursor belongs to whichever pane is taking keystrokes; drawing
+                        // one in every pane would make focus unreadable.
+                        let mut cursor = Cursor::default();
+                        if !focused {
+                            cursor.hide();
+                        }
+                        frame.render_widget(
+                            PseudoTerminal::new(screen.screen()).cursor(cursor),
+                            inner,
+                        );
+                    }
+                    None => {
+                        let mut placeholder = vec![Line::styled(
+                            "starting…",
+                            Style::default().fg(self.theme.muted),
+                        )];
+                        if run_id.is_none() {
+                            placeholder.push(Line::styled(
+                                "Ctrl+B l launches an agent here",
+                                Style::default().fg(self.theme.muted),
+                            ));
+                        }
+                        frame.render_widget(
+                            Paragraph::new(placeholder).wrap(Wrap { trim: true }),
+                            inner,
+                        );
+                    }
+                }
             }
             LayoutNode::Split {
                 axis,
@@ -454,10 +571,55 @@ impl Dashboard {
         }
     }
 
+    /// The binding facts the pane body used to spell out line by line. They survive as a
+    /// title suffix because the body is now the emulated screen and has no room for them.
+    fn pane_location(&self, pane: &PaneLayout) -> String {
+        let Some(run_id) = pane.run_id.as_deref() else {
+            return "unbound".into();
+        };
+        let Some(run) = self.runs.iter().find(|run| run.run_id == run_id) else {
+            return format!("{run_id} · unavailable");
+        };
+        match run.binding_kind {
+            BindingKind::Terminal => run_id.to_owned(),
+            BindingKind::Repository => format!("{run_id} · {}", run.external_task_ref),
+        }
+    }
+
+    /// Announces a pane's inner geometry to the daemon, but only when it actually changed.
+    /// `render` runs on every frame, so re-sending an identical size would put one resize
+    /// request per pane per frame onto a socket that is otherwise silent when nothing moves.
+    ///
+    /// The record is keyed by run as well as size: a pane that just gained a run must be
+    /// announced even at unchanged geometry, because the new PTY started at the daemon's
+    /// own default rather than at this pane's size.
+    fn queue_resize(
+        &mut self,
+        workspace_id: &str,
+        pane_id: &str,
+        run_id: Option<&str>,
+        inner: Rect,
+    ) {
+        let Some(run_id) = run_id else {
+            return;
+        };
+        let geometry = (run_id.to_owned(), inner.height, inner.width);
+        if self.pane_geometry.get(pane_id) == Some(&geometry) {
+            return;
+        }
+        self.pane_geometry.insert(pane_id.to_owned(), geometry);
+        self.pending_resizes.push((
+            workspace_id.to_owned(),
+            pane_id.to_owned(),
+            inner.height,
+            inner.width,
+        ));
+    }
+
     fn render_narrow(&self, frame: &mut Frame, area: Rect) {
         let mut lines = vec![Line::styled(
             "d·ock · compact runtime",
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(self.theme.accent),
         )];
         if let Some(workspace) = self.workspace() {
             lines.push(Line::from(format!(
@@ -472,18 +634,23 @@ impl Dashboard {
                         pane.name,
                         runtime_label(pane.runtime)
                     ),
-                    Style::default().fg(runtime_color(pane.runtime)),
+                    Style::default().fg(self.theme.accent),
                 ));
             }
         } else {
             lines.push(Line::from("No workspace · n create"));
         }
         lines.push(Line::styled(
-            "n new · h/v split · Tab focus · l launch · ? help · q quit",
-            Style::default().fg(Color::DarkGray),
+            "Ctrl+B then n new · h/v split · Tab focus · l launch · ? help · q quit",
+            Style::default().fg(self.theme.muted),
         ));
         frame.render_widget(
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
+            Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(Theme::border_type())
+                    .border_style(Style::default().fg(self.theme.border)),
+            ),
             area,
         );
     }
@@ -497,27 +664,39 @@ impl Dashboard {
             width,
             height,
         );
+        let heading = Style::default()
+            .fg(self.theme.accent)
+            .add_modifier(Modifier::BOLD);
         let lines = vec![
-            Line::styled("DAILY", Style::default().add_modifier(Modifier::BOLD)),
-            Line::from("n new workspace   h/v split   Tab/arrows focus"),
-            Line::from("r rename   x close   l launch   i input   q quit   ? help"),
-            Line::styled("LAYOUT", Style::default().add_modifier(Modifier::BOLD)),
-            Line::from("←/↑ previous focus   →/↓/Tab next focus   +/- resize focused split"),
-            Line::styled("FORMS", Style::default().add_modifier(Modifier::BOLD)),
+            Line::styled("TYPING", heading),
+            Line::from("Every key goes to the focused pane, Esc and Ctrl-C included."),
+            Line::from("Ctrl+B is the only key Dock keeps; Ctrl+B Ctrl+B sends a literal one."),
+            Line::styled("AFTER Ctrl+B", heading),
+            Line::from("n new workspace   h/v split   z zoom"),
+            Line::from("r rename   x close   l launch   d detach   q quit"),
+            Line::from("Tab/S-Tab or arrows focus   +/- resize"),
+            Line::styled("FORMS", heading),
             Line::from("type to filter/edit   ↑/↓ or j/k select   Enter review/confirm"),
-            Line::from("Esc always cancels a form or exits input mode; it is never forwarded"),
-            Line::styled("CURRENT", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from("Esc cancels a form rather than reaching the pane while one is open."),
+            Line::styled("CURRENT", heading),
             Line::from(if self.workspace().is_some() {
                 "Workspace selected; pane commands are available."
             } else {
-                "No workspace: create one with n before pane actions."
+                "No workspace: create one with Ctrl+B n before pane actions."
             }),
             Line::from("Esc or ? closes help"),
         ];
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL).title(" KEYMAP ")),
+                .style(Style::default().fg(self.theme.text))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(Theme::border_type())
+                        .border_style(Style::default().fg(self.theme.border_focused))
+                        .title(" KEYMAP "),
+                ),
             popup,
         );
     }
@@ -536,9 +715,12 @@ impl Dashboard {
                 Line::from(format!("Name: {value}█")),
                 Line::from("Enter saves · Esc cancels"),
             ])
+            .style(Style::default().fg(self.theme.text))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(Theme::border_type())
+                    .border_style(Style::default().fg(self.theme.border_focused))
                     .title(" RENAME FOCUSED PANE "),
             ),
             popup,
@@ -558,50 +740,19 @@ impl Dashboard {
         if self.launch_form.is_some() {
             return self.launch_key(key);
         }
-        if self.input_mode {
-            if key.code == KeyCode::Esc {
-                self.input_mode = false;
-                return UiCommand::None;
-            }
-            let input = match key.code {
-                KeyCode::Char(character)
-                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-                {
-                    character.to_string()
-                }
-                KeyCode::Enter => "\n".into(),
-                KeyCode::Backspace => "\u{7f}".into(),
-                _ => return UiCommand::None,
-            };
-            let Some(workspace) = self.workspace() else {
-                return UiCommand::None;
-            };
-            return UiCommand::Request(Box::new(Request::PaneInput(PaneInputRequest {
-                workspace_id: workspace.workspace_id.clone(),
-                pane_id: workspace.focused_pane_id.clone(),
-                // Protocol v7 carries pane input base64-encoded; raw text is rejected by the
-                // daemon's decode and would corrupt any control byte that did get through.
-                input: PaneInputRequest::encode(input.as_bytes()),
-            })));
+        let encoding = self.encoding_for_focused_pane();
+        match self.keymap.handle(key, encoding) {
+            // Deliberately not a `Request`: pane input is fire-and-forget, and routing it
+            // through the request arm would put two daemon round trips in front of the echo.
+            KeyOutcome::Passthrough(bytes) => UiCommand::PaneInput(bytes),
+            KeyOutcome::Command(command) => self.run_command(command),
+            KeyOutcome::PendingPrefix | KeyOutcome::Ignored => UiCommand::None,
         }
-        match key.code {
-            KeyCode::Char('?') => {
-                self.error = None;
-                self.help_open = true;
-                UiCommand::None
-            }
-            KeyCode::Char('q') => UiCommand::Quit,
-            KeyCode::Char('i') => {
-                if self.focused_owned_run().is_some() {
-                    self.input_mode = true;
-                    self.error = None;
-                } else {
-                    self.error =
-                        Some("input unavailable: focused pane has no Dock-owned run".into());
-                }
-                UiCommand::None
-            }
-            KeyCode::Char('n') => {
+    }
+
+    fn run_command(&mut self, command: PaneCommand) -> UiCommand {
+        match command {
+            PaneCommand::NewWorkspace => {
                 let workspace_id = self.next_unique_id("workspace");
                 let pane_id = self.next_unique_id("pane");
                 UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Create {
@@ -610,41 +761,67 @@ impl Dashboard {
                     pane_id,
                 })))
             }
-            KeyCode::Char('d') => {
-                self.external.clear();
-                UiCommand::None
-            }
-            KeyCode::Char('l') => {
+            PaneCommand::Split(axis) => self.split(axis),
+            // Focus is still ordinal rather than geometric, so the two backwards directions
+            // and the two forwards ones collapse onto the existing cycle.
+            PaneCommand::Focus(direction) => self.focus_next(matches!(
+                direction,
+                FocusDirection::Previous | FocusDirection::Left | FocusDirection::Up
+            )),
+            PaneCommand::Resize(delta) => self.resize_keyboard(delta),
+            PaneCommand::Zoom => self.zoom(),
+            PaneCommand::Rename => self.rename(),
+            PaneCommand::Close => self.close(),
+            PaneCommand::Launch => {
                 self.open_launch();
                 UiCommand::LoadCatalog
             }
-            KeyCode::Char('[') => {
-                self.workspace_index = self.workspace_index.saturating_sub(1);
+            // The daemon owns every run, so leaving the dashboard signals nothing and tears
+            // nothing down. Detaching and quitting are therefore the same act here.
+            PaneCommand::Detach | PaneCommand::Quit => UiCommand::Quit,
+            PaneCommand::Help => {
+                self.error = None;
+                self.help_open = true;
                 UiCommand::None
             }
-            KeyCode::Char(']') => {
-                if self.workspace_index + 1 < self.layout.workspaces.len() {
-                    self.workspace_index += 1;
-                }
-                UiCommand::None
-            }
-            KeyCode::Tab
-            | KeyCode::BackTab
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Up
-            | KeyCode::Down => self.focus_next(matches!(
-                key.code,
-                KeyCode::BackTab | KeyCode::Left | KeyCode::Up
-            )),
-            KeyCode::Char('h') => self.split(SplitAxis::Horizontal),
-            KeyCode::Char('v') => self.split(SplitAxis::Vertical),
-            KeyCode::Char('r') => self.rename(),
-            KeyCode::Char('x') => self.close(),
-            KeyCode::Char('+') | KeyCode::Char('=') => self.resize_keyboard(50),
-            KeyCode::Char('-') => self.resize_keyboard(-50),
-            _ => UiCommand::None,
         }
+    }
+
+    /// Toggles a full-area view of the focused pane. Zoom is local to this client: the
+    /// daemon's layout tree is unchanged, so it costs no request, but the pane's inner
+    /// geometry does change and the next frame announces the new PTY size.
+    fn zoom(&mut self) -> UiCommand {
+        let Some(workspace) = self.workspace() else {
+            self.error = Some("zoom unavailable: create a workspace first".into());
+            return UiCommand::None;
+        };
+        let focused = workspace.focused_pane_id.clone();
+        self.zoomed = match self.zoomed.take() {
+            Some(current) if current == focused => None,
+            _ => Some(focused),
+        };
+        self.error = None;
+        UiCommand::None
+    }
+
+    /// The focused pane's own key encoding. A program that sets DECCKM changes what bytes
+    /// an arrow key must produce, so this is read per pane rather than assumed globally.
+    fn encoding_for_focused_pane(&self) -> KeyEncoding {
+        self.focused_run_id()
+            .and_then(|run_id| self.screens.get(run_id))
+            .map(|screen| KeyEncoding {
+                application_cursor: screen.screen().application_cursor(),
+            })
+            .unwrap_or_default()
+    }
+
+    fn focused_run_id(&self) -> Option<&str> {
+        let workspace = self.workspace()?;
+        workspace
+            .panes
+            .get(&workspace.focused_pane_id)?
+            .run_id
+            .as_deref()
     }
 
     fn open_launch(&mut self) {
@@ -836,11 +1013,11 @@ impl Dashboard {
                     }
                 ),
                 Style::default().fg(if !matches {
-                    Color::Black
+                    self.theme.surface
                 } else if available {
-                    Color::Green
+                    self.theme.accent
                 } else {
-                    Color::DarkGray
+                    self.theme.muted
                 }),
             ));
         }
@@ -862,11 +1039,15 @@ impl Dashboard {
             1,
         ));
         frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" LAUNCH FIXED PROFILE "),
-            ),
+            Paragraph::new(lines)
+                .style(Style::default().fg(self.theme.text))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(Theme::border_type())
+                        .border_style(Style::default().fg(self.theme.border_focused))
+                        .title(" LAUNCH FIXED PROFILE "),
+                ),
             popup,
         );
     }
@@ -999,20 +1180,6 @@ impl Dashboard {
             }
             _ => UiCommand::None,
         }
-    }
-
-    fn focused_owned_run(&self) -> Option<&RuntimeSnapshot> {
-        let workspace = self.workspace()?;
-        let run_id = workspace
-            .panes
-            .get(&workspace.focused_pane_id)?
-            .run_id
-            .as_deref()?;
-        self.runs.iter().find(|run| {
-            run.run_id == run_id
-                && run.workspace_id == workspace.workspace_id
-                && run.pane_id == workspace.focused_pane_id
-        })
     }
 
     fn resize_keyboard(&mut self, delta: i16) -> UiCommand {
@@ -1328,14 +1495,17 @@ fn drag_ratio(divider: &Divider, x: u16, y: u16) -> u16 {
         ((u32::from(bounded) * 1000) / u32::from(length)) as u16
     }
 }
-pub fn runtime_color(runtime: PaneRuntime) -> Color {
-    match runtime {
-        PaneRuntime::Running => Color::Green,
-        PaneRuntime::Exited => Color::Red,
-        PaneRuntime::Restored => Color::Yellow,
-        PaneRuntime::Empty => Color::DarkGray,
+fn ellipsise(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
     }
+    value
+        .chars()
+        .take(width.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
 }
+
 fn runtime_label(runtime: PaneRuntime) -> &'static str {
     match runtime {
         PaneRuntime::Running => "running",
@@ -1353,7 +1523,7 @@ mod tests {
         adapter::{AdapterCapabilities, ProcessCapabilities},
         protocol::{ProcessState, ProviderState},
     };
-    use crossterm::event::KeyEventKind;
+    use crossterm::event::{KeyEventKind, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
     use std::collections::BTreeMap;
 
@@ -1401,6 +1571,62 @@ mod tests {
         }
     }
 
+    fn prefix(dashboard: &mut Dashboard) {
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            UiCommand::None
+        );
+        assert!(dashboard.prefix_pending());
+    }
+
+    fn command(dashboard: &mut Dashboard, code: KeyCode) -> UiCommand {
+        prefix(dashboard);
+        dashboard.key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn render_to_string(dashboard: &mut Dashboard, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// A full-screen seed for `run_id`, sized to the inner geometry a 100x30 dashboard gives
+    /// the left pane, so nothing this feeds is clipped for a reason other than pane size.
+    fn attach_event(run_id: &str, bytes: &[u8]) -> Event {
+        let mut source = crate::terminal::VtTerminal::new(PANE_ROWS, PANE_COLS, 0);
+        source.feed(bytes);
+        Event::PaneAttached {
+            run_id: run_id.into(),
+            revision: 1,
+            rows: PANE_ROWS,
+            cols: PANE_COLS,
+            screen: STANDARD.encode(source.state_bytes()),
+        }
+    }
+
+    /// Inner geometry of pane "a" when the fixture dashboard is drawn at 100x30: a two-row
+    /// header and a two-row footer leave a 26-row body; the 28-column sidebar leaves 72
+    /// columns, whose even vertical split gives the left pane 35; borders take one cell on
+    /// each side of both axes.
+    const PANE_ROWS: u16 = 24;
+    const PANE_COLS: u16 = 33;
+
+    fn bound_dashboard() -> Dashboard {
+        let mut dashboard = dashboard();
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("a")
+            .unwrap()
+            .run_id = Some("run_1".into());
+        dashboard
+    }
+
     fn snapshot() -> RuntimeSnapshot {
         RuntimeSnapshot {
             binding_kind: crate::protocol::BindingKind::Repository,
@@ -1433,21 +1659,23 @@ mod tests {
     #[test]
     fn renders_split_focus_states_and_narrow_fallback() {
         for (width, height) in [(90, 24), (40, 10)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut dashboard = dashboard();
-            terminal.draw(|frame| dashboard.render(frame)).unwrap();
-            let text = terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
+            let text = render_to_string(&mut dashboard, width, height);
             assert!(text.contains("Daily"));
             assert!(text.contains(if width < 52 { "compact" } else { "editor" }));
         }
-        assert_eq!(runtime_color(PaneRuntime::Running), Color::Green);
-        assert_eq!(runtime_color(PaneRuntime::Restored), Color::Yellow);
+        // Focus is now carried entirely by the theme's border tokens rather than by a
+        // per-runtime body colour, so that is what the render has to prove.
+        let mut dashboard = dashboard();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        let theme = Theme::warm();
+        let focused = dashboard.pane_areas["a"];
+        let unfocused = dashboard.pane_areas["b"];
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(focused.x, focused.y + 1)].fg, theme.border_focused);
+        assert_eq!(buffer[(unfocused.x, unfocused.y + 1)].fg, theme.border);
+        assert_ne!(theme.border_focused, theme.border);
     }
 
     #[test]
@@ -1455,6 +1683,7 @@ mod tests {
         let mut dashboard = dashboard();
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
         terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        prefix(&mut dashboard);
         let tab = dashboard.key(KeyEvent::new_with_kind(
             KeyCode::Tab,
             KeyModifiers::NONE,
@@ -1489,7 +1718,6 @@ mod tests {
         assert!(
             matches!(resize, UiCommand::Request(request) if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Resize { ratio_milli, .. }) if *ratio_milli > 0 && *ratio_milli < 500))
         );
-        assert!(!dashboard.input_mode);
     }
 
     #[test]
@@ -1541,14 +1769,14 @@ mod tests {
                 runtime: PaneRuntime::Restored,
             },
         );
-        let create = dashboard.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        let create = command(&mut dashboard, KeyCode::Char('n'));
         assert!(matches!(
             create,
             UiCommand::Request(request)
                 if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Create { workspace_id, pane_id, .. })
                     if workspace_id == "workspace_4" && pane_id == "pane_5")
         ));
-        let split = dashboard.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        let split = command(&mut dashboard, KeyCode::Char('h'));
         assert!(matches!(
             split,
             UiCommand::Request(request)
@@ -1558,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_runtime_binding_facts_and_explicit_unbound_facts() {
+    fn binding_facts_move_into_the_pane_title_and_never_replace_the_screen() {
         let mut dashboard = dashboard();
         dashboard.layout.workspaces[0]
             .panes
@@ -1566,20 +1794,19 @@ mod tests {
             .unwrap()
             .run_id = Some("dock_real".into());
         dashboard.runs.push(snapshot());
-        let mut terminal = Terminal::new(TestBackend::new(110, 28)).unwrap();
-        terminal.draw(|frame| dashboard.render(frame)).unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(text.contains("repository: /repo/real"));
-        assert!(text.contains("task: TASK-61"));
-        assert!(text.contains("binding: w/a"));
-        assert!(text.contains("repository: unbound"));
-        assert!(text.contains("task: unbound"));
+        let text = render_to_string(&mut dashboard, 110, 28);
+        // The body is the emulated screen now, so the run's identity has to survive in the
+        // one place still reserved for facts about the binding: the pane's own title.
+        assert!(text.contains("dock_real · TASK-61"), "{text:?}");
+        assert!(text.contains("agent · unbound"), "{text:?}");
+        for gone in [
+            "repository: /repo/real",
+            "task: TASK-61",
+            "binding: w/a",
+            "No Dock-owned run bound",
+        ] {
+            assert!(!text.contains(gone), "pane body still prints {gone}");
+        }
     }
 
     #[test]
@@ -1591,13 +1818,15 @@ mod tests {
             provider: "Codex CLI".into(),
             repository_match: false,
         });
-        assert_eq!(
+        // `d` is a pane keystroke now, so it must reach the PTY rather than clear the list.
+        assert!(matches!(
             dashboard.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
-            UiCommand::None
-        );
-        assert!(dashboard.external.is_empty());
+            UiCommand::PaneInput(bytes) if bytes == b"d"
+        ));
+        assert_eq!(dashboard.external.len(), 1);
+        dashboard.external.clear();
         assert_eq!(
-            dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            command(&mut dashboard, KeyCode::Char('l')),
             UiCommand::LoadCatalog
         );
         assert_eq!(
@@ -1703,33 +1932,24 @@ mod tests {
     #[test]
     fn published_keymap_help_is_contextual_and_escape_is_local() {
         let mut dashboard = dashboard();
-        assert_eq!(
-            dashboard.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
-            UiCommand::None
-        );
+        assert_eq!(command(&mut dashboard, KeyCode::Char('?')), UiCommand::None);
         assert!(dashboard.help_open);
-        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
-        terminal.draw(|frame| dashboard.render(frame)).unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let text = render_to_string(&mut dashboard, 90, 24);
         for key in [
+            "Every key goes to the focused pane",
             "n new workspace",
             "h/v split",
-            "Tab/arrows focus",
+            "z zoom",
             "r rename",
             "x close",
             "l launch",
-            "i input",
+            "d detach",
             "q quit",
-            "? help",
         ] {
             assert!(text.contains(key), "missing published mnemonic: {key}");
         }
+        // Esc closes the overlay instead of reaching the pane, which is the one place the
+        // dashboard is still allowed to keep a key for itself.
         assert_eq!(
             dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             UiCommand::None
@@ -1738,36 +1958,41 @@ mod tests {
     }
 
     #[test]
-    fn input_mode_requires_owned_binding_and_escape_never_forwards_a_byte() {
-        let mut dashboard = dashboard();
-        assert_eq!(
-            dashboard.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
-            UiCommand::None
-        );
-        assert_eq!(
-            dashboard.error.as_deref(),
-            Some("input unavailable: focused pane has no Dock-owned run")
-        );
-        dashboard.layout.workspaces[0]
-            .panes
-            .get_mut("a")
-            .unwrap()
-            .run_id = Some("dock_real".into());
+    fn every_pane_key_is_fire_and_forget_input_and_never_a_daemon_request() {
+        let mut dashboard = bound_dashboard();
         dashboard.runs.push(snapshot());
-        assert_eq!(
-            dashboard.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
-            UiCommand::None
-        );
-        assert!(dashboard.input_mode);
-        assert_eq!(
-            dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            UiCommand::None
-        );
-        assert!(!dashboard.input_mode);
-        assert!(matches!(
-            dashboard.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
-            UiCommand::Quit
-        ));
+        // There is no mode to enter any more: the very first keystroke is pane input, and it
+        // must be `PaneInput`, because the `Request` arm costs two daemon round trips before
+        // the echo can be painted.
+        for (key, expected) in [
+            (
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                b"q".to_vec(),
+            ),
+            (KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), vec![0x1b]),
+            (
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                b"\r".to_vec(),
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                vec![0x03],
+            ),
+        ] {
+            let outcome = dashboard.key(key);
+            assert_eq!(
+                outcome,
+                UiCommand::PaneInput(expected),
+                "{key:?} must be fire-and-forget pane input"
+            );
+            assert!(
+                !matches!(outcome, UiCommand::Request(_)),
+                "{key:?} took the slow request path"
+            );
+        }
+        // Only the prefixed form still commands the dashboard.
+        assert_eq!(command(&mut dashboard, KeyCode::Char('q')), UiCommand::Quit);
+        assert_eq!(command(&mut dashboard, KeyCode::Char('d')), UiCommand::Quit);
     }
 
     #[test]
@@ -1800,17 +2025,20 @@ mod tests {
     #[test]
     fn focus_split_resize_and_forms_change_locally_before_requests_complete() {
         let mut dashboard = dashboard();
-        let command = dashboard.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(matches!(command, UiCommand::Request(_)));
+        let focus = command(&mut dashboard, KeyCode::Tab);
+        assert!(matches!(focus, UiCommand::Request(_)));
         assert_eq!(dashboard.workspace().unwrap().focused_pane_id, "b");
+        prefix(&mut dashboard);
+        let back = dashboard.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(matches!(back, UiCommand::Request(_)));
+        assert_eq!(dashboard.workspace().unwrap().focused_pane_id, "a");
+        let focus = command(&mut dashboard, KeyCode::Tab);
+        assert!(matches!(focus, UiCommand::Request(_)));
         let panes = dashboard.workspace().unwrap().panes.len();
-        let command = dashboard.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-        assert!(matches!(command, UiCommand::Request(_)));
+        let split = command(&mut dashboard, KeyCode::Char('h'));
+        assert!(matches!(split, UiCommand::Request(_)));
         assert_eq!(dashboard.workspace().unwrap().panes.len(), panes + 1);
-        assert_eq!(
-            dashboard.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
-            UiCommand::None
-        );
+        assert_eq!(command(&mut dashboard, KeyCode::Char('r')), UiCommand::None);
         assert!(dashboard.rename_form.is_some());
         assert_eq!(
             dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -1818,7 +2046,7 @@ mod tests {
         );
         assert!(dashboard.rename_form.is_none());
         assert_eq!(
-            dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            command(&mut dashboard, KeyCode::Char('l')),
             UiCommand::LoadCatalog
         );
         assert!(dashboard.launch_form.is_some());
@@ -1832,11 +2060,8 @@ mod tests {
     #[test]
     fn unavailable_actions_always_explain_the_reason() {
         let mut dashboard = Dashboard::default();
-        for key in ['i', 'h', 'r', 'x', '+'] {
-            assert_eq!(
-                dashboard.key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
-                UiCommand::None
-            );
+        for key in ['h', 'r', 'x', '+', 'z'] {
+            assert_eq!(command(&mut dashboard, KeyCode::Char(key)), UiCommand::None);
             assert!(
                 dashboard
                     .error
@@ -1845,6 +2070,145 @@ mod tests {
                 "{key} silently no-op'd"
             );
         }
+    }
+
+    #[test]
+    fn a_bound_pane_renders_emulated_screen_content_not_binding_facts() {
+        let mut dashboard = bound_dashboard();
+        // Twenty distinct rows, not one line: a screen with a couple of lines on it is
+        // rendered identically whether the pane is 24 rows tall or 4, so only output that
+        // fills the pane can prove the geometry as well as the content.
+        let mut output = Vec::new();
+        for index in 1..=20 {
+            output.extend_from_slice(format!("screen row {index:02}\r\n").as_bytes());
+        }
+        dashboard.apply_event(attach_event("run_1", &output));
+        let rendered = render_to_string(&mut dashboard, 100, 30);
+        for index in 1..=20 {
+            assert!(
+                rendered.contains(&format!("screen row {index:02}")),
+                "row {index} missing, so the pane is not being drawn at its full height"
+            );
+        }
+        assert!(!rendered.contains("No Dock-owned run bound"));
+    }
+
+    #[test]
+    fn an_unattached_pane_shows_a_placeholder_until_its_first_screen_arrives() {
+        let mut dashboard = bound_dashboard();
+        assert!(render_to_string(&mut dashboard, 100, 30).contains("starting…"));
+        dashboard.apply_event(attach_event("run_1", b"shell is up\r\n"));
+        let rendered = render_to_string(&mut dashboard, 100, 30);
+        assert!(rendered.contains("shell is up"));
+    }
+
+    #[test]
+    fn keys_reach_the_pane_and_the_prefix_opens_command_mode() {
+        let mut dashboard = dashboard();
+        let outcome = dashboard.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(outcome, UiCommand::PaneInput(bytes) if bytes == b"x"));
+        let pending = dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(pending, UiCommand::None);
+        assert!(dashboard.prefix_pending());
+        // A second prefix is the escape hatch for a literal Ctrl+B in the pane.
+        assert!(matches!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            UiCommand::PaneInput(bytes) if bytes == vec![0x02]
+        ));
+        assert!(!dashboard.prefix_pending());
+    }
+
+    #[test]
+    fn which_key_hints_appear_only_while_the_prefix_is_pending() {
+        let mut dashboard = dashboard();
+        let quiet = render_to_string(&mut dashboard, 100, 30);
+        assert!(!quiet.contains("split"), "{quiet:?}");
+        assert!(quiet.contains("Ctrl+B ? help"), "{quiet:?}");
+        prefix(&mut dashboard);
+        let pending = render_to_string(&mut dashboard, 100, 30);
+        for hint in ["split", "zoom", "detach", "focus prev"] {
+            assert!(pending.contains(hint), "missing which-key hint {hint}");
+        }
+    }
+
+    #[test]
+    fn a_long_agent_label_is_shortened_rather_than_wrapped_onto_a_second_line() {
+        let mut dashboard = dashboard();
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "dock_sh_workspace_1_pane_2".into(),
+            agent: None,
+            state: AgentState::Working,
+        });
+        let rendered = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            rendered.contains("dock_sh_workspace_1_pan…"),
+            "{rendered:?}"
+        );
+        assert!(!rendered.contains("dock_sh_workspace_1_pane_2"));
+    }
+
+    #[test]
+    fn sidebar_lists_agents_with_blocked_first() {
+        let mut dashboard = dashboard();
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_idle".into(),
+            agent: Some(AgentKind::Amp),
+            state: AgentState::Idle,
+        });
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_blocked".into(),
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Blocked,
+        });
+        let rendered = render_to_string(&mut dashboard, 100, 30);
+        let claude = rendered.find("claude").expect("claude listed");
+        let amp = rendered.find("amp").expect("amp listed");
+        assert!(claude < amp, "blocked agents must sort above idle ones");
+    }
+
+    #[test]
+    fn a_bound_pane_is_resized_to_its_inner_geometry_and_only_when_it_changes() {
+        let mut dashboard = bound_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        let first = dashboard.take_pending_resizes();
+        assert_eq!(
+            first,
+            vec![("w".to_owned(), "a".to_owned(), PANE_ROWS, PANE_COLS)],
+            "only the pane with a run needs a PTY, and it must be told its exact inner size"
+        );
+        render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            dashboard.take_pending_resizes().is_empty(),
+            "unchanged geometry must not re-send"
+        );
+        render_to_string(&mut dashboard, 120, 40);
+        assert_eq!(dashboard.take_pending_resizes().len(), 1);
+    }
+
+    #[test]
+    fn zoom_gives_the_focused_pane_the_whole_body_and_resizes_its_pty() {
+        let mut dashboard = bound_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        dashboard.take_pending_resizes();
+        assert_eq!(command(&mut dashboard, KeyCode::Char('z')), UiCommand::None);
+        render_to_string(&mut dashboard, 100, 30);
+        let zoomed = dashboard.take_pending_resizes();
+        // The body is 72 columns wide; zoomed, pane "a" owns all of it rather than the 35
+        // its half of the vertical split gave it.
+        assert_eq!(
+            zoomed,
+            vec![("w".to_owned(), "a".to_owned(), PANE_ROWS, 70)]
+        );
+        assert!(
+            !dashboard.pane_areas.contains_key("b"),
+            "b is hidden while a is zoomed"
+        );
+        assert_eq!(command(&mut dashboard, KeyCode::Char('z')), UiCommand::None);
+        render_to_string(&mut dashboard, 100, 30);
+        assert_eq!(
+            dashboard.take_pending_resizes(),
+            vec![("w".to_owned(), "a".to_owned(), PANE_ROWS, PANE_COLS)]
+        );
     }
 
     #[test]

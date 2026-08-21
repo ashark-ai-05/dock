@@ -84,6 +84,8 @@ impl Keymap {
             ("n", "workspace"),
             ("h", "split ⇋"),
             ("v", "split ⇵"),
+            ("Tab", "focus next"),
+            ("S-Tab", "focus prev"),
             ("←↑→↓", "focus"),
             ("+/-", "resize"),
             ("z", "zoom"),
@@ -116,6 +118,9 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Char('+') => PaneCommand::Resize(50),
         KeyCode::Char('-') => PaneCommand::Resize(-50),
         KeyCode::Tab => PaneCommand::Focus(FocusDirection::Next),
+        // Shift+Tab cycles backwards nearly everywhere it exists, and without it
+        // `FocusDirection::Previous` has no key at all.
+        KeyCode::BackTab => PaneCommand::Focus(FocusDirection::Previous),
         KeyCode::Left => PaneCommand::Focus(FocusDirection::Left),
         KeyCode::Right => PaneCommand::Focus(FocusDirection::Right),
         KeyCode::Up => PaneCommand::Focus(FocusDirection::Up),
@@ -195,9 +200,25 @@ mod tests {
     }
 
     #[test]
+    fn shift_tab_after_the_prefix_cycles_focus_backwards() {
+        let mut keymap = Keymap::new();
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                KeyEncoding::default()
+            ),
+            KeyOutcome::Command(PaneCommand::Focus(FocusDirection::Previous))
+        );
+        assert!(!keymap.is_pending());
+    }
+
+    #[test]
     fn published_hints_cover_every_documented_binding() {
         let keys: Vec<&str> = Keymap::hints().iter().map(|(key, _)| *key).collect();
-        for expected in ["n", "h", "v", "z", "r", "x", "l", "d", "?", "q"] {
+        for expected in [
+            "n", "h", "v", "z", "r", "x", "l", "d", "?", "q", "Tab", "S-Tab",
+        ] {
             assert!(keys.contains(&expected), "missing hint for {expected}");
         }
     }

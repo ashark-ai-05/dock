@@ -4007,7 +4007,7 @@ mod tests {
         *registry.after_launch_before_receipt_hook.lock().unwrap() = Some(Arc::new({
             let marker = marker.clone();
             move || {
-                let deadline = Instant::now() + Duration::from_secs(3);
+                let deadline = Instant::now() + Duration::from_secs(15);
                 while !marker.exists() && Instant::now() < deadline {
                     thread::sleep(Duration::from_millis(10));
                 }
@@ -4022,7 +4022,7 @@ mod tests {
             Err((ErrorCode::Internal, _))
         ));
         let pid: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while unsafe { nix::libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }

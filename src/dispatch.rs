@@ -87,6 +87,11 @@ struct RuntimeEntry {
 struct RuntimeSlot {
     transition: Arc<Mutex<()>>,
     state: RuntimeSlotState,
+    /// A pane's auto-launched shell is infrastructure the user opened, not agent work, so it is
+    /// excluded from every capacity count (Ruling R20). Decided once at admission from an
+    /// explicit caller flag and carried here, never re-derived from the run id at a counting
+    /// site.
+    pane_shell: bool,
 }
 
 #[derive(Clone)]
@@ -352,7 +357,7 @@ impl RuntimeRegistry {
         profile: DashboardProfile,
         runtime_directory: String,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
-        validate_run_id(&run_id).map_err(|m| (ErrorCode::InvalidBinding, m))?;
+        validate_external_run_id(&run_id).map_err(|m| (ErrorCode::InvalidBinding, m))?;
         let directory = canonical_terminal_directory(Path::new(&runtime_directory))
             .map_err(|m| (ErrorCode::InvalidBinding, m))?;
         let adapter_id = crate::adapter::AdapterId::from(profile);
@@ -386,7 +391,13 @@ impl RuntimeRegistry {
             workspace_id: workspace_id.clone(),
             pane_id: pane_id.clone(),
         };
-        self.dispatch_with_binding(request, false, Some((workspace_id, pane_id)), Some(binding))
+        self.dispatch_with_binding(
+            request,
+            false,
+            Some((workspace_id, pane_id)),
+            Some(binding),
+            false,
+        )
     }
 
     /// Every Dock pane is a working terminal from the moment it exists. This is a Dock-created
@@ -408,6 +419,9 @@ impl RuntimeRegistry {
             return;
         };
         let run_id = pane_shell_run_id(workspace_id, pane_id);
+        // A pane closed and recreated under the same identity would otherwise inherit the dead
+        // reservation of its predecessor and be refused as a duplicate run id.
+        self.clear_pane_shell_reservation(&run_id);
         let request = DispatchRequest {
             repository_root: directory.display().to_string(),
             external_task_ref: String::new(),
@@ -437,14 +451,13 @@ impl RuntimeRegistry {
             false,
             Some((workspace_id.to_owned(), pane_id.to_owned())),
             Some(binding),
+            true,
         );
     }
 
-    /// Frees a pane's shell identity so the pane can be launched into. The auto-launched shell is
-    /// a placeholder, not a claim on the pane: without this, every pane would permanently refuse
-    /// `launch_into_pane` and `terminal_launch` with "pane already has a run". Retiring also
-    /// clears the durable reservation left by a previous occupant of the same pane identity, so
-    /// a recreated pane is not left inert by a duplicate run id.
+    /// Retires the placeholder shell a committed dispatch has just displaced from a pane. Called
+    /// only after that dispatch is irrevocable, so a refused or rolled-back launch always leaves
+    /// the pane's working shell running and bound.
     fn retire_pane_shell(&self, workspace_id: &str, pane_id: &str) {
         let run_id = pane_shell_run_id(workspace_id, pane_id);
         let slot = self
@@ -478,19 +491,29 @@ impl RuntimeRegistry {
             {
                 return;
             }
+            // A no-op unless the pane still points at the shell, which is the case only when
+            // this displaced it rather than a rollback having already restored something else.
             layout.unbind_run(workspace_id, pane_id, &run_id);
             runs.remove(&run_id);
         }
+        self.clear_pane_shell_reservation(&run_id);
+    }
+
+    /// A pane shell's identity belongs to the pane, not to one launch, so its durable reservation
+    /// must not outlive the run holding it: otherwise the pane's next shell is refused as a
+    /// duplicate run id and the pane is left silently inert. Only ever clears an identity that no
+    /// live run holds.
+    fn clear_pane_shell_reservation(&self, run_id: &str) {
         if self
             .runs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .contains_key(&run_id)
+            .contains_key(run_id)
         {
             return;
         }
         // Guarded by `exists` so the common case costs no directory fsync.
-        if let Ok(receipt) = self.receipt_path(&run_id)
+        if let Ok(receipt) = self.receipt_path(run_id)
             && receipt.exists()
         {
             let _ = rollback_run_id_reservation(&receipt);
@@ -545,11 +568,12 @@ impl RuntimeRegistry {
                     layout.clone(),
                     receipt.clone(),
                     repository_root.clone(),
+                    slot.pane_shell,
                 )),
                 _ => None,
             })
             .collect();
-        for (run_id, transition, entry, layout, receipt, repository_root) in stopping {
+        for (run_id, transition, entry, layout, receipt, repository_root, pane_shell) in stopping {
             // Never block in process shutdown while holding a registry or layout lock.
             let _transition = transition.lock().unwrap_or_else(|p| p.into_inner());
             if entry.runtime.stop().is_err() {
@@ -574,6 +598,7 @@ impl RuntimeRegistry {
                             layout: Some(layout),
                             receipt,
                         },
+                        pane_shell,
                     },
                 );
             }
@@ -801,7 +826,7 @@ impl RuntimeRegistry {
         gate_release_authorized: bool,
         launch_target: Option<(String, String)>,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
-        self.dispatch_with_binding(request, gate_release_authorized, launch_target, None)
+        self.dispatch_with_binding(request, gate_release_authorized, launch_target, None, false)
     }
 
     fn dispatch_with_binding(
@@ -810,6 +835,7 @@ impl RuntimeRegistry {
         gate_release_authorized: bool,
         launch_target: Option<(String, String)>,
         binding: Option<RunBinding>,
+        pane_shell: bool,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
         self.reconcile_failed_dispatches();
         let mut binding = match binding {
@@ -836,11 +862,6 @@ impl RuntimeRegistry {
             .adapter
             .resolve()
             .map_err(|m| (ErrorCode::AdapterUnavailable, m))?;
-        // Only once this launch has a real executable behind it: a pane's auto-launched shell is
-        // a placeholder that any real run replaces, but a launch that was never going to start
-        // must not cost the user their working shell. Binding a pane without retiring its shell
-        // would leave that shell running with no pane, unreachable and still holding capacity.
-        self.retire_pane_shell(&binding.workspace_id, &binding.pane_id);
         let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
         // All operations needing both registries take runs before programme. Queueing uses the
         // same order, so the identity check and subsequent run reservation cannot deadlock or be
@@ -859,9 +880,17 @@ impl RuntimeRegistry {
         self.check_capacity(&runs, &binding.repository_root)?;
         let mut layout = self.layout.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((workspace_id, pane_id)) = &launch_target {
-            layout
-                .check_launch_target(workspace_id, pane_id)
-                .map_err(layout_error)?;
+            // A pane's auto-launched shell is a placeholder, not an occupant: it must not make
+            // the pane permanently un-launchable-into. Every other refusal — missing workspace,
+            // missing pane, a real run already bound — still applies, and the shell itself is
+            // only retired once this dispatch is irrevocably committed far below.
+            let placeholder = layout.pane_run(workspace_id, pane_id).as_deref()
+                == Some(pane_shell_run_id(workspace_id, pane_id).as_str());
+            if let Err(message) = layout.check_launch_target(workspace_id, pane_id)
+                && !placeholder
+            {
+                return Err(layout_error(message));
+            }
         }
         layout
             .check_bind_capacity(&binding.workspace_id, &binding.pane_id)
@@ -876,6 +905,7 @@ impl RuntimeRegistry {
                 state: RuntimeSlotState::Launching {
                     repository_root: binding.repository_root.clone(),
                 },
+                pane_shell,
             },
         );
         let layout_rollback = match layout.ensure_bound_pane(
@@ -909,6 +939,7 @@ impl RuntimeRegistry {
             hook();
         }
         let size = self.pane_size(&binding.workspace_id, &binding.pane_id);
+        let bound_pane = (binding.workspace_id.clone(), binding.pane_id.clone());
         let runtime = Arc::new(OwnedRuntime::launch(
             binding,
             adapter,
@@ -983,6 +1014,7 @@ impl RuntimeRegistry {
                                 layout: layout_rollback,
                                 receipt,
                             },
+                            pane_shell,
                         },
                     );
                     drop(runs);
@@ -1014,6 +1046,7 @@ impl RuntimeRegistry {
                                 layout: Some(layout_rollback),
                                 receipt: receipt.clone(),
                             },
+                            pane_shell,
                         },
                     );
                 } else if let Err(error) = rollback_run_id_reservation(&receipt) {
@@ -1027,6 +1060,7 @@ impl RuntimeRegistry {
                                 layout: None,
                                 receipt: receipt.clone(),
                             },
+                            pane_shell,
                         },
                     );
                 } else {
@@ -1068,6 +1102,7 @@ impl RuntimeRegistry {
                     runtime,
                     selection: request.adapter,
                 }),
+                pane_shell,
             },
         );
         if gate_release_authorized {
@@ -1084,6 +1119,15 @@ impl RuntimeRegistry {
             }
             programme.gates.remove(&run_id);
             programme.releasing.remove(&run_id);
+        }
+        drop(runs);
+        if !pane_shell {
+            // Every refusal and every rollback above leaves the pane's shell running and bound —
+            // `ensure_bound_pane` records it as the prior binding and `rollback_bound_pane`
+            // restores it. Only here, with the new run irrevocably owning the pane, is the
+            // shell it replaced unreachable, so only here is it safe to retire. Retiring any
+            // earlier would leave a pane permanently inert after a refused dispatch.
+            self.retire_pane_shell(&bound_pane.0, &bound_pane.1);
         }
         Ok(snapshot)
     }
@@ -1572,6 +1616,7 @@ impl RuntimeRegistry {
                                 repository_root: runtime.binding().repository_root,
                                 entry: entry.clone(),
                             },
+                            pane_shell: slot.pane_shell,
                         },
                     );
                 }
@@ -1592,6 +1637,7 @@ impl RuntimeRegistry {
                             RuntimeSlot {
                                 transition: Arc::clone(&slot.transition),
                                 state: RuntimeSlotState::Active(entry.clone()),
+                                pane_shell: slot.pane_shell,
                             },
                         );
                     }
@@ -1608,6 +1654,7 @@ impl RuntimeRegistry {
                             RuntimeSlot {
                                 transition: Arc::clone(&slot.transition),
                                 state: RuntimeSlotState::Active(entry.clone()),
+                                pane_shell: slot.pane_shell,
                             },
                         );
                     }
@@ -1672,6 +1719,7 @@ impl RuntimeRegistry {
                             runtime: Arc::clone(&replacement),
                             selection: entry.selection,
                         }),
+                        pane_shell: slot.pane_shell,
                     },
                 );
                 Ok(snapshot)
@@ -2207,7 +2255,7 @@ fn layout_error(message: String) -> (ErrorCode, String) {
 }
 
 fn validate_binding(request: &DispatchRequest) -> Result<RunBinding, String> {
-    validate_run_id(&request.run_id)?;
+    validate_external_run_id(&request.run_id)?;
     if request.external_task_ref.trim().is_empty() {
         return Err("external_task_ref is required".into());
     }
@@ -2398,6 +2446,20 @@ fn relative_path(from: &Path, to: &Path) -> Result<PathBuf, String> {
         relative.push(component.as_os_str());
     }
     Ok(relative)
+}
+
+/// Run ids that arrive from a client. Dock's own pane shells own the `dock_sh_` namespace and
+/// are identified by it inside the registry, so a caller must not be able to mint an id there:
+/// a real run wearing a pane's shell identity would be stopped and unbound by the next dispatch
+/// into that pane.
+fn validate_external_run_id(value: &str) -> Result<(), String> {
+    validate_run_id(value)?;
+    if value.starts_with(PANE_SHELL_RUN_ID_PREFIX) {
+        return Err(format!(
+            "run_id prefix {PANE_SHELL_RUN_ID_PREFIX:?} is reserved for Dock-owned pane shells"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_run_id(value: &str) -> Result<(), String> {
@@ -2591,6 +2653,12 @@ fn is_capacity_active(snapshot: &RuntimeSnapshot) -> bool {
 }
 
 fn slot_reserves_capacity(slot: &RuntimeSlot) -> bool {
+    if slot.pane_shell {
+        // Ruling R20: capacity bounds concurrent agent work. A terminal the user opened is
+        // infrastructure, so counting it would make the setting mean "agents plus panes" and
+        // would silently refuse both the next agent dispatch and the next pane's own shell.
+        return false;
+    }
     match &slot.state {
         RuntimeSlotState::Launching { .. }
         | RuntimeSlotState::Restarting { .. }
@@ -2611,8 +2679,10 @@ fn pane_size_key(workspace_id: &str, pane_id: &str) -> String {
 /// A pane's shell is identified by the pane it serves, not by the launch that created it, so the
 /// same pane always reclaims the same identity across relaunches.
 fn pane_shell_run_id(workspace_id: &str, pane_id: &str) -> String {
-    format!("dock_sh_{workspace_id}_{pane_id}")
+    format!("{PANE_SHELL_RUN_ID_PREFIX}{workspace_id}_{pane_id}")
 }
+
+const PANE_SHELL_RUN_ID_PREFIX: &str = "dock_sh_";
 
 /// One snapshot of the process table, shared by every run in a single `inspect`. Agent detection
 /// sits on the event-stream hot path, so it must not cost one subprocess per run.
@@ -2677,6 +2747,10 @@ mod tests {
     }
 
     fn registry() -> TestRegistry {
+        registry_with_capacity(CapacityPolicy::default())
+    }
+
+    fn registry_with_capacity(capacity: CapacityPolicy) -> TestRegistry {
         let state = std::env::current_dir()
             .unwrap()
             .join("target")
@@ -2687,7 +2761,7 @@ mod tests {
             ));
         fs::create_dir_all(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
-        let registry = RuntimeRegistry::new(&state, 2000).unwrap();
+        let registry = RuntimeRegistry::with_capacity(&state, 2000, capacity).unwrap();
         TestRegistry { registry, state }
     }
 
@@ -2762,6 +2836,175 @@ mod tests {
             .find(|run| run.pane_id == "p1")
             .expect("bound run");
         assert_eq!((run.rows, run.cols), (40, 120));
+    }
+
+    /// A dispatch can be refused after adapter resolution by six further checks. Retiring the
+    /// pane's shell before any of them would leave the pane permanently inert, which is the
+    /// exact failure auto-launch exists to eliminate.
+    #[test]
+    fn a_dispatch_refused_after_adapter_resolution_leaves_the_pane_shell_running() {
+        let registry = registry();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Daily".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+        registry
+            .workspace(WorkspaceRequest::Split {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+                new_pane_id: "p2".into(),
+                axis: crate::layout::SplitAxis::Vertical,
+            })
+            .expect("split pane");
+        let directory = registry.state.display().to_string();
+        registry
+            .terminal_launch(
+                "w1".into(),
+                "p2".into(),
+                "dock_taken".into(),
+                DashboardProfile::Fixture,
+                directory.clone(),
+            )
+            .expect("first launch claims the run id");
+
+        let refused = registry.terminal_launch(
+            "w1".into(),
+            "p1".into(),
+            "dock_taken".into(),
+            DashboardProfile::Fixture,
+            directory,
+        );
+        assert!(matches!(refused, Err((ErrorCode::DuplicateRunId, _))));
+
+        let shell_run_id = pane_shell_run_id("w1", "p1");
+        let layout = registry.layout();
+        let pane = &layout.workspaces[0].panes["p1"];
+        assert_eq!(
+            pane.run_id.as_deref(),
+            Some(shell_run_id.as_str()),
+            "a refused dispatch must leave the pane bound to its shell"
+        );
+        assert_eq!(pane.runtime, PaneRuntime::Running);
+        let snapshot = registry.inspect(Some(&shell_run_id)).expect("shell run");
+        assert_eq!(snapshot[0].state, crate::protocol::ProcessState::Running);
+    }
+
+    /// Ruling R20: capacity bounds concurrent agent work, so the terminals a user opens must
+    /// neither be refused by it nor consume it.
+    #[test]
+    fn pane_shells_neither_consume_nor_are_refused_by_agent_capacity() {
+        let registry = registry_with_capacity(CapacityPolicy {
+            global_run_capacity: 2,
+            per_repository_run_capacity: 2,
+            human_review_reserved: 0,
+        });
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Daily".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+        for (from, new) in [("p1", "p2"), ("p2", "p3")] {
+            registry
+                .workspace(WorkspaceRequest::Split {
+                    workspace_id: "w1".into(),
+                    pane_id: from.into(),
+                    new_pane_id: new.into(),
+                    axis: crate::layout::SplitAxis::Vertical,
+                })
+                .expect("split pane");
+        }
+        let layout = registry.layout();
+        for pane_id in ["p1", "p2", "p3"] {
+            let pane = &layout.workspaces[0].panes[pane_id];
+            assert_eq!(
+                pane.runtime,
+                PaneRuntime::Running,
+                "pane {pane_id} must have a shell even past the agent capacity of 2"
+            );
+        }
+        assert_eq!(
+            registry.inspect_programme().global_active,
+            0,
+            "pane shells are infrastructure and must not be counted as agent runs"
+        );
+        registry
+            .terminal_launch(
+                "w1".into(),
+                "p1".into(),
+                "dock_agent_run".into(),
+                DashboardProfile::Fixture,
+                registry.state.display().to_string(),
+            )
+            .expect("agent dispatch must still be admitted with three panes open");
+        assert_eq!(registry.inspect_programme().global_active, 1);
+    }
+
+    #[test]
+    fn the_pane_shell_run_id_namespace_is_reserved_against_callers() {
+        let registry = registry();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Daily".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+        let error = registry
+            .terminal_launch(
+                "w1".into(),
+                "p1".into(),
+                pane_shell_run_id("w1", "p1"),
+                DashboardProfile::Fixture,
+                registry.state.display().to_string(),
+            )
+            .expect_err("a caller must not mint a pane-shell identity");
+        assert_eq!(error.0, ErrorCode::InvalidBinding);
+        assert!(error.1.contains("reserved"), "{}", error.1);
+    }
+
+    /// Auto-launch means `workspace()` no longer produces an empty pane, so the empty-target
+    /// binding path needs its own coverage rather than riding on the replace-a-shell path.
+    #[test]
+    fn launch_into_pane_binds_a_genuinely_empty_pane() {
+        let repo = Repo::new("launch-into-empty-pane");
+        let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
+        *registry.suppress_pane_shells.lock().unwrap() = true;
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "ui_workspace".into(),
+                name: "UI workspace".into(),
+                pane_id: "ui_pane".into(),
+            })
+            .unwrap();
+        assert!(
+            registry
+                .layout()
+                .workspaces
+                .iter()
+                .all(|workspace| workspace.panes["ui_pane"].run_id.is_none())
+        );
+        let snapshot = registry
+            .launch_into_pane(
+                repo.request("dock_empty_pane_target"),
+                "ui_workspace".into(),
+                "ui_pane".into(),
+            )
+            .unwrap();
+        assert_eq!(snapshot.pane_id, "ui_pane");
+        assert_eq!(
+            registry
+                .layout
+                .lock()
+                .unwrap()
+                .pane_run("ui_workspace", "ui_pane")
+                .as_deref(),
+            Some("dock_empty_pane_target")
+        );
     }
 
     #[test]
@@ -5236,6 +5479,14 @@ mod tests {
             .unwrap();
         registry
             .lifecycle(&unrelated_id, LifecycleOperation::Stop)
+            .unwrap();
+        // The pane created mid-test auto-launched a real login shell. Close it through the
+        // ownership-safe path so the suite does not leak a Dock-owned process group.
+        registry
+            .workspace(WorkspaceRequest::Close {
+                workspace_id: "work_unrelated_manual".into(),
+                pane_id: "pane_unrelated_manual".into(),
+            })
             .unwrap();
     }
 

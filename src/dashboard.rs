@@ -12,10 +12,10 @@ use ratatui::{
 use crate::{
     adapter::{AdapterId, AdapterSelection},
     discovery::ExternalAgentCandidate,
-    layout::{LayoutNode, LayoutSnapshot, PaneRuntime, SplitAxis, WorkspaceLayout},
+    layout::{LayoutNode, LayoutSnapshot, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout},
     protocol::{
-        DispatchRequest, LaunchIntoPaneRequest, PaneInputRequest, Request, RuntimeSnapshot,
-        WorkspaceRequest,
+        BindingKind, DashboardProfile, DispatchRequest, LaunchIntoPaneRequest, PaneInputRequest,
+        Request, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
     },
 };
 
@@ -25,6 +25,7 @@ const MIN_PANE_HEIGHT: u16 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Request(Box<Request>),
+    LoadCatalog,
     Refresh,
     Quit,
     None,
@@ -36,6 +37,8 @@ pub struct Dashboard {
     pub runs: Vec<RuntimeSnapshot>,
     pub external: Vec<ExternalAgentCandidate>,
     pub repository_root: String,
+    pub runtime_directory: String,
+    pub repository_launches: Vec<RepositoryLaunchOption>,
     pub workspace_index: usize,
     pub error: Option<String>,
     pub input_mode: bool,
@@ -45,7 +48,37 @@ pub struct Dashboard {
     sequence: u64,
     dismiss_external_area: Option<Rect>,
     launch_area: Option<Rect>,
+    launch_form: Option<LaunchForm>,
+    launch_profile_areas: Vec<Rect>,
+    launch_confirm_area: Option<Rect>,
+    launch_mode_area: Option<Rect>,
+    help_open: bool,
+    rename_form: Option<String>,
+    last_launch_profile: usize,
+    last_repository_mode: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryLaunchOption {
+    pub task_ref: String,
+    pub worktree: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchForm {
+    index: usize,
+    repository_mode: bool,
+    confirming: bool,
+    query: String,
+}
+
+const PROFILES: &[(DashboardProfile, &str)] = &[
+    (DashboardProfile::Fixture, "Fixture"),
+    (DashboardProfile::Amp, "Amp"),
+    (DashboardProfile::ClaudeCode, "Claude Code"),
+    (DashboardProfile::CodexCli, "Codex CLI"),
+    (DashboardProfile::GithubCopilotCli, "GitHub Copilot CLI"),
+];
 
 #[derive(Debug, Clone)]
 struct Divider {
@@ -62,6 +95,20 @@ struct DragTarget {
 }
 
 impl Dashboard {
+    pub fn set_repository_catalog(
+        &mut self,
+        repository_root: String,
+        repository_launches: Vec<RepositoryLaunchOption>,
+    ) {
+        self.repository_root = repository_root;
+        self.repository_launches = repository_launches;
+        if self.repository_launches.is_empty()
+            && let Some(form) = self.launch_form.as_mut()
+        {
+            form.repository_mode = false;
+        }
+    }
+
     pub fn workspace(&self) -> Option<&WorkspaceLayout> {
         self.layout.workspaces.get(self.workspace_index)
     }
@@ -71,6 +118,9 @@ impl Dashboard {
         self.dividers.clear();
         self.dismiss_external_area = None;
         self.launch_area = None;
+        self.launch_profile_areas.clear();
+        self.launch_confirm_area = None;
+        self.launch_mode_area = None;
         let area = frame.area();
         if area.width < 52 || area.height < 14 {
             self.dragging = None;
@@ -112,10 +162,23 @@ impl Dashboard {
         }) {
             self.dragging = None;
         }
+        if self.launch_form.is_some() {
+            self.render_launch_form(frame, area);
+        }
+        if self.help_open {
+            self.render_help(frame, area);
+        }
+        if self.rename_form.is_some() {
+            self.render_rename(frame, area);
+        }
         let notice = self.error.as_deref().unwrap_or(if self.input_mode {
-            "INPUT → selected Dock-owned pane · Esc exits input mode"
+            "INPUT MODE · bytes go only to focused Dock-owned run · Esc exits (not forwarded)"
+        } else if self.help_open {
+            "HELP · Esc/? closes"
+        } else if self.rename_form.is_some() {
+            "RENAME · type a pane name · Enter saves · Esc cancels"
         } else {
-            "[n] workspace  [l] launch owned fixture  [i] input  [d] dismiss externals  [Tab] focus  [q] quit"
+            "[n] workspace [h/v] split [Tab/←↑→↓] focus [r] rename [x] close [l] launch [i] input [?] help [q] quit"
         });
         frame.render_widget(
             Paragraph::new(notice).style(Style::default().fg(if self.error.is_some() {
@@ -195,7 +258,7 @@ impl Dashboard {
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            "[l] LAUNCH DOCK FIXTURE",
+            "[l] LAUNCH DOCK AGENT",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -228,9 +291,10 @@ impl Dashboard {
                     .and_then(|id| self.runs.iter().find(|run| run.run_id == id));
                 let output = match run {
                     Some(run) => format!(
-                        "repository: {}\ntask: {}\nrun: {}\nbinding: {}/{}\n\n{}",
-                        run.repository_root,
-                        run.external_task_ref,
+                        "mode: {}\nrepository: {}\ntask: {}\nrun: {}\nbinding: {}/{}\n\n{}",
+                        if run.binding_kind == BindingKind::Terminal { "unbound terminal" } else { "repository dispatch" },
+                        if run.binding_kind == BindingKind::Terminal { "unbound" } else { &run.repository_root },
+                        if run.binding_kind == BindingKind::Terminal { "unbound" } else { &run.external_task_ref },
                         run.run_id,
                         run.workspace_id,
                         run.pane_id,
@@ -301,15 +365,10 @@ impl Dashboard {
                 workspace.name,
                 workspace.panes.len()
             )));
-            for pane in workspace.panes.values() {
+            if let Some(pane) = workspace.panes.get(&workspace.focused_pane_id) {
                 lines.push(Line::styled(
                     format!(
-                        "{} {} · {}",
-                        if pane.pane_id == workspace.focused_pane_id {
-                            "›"
-                        } else {
-                            " "
-                        },
+                        "› {} · {} · focused",
                         pane.name,
                         runtime_label(pane.runtime)
                     ),
@@ -320,7 +379,7 @@ impl Dashboard {
             lines.push(Line::from("No workspace · n create"));
         }
         lines.push(Line::styled(
-            "q quit · Tab focus · h/v split",
+            "n new · h/v split · Tab focus · l launch · ? help · q quit",
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(
@@ -329,7 +388,76 @@ impl Dashboard {
         );
     }
 
+    fn render_help(&self, frame: &mut Frame, area: Rect) {
+        let width = area.width.min(68);
+        let height = area.height.min(18);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        let lines = vec![
+            Line::styled("DAILY", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from("n new workspace   h/v split   Tab/arrows focus"),
+            Line::from("r rename   x close   l launch   i input   q quit   ? help"),
+            Line::styled("LAYOUT", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from("←/↑ previous focus   →/↓/Tab next focus   +/- resize focused split"),
+            Line::styled("FORMS", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from("type to filter/edit   ↑/↓ or j/k select   Enter review/confirm"),
+            Line::from("Esc always cancels a form or exits input mode; it is never forwarded"),
+            Line::styled("CURRENT", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from(if self.workspace().is_some() {
+                "Workspace selected; pane commands are available."
+            } else {
+                "No workspace: create one with n before pane actions."
+            }),
+            Line::from("Esc or ? closes help"),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::ALL).title(" KEYMAP ")),
+            popup,
+        );
+    }
+
+    fn render_rename(&self, frame: &mut Frame, area: Rect) {
+        let width = area.width.min(48);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + area.height.saturating_sub(5) / 2,
+            width,
+            5,
+        );
+        let value = self.rename_form.as_deref().unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!("Name: {value}█")),
+                Line::from("Enter saves · Esc cancels"),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" RENAME FOCUSED PANE "),
+            ),
+            popup,
+        );
+    }
+
     pub fn key(&mut self, key: KeyEvent) -> UiCommand {
+        if self.help_open {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
+                self.help_open = false;
+            }
+            return UiCommand::None;
+        }
+        if self.rename_form.is_some() {
+            return self.rename_key(key);
+        }
+        if self.launch_form.is_some() {
+            return self.launch_key(key);
+        }
         if self.input_mode {
             if key.code == KeyCode::Esc {
                 self.input_mode = false;
@@ -355,9 +483,20 @@ impl Dashboard {
             })));
         }
         match key.code {
+            KeyCode::Char('?') => {
+                self.error = None;
+                self.help_open = true;
+                UiCommand::None
+            }
             KeyCode::Char('q') => UiCommand::Quit,
             KeyCode::Char('i') => {
-                self.input_mode = true;
+                if self.focused_owned_run().is_some() {
+                    self.input_mode = true;
+                    self.error = None;
+                } else {
+                    self.error =
+                        Some("input unavailable: focused pane has no Dock-owned run".into());
+                }
                 UiCommand::None
             }
             KeyCode::Char('n') => {
@@ -373,7 +512,10 @@ impl Dashboard {
                 self.external.clear();
                 UiCommand::None
             }
-            KeyCode::Char('l') => self.launch_fixture(),
+            KeyCode::Char('l') => {
+                self.open_launch();
+                UiCommand::LoadCatalog
+            }
             KeyCode::Char('[') => {
                 self.workspace_index = self.workspace_index.saturating_sub(1);
                 UiCommand::None
@@ -397,44 +539,239 @@ impl Dashboard {
             KeyCode::Char('v') => self.split(SplitAxis::Vertical),
             KeyCode::Char('r') => self.rename(),
             KeyCode::Char('x') => self.close(),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.resize_keyboard(50),
+            KeyCode::Char('-') => self.resize_keyboard(-50),
             _ => UiCommand::None,
         }
     }
 
-    fn launch_fixture(&mut self) -> UiCommand {
-        if self.repository_root.is_empty() {
-            self.error = Some("cannot launch: repository is unbound".into());
-            return UiCommand::None;
+    fn open_launch(&mut self) {
+        self.error = None;
+        self.launch_form = Some(LaunchForm {
+            index: self.last_launch_profile.min(PROFILES.len() - 1),
+            repository_mode: self.last_repository_mode && !self.repository_launches.is_empty(),
+            confirming: false,
+            query: String::new(),
+        });
+    }
+
+    fn launch_key(&mut self, key: KeyEvent) -> UiCommand {
+        let form = self.launch_form.as_mut().expect("launch form");
+        match key.code {
+            KeyCode::Esc => {
+                self.launch_form = None;
+                UiCommand::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                form.index = previous_matching(form.index, &form.query);
+                form.confirming = false;
+                UiCommand::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                form.index = next_matching(form.index, &form.query);
+                form.confirming = false;
+                UiCommand::None
+            }
+            KeyCode::Tab => {
+                if self.repository_launches.is_empty() {
+                    self.error = Some(
+                        "repository mode unavailable: no verified repository/task/worktree option"
+                            .into(),
+                    );
+                } else {
+                    form.repository_mode = !form.repository_mode;
+                    form.confirming = false;
+                    self.error = None;
+                }
+                UiCommand::None
+            }
+            KeyCode::Char(character) if !form.confirming && !character.is_control() => {
+                form.query.push(character);
+                if let Some(index) = matching_profiles(&form.query).next() {
+                    form.index = index;
+                    self.error = None;
+                } else {
+                    self.error = Some(format!("no fixed provider matches ‘{}’", form.query));
+                }
+                UiCommand::None
+            }
+            KeyCode::Backspace if !form.confirming => {
+                form.query.pop();
+                if let Some(index) = matching_profiles(&form.query).next() {
+                    form.index = index;
+                    self.error = None;
+                }
+                UiCommand::None
+            }
+            KeyCode::Enter if !form.confirming => {
+                if matching_profiles(&form.query).any(|index| index == form.index) {
+                    form.confirming = true;
+                    self.error = None;
+                } else {
+                    self.error = Some("launch unavailable: no provider matches the filter".into());
+                }
+                UiCommand::None
+            }
+            KeyCode::Enter => self.confirm_launch(),
+            _ => UiCommand::None,
         }
+    }
+
+    fn confirm_launch(&mut self) -> UiCommand {
+        let form = self.launch_form.clone().expect("launch form");
         let Some(workspace) = self.workspace() else {
             self.error = Some("cannot launch: create a workspace first".into());
+            self.launch_form = None;
             return UiCommand::None;
         };
         let workspace_id = workspace.workspace_id.clone();
         let pane_id = workspace.focused_pane_id.clone();
         let run_id = self.next_unique_id("dock_ui");
+        let profile = PROFILES[form.index].0;
+        let id = AdapterId::from(profile);
+        if !crate::adapter::builtin_available(&id) {
+            self.error = Some(format!(
+                "{} is unavailable: fixed executable not found",
+                PROFILES[form.index].1
+            ));
+            return UiCommand::None;
+        }
+        self.last_launch_profile = form.index;
+        self.last_repository_mode = form.repository_mode;
+        self.launch_form = None;
+        if !form.repository_mode {
+            return UiCommand::Request(Box::new(Request::TerminalLaunch(TerminalLaunchRequest {
+                workspace_id,
+                pane_id,
+                run_id,
+                profile,
+                runtime_directory: self.runtime_directory.clone(),
+            })));
+        }
+        let Some(option) = self.repository_launches.first() else {
+            self.error = Some("repository dispatch is unavailable".into());
+            return UiCommand::None;
+        };
         UiCommand::Request(Box::new(Request::LaunchIntoPane(LaunchIntoPaneRequest {
             workspace_id,
             pane_id,
             dispatch: DispatchRequest {
                 repository_root: self.repository_root.clone(),
-                external_task_ref: format!("ui-{run_id}"),
+                external_task_ref: option.task_ref.clone(),
                 run_id,
-                worktree: self.repository_root.clone(),
+                worktree: option.worktree.clone(),
                 adapter: AdapterSelection {
-                    id: AdapterId::Fixture,
+                    id,
                     executable: None,
-                    arguments: vec![
-                        "-c".into(),
-                        "printf 'Dock-owned fixture ready\\n'; sleep 30".into(),
-                    ],
+                    arguments: if profile == DashboardProfile::Fixture {
+                        vec![
+                            "-c".into(),
+                            "printf 'Dock-owned fixture ready\\n'; sleep 30".into(),
+                        ]
+                    } else {
+                        vec![]
+                    },
                 },
             },
         })))
     }
 
-    fn focus_next(&self, reverse: bool) -> UiCommand {
+    fn render_launch_form(&mut self, frame: &mut Frame, area: Rect) {
+        let form = self.launch_form.as_ref().expect("launch form");
+        let width = area.width.min(58);
+        let height = area.height.min(13);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        let target = self
+            .workspace()
+            .map(|workspace| format!("{}/{}", workspace.name, workspace.focused_pane_id))
+            .unwrap_or_else(|| "unavailable (create workspace first)".into());
+        let mut lines = vec![Line::from(format!(
+            "Mode: {}  [Tab] toggle · Target: {}",
+            if form.repository_mode {
+                "repository-bound"
+            } else {
+                "unbound terminal"
+            },
+            target
+        ))];
+        self.launch_mode_area = Some(Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            1,
+        ));
+        self.launch_profile_areas = (0..PROFILES.len())
+            .map(|index| {
+                Rect::new(
+                    popup.x + 1,
+                    popup.y + 2 + index as u16,
+                    popup.width.saturating_sub(2),
+                    1,
+                )
+            })
+            .collect();
+        for (index, (profile, label)) in PROFILES.iter().enumerate() {
+            let available = crate::adapter::builtin_available(&AdapterId::from(*profile));
+            let matches = profile_matches(index, &form.query);
+            lines.push(Line::styled(
+                format!(
+                    "{} {} — {}",
+                    if index == form.index && matches {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    label,
+                    if available {
+                        "available"
+                    } else {
+                        "unavailable: fixed executable not found"
+                    }
+                ),
+                Style::default().fg(if !matches {
+                    Color::Black
+                } else if available {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }),
+            ));
+        }
+        lines.push(Line::from(if form.confirming {
+            format!(
+                "REVIEW {} → {} · Enter launches · Esc cancels",
+                PROFILES[form.index].1, target
+            )
+        } else {
+            format!(
+                "Filter: {}█ · type, ↑/↓/j/k select · Enter review · Esc cancels",
+                form.query
+            )
+        }));
+        self.launch_confirm_area = Some(Rect::new(
+            popup.x + 1,
+            popup.y + 2 + PROFILES.len() as u16,
+            popup.width.saturating_sub(2),
+            1,
+        ));
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" LAUNCH FIXED PROFILE "),
+            ),
+            popup,
+        );
+    }
+
+    fn focus_next(&mut self, reverse: bool) -> UiCommand {
         let Some(workspace) = self.workspace() else {
+            self.error = Some("focus unavailable: create a workspace first".into());
             return UiCommand::None;
         };
         let ids: Vec<_> = workspace.panes.keys().collect();
@@ -449,9 +786,13 @@ impl Dashboard {
         } else {
             (current + 1) % ids.len()
         };
+        let workspace_id = workspace.workspace_id.clone();
+        let pane_id = ids[next].to_string();
+        self.layout.workspaces[self.workspace_index].focused_pane_id = pane_id.clone();
+        self.error = None;
         UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Focus {
-            workspace_id: workspace.workspace_id.clone(),
-            pane_id: ids[next].to_string(),
+            workspace_id,
+            pane_id,
         })))
     }
 
@@ -462,9 +803,22 @@ impl Dashboard {
                 workspace.focused_pane_id.clone(),
             )
         }) else {
+            self.error = Some("split unavailable: create a workspace first".into());
             return UiCommand::None;
         };
         let new_pane_id = self.next_unique_id("pane");
+        let workspace = &mut self.layout.workspaces[self.workspace_index];
+        split_leaf(&mut workspace.root, &pane_id, new_pane_id.clone(), axis);
+        workspace.panes.insert(
+            new_pane_id.clone(),
+            PaneLayout {
+                pane_id: new_pane_id.clone(),
+                name: new_pane_id.replace('_', " "),
+                run_id: None,
+                runtime: PaneRuntime::Empty,
+            },
+        );
+        workspace.focused_pane_id = new_pane_id.clone();
         UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Split {
             workspace_id,
             pane_id,
@@ -474,24 +828,18 @@ impl Dashboard {
     }
 
     fn rename(&mut self) -> UiCommand {
-        let Some((workspace_id, pane_id)) = self.workspace().map(|workspace| {
-            (
-                workspace.workspace_id.clone(),
-                workspace.focused_pane_id.clone(),
-            )
-        }) else {
+        let Some(workspace) = self.workspace() else {
+            self.error = Some("rename unavailable: create a workspace first".into());
             return UiCommand::None;
         };
-        self.sequence += 1;
-        UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Rename {
-            workspace_id,
-            pane_id: Some(pane_id),
-            name: format!("pane {}", self.sequence),
-        })))
+        self.rename_form = Some(workspace.panes[&workspace.focused_pane_id].name.clone());
+        self.error = None;
+        UiCommand::None
     }
 
-    fn close(&self) -> UiCommand {
+    fn close(&mut self) -> UiCommand {
         let Some(workspace) = self.workspace() else {
+            self.error = Some("close unavailable: create a workspace first".into());
             return UiCommand::None;
         };
         UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Close {
@@ -500,7 +848,137 @@ impl Dashboard {
         })))
     }
 
+    fn rename_key(&mut self, key: KeyEvent) -> UiCommand {
+        match key.code {
+            KeyCode::Esc => {
+                self.rename_form = None;
+                self.error = None;
+                UiCommand::None
+            }
+            KeyCode::Backspace => {
+                self.rename_form.as_mut().expect("rename form").pop();
+                UiCommand::None
+            }
+            KeyCode::Char(character) if !character.is_control() => {
+                let value = self.rename_form.as_mut().expect("rename form");
+                if value.chars().count() < 80 {
+                    value.push(character);
+                }
+                UiCommand::None
+            }
+            KeyCode::Enter => {
+                let name = self
+                    .rename_form
+                    .as_ref()
+                    .expect("rename form")
+                    .trim()
+                    .to_owned();
+                if name.is_empty() {
+                    self.error = Some("rename unavailable: name cannot be empty".into());
+                    return UiCommand::None;
+                }
+                let workspace = self
+                    .workspace()
+                    .expect("workspace retained while form open");
+                let workspace_id = workspace.workspace_id.clone();
+                let pane_id = workspace.focused_pane_id.clone();
+                self.layout.workspaces[self.workspace_index]
+                    .panes
+                    .get_mut(&pane_id)
+                    .expect("focused pane")
+                    .name = name.clone();
+                self.rename_form = None;
+                self.error = None;
+                UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Rename {
+                    workspace_id,
+                    pane_id: Some(pane_id),
+                    name,
+                })))
+            }
+            _ => UiCommand::None,
+        }
+    }
+
+    fn focused_owned_run(&self) -> Option<&RuntimeSnapshot> {
+        let workspace = self.workspace()?;
+        let run_id = workspace
+            .panes
+            .get(&workspace.focused_pane_id)?
+            .run_id
+            .as_deref()?;
+        self.runs.iter().find(|run| {
+            run.run_id == run_id
+                && run.workspace_id == workspace.workspace_id
+                && run.pane_id == workspace.focused_pane_id
+        })
+    }
+
+    fn resize_keyboard(&mut self, delta: i16) -> UiCommand {
+        let Some(workspace) = self.workspace() else {
+            self.error = Some("resize unavailable: create a split workspace first".into());
+            return UiCommand::None;
+        };
+        let workspace_id = workspace.workspace_id.clone();
+        let pane_id = workspace.focused_pane_id.clone();
+        let Some(ratio) = adjust_parent_ratio(
+            &mut self.layout.workspaces[self.workspace_index].root,
+            &pane_id,
+            delta,
+        ) else {
+            self.error = Some("resize unavailable: focused pane has no split divider".into());
+            return UiCommand::None;
+        };
+        self.error = None;
+        UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Resize {
+            workspace_id,
+            pane_id,
+            ratio_milli: ratio,
+        })))
+    }
+
     pub fn mouse(&mut self, event: MouseEvent) -> UiCommand {
+        if self.launch_form.is_some() {
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                if self
+                    .launch_mode_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    if self.repository_launches.is_empty() {
+                        self.error = Some("repository mode unavailable: no verified repository/task/worktree option".into());
+                    } else {
+                        let form = self.launch_form.as_mut().expect("launch form");
+                        form.repository_mode = !form.repository_mode;
+                        form.confirming = false;
+                        self.error = None;
+                    }
+                    return UiCommand::None;
+                }
+                if let Some(index) = self
+                    .launch_profile_areas
+                    .iter()
+                    .position(|area| contains(*area, event.column, event.row))
+                {
+                    let form = self.launch_form.as_mut().expect("launch form");
+                    form.index = index;
+                    form.confirming = false;
+                    return UiCommand::None;
+                }
+                if self
+                    .launch_confirm_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    if self
+                        .launch_form
+                        .as_ref()
+                        .is_some_and(|form| form.confirming)
+                    {
+                        return self.confirm_launch();
+                    }
+                    self.launch_form.as_mut().expect("launch form").confirming = true;
+                }
+            }
+            return UiCommand::None;
+        }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self
@@ -514,7 +992,8 @@ impl Dashboard {
                     .launch_area
                     .is_some_and(|area| contains(area, event.column, event.row))
                 {
-                    return self.launch_fixture();
+                    self.open_launch();
+                    return UiCommand::LoadCatalog;
                 }
                 if let Some(divider) = self
                     .dividers
@@ -538,6 +1017,7 @@ impl Dashboard {
                 else {
                     return UiCommand::None;
                 };
+                self.layout.workspaces[self.workspace_index].focused_pane_id = pane_id.clone();
                 UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Focus {
                     workspace_id,
                     pane_id,
@@ -554,12 +1034,19 @@ impl Dashboard {
                     return UiCommand::None;
                 };
                 let ratio = drag_ratio(divider, event.column, event.row);
+                let pane_id = divider.pane_id.clone();
                 let Some(workspace) = self.workspace() else {
                     return UiCommand::None;
                 };
+                let workspace_id = workspace.workspace_id.clone();
+                set_parent_ratio(
+                    &mut self.layout.workspaces[self.workspace_index].root,
+                    &pane_id,
+                    ratio,
+                );
                 UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Resize {
-                    workspace_id: workspace.workspace_id.clone(),
-                    pane_id: divider.pane_id.clone(),
+                    workspace_id,
+                    pane_id,
                     ratio_milli: ratio,
                 })))
             }
@@ -595,6 +1082,92 @@ impl Dashboard {
             });
             if !collision {
                 return candidate;
+            }
+        }
+    }
+}
+
+fn matching_profiles(query: &str) -> impl Iterator<Item = usize> + '_ {
+    (0..PROFILES.len()).filter(move |index| profile_matches(*index, query))
+}
+
+fn profile_matches(index: usize, query: &str) -> bool {
+    PROFILES[index]
+        .1
+        .to_ascii_lowercase()
+        .contains(&query.to_ascii_lowercase())
+}
+
+fn next_matching(current: usize, query: &str) -> usize {
+    (1..=PROFILES.len())
+        .map(|offset| (current + offset) % PROFILES.len())
+        .find(|index| profile_matches(*index, query))
+        .unwrap_or(current)
+}
+
+fn previous_matching(current: usize, query: &str) -> usize {
+    (1..=PROFILES.len())
+        .map(|offset| (current + PROFILES.len() - offset) % PROFILES.len())
+        .find(|index| profile_matches(*index, query))
+        .unwrap_or(current)
+}
+
+fn split_leaf(node: &mut LayoutNode, pane_id: &str, new_pane_id: String, axis: SplitAxis) -> bool {
+    match node {
+        LayoutNode::Pane { pane_id: id } if id == pane_id => {
+            let old = id.clone();
+            *node = LayoutNode::Split {
+                axis,
+                ratio_milli: 500,
+                first: Box::new(LayoutNode::Pane { pane_id: old }),
+                second: Box::new(LayoutNode::Pane {
+                    pane_id: new_pane_id,
+                }),
+            };
+            true
+        }
+        LayoutNode::Pane { .. } => false,
+        LayoutNode::Split { first, second, .. } => {
+            split_leaf(first, pane_id, new_pane_id.clone(), axis)
+                || split_leaf(second, pane_id, new_pane_id, axis)
+        }
+    }
+}
+
+fn adjust_parent_ratio(node: &mut LayoutNode, pane_id: &str, delta: i16) -> Option<u16> {
+    match node {
+        LayoutNode::Pane { .. } => None,
+        LayoutNode::Split {
+            ratio_milli,
+            first,
+            second,
+            ..
+        } => {
+            if first_leaf(second) == pane_id {
+                *ratio_milli = (i32::from(*ratio_milli) + i32::from(delta)).clamp(100, 900) as u16;
+                Some(*ratio_milli)
+            } else {
+                adjust_parent_ratio(first, pane_id, delta)
+                    .or_else(|| adjust_parent_ratio(second, pane_id, delta))
+            }
+        }
+    }
+}
+
+fn set_parent_ratio(node: &mut LayoutNode, pane_id: &str, ratio: u16) -> bool {
+    match node {
+        LayoutNode::Pane { .. } => false,
+        LayoutNode::Split {
+            ratio_milli,
+            first,
+            second,
+            ..
+        } => {
+            if first_leaf(second) == pane_id {
+                *ratio_milli = ratio;
+                true
+            } else {
+                set_parent_ratio(first, pane_id, ratio) || set_parent_ratio(second, pane_id, ratio)
             }
         }
     }
@@ -728,6 +1301,7 @@ mod tests {
 
     fn snapshot() -> RuntimeSnapshot {
         RuntimeSnapshot {
+            binding_kind: crate::protocol::BindingKind::Repository,
             repository_root: "/repo/real".into(),
             external_task_ref: "TASK-61".into(),
             run_id: "dock_real".into(),
@@ -908,6 +1482,7 @@ mod tests {
     fn external_dismiss_and_owned_launch_have_keyboard_and_mouse_actions() {
         let mut dashboard = dashboard();
         dashboard.repository_root = "/repo".into();
+        dashboard.runtime_directory = "/tmp".into();
         dashboard.external.push(ExternalAgentCandidate {
             provider: "Codex CLI".into(),
             repository_match: false,
@@ -917,9 +1492,17 @@ mod tests {
             UiCommand::None
         );
         assert!(dashboard.external.is_empty());
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            UiCommand::LoadCatalog
+        );
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiCommand::None
+        );
         assert!(
-            matches!(dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)), UiCommand::Request(request)
-            if matches!(request.as_ref(), Request::LaunchIntoPane(request) if request.dispatch.adapter.id == AdapterId::Fixture && request.dispatch.repository_root == "/repo" && request.workspace_id == "w" && request.pane_id == "a"))
+            matches!(dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), UiCommand::Request(request)
+            if matches!(request.as_ref(), Request::TerminalLaunch(request) if request.profile == DashboardProfile::Fixture && request.runtime_directory == "/tmp" && request.workspace_id == "w" && request.pane_id == "a"))
         );
 
         dashboard.external.push(ExternalAgentCandidate {
@@ -941,9 +1524,222 @@ mod tests {
         assert!(dashboard.external.is_empty());
         terminal.draw(|frame| dashboard.render(frame)).unwrap();
         let launch = dashboard.launch_area.unwrap();
-        assert!(
-            matches!(dashboard.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: launch.x + 1, row: launch.y, modifiers: KeyModifiers::NONE }), UiCommand::Request(request)
-            if matches!(request.as_ref(), Request::LaunchIntoPane(request) if request.dispatch.adapter.id == AdapterId::Fixture && request.workspace_id == "w" && request.pane_id == "a"))
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: launch.x + 1,
+                row: launch.y,
+                modifiers: KeyModifiers::NONE
+            }),
+            UiCommand::LoadCatalog
         );
+        assert!(dashboard.launch_form.is_some());
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(dashboard.launch_form.is_none());
+    }
+
+    #[test]
+    fn mouse_launch_form_selects_reviews_and_confirms_the_exact_focused_pane() {
+        let mut dashboard = dashboard();
+        dashboard.runtime_directory = "/tmp".into();
+        dashboard.open_launch();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        let profile = dashboard.launch_profile_areas[0];
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: profile.x,
+                row: profile.y,
+                modifiers: KeyModifiers::NONE
+            }),
+            UiCommand::None
+        );
+        let confirm = dashboard.launch_confirm_area.unwrap();
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: confirm.x,
+                row: confirm.y,
+                modifiers: KeyModifiers::NONE
+            }),
+            UiCommand::None
+        );
+        assert!(
+            matches!(dashboard.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: confirm.x, row: confirm.y, modifiers: KeyModifiers::NONE }), UiCommand::Request(request)
+            if matches!(request.as_ref(), Request::TerminalLaunch(request) if request.workspace_id == "w" && request.pane_id == "a"))
+        );
+    }
+
+    #[test]
+    fn repository_mode_constructs_only_the_existing_verified_option() {
+        let mut dashboard = dashboard();
+        dashboard.repository_root = "/repo".into();
+        dashboard.repository_launches.push(RepositoryLaunchOption {
+            task_ref: "TASK-12".into(),
+            worktree: "/repo/wt".into(),
+        });
+        dashboard.open_launch();
+        dashboard.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), UiCommand::Request(request)
+            if matches!(request.as_ref(), Request::LaunchIntoPane(request) if request.workspace_id == "w" && request.pane_id == "a" && request.dispatch.external_task_ref == "TASK-12" && request.dispatch.worktree == "/repo/wt"))
+        );
+        assert!(
+            PROFILES
+                .iter()
+                .all(|(profile, _)| AdapterId::from(*profile) != AdapterId::Generic)
+        );
+    }
+
+    #[test]
+    fn published_keymap_help_is_contextual_and_escape_is_local() {
+        let mut dashboard = dashboard();
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(dashboard.help_open);
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for key in [
+            "n new workspace",
+            "h/v split",
+            "Tab/arrows focus",
+            "r rename",
+            "x close",
+            "l launch",
+            "i input",
+            "q quit",
+            "? help",
+        ] {
+            assert!(text.contains(key), "missing published mnemonic: {key}");
+        }
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(!dashboard.help_open);
+    }
+
+    #[test]
+    fn input_mode_requires_owned_binding_and_escape_never_forwards_a_byte() {
+        let mut dashboard = dashboard();
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert_eq!(
+            dashboard.error.as_deref(),
+            Some("input unavailable: focused pane has no Dock-owned run")
+        );
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("a")
+            .unwrap()
+            .run_id = Some("dock_real".into());
+        dashboard.runs.push(snapshot());
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(dashboard.input_mode);
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(!dashboard.input_mode);
+        assert!(matches!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            UiCommand::Quit
+        ));
+    }
+
+    #[test]
+    fn launch_typeahead_review_and_safe_choice_retention_are_pointer_independent() {
+        let mut dashboard = dashboard();
+        dashboard.runtime_directory = "/tmp".into();
+        dashboard.open_launch();
+        for character in "fix".chars() {
+            assert_eq!(
+                dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                UiCommand::None
+            );
+        }
+        assert_eq!(dashboard.launch_form.as_ref().unwrap().index, 0);
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(dashboard.launch_form.as_ref().unwrap().confirming);
+        assert!(
+            matches!(dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), UiCommand::Request(request) if matches!(request.as_ref(), Request::TerminalLaunch(request) if request.profile == DashboardProfile::Fixture))
+        );
+        dashboard.open_launch();
+        let retained = dashboard.launch_form.as_ref().unwrap();
+        assert_eq!(retained.index, 0);
+        assert!(!retained.repository_mode);
+        assert!(retained.query.is_empty());
+    }
+
+    #[test]
+    fn focus_split_resize_and_forms_change_locally_before_requests_complete() {
+        let mut dashboard = dashboard();
+        let command = dashboard.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(command, UiCommand::Request(_)));
+        assert_eq!(dashboard.workspace().unwrap().focused_pane_id, "b");
+        let panes = dashboard.workspace().unwrap().panes.len();
+        let command = dashboard.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(matches!(command, UiCommand::Request(_)));
+        assert_eq!(dashboard.workspace().unwrap().panes.len(), panes + 1);
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(dashboard.rename_form.is_some());
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(dashboard.rename_form.is_none());
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            UiCommand::LoadCatalog
+        );
+        assert!(dashboard.launch_form.is_some());
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(dashboard.launch_form.is_none());
+    }
+
+    #[test]
+    fn unavailable_actions_always_explain_the_reason() {
+        let mut dashboard = Dashboard::default();
+        for key in ['i', 'h', 'r', 'x', '+'] {
+            assert_eq!(
+                dashboard.key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                UiCommand::None
+            );
+            assert!(
+                dashboard
+                    .error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("unavailable")),
+                "{key} silently no-op'd"
+            );
+        }
     }
 }

@@ -1,5 +1,7 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     fs,
+    hash::{Hash, Hasher},
     io::ErrorKind,
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -11,18 +13,36 @@ use std::{
 const RUNTIME_DIRECTORY_MODE: u32 = 0o700;
 
 pub fn default_socket_path() -> Result<PathBuf, String> {
+    runtime_paths_for(
+        &std::env::current_dir().map_err(|e| format!("could not read current directory: {e}"))?,
+    )
+    .map(|p| p.0)
+}
+
+/// Selects private durable state by canonical runtime directory. This is deliberately independent
+/// of Git and lets unrelated directories have tmux-like daemon namespaces.
+pub fn runtime_paths_for(directory: &Path) -> Result<(PathBuf, PathBuf), String> {
     let uid = unsafe { nix::libc::geteuid() };
     #[cfg(target_os = "linux")]
-    let (base, directory) = match std::env::var_os("XDG_RUNTIME_DIR") {
+    let (base, namespace) = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(path) => (PathBuf::from(path), "dock".to_owned()),
         None => (std::env::temp_dir(), format!("dock-{uid}")),
     };
     #[cfg(target_os = "macos")]
-    let (base, directory) = (std::env::temp_dir(), format!("dock-{uid}"));
+    let (base, namespace) = (std::env::temp_dir(), format!("dock-{uid}"));
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let (base, directory) = (std::env::temp_dir(), format!("dock-{uid}"));
+    let (base, namespace) = (std::env::temp_dir(), format!("dock-{uid}"));
 
-    socket_path_in(&base, &directory, uid)
+    let canonical = fs::canonicalize(directory)
+        .map_err(|error| format!("could not canonicalize runtime directory: {error}"))?;
+    let base = fs::canonicalize(&base)
+        .map_err(|error| format!("could not canonicalize runtime base: {error}"))?;
+    let mut hasher = DefaultHasher::new();
+    canonical.as_os_str().hash(&mut hasher);
+    let namespace = format!("{namespace}-{:016x}", hasher.finish());
+    let socket = socket_path_in(&base, &namespace, uid)?;
+    let state = socket.parent().expect("socket parent").join("state");
+    Ok((socket, state))
 }
 
 pub fn prepare_default_socket_path() -> Result<PathBuf, String> {

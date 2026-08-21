@@ -6,7 +6,7 @@ Status reflects the initial Slice 6 vertical slice, not complete terminal-emulat
 |---|---|---|
 | Multiple workspaces and panes | Shipped | Dynamic daemon-owned model and protocol v6 CLI |
 | Horizontal/vertical split | Shipped | Deterministic bounded binary layout tree |
-| Focus, resize, rename, close | Shipped | Foreground `dock` dashboard with keyboard/mouse actions; strict socket commands remain compatible |
+| Focus, resize, rename, close | Shipped | Published keyboard-first map plus mouse equivalents; focus and geometry paint optimistically before strict socket authority replies |
 | Layout persistence | Shipped | Owner-only atomic topology and labels |
 | Bounded pane admission | Shipped | 64 panes per workspace; atomic refusal precedes receipt, pane, PTY, and process creation; explicit close reaps the owned runtime and frees the slot |
 | Client reconnect | Shipped | Live daemon state remains authoritative |
@@ -16,9 +16,9 @@ Status reflects the initial Slice 6 vertical slice, not complete terminal-emulat
 | Bounded live scrollback | Shipped | Per-runtime configured byte bound; oldest bytes are discarded as live output arrives; available on same-daemon reconnect only and absent from durable layout/restart recovery |
 | Pane swap | Deferred | Follow-on tree operation |
 | Zoom | Deferred | Follow-on layout operation |
-| Terminal input/full emulation | Deferred | Emulator selection remains open |
+| Terminal input | Shipped (bounded) | Explicit labelled input mode for a focused Dock-owned run; `Esc` exits locally and is never forwarded. Full terminal emulation remains deferred |
 | Themes/configuration | Deferred | Slice 6 follow-on |
 | Notifications | Deferred | Slice 6 follow-on |
-| Mouse layout interaction | Deferred | Add only for demonstrated value |
+| Mouse layout interaction | Shipped | Pane focus, divider resize, dismiss, and fixed-profile launch mirror keyboard-accessible actions |
 
 Durable layout records contain no raw terminal content, command vectors, PIDs, process-group IDs, retained run bindings after restart, or absolute repository/worktree paths. Git, task, worktree, and programme authority remains unchanged.

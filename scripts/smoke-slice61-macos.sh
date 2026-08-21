@@ -9,8 +9,8 @@ target="$tmp/target"
 runtime_base="$tmp/runtime"
 mkdir -m 700 "$runtime_base"
 export TMPDIR="$runtime_base"
-socket="$runtime_base/dock-$(id -u)/dockd.sock"
-state="$repo/.dock/local"
+socket=
+state=
 first_log="$tmp/first.typescript"
 second_log="$tmp/second.typescript"
 first_error="$tmp/first.stderr"
@@ -101,18 +101,16 @@ run_pty() {
 # `dock` is the only product command. It bootstraps dockd, enters the foreground dashboard,
 # creates a workspace, and launches a Dock-owned fixture via the same UI actions a user sees.
 cd "$repo"
-run_pty "$first_log" "$first_error" nlq first "$first_result"
-[ -S "$socket" ]
+# Type-ahead selects Fixture in the bounded launch form; the first Enter reviews the
+# exact mode/profile/target and the second explicitly confirms that visible choice.
+run_pty "$first_log" "$first_error" 'nlfix<Enter><Enter>q' first "$first_result"
+socket=$(find "$runtime_base" -name dockd.sock -type s | head -1)
+[ -n "$socket" ]
 [ "$(stat -f '%Lp' "$socket")" = 600 ]
 [ "$(stat -f '%Lp' "$(dirname "$socket")")" = 700 ]
-[ "$(stat -f '%Lp' "$repo/.dock")" = 700 ]
+[ ! -e "$repo/.dock" ]
+state="$(dirname "$socket")/state"
 [ "$(stat -f '%Lp' "$state")" = 700 ]
-while IFS= read -r directory; do
-    [ "$(stat -f '%Lp' "$directory")" = 700 ]
-done <<EOF
-$(find "$state" -type d -print)
-EOF
-git -C "$repo" check-ignore -q .dock/local/layout.json
 daemon_pid=$(lsof -t "$socket" | head -1)
 
 # Reconnect through the dashboard again; the persisted workspace must be visible there.

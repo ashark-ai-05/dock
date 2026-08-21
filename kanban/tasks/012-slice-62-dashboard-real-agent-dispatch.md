@@ -1,10 +1,10 @@
 ---
 id: 12
 title: 'Slice 6.2: repo-optional terminal runtime and real-agent launch'
-status: ready
+status: done
 priority: high
 created: 2026-08-21T12:55:48+10:00
-updated: 2026-08-21T13:05:00+10:00
+updated: 2026-08-21T11:26:42Z
 tags:
     - runtime
     - tui

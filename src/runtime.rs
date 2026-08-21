@@ -83,6 +83,19 @@ struct OwnedProcessGroup(Pid);
 
 type ChildLaunch = (Child, u32, UnixStream, SyncSender<Vec<u8>>, Arc<File>);
 
+/// Every signal a terminal's line discipline or a lifecycle command can raise on a pane. Dock
+/// hands each pane child the default disposition for all of them, so a pane behaves the same
+/// whether dockd runs in the foreground, as a background job, or under `nohup`.
+const TERMINAL_SIGNALS: [nix::libc::c_int; 7] = [
+    nix::libc::SIGHUP,
+    nix::libc::SIGINT,
+    nix::libc::SIGQUIT,
+    nix::libc::SIGTERM,
+    nix::libc::SIGTSTP,
+    nix::libc::SIGTTIN,
+    nix::libc::SIGTTOU,
+];
+
 #[derive(Debug)]
 enum LifecycleState {
     Running,
@@ -588,22 +601,20 @@ fn launch_child_with_before_spawn(
     process
         .arg("-c")
         .arg(
-            r#"(dock_cleanup() { trap '' INT TERM; kill -TERM -$$; sleep 1; kill -KILL -$$; }
+            r#"(dock_cleanup() { trap '' INT TERM HUP; kill -TERM -$$; sleep 1; kill -KILL -$$; }
 trap dock_cleanup TERM
-trap 'exit 0' USR1
+# The worker replaces this shell, so the only notice the watcher gets of a normal worker exit is
+# the SIGHUP the kernel sends to the foreground group when a session's controlling process dies.
+# Cleanup must ignore it: cleanup kills the leader itself, and that SIGHUP would otherwise abort
+# the escalation to SIGKILL before it ran.
+trap 'exit 0' HUP
 IFS= read -r dock_guard <&3
 dock_cleanup) &
-dock_watcher=$!
-"$@" 3<&- </dev/tty &
-dock_child=$!
-# The supervisor must survive group lifecycle signals long enough to reap the worker. Install
-# these only after spawn so the worker receives SIGINT/SIGTERM with its own dispositions.
-trap '' INT TERM
-wait "$dock_child"
-dock_status=$?
-kill -USR1 "$dock_watcher" 2>/dev/null || true
-wait "$dock_watcher" 2>/dev/null || true
-exit "$dock_status""#,
+# exec, never an async job. POSIX requires a non-interactive shell to set SIGINT and SIGQUIT to
+# ignore for background jobs, and SIG_IGN survives exec, so a backgrounded worker could never be
+# interrupted by Ctrl+C or by killpg. exec keeps the pid, process group and session, so Dock's
+# owned-group authority, the reaper's wait and the guardian's cleanup reach are all unchanged.
+exec "$@" 3<&-"#,
         )
         .arg("dock-launch-guardian")
         .args(command)
@@ -612,10 +623,20 @@ exit "$dock_status""#,
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(slave));
     process.env("DOCK_WORKTREE", worktree);
-    // SAFETY: setsid(2) and ioctl(2) are async-signal-safe syscalls here. The PTY slave is already
-    // fd 0, so the new session leader can safely make it its controlling terminal before exec.
+    // SAFETY: signal(2), setsid(2) and ioctl(2) are async-signal-safe syscalls here. The PTY slave
+    // is already fd 0, so the new session leader can safely make it its controlling terminal
+    // before exec.
     unsafe {
         process.pre_exec(move || {
+            // How dockd itself was started must never decide what a pane can be sent. A process
+            // launched as a shell's background job inherits SIGINT and SIGQUIT set to ignore, and
+            // SIG_IGN — unlike a handler — survives exec, so without this reset every pane child
+            // of a backgrounded dockd would be permanently deaf to Ctrl+C.
+            for terminal_signal in TERMINAL_SIGNALS {
+                if nix::libc::signal(terminal_signal, nix::libc::SIG_DFL) == nix::libc::SIG_ERR {
+                    return Err(Error::last_os_error());
+                }
+            }
             setsid().map_err(Error::other)?;
             if guardian_fd == 3 {
                 if nix::libc::fcntl(guardian_fd, nix::libc::F_SETFD, 0) == -1 {
@@ -735,6 +756,59 @@ mod tests {
             !process_group_exists(process_group_id),
             "Dock-owned process group {process_group_id} survived lifecycle completion"
         );
+    }
+
+    /// Every live process sharing `process_group_id`, as `(pid, argv)`. The process table is the
+    /// only witness that can tell the exec'd worker apart from the guardian watcher that survives
+    /// beside it, because after `exec` only the watcher still carries the guardian argv.
+    fn process_group_members(process_group_id: i32) -> Vec<(i32, String)> {
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,pgid=,args="])
+            .output()
+            .expect("read the process table");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse::<i32>().ok()?;
+                let pgid = fields.next()?.parse::<i32>().ok()?;
+                (pgid == process_group_id).then(|| {
+                    let arguments = line
+                        .split_whitespace()
+                        .skip(2)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (pid, arguments)
+                })
+            })
+            .collect()
+    }
+
+    fn signal_name(signal: nix::libc::c_int) -> &'static str {
+        match signal {
+            nix::libc::SIGHUP => "SIGHUP",
+            nix::libc::SIGINT => "SIGINT",
+            nix::libc::SIGQUIT => "SIGQUIT",
+            nix::libc::SIGTERM => "SIGTERM",
+            nix::libc::SIGTSTP => "SIGTSTP",
+            nix::libc::SIGTTIN => "SIGTTIN",
+            nix::libc::SIGTTOU => "SIGTTOU",
+            _ => "UNKNOWN",
+        }
+    }
+
+    fn signal_disposition(signal: nix::libc::c_int) -> &'static str {
+        let mut observed = std::mem::MaybeUninit::<nix::libc::sigaction>::uninit();
+        // SAFETY: a null new-action queries without mutating, and sigaction fills exactly one
+        // `struct sigaction`, which is initialised on success and never read otherwise.
+        if unsafe { nix::libc::sigaction(signal, std::ptr::null(), observed.as_mut_ptr()) } == -1 {
+            return "QUERY_FAILED";
+        }
+        match unsafe { observed.assume_init() }.sa_sigaction {
+            handler if handler == nix::libc::SIG_DFL => "SIG_DFL",
+            handler if handler == nix::libc::SIG_IGN => "SIG_IGN",
+            _ => "HANDLER",
+        }
     }
 
     const FIXTURE_SIZE: PtySize = PtySize { rows: 24, cols: 80 };
@@ -983,6 +1057,184 @@ mod tests {
         wait_for_group_exit(process_group_id);
     }
 
+    /// Not a test of Dock but the worker-side half of
+    /// `worker_execs_with_a_default_sigint_disposition`: that test relaunches this binary under a
+    /// Dock PTY selecting exactly this case, so the report below is made by a real worker, at the
+    /// moment it starts, from its own `sigaction` call. Run in-suite it is simply a no-op probe.
+    #[test]
+    fn reports_the_signal_dispositions_this_process_inherited() {
+        // One narrow line per signal: the probe reports onto an 80-column pane, and a wrapped
+        // report would not be findable on the emulated screen.
+        for signal in TERMINAL_SIGNALS {
+            println!(
+                "DOCKPROBE {}={}",
+                signal_name(signal),
+                signal_disposition(signal)
+            );
+        }
+    }
+
+    fn launch_signal_probe() -> OwnedRuntime {
+        let probe = std::env::current_exe().expect("this test binary");
+        OwnedRuntime::launch_fixture(
+            vec![
+                probe.display().to_string(),
+                "--exact".into(),
+                "runtime::tests::reports_the_signal_dispositions_this_process_inherited".into(),
+                "--nocapture".into(),
+            ],
+            256,
+            FIXTURE_SIZE,
+        )
+    }
+
+    fn assert_probe_reports_every_terminal_signal_defaulted(runtime: &OwnedRuntime) {
+        for signal in TERMINAL_SIGNALS {
+            wait_for_screen_text(
+                runtime,
+                &format!("DOCKPROBE {}=SIG_DFL", signal_name(signal)),
+                Duration::from_secs(30),
+            );
+        }
+    }
+
+    #[test]
+    fn worker_execs_with_a_default_sigint_disposition() {
+        // SIG_IGN, unlike a handler, survives exec: an inherited ignore would make the worker and
+        // everything it runs permanently deaf to Ctrl+C, which is the defect this guards.
+        let runtime = launch_signal_probe();
+        assert_probe_reports_every_terminal_signal_defaulted(&runtime);
+        let _ = runtime.stop();
+    }
+
+    /// Restores one signal's disposition however the test that borrowed it ends.
+    struct RestoredDisposition(nix::libc::c_int, nix::libc::sigaction);
+
+    impl Drop for RestoredDisposition {
+        fn drop(&mut self) {
+            // SAFETY: the action being restored is the one this process was observed to hold.
+            unsafe { nix::libc::sigaction(self.0, &self.1, std::ptr::null_mut()) };
+        }
+    }
+
+    #[test]
+    fn worker_signal_dispositions_do_not_depend_on_how_dockd_was_started() {
+        // Every smoke script starts `dockd ... &` from a non-interactive shell, which POSIX
+        // requires to set SIGINT and SIGQUIT to ignore for that job. Reproduce that inheritance
+        // exactly, because exec'ing the worker fixes nothing if the ignore came from above.
+        let mut inherited = std::mem::MaybeUninit::<nix::libc::sigaction>::uninit();
+        let mut ignore = std::mem::MaybeUninit::<nix::libc::sigaction>::zeroed();
+        // SAFETY: both actions are fully written before use, and the previous action is captured
+        // so `RestoredDisposition` can put this process back exactly as it was found.
+        let restored = unsafe {
+            (*ignore.as_mut_ptr()).sa_sigaction = nix::libc::SIG_IGN;
+            nix::libc::sigemptyset(&raw mut (*ignore.as_mut_ptr()).sa_mask);
+            assert_eq!(
+                nix::libc::sigaction(nix::libc::SIGINT, ignore.as_ptr(), inherited.as_mut_ptr()),
+                0
+            );
+            RestoredDisposition(nix::libc::SIGINT, inherited.assume_init())
+        };
+        assert_eq!(signal_disposition(nix::libc::SIGINT), "SIG_IGN");
+
+        let runtime = launch_signal_probe();
+        assert_probe_reports_every_terminal_signal_defaulted(&runtime);
+        let _ = runtime.stop();
+        drop(restored);
+        assert_eq!(signal_disposition(nix::libc::SIGINT), "SIG_DFL");
+    }
+
+    #[test]
+    fn a_ctrl_c_byte_written_to_the_owned_pty_interrupts_the_running_child() {
+        let runtime = OwnedRuntime::launch_fixture(
+            vec!["/bin/sh".into(), "-c".into(), "echo ready; sleep 60".into()],
+            128,
+            FIXTURE_SIZE,
+        );
+        wait_for_screen_text(&runtime, "ready", Duration::from_secs(15));
+        let process_group_id = runtime
+            .snapshot()
+            .process_group_id
+            .expect("owned process group");
+
+        // Exactly the path a user's Ctrl+C takes: one byte to the PTY master, converted by the
+        // line discipline into SIGINT for the terminal's foreground process group.
+        runtime
+            .input(&[0x03])
+            .expect("write ctrl-c to the owned pty");
+
+        wait_for(&runtime, |snapshot| {
+            matches!(snapshot.state, ProcessState::Exited { .. })
+        });
+        let status = match &*runtime.lifecycle.lock().unwrap() {
+            LifecycleState::Exited(status) => *status,
+            other => panic!("ctrl-c left the pane child alive: {other:?}"),
+        };
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(nix::libc::SIGINT),
+            "the child must die of SIGINT, not of anything else"
+        );
+        wait_for_group_exit(process_group_id);
+    }
+
+    #[test]
+    fn the_exec_d_worker_shares_one_process_group_with_its_guardian_watcher() {
+        let runtime = OwnedRuntime::launch_fixture(
+            vec!["/bin/sh".into(), "-c".into(), "echo ready; sleep 60".into()],
+            128,
+            FIXTURE_SIZE,
+        );
+        wait_for_screen_text(&runtime, "ready", Duration::from_secs(15));
+        let snapshot = runtime.snapshot();
+        let leader = snapshot.pid.expect("launched child") as i32;
+        let process_group_id = snapshot.process_group_id.expect("owned process group");
+
+        assert_eq!(process_group_id, leader);
+        // The kernel's own view, not just Dock's bookkeeping: a worker moved into its own group
+        // (as job control would) would leave Dock signalling a group the worker is not in.
+        assert_eq!(unsafe { nix::libc::getpgid(leader) }, leader);
+
+        let members = process_group_members(process_group_id);
+        let leader_arguments = members
+            .iter()
+            .find(|(pid, _)| *pid == leader)
+            .map(|(_, arguments)| arguments.clone())
+            .expect("leader must be in its own group");
+        assert!(
+            !leader_arguments.contains("dock-launch-guardian"),
+            "the guardian shell must have exec'd the worker, not stayed as its parent: \
+             {leader_arguments:?}"
+        );
+        assert!(
+            members.iter().any(
+                |(pid, arguments)| *pid != leader && arguments.contains("dock-launch-guardian")
+            ),
+            "the guardian watcher must stay in the worker's process group: {members:?}"
+        );
+
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn the_guardian_watcher_does_not_outlive_a_normally_exiting_worker() {
+        let runtime = OwnedRuntime::launch_fixture(
+            vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            128,
+            FIXTURE_SIZE,
+        );
+        let process_group_id = wait_for(&runtime, |snapshot| {
+            matches!(snapshot.state, ProcessState::Exited { .. })
+        })
+        .process_group_id
+        .expect("owned process group");
+
+        // The runtime is deliberately still alive, so `guardian_control` is still open and the
+        // watcher's `read` cannot have returned. Only the worker's exit can retire it.
+        wait_for_group_exit(process_group_id);
+        assert_eq!(process_group_members(process_group_id), Vec::new());
+    }
+
     #[test]
     fn stop_retires_owned_descendant_after_leader_is_already_reaped() {
         let runtime = OwnedRuntime::launch_fixture(
@@ -1048,6 +1300,11 @@ mod tests {
             .owned_process_group
             .as_ref()
             .expect("owned process group");
+        // The guardian watcher retires on the SIGHUP the kernel raises when the exec'd worker —
+        // the session's controlling process — exits, so the group empties just after the leader is
+        // reaped rather than strictly before it. The lifecycle is still unpublished throughout, so
+        // this remains exactly the ESRCH-before-publication scenario under test.
+        assert!(wait_for_owned_group_exit(group, Duration::from_secs(3)));
         assert_eq!(probe_owned_group(group), Err(nix::errno::Errno::ESRCH));
         assert_eq!(runtime.snapshot().state, ProcessState::Running);
 

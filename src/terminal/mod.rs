@@ -1,5 +1,7 @@
+mod keys;
 mod vt;
 
+pub use keys::{KeyEncoding, encode_key, encode_paste};
 pub use vt::{ShellSignals, VtTerminal};
 
 /// Single swap point for the terminal engine. `rio-vt` can replace `VtTerminal` here

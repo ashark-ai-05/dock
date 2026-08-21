@@ -86,7 +86,7 @@ comes from public documentation.
 ```
                       ┌─────────────────────── dockd ───────────────────────┐
   PTY master bytes ──▶│ OwnedRuntime                                        │
-                      │   PaneTerminal (vt100::Parser + Hooks)              │
+                      │   PaneScreen = VtTerminal (vt100 + TerminalHooks)   │
                       │     ├── screen        authoritative grid            │
                       │     ├── prev          last screen sent per client   │
                       │     └── hooks         title / cwd / OSC 133 marks   │
@@ -123,8 +123,8 @@ for state detection. The client parses a *second* time so it can hand `tui-term`
 
 | Path | Responsibility |
 |---|---|
-| `src/terminal/mod.rs` | `PaneTerminal` trait — feed bytes, resize, snapshot, delta. Abstracts the emulator so `rio-vt` (3x faster parse, 45x faster resize) can replace `vt100` later without touching callers |
-| `src/terminal/vt.rs` | `vt100` implementation of `PaneTerminal` plus `Hooks` (title, cwd, OSC 133) |
+| `src/terminal/mod.rs` | `PaneScreen` type alias and `ScreenSync`. The alias is the single swap point so `rio-vt` (3x faster parse, 45x faster resize) can replace `vt100` later without touching callers |
+| `src/terminal/vt.rs` | `VtTerminal` plus `TerminalHooks` (title, cwd, OSC 133) |
 | `src/terminal/keys.rs` | `encode(KeyEvent) -> Vec<u8>`: arrows, function keys, ctrl/alt combos, application cursor mode, bracketed paste |
 | `src/keymap.rs` | Prefix state machine: `Direct \| Pending \| Command`. Owns the published binding table |
 | `src/theme.rs` | `Theme` struct, palette tokens, border and dot glyphs |
@@ -135,24 +135,53 @@ for state detection. The client parses a *second* time so it can hand `tui-term`
 
 ## Terminal emulation
 
-`PaneTerminal` replaces `Scrollback` in `OwnedRuntime`:
+`VtTerminal` replaces `Scrollback` in `OwnedRuntime`:
 
 ```rust
-pub trait PaneTerminal: Send {
-    fn feed(&mut self, bytes: &[u8]);
-    fn resize(&mut self, rows: u16, cols: u16);
-    fn full_snapshot(&self) -> Vec<u8>;
-    fn delta_since(&self, prev: &Self) -> Vec<u8>;
-    fn text_tail(&self, rows: u16) -> String;   // for heuristic detection
-    fn cursor(&self) -> (u16, u16);
-    fn alternate_screen(&self) -> bool;
+impl VtTerminal {
+    pub fn new(rows: u16, cols: u16, scrollback_rows: usize) -> Self;
+    pub fn feed(&mut self, bytes: &[u8]);
+    pub fn resize(&mut self, rows: u16, cols: u16);
+    pub fn size(&self) -> (u16, u16);
+    pub fn cursor(&self) -> (u16, u16);
+    pub fn alternate_screen(&self) -> bool;
+    pub fn state_bytes(&self) -> Vec<u8>;      // full state incl. cursor
+    pub fn text_tail(&self, rows: u16) -> String;
+    pub fn title(&self) -> Option<String>;     // OSC 2
+    pub fn cwd(&self) -> Option<String>;       // OSC 7
+    pub fn last_exit_status(&self) -> Option<i32>;  // OSC 133;D
+}
+
+/// Single swap point for the engine. `rio-vt` replaces this line, and nothing else.
+pub type PaneScreen = VtTerminal;
+```
+
+Deltas use a **dual-parser** scheme rather than a `delta_since(&self, prev: &Self)` method,
+which could not be called through a trait object. The daemon holds `live`; each subscriber
+holds a `ScreenSync` wrapping a `sent` parser advanced only by bytes actually transmitted:
+
+```rust
+impl ScreenSync {
+    pub fn new(rows: u16, cols: u16) -> Self;
+    pub fn delta_from(&self, live: &VtTerminal) -> Vec<u8>;
+    pub fn apply(&mut self, delta: &[u8]);
+    pub fn resize(&mut self, rows: u16, cols: u16);
 }
 ```
 
+This must use `state_diff` / `state_formatted`, never `contents_diff` / `contents_formatted`:
+a probe confirmed only the `state_*` family carries cursor position. Convergence was verified
+through SGR, clear-and-home, alternate-screen enter and exit, and resize.
+
+The performance property is **silence, not compression**. Per-write, deltas are roughly the
+size of the input (135 bytes against 136 in the probe). The win is that an unchanged pane
+emits zero bytes, where the v6 protocol re-serialized every run's full scrollback five times
+a second regardless of activity.
+
 Scrollback capacity moves from a byte budget to a **row** budget (`vt100::Parser::new(rows,
-cols, scrollback_rows)`), which is the unit users reason about. The privacy invariant is
-unchanged: screen state is memory-only, never written to durable layout, never restored
-across daemon restart.
+cols, scrollback_rows)`, default 2000), which is the unit users reason about. The privacy
+invariant is unchanged: screen state is memory-only, never written to durable layout, never
+restored across daemon restart.
 
 ## PTY sizing
 
@@ -326,7 +355,7 @@ P0 is complete when, on a clean checkout:
 | Risk | Mitigation |
 |---|---|
 | Scope creep back into P1–P4 | Non-goals are enumerated above and enforced at review |
-| `vt100` is stable but last released 2025-07 | `PaneTerminal` trait makes `rio-vt` a drop-in later; `rio-vt` is deliberately not adopted now at 21k downloads |
+| `vt100` is stable but last released 2025-07 | The `PaneScreen` alias makes `rio-vt` a drop-in later; `rio-vt` is deliberately not adopted now at 21k downloads |
 | Duplicate parsing cost on client | Client is fed deltas only; probe shows 11 bytes for a typical update |
 | Prefix key breaks existing muscle memory | Unavoidable once panes are live terminals; `Ctrl+B` matches tmux and Herdr so it is the least surprising choice |
 | Test churn | Rewrite rather than delete; contract coverage must not regress |

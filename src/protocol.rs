@@ -116,9 +116,15 @@ pub struct SubscribeRequest {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
+    /// A full screen snapshot, sent when a subscriber first sees a run and again whenever
+    /// the pane's geometry changes. `rows`/`cols` are carried so a client that did not
+    /// originate the resize can size its parser from this frame alone: without them a
+    /// subscriber keeps its old geometry and renders only the tail rows of the snapshot.
     PaneAttached {
         run_id: String,
         revision: u64,
+        rows: u16,
+        cols: u16,
         screen: String,
     },
     PaneDelta {
@@ -516,6 +522,38 @@ mod tests {
     fn resize_request_rejects_unknown_fields() {
         let json = r#"{"workspace_id":"w","pane_id":"p","rows":24,"cols":80,"extra":1}"#;
         assert!(serde_json::from_str::<PaneResizeRequest>(json).is_err());
+    }
+
+    #[test]
+    fn an_attach_event_carries_the_geometry_a_client_needs_to_size_its_parser() {
+        let event = Event::PaneAttached {
+            run_id: "r1".into(),
+            revision: 4,
+            rows: 40,
+            cols: 120,
+            screen: "AA==".into(),
+        };
+        let wire = serde_json::to_string(&event).expect("serialise attach event");
+        assert!(wire.contains(r#""rows":40"#), "{wire}");
+        assert!(wire.contains(r#""cols":120"#), "{wire}");
+        assert_eq!(
+            serde_json::from_str::<Event>(&wire).expect("round trip"),
+            event
+        );
+        // A subscriber must not be able to size its parser from a frame that omits geometry.
+        assert!(
+            serde_json::from_str::<Event>(
+                r#"{"event":"pane_attached","run_id":"r1","revision":4,"screen":"AA=="}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Event>(
+                r#"{"event":"pane_attached","run_id":"r1","revision":4,"rows":40,"cols":120,"screen":"AA==","extra":1}"#
+            )
+            .is_err(),
+            "the event shape must stay closed"
+        );
     }
 
     #[test]

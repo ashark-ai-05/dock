@@ -363,6 +363,9 @@ fn stream_events(
     deadline: Option<Instant>,
 ) -> Result<(), String> {
     let mut syncs: HashMap<String, SubscriberView> = HashMap::new();
+    // Kept outside `syncs` so a re-seed cannot restart the numbering: Task 11's client reads a
+    // revision that moves backwards as a dropped frame and asks to re-attach, which would loop.
+    let mut revisions: HashMap<String, u64> = HashMap::new();
     let mut states: HashMap<String, (Option<AgentKind>, AgentState)> = HashMap::new();
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -390,10 +393,7 @@ fn stream_events(
             // snapshot rather than a delta if it becomes readable later.
             let Some(delta) = delta else { continue };
             if !delta.is_empty() {
-                let view = syncs
-                    .entry(snapshot.run_id.clone())
-                    .or_insert_with(|| SubscriberView::new(snapshot.rows, snapshot.cols));
-                let revision = view.revision + 1;
+                let revision = revisions.get(&snapshot.run_id).copied().unwrap_or(0) + 1;
                 let encoded = STANDARD.encode(&delta);
                 let event = if attached {
                     Event::PaneDelta {
@@ -405,14 +405,20 @@ fn stream_events(
                     Event::PaneAttached {
                         run_id: snapshot.run_id.clone(),
                         revision,
+                        rows: snapshot.rows,
+                        cols: snapshot.cols,
                         screen: encoded,
                     }
                 };
                 // Advance this subscriber's view only once the write succeeded, so a failed
                 // write leaves it consistent with what the client actually received.
                 write_response(stream, &Response::Stream { event })?;
-                view.sync.apply(&delta);
-                view.revision = revision;
+                syncs
+                    .entry(snapshot.run_id.clone())
+                    .or_insert_with(|| SubscriberView::new(snapshot.rows, snapshot.cols))
+                    .sync
+                    .apply(&delta);
+                revisions.insert(snapshot.run_id.clone(), revision);
             }
             let current = (snapshot.agent, snapshot.agent_state);
             if states.get(&snapshot.run_id) != Some(&current) {
@@ -433,11 +439,10 @@ fn stream_events(
     }
 }
 
-/// What one subscriber has already been sent for one run.
+/// The screen one subscriber has already been sent for one run, and the geometry that view
+/// was built at. Revisions live outside this so dropping it to re-seed cannot reset them.
 struct SubscriberView {
     sync: ScreenSync,
-    /// Monotonic per run so a client can detect a dropped frame as a gap.
-    revision: u64,
     size: (u16, u16),
 }
 
@@ -445,7 +450,6 @@ impl SubscriberView {
     fn new(rows: u16, cols: u16) -> Self {
         Self {
             sync: ScreenSync::new(rows, cols),
-            revision: 0,
             size: (rows, cols),
         }
     }
@@ -961,6 +965,261 @@ mod tests {
             announcements <= 1,
             "a pane whose agent state never changes must be announced at most once, got {announcements}"
         );
+    }
+
+    /// Backstop only: the subscribers below stop as soon as the daemon has demonstrably gone
+    /// quiet, so this bound is never reached unless something has genuinely wedged.
+    const CONVERGENCE_BACKSTOP: Duration = Duration::from_millis(5000);
+    /// How long a subscriber must receive nothing before it calls the daemon quiescent. The
+    /// comparison against the live screen is taken immediately after that, so this is the
+    /// window in which a late write could still race the assertion.
+    const QUIET: Duration = Duration::from_millis(400);
+
+    fn subscribe_line() -> String {
+        serde_json::to_string(&Request::Subscribe(SubscribeRequest {})).unwrap()
+    }
+
+    /// Reads pushed frames until the daemon has been silent for `QUIET` *and* the test has
+    /// signalled that it is done making changes. Stopping on proven silence rather than on a
+    /// clock is what lets the assertion compare against the live screen without racing it:
+    /// anything the daemon wrote, this subscriber has already received.
+    fn drain_until_quiet(client: UnixStream, ready: &std::sync::atomic::AtomicBool) -> Vec<Event> {
+        client.set_read_timeout(Some(QUIET)).expect("read timeout");
+        let mut reader = BufReader::new(client);
+        let mut responses = Vec::new();
+        // Held across iterations: a read that times out part-way through a frame must resume
+        // rather than discard the bytes it already has.
+        let mut pending = String::new();
+        loop {
+            match reader.read_line(&mut pending) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if pending.ends_with('\n') {
+                        let response: Response = serde_json::from_str(&pending).expect("response");
+                        responses.push(response);
+                        pending.clear();
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    if ready.load(Ordering::Acquire) && pending.is_empty() {
+                        break;
+                    }
+                }
+                Err(error) => panic!("subscriber read failed: {error}"),
+            }
+        }
+        collect_events(&responses)
+    }
+
+    /// Replays what one subscriber received into a terminal of its own, exactly as a client
+    /// must: size the parser from the attach frame, then feed every delta.
+    fn replay(events: &[Event], run_id: &str) -> crate::terminal::VtTerminal {
+        let mut screen: Option<crate::terminal::VtTerminal> = None;
+        for event in events {
+            match event {
+                Event::PaneAttached {
+                    run_id: id,
+                    rows,
+                    cols,
+                    screen: bytes,
+                    ..
+                } if id == run_id => {
+                    // The whole point of the geometry fields: this client never saw the
+                    // resize request and has no other source for the new size.
+                    let mut fresh = crate::terminal::VtTerminal::new(*rows, *cols, 0);
+                    fresh.feed(&STANDARD.decode(bytes).expect("attach screen is base64"));
+                    screen = Some(fresh);
+                }
+                Event::PaneDelta {
+                    run_id: id, bytes, ..
+                } if id == run_id => {
+                    let screen = screen.as_mut().expect("a delta before any attach frame");
+                    screen.feed(&STANDARD.decode(bytes).expect("delta is base64"));
+                }
+                _ => {}
+            }
+        }
+        screen.expect("subscriber never received an attach frame")
+    }
+
+    fn screen_revisions(events: &[Event]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::PaneAttached { revision, .. } | Event::PaneDelta { revision, .. } => {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_subscriber_converges_across_a_resize_it_did_not_originate() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let run_id = runtime
+            .inspect(None)
+            .expect("inspect")
+            .into_iter()
+            .find(|run| run.pane_id == "p1")
+            .expect("bound run")
+            .run_id;
+        let deadline = Instant::now() + CONVERGENCE_BACKSTOP;
+        let ready = std::sync::atomic::AtomicBool::new(false);
+
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let (client, mut server) = UnixStream::pair().expect("socket pair");
+            let shared = runtime.shared();
+            // Detached: a quiet stream never writes, so the handler cannot notice the client
+            // leaving and would otherwise hold the test open until its backstop expires.
+            std::thread::spawn(move || {
+                handle_connection_with_timeout(
+                    &mut server,
+                    &shared,
+                    CLIENT_READ_TIMEOUT,
+                    Some(deadline),
+                )
+                .ok();
+            });
+            clients.push(client);
+        }
+
+        let registry_ref: &RuntimeRegistry = &runtime;
+        let (first, second) = std::thread::scope(|scope| {
+            let mut readers = Vec::new();
+            for mut client in clients {
+                let ready = &ready;
+                readers.push(scope.spawn(move || {
+                    for line in [hello(), subscribe_line()] {
+                        client.write_all(line.as_bytes()).expect("write request");
+                        client.write_all(b"\n").expect("write newline");
+                    }
+                    client.shutdown(Shutdown::Write).expect("finish requests");
+                    drain_until_quiet(client, ready)
+                }));
+            }
+
+            let live = || {
+                registry_ref
+                    .with_run_screen(&run_id, |screen| screen.state_bytes())
+                    .expect("live screen")
+            };
+            let headroom = |what: &str| {
+                assert!(
+                    Instant::now() + QUIET + Duration::from_millis(600) < deadline,
+                    "{what} did not happen inside the stream window"
+                );
+            };
+
+            // Let both subscribers attach at the original geometry before anything changes.
+            thread::sleep(Duration::from_millis(250));
+            // The resize arrives on a third, ordinary request connection: neither subscriber
+            // originated it, so neither learns the new size except from the stream itself.
+            let resized = exchange(
+                &[
+                    &hello(),
+                    &serde_json::to_string(&Request::PaneResize(PaneResizeRequest {
+                        workspace_id: "w1".into(),
+                        pane_id: "p1".into(),
+                        rows: 40,
+                        cols: 120,
+                    }))
+                    .unwrap(),
+                ],
+                registry_ref,
+            );
+            assert!(matches!(resized[1], Response::Ack));
+
+            // Fill the screen past the *old* height. Without this the pane holds only a short
+            // prompt, and vt100 elides trailing blank rows, so an undersized replay would
+            // still produce byte-identical `state_formatted` output and the comparison below
+            // would pass vacuously.
+            let before = live();
+            let typed = exchange(
+                &[
+                    &hello(),
+                    &serde_json::to_string(&Request::PaneInput(PaneInputRequest {
+                        workspace_id: "w1".into(),
+                        pane_id: "p1".into(),
+                        input: PaneInputRequest::encode(b"seq 1 50\n"),
+                    }))
+                    .unwrap(),
+                ],
+                registry_ref,
+            );
+            assert!(matches!(typed[1], Response::PaneInputAccepted { .. }));
+            while live() == before {
+                headroom("the shell never echoed the typed command");
+                thread::sleep(Duration::from_millis(50));
+            }
+            headroom("the screen filled too late");
+
+            // Nothing else will change the pane. Whatever the shell still emits — a late
+            // asynchronous prompt segment, say — the subscribers keep receiving until they
+            // have seen `QUIET` of silence, so they cannot be left behind the live screen.
+            ready.store(true, Ordering::Release);
+            let mut done = readers.into_iter();
+            let first = done.next().unwrap().join().expect("first subscriber");
+            let second = done.next().unwrap().join().expect("second subscriber");
+            (first, second)
+        });
+
+        let expected = runtime
+            .with_run_screen(&run_id, |screen| screen.state_bytes())
+            .expect("live screen");
+        for (label, events) in [("first", &first), ("second", &second)] {
+            let attached: Vec<_> = events
+                .iter()
+                .filter(|event| matches!(event, Event::PaneAttached { .. }))
+                .collect();
+            assert_eq!(
+                attached.len(),
+                2,
+                "{label} subscriber must be re-seeded by the resize, got {attached:?}"
+            );
+            let reseed = match attached[1] {
+                Event::PaneAttached {
+                    revision,
+                    rows,
+                    cols,
+                    ..
+                } => (*revision, (*rows, *cols)),
+                other => panic!("expected an attach frame, got {other:?}"),
+            };
+            assert_eq!(
+                reseed.1,
+                (40, 120),
+                "{label} subscriber's re-seed must announce the new geometry"
+            );
+            assert!(
+                reseed.0 > 1,
+                "{label} subscriber's re-seed restarted the numbering at {} instead of carrying it forward",
+                reseed.0
+            );
+            let replayed = replay(events, &run_id);
+            assert_eq!(
+                replayed.size(),
+                (40, 120),
+                "{label} subscriber must size its parser from the attach frame alone"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&replayed.state_bytes()),
+                String::from_utf8_lossy(&expected),
+                "{label} subscriber did not converge on the daemon's live screen"
+            );
+            let revisions = screen_revisions(events);
+            assert!(
+                revisions.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                "{label} subscriber saw a revision gap or reset across the resize: {revisions:?}"
+            );
+        }
     }
 
     #[test]

@@ -32,6 +32,19 @@ A developer can run `dock` from **any directory**, including outside a Git repos
 - Retain Fixture as a selectable deterministic profile. Expose supported built-in providers only when their fixed executable is available: Amp, Claude Code, Codex CLI, and GitHub Copilot CLI.
 - Render whether the selected pane/run is unbound terminal work or repository/task/worktree-bound dispatch; never infer facts that do not exist.
 
+# Interaction bar: faster and clearer than Herdr
+
+This is a foreground runtime, not a settings dashboard. The keyboard path must be faster than reaching for a mouse and must remain discoverable under pressure.
+
+- **Instant orientation:** on launch, render the current workspace, focused pane, run state, connection state, and a one-line contextual key legend without a modal or loading dead-end. A warm daemon reconnect must not block on adapter/task/worktree catalog discovery; catalog loading is asynchronous and only requested when launch is opened.
+- **Stable mnemonic command layer:** reserve single keys for the daily loop: `n` workspace, `h`/`v` split, `Tab`/arrows focus, `r` rename, `x` close, `l` launch, `i` input, `q` quit, `?` help. Modals use `Esc` cancel, `Enter` confirm, arrows/`j`/`k` select. Every enabled key must be shown contextually; unavailable actions must explain why rather than silently no-op.
+- **Zero-friction launch:** `l` opens with focus on a compact provider picker; type-ahead filters fixed providers and `Enter` advances/launches only after an explicit concise review of target pane and whether the work is terminal-unbound or repository-bound. Reopening retains the prior safe selections for the current runtime, never credentials or arbitrary commands.
+- **No mode confusion:** terminal input mode has an unmistakable visual indicator and an immediate `Esc` exit. Layout navigation and launch-form keys must never accidentally forward bytes to a live process.
+- **Mouse is acceleration, never dependency:** clicking a pane, divider, or visible action exactly mirrors an available keyboard action. All daily flows—including help, launch, cancellation, focus, split, resize, lifecycle, and quit—work with no pointer.
+- **Blazing local feedback:** direct UI state changes (focus, split, selector movement, modal open/close, optimistic local geometry) render in the same event loop without a daemon round trip. Daemon requests are bounded/asynchronous; failures preserve the user’s location and show a concise inline error. No polling/spinners or full-screen redraw flicker during normal navigation.
+- **Compact, information-dense visual system:** active pane, terminal-input mode, owned-running/stopped/error states, external/read-only candidates, and unbound versus repository-bound facts are distinguishable at a glance using colour *and* labels. Narrow terminals degrade to an intentional focused-pane view, not overlapping/noisy chrome.
+- **Help is executable documentation:** `?` opens a grouped keymap that reflects the current state. Each modal/footer must expose its next action and escape path.
+
 # Hard boundaries
 
 - No arbitrary executable, command, arguments, environment, PID, or shell entry in the dashboard form. `generic` remains explicit CLI/API only.
@@ -50,6 +63,8 @@ A developer can run `dock` from **any directory**, including outside a Git repos
 - Protocol/server/client tests strictly serialize and validate separate terminal-launch and repository-bound-dispatch requests; unbound terminal launches cannot contain repository/task/worktree fields, and generic executable/argument fields cannot enter dashboard selection.
 - Adapter tests prove fixed built-in profiles, availability reporting, missing-binary behavior, and generic exclusion.
 - Dashboard tests prove keyboard and mouse launch-form navigation, cancellation, explicit mode/adapter confirmation, unavailable/empty catalog errors, exact focused-pane request construction, and honest unbound/bound fact rendering.
+- Dashboard tests prove the published single-key map, contextual help, `Esc` safety exit from every form/input state, and that dashboard commands never enter an owned pane unless explicit terminal-input mode is active.
+- Dashboard tests prove launch-form type-ahead, retained safe selections, no-pointer completion, visible unavailable-action reason, narrow focused-pane fallback, and local focus/selector/modal state changes without a request round trip.
 - Fixture selection launches through the same form and binds only the addressed Dock-owned pane. Existing external candidate discovery remains display-only and cannot be adopted.
 - `cargo fmt --check`, `cargo test --all-targets`, warnings-denied Clippy, and Slice 5, Slice 6, Slice 6.1, and Slice 6.2 smokes pass.
 

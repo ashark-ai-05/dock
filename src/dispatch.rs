@@ -50,6 +50,8 @@ pub struct RuntimeRegistry {
     /// they keep measuring dispatch rollback rather than the pane placeholder.
     suppress_pane_shells: Mutex<bool>,
     #[cfg(test)]
+    retire_pane_shell_stop_failure: Mutex<Option<String>>,
+    #[cfg(test)]
     restart_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     restart_after_stop_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -305,6 +307,8 @@ impl RuntimeRegistry {
             #[cfg(test)]
             suppress_pane_shells: Mutex::new(false),
             #[cfg(test)]
+            retire_pane_shell_stop_failure: Mutex::new(None),
+            #[cfg(test)]
             restart_hook: Mutex::new(None),
             #[cfg(test)]
             restart_after_stop_hook: Mutex::new(None),
@@ -418,10 +422,8 @@ impl RuntimeRegistry {
         else {
             return;
         };
+        self.reclaim_pane_shell_identity(workspace_id, pane_id);
         let run_id = pane_shell_run_id(workspace_id, pane_id);
-        // A pane closed and recreated under the same identity would otherwise inherit the dead
-        // reservation of its predecessor and be refused as a duplicate run id.
-        self.clear_pane_shell_reservation(&run_id);
         let request = DispatchRequest {
             repository_root: directory.display().to_string(),
             external_task_ref: String::new(),
@@ -477,10 +479,21 @@ impl RuntimeRegistry {
                 .filter(|current| Arc::ptr_eq(&current.transition, &slot.transition))
                 .and_then(RuntimeSlot::active)
                 .cloned();
-            // The exact group staying live means its authority and pane binding stay put too.
-            if let Some(entry) = entry
-                && entry.runtime.stop().is_err()
+            #[cfg(test)]
+            let stop = match self
+                .retire_pane_shell_stop_failure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
             {
+                Some(message) => Err(message),
+                None => entry.as_ref().map_or(Ok(()), |entry| entry.runtime.stop()),
+            };
+            #[cfg(not(test))]
+            let stop = entry.as_ref().map_or(Ok(()), |entry| entry.runtime.stop());
+            // The exact group staying live means its authority and pane binding stay put too.
+            // `reclaim_pane_shell_identity` is what stops this becoming permanent.
+            if stop.is_err() {
                 return;
             }
             let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
@@ -495,6 +508,55 @@ impl RuntimeRegistry {
             // this displaced it rather than a rollback having already restored something else.
             layout.unbind_run(workspace_id, pane_id, &run_id);
             runs.remove(&run_id);
+        }
+        self.clear_pane_shell_reservation(&run_id);
+    }
+
+    /// A pane's shell slot is always recoverable. `validate_external_run_id` reserves the
+    /// `dock_sh_` namespace, so any run wearing this pane's shell identity is definitionally
+    /// Dock's own earlier shell for this pane; if it is no longer the pane's binding it is stale
+    /// and is reclaimed here rather than being allowed to hold the identity forever.
+    ///
+    /// This closes a class, not two paths. A shell whose `stop` failed during retirement, one
+    /// skipped because the commit path errored after the replacement went `Active`, and any third
+    /// route that leaves the same residue all end identically: the pane's next shell refused as a
+    /// duplicate run id, leaving a recreated pane permanently inert — the exact failure
+    /// auto-launch exists to prevent.
+    fn reclaim_pane_shell_identity(&self, workspace_id: &str, pane_id: &str) {
+        let run_id = pane_shell_run_id(workspace_id, pane_id);
+        let slot = self
+            .runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&run_id)
+            .cloned();
+        if let Some(slot) = slot {
+            // Serialises against an in-flight launch of this same identity, and is never held
+            // while a registry or layout lock is, so process shutdown cannot block either.
+            let _transition = slot.transition.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = self
+                .runs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&run_id)
+                .filter(|current| Arc::ptr_eq(&current.transition, &slot.transition))
+                .and_then(RuntimeSlot::active)
+                .cloned();
+            // Best-effort by design. A group that refuses to die is already unreachable — it has
+            // no pane and no caller can name it — so keeping the identity pinned to it would
+            // trade a survivable leak for a permanently unusable pane.
+            if let Some(entry) = &entry {
+                let _ = entry.runtime.stop();
+            }
+            let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+            let mut layout = self.layout.lock().unwrap_or_else(|p| p.into_inner());
+            if runs
+                .get(&run_id)
+                .is_some_and(|current| Arc::ptr_eq(&current.transition, &slot.transition))
+            {
+                layout.unbind_run(workspace_id, pane_id, &run_id);
+                runs.remove(&run_id);
+            }
         }
         self.clear_pane_shell_reservation(&run_id);
     }
@@ -3005,6 +3067,110 @@ mod tests {
                 .as_deref(),
             Some("dock_empty_pane_target")
         );
+    }
+
+    /// A shell whose retirement `stop` fails stays registered under the pane's reserved identity.
+    /// Nothing retries that retirement, so unless the identity is reclaimed the pane's next shell
+    /// is refused as a duplicate run id and the recreated pane is permanently inert.
+    #[test]
+    fn a_pane_shell_that_failed_to_stop_does_not_poison_the_panes_next_shell() {
+        let registry = registry();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Daily".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+        let shell_run_id = pane_shell_run_id("w1", "p1");
+        *registry
+            .retire_pane_shell_stop_failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some("injected retirement stop failure".into());
+        registry
+            .terminal_launch(
+                "w1".into(),
+                "p1".into(),
+                "dock_replacement".into(),
+                DashboardProfile::Fixture,
+                registry.state.display().to_string(),
+            )
+            .expect("launch replaces the pane shell");
+        assert!(
+            registry
+                .runs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&shell_run_id),
+            "the failed retirement must leave the stale shell registered, or this proves nothing"
+        );
+
+        registry
+            .workspace(WorkspaceRequest::Close {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("close pane");
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Daily".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("recreate workspace");
+
+        let layout = registry.layout();
+        let pane = &layout.workspaces[0].panes["p1"];
+        assert_eq!(
+            pane.run_id.as_deref(),
+            Some(shell_run_id.as_str()),
+            "the recreated pane must reclaim its own shell identity"
+        );
+        assert_eq!(
+            pane.runtime,
+            PaneRuntime::Running,
+            "a stale run under the reserved identity must never leave a pane inert"
+        );
+    }
+
+    /// The same property stated directly against the residue itself, independent of which path
+    /// produced it: any run holding a pane's reserved shell identity without owning the pane is
+    /// stale, and the pane's shell must launch regardless.
+    #[test]
+    fn a_stale_run_under_a_reserved_shell_identity_is_reclaimed_on_pane_creation() {
+        let registry = registry();
+        let shell_run_id = pane_shell_run_id("w1", "p1");
+        let receipt = registry.receipt_path(&shell_run_id).expect("receipt path");
+        reserve_run_id(&receipt).expect("seed a durable reservation");
+        registry
+            .runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                shell_run_id.clone(),
+                RuntimeSlot {
+                    transition: Arc::new(Mutex::new(())),
+                    state: RuntimeSlotState::Launching {
+                        repository_root: registry.state.clone(),
+                    },
+                    pane_shell: true,
+                },
+            );
+
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Daily".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+
+        let layout = registry.layout();
+        let pane = &layout.workspaces[0].panes["p1"];
+        assert_eq!(pane.run_id.as_deref(), Some(shell_run_id.as_str()));
+        assert_eq!(pane.runtime, PaneRuntime::Running);
+        let snapshot = registry.inspect(Some(&shell_run_id)).expect("shell run");
+        assert_eq!(snapshot[0].state, crate::protocol::ProcessState::Running);
     }
 
     #[test]

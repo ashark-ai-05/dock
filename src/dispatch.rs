@@ -26,14 +26,14 @@ use crate::{
         DurableProgrammeGate, ErrorCode, GateState, LifecycleOperation, ProgrammeSnapshot,
         RepositoryPortfolioSnapshot, RuntimeSnapshot, WorkspaceRequest,
     },
-    runtime::{OwnedRuntime, RunBinding},
+    runtime::{OwnedRuntime, PtySize, RunBinding},
     storage::LocalStore,
 };
 
 pub struct RuntimeRegistry {
     runs: Mutex<HashMap<String, RuntimeSlot>>,
     receipts: PathBuf,
-    scrollback_capacity: usize,
+    scrollback_rows: usize,
     store: LocalStore,
     programme: Mutex<ProgrammeState>,
     capacity: CapacityPolicy,
@@ -206,13 +206,13 @@ struct DispatchReceipt {
 }
 
 impl RuntimeRegistry {
-    pub fn new(state_dir: impl Into<PathBuf>, scrollback_capacity: usize) -> Result<Self, String> {
-        Self::with_capacity(state_dir, scrollback_capacity, CapacityPolicy::default())
+    pub fn new(state_dir: impl Into<PathBuf>, scrollback_rows: usize) -> Result<Self, String> {
+        Self::with_capacity(state_dir, scrollback_rows, CapacityPolicy::default())
     }
 
     pub fn with_capacity(
         state_dir: impl Into<PathBuf>,
-        scrollback_capacity: usize,
+        scrollback_rows: usize,
         capacity: CapacityPolicy,
     ) -> Result<Self, String> {
         let capacity = capacity.validate()?;
@@ -280,7 +280,7 @@ impl RuntimeRegistry {
         Ok(Self {
             runs: Mutex::new(HashMap::new()),
             receipts,
-            scrollback_capacity,
+            scrollback_rows,
             store,
             programme: Mutex::new(programme),
             capacity,
@@ -761,7 +761,9 @@ impl RuntimeRegistry {
         let runtime = Arc::new(OwnedRuntime::launch(
             binding,
             adapter,
-            self.scrollback_capacity,
+            self.scrollback_rows,
+            // Placeholder geometry until the registry tracks measured pane sizes.
+            PtySize { rows: 24, cols: 80 },
         ));
         let snapshot = runtime.snapshot();
         #[cfg(test)]
@@ -1473,7 +1475,9 @@ impl RuntimeRegistry {
                 let replacement = Arc::new(OwnedRuntime::launch(
                     runtime.binding(),
                     adapter,
-                    self.scrollback_capacity,
+                    self.scrollback_rows,
+                    // Placeholder geometry until the registry tracks measured pane sizes.
+                    PtySize { rows: 24, cols: 80 },
                 ));
                 let snapshot = replacement.snapshot();
                 if snapshot.pid.is_none() {
@@ -2419,6 +2423,30 @@ mod tests {
         );
     }
 
+    /// Pane output now lives on the emulated screen rather than on the snapshot, so tests read
+    /// it straight from the owned runtime the registry holds for that run.
+    fn run_screen_text(registry: &RuntimeRegistry, run_id: &str) -> String {
+        registry
+            .runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(run_id)
+            .and_then(|slot| slot.active())
+            .map(|entry| entry.runtime.with_screen(|screen| screen.text_tail(60)))
+            .unwrap_or_default()
+    }
+
+    fn wait_for_run_screen_text(registry: &RuntimeRegistry, run_id: &str, needle: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let text = run_screen_text(registry, run_id);
+            if text.contains(needle) || Instant::now() >= deadline {
+                return text;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     struct Repo {
         root: PathBuf,
         state: PathBuf,
@@ -2614,17 +2642,8 @@ mod tests {
                 .unwrap(),
             6
         );
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !registry.inspect(Some(&snapshot.run_id)).unwrap()[0]
-            .scrollback
-            .contains("got:hello")
-            && Instant::now() < deadline
-        {
-            thread::sleep(Duration::from_millis(10));
-        }
         assert!(
-            registry.inspect(Some(&snapshot.run_id)).unwrap()[0]
-                .scrollback
+            wait_for_run_screen_text(&registry, &snapshot.run_id, "got:hello")
                 .contains("got:hello")
         );
         registry
@@ -2687,11 +2706,7 @@ mod tests {
             Err((ErrorCode::InvalidBinding, message)) if message.contains("changed")
         ));
         thread::sleep(Duration::from_millis(50));
-        assert!(
-            !registry.inspect(Some(&snapshot.run_id)).unwrap()[0]
-                .scrollback
-                .contains("stale:wrong")
-        );
+        assert!(!run_screen_text(&registry, &snapshot.run_id).contains("stale:wrong"));
         registry
             .lifecycle(&snapshot.run_id, LifecycleOperation::Stop)
             .unwrap();
@@ -2761,21 +2776,23 @@ mod tests {
             initial.repository_root,
             fs::canonicalize(&repo.root).unwrap().display().to_string()
         );
+        let expected_worktree = fs::canonicalize(repo.root.join("fixture"))
+            .unwrap()
+            .display()
+            .to_string();
         let deadline = Instant::now() + Duration::from_secs(3);
-        let snapshot = loop {
-            let s = registry.inspect(Some("dock_valid")).unwrap().remove(0);
-            if s.scrollback.contains("fixture") || Instant::now() >= deadline {
-                break s;
+        let observed = loop {
+            // The emulated screen wraps at the pane width, so a long path can span rows;
+            // rejoining the rows compares the path itself rather than the wrap points.
+            let observed: String = run_screen_text(&registry, "dock_valid")
+                .split_whitespace()
+                .collect();
+            if observed == expected_worktree || Instant::now() >= deadline {
+                break observed;
             }
             thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(
-            snapshot.scrollback.trim(),
-            fs::canonicalize(repo.root.join("fixture"))
-                .unwrap()
-                .display()
-                .to_string()
-        );
+        assert_eq!(observed, expected_worktree);
         let receipt = fs::read_to_string(repo.state.join("dispatches/dock_valid.json")).unwrap();
         assert!(!receipt.contains("scrollback"));
         assert!(!receipt.contains("do-not-persist"));

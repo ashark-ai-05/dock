@@ -343,10 +343,8 @@ pub struct RuntimeSnapshot {
     pub process_capabilities: ProcessCapabilities,
     pub adapter_capabilities: AdapterCapabilities,
     pub provider_state: ProviderState,
-    pub scrollback: String,
-    pub scrollback_bytes: usize,
-    pub scrollback_capacity_bytes: usize,
-    pub scrollback_truncated: bool,
+    pub rows: u16,
+    pub cols: u16,
     pub diagnostic: Option<String>,
 }
 

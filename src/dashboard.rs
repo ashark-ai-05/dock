@@ -291,14 +291,17 @@ impl Dashboard {
                     .and_then(|id| self.runs.iter().find(|run| run.run_id == id));
                 let output = match run {
                     Some(run) => format!(
-                        "mode: {}\nrepository: {}\ntask: {}\nrun: {}\nbinding: {}/{}\n\n{}",
+                        // The snapshot no longer carries pane text; emulated screens reach the
+                        // dashboard over pane subscriptions instead of being re-sent by polling.
+                        "mode: {}\nrepository: {}\ntask: {}\nrun: {}\nbinding: {}/{}\nsize: {}x{}",
                         if run.binding_kind == BindingKind::Terminal { "unbound terminal" } else { "repository dispatch" },
                         if run.binding_kind == BindingKind::Terminal { "unbound" } else { &run.repository_root },
                         if run.binding_kind == BindingKind::Terminal { "unbound" } else { &run.external_task_ref },
                         run.run_id,
                         run.workspace_id,
                         run.pane_id,
-                        run.scrollback
+                        run.cols,
+                        run.rows
                     ),
                     None if pane.run_id.is_some() => format!(
                         "repository: unavailable\ntask: unavailable\nrun: {}\nbinding: {}/{}\n\nDock-owned run facts are unavailable.",
@@ -1318,10 +1321,8 @@ mod tests {
             process_capabilities: ProcessCapabilities::OWNED_RUNTIME,
             adapter_capabilities: AdapterCapabilities::NONE,
             provider_state: ProviderState::Running,
-            scrollback: "owned output".into(),
-            scrollback_bytes: 12,
-            scrollback_capacity_bytes: 1024,
-            scrollback_truncated: false,
+            rows: 24,
+            cols: 80,
             diagnostic: None,
         }
     }

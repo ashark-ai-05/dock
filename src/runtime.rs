@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     fs::File,
     io::{Error, Read, Write},
     os::unix::{io::AsRawFd, net::UnixStream, process::CommandExt},
@@ -22,6 +21,7 @@ use nix::{
 use crate::{
     adapter::{AdapterCapabilities, AdapterId, ProcessCapabilities, ResolvedAdapter},
     protocol::{BindingKind, ProcessState, ProviderState, RuntimeSnapshot},
+    terminal::PaneScreen,
 };
 
 #[derive(Debug, Clone)]
@@ -37,25 +37,21 @@ pub struct RunBinding {
     pub pane_id: String,
 }
 
-#[derive(Debug)]
-struct Scrollback {
-    bytes: VecDeque<u8>,
-    capacity: usize,
-    truncated: bool,
+/// Character-cell geometry of a Dock-owned PTY. Panes are measured in cells, so this is the
+/// single unit both the emulator and the kernel-side window size agree on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtySize {
+    pub rows: u16,
+    pub cols: u16,
 }
 
-impl Scrollback {
-    fn push(&mut self, input: &[u8]) {
-        if self.capacity == 0 {
-            self.truncated |= !input.is_empty();
-            return;
-        }
-        for byte in input {
-            if self.bytes.len() == self.capacity {
-                self.bytes.pop_front();
-                self.truncated = true;
-            }
-            self.bytes.push_back(*byte);
+impl PtySize {
+    fn to_winsize(self) -> nix::pty::Winsize {
+        nix::pty::Winsize {
+            ws_row: self.rows,
+            ws_col: self.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
         }
     }
 }
@@ -72,7 +68,11 @@ pub struct OwnedRuntime {
     owned_process_group: Option<OwnedProcessGroup>,
     guardian_control: Option<UnixStream>,
     pty_input: Option<SyncSender<Vec<u8>>>,
-    scrollback: Arc<Mutex<Scrollback>>,
+    /// Retained clone of the PTY master purely so the pane can be resized. The reader and
+    /// writer threads each own their own clone.
+    pty_control: Option<Arc<File>>,
+    size: Mutex<PtySize>,
+    screen: Arc<Mutex<PaneScreen>>,
     launch_error: Option<String>,
 }
 
@@ -81,7 +81,7 @@ pub struct OwnedRuntime {
 #[derive(Debug)]
 struct OwnedProcessGroup(Pid);
 
-type ChildLaunch = (Child, u32, UnixStream, SyncSender<Vec<u8>>);
+type ChildLaunch = (Child, u32, UnixStream, SyncSender<Vec<u8>>, Arc<File>);
 
 #[derive(Debug)]
 enum LifecycleState {
@@ -94,27 +94,29 @@ impl OwnedRuntime {
     pub fn launch(
         binding: RunBinding,
         adapter: ResolvedAdapter,
-        scrollback_capacity: usize,
+        scrollback_rows: usize,
+        size: PtySize,
     ) -> Self {
-        Self::launch_with_before_lifecycle_publish(binding, adapter, scrollback_capacity, || {})
+        Self::launch_with_before_lifecycle_publish(binding, adapter, scrollback_rows, size, || {})
     }
 
     fn launch_with_before_lifecycle_publish(
         binding: RunBinding,
         adapter: ResolvedAdapter,
-        scrollback_capacity: usize,
+        scrollback_rows: usize,
+        size: PtySize,
         before_lifecycle_publish: impl FnOnce() + Send + 'static,
     ) -> Self {
         let command = adapter.command;
         let adapter_id = adapter.id;
         let adapter_capabilities = adapter.capabilities;
-        let scrollback = Arc::new(Mutex::new(Scrollback {
-            bytes: VecDeque::with_capacity(scrollback_capacity),
-            capacity: scrollback_capacity,
-            truncated: false,
-        }));
-        match launch_child(&command, &binding.worktree, Arc::clone(&scrollback)) {
-            Ok((child, pid, guardian_control, pty_input_sender)) => {
+        let screen = Arc::new(Mutex::new(PaneScreen::new(
+            size.rows,
+            size.cols,
+            scrollback_rows,
+        )));
+        match launch_child(&command, &binding.worktree, Arc::clone(&screen), size) {
+            Ok((child, pid, guardian_control, pty_input_sender, pty_control)) => {
                 let lifecycle = Arc::new(Mutex::new(LifecycleState::Running));
                 let reaper_lifecycle = Arc::clone(&lifecycle);
                 let child = Arc::new(Mutex::new(Some(child)));
@@ -155,7 +157,9 @@ impl OwnedRuntime {
                             .map(OwnedProcessGroup),
                         guardian_control: Some(guardian_control),
                         pty_input: Some(pty_input_sender),
-                        scrollback,
+                        pty_control: Some(pty_control),
+                        size: Mutex::new(size),
+                        screen,
                         launch_error: None,
                     },
                     Err(error) => Self {
@@ -175,7 +179,9 @@ impl OwnedRuntime {
                             .map(OwnedProcessGroup),
                         guardian_control: Some(guardian_control),
                         pty_input: Some(pty_input_sender),
-                        scrollback,
+                        pty_control: Some(pty_control),
+                        size: Mutex::new(size),
+                        screen,
                         launch_error: None,
                     },
                 }
@@ -192,14 +198,16 @@ impl OwnedRuntime {
                 owned_process_group: None,
                 guardian_control: None,
                 pty_input: None,
-                scrollback,
+                pty_control: None,
+                size: Mutex::new(size),
+                screen,
                 launch_error: Some(error),
             },
         }
     }
 
     #[cfg(test)]
-    pub fn launch_fixture(command: Vec<String>, scrollback_capacity: usize) -> Self {
+    pub fn launch_fixture(command: Vec<String>, scrollback_rows: usize, size: PtySize) -> Self {
         let worktree = std::env::current_dir().expect("fixture current directory");
         Self::launch(
             RunBinding {
@@ -221,7 +229,8 @@ impl OwnedRuntime {
                     ..AdapterCapabilities::default()
                 },
             },
-            scrollback_capacity,
+            scrollback_rows,
+            size,
         )
     }
 
@@ -246,11 +255,7 @@ impl OwnedRuntime {
                 }
             }
         };
-        let scrollback = self
-            .scrollback
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let bytes: Vec<u8> = scrollback.bytes.iter().copied().collect();
+        let (rows, cols) = self.with_screen(|screen| screen.size());
         RuntimeSnapshot {
             binding_kind: self.binding.binding_kind,
             repository_root: self.binding.repository_root.display().to_string(),
@@ -280,10 +285,8 @@ impl OwnedRuntime {
                     _ => ProviderState::Unknown,
                 }
             },
-            scrollback: String::from_utf8_lossy(&bytes).into_owned(),
-            scrollback_bytes: bytes.len(),
-            scrollback_capacity_bytes: scrollback.capacity,
-            scrollback_truncated: scrollback.truncated,
+            rows,
+            cols,
             diagnostic: self.launch_error.clone().or(runtime_diagnostic),
         }
     }
@@ -301,6 +304,51 @@ impl OwnedRuntime {
     }
     pub fn interrupt(&self) -> Result<(), String> {
         self.signal(Signal::SIGINT)
+    }
+    /// Resizes the owned PTY and notifies the owned process group. A terminated run is a
+    /// no-op rather than an error, and a stale PGID is never signalled — the group token can
+    /// only originate from Dock's own successful launch.
+    pub fn resize(&self, size: PtySize) -> Result<(), String> {
+        {
+            let mut current = self.size.lock().unwrap_or_else(|p| p.into_inner());
+            if *current == size {
+                return Ok(());
+            }
+            *current = size;
+        }
+        self.screen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .resize(size.rows, size.cols);
+        if self.lifecycle_is_terminal() {
+            return Ok(());
+        }
+        let Some(control) = self.pty_control.as_ref() else {
+            return Ok(());
+        };
+        let winsize = size.to_winsize();
+        // SAFETY: the fd is a PTY master this runtime opened and still owns, and `winsize`
+        // outlives the call, so TIOCSWINSZ reads exactly one live `struct winsize`.
+        let result = unsafe {
+            nix::libc::ioctl(
+                control.as_raw_fd(),
+                nix::libc::TIOCSWINSZ as nix::libc::c_ulong,
+                &winsize,
+            )
+        };
+        if result == -1 {
+            return Err(format!(
+                "could not resize Dock-owned PTY: {}",
+                Error::last_os_error()
+            ));
+        }
+        // Reuse the lifecycle-guarded signal path rather than killpg: only a group Dock
+        // launched and still owns may ever be signalled.
+        self.signal(Signal::SIGWINCH)
+    }
+    pub fn with_screen<T>(&self, apply: impl FnOnce(&PaneScreen) -> T) -> T {
+        let screen = self.screen.lock().unwrap_or_else(|p| p.into_inner());
+        apply(&screen)
     }
     pub fn input(&self, input: &[u8]) -> Result<(), String> {
         if input.is_empty() {
@@ -480,26 +528,34 @@ fn wait_for_owned_group_exit(group: &OwnedProcessGroup, timeout: Duration) -> bo
 fn launch_child(
     command: &[String],
     worktree: &Path,
-    scrollback: Arc<Mutex<Scrollback>>,
+    screen: Arc<Mutex<PaneScreen>>,
+    size: PtySize,
 ) -> Result<ChildLaunch, String> {
-    launch_child_with_before_spawn(command, worktree, scrollback, || {})
+    launch_child_with_before_spawn(command, worktree, screen, size, || {})
 }
 
 fn launch_child_with_before_spawn(
     command: &[String],
     worktree: &Path,
-    scrollback: Arc<Mutex<Scrollback>>,
+    screen: Arc<Mutex<PaneScreen>>,
+    size: PtySize,
     before_spawn: impl FnOnce(),
 ) -> Result<ChildLaunch, String> {
     let Some(program) = command.first() else {
         return Err("fixture command is required".into());
     };
-    let pty =
-        openpty(None, None).map_err(|error| format!("could not allocate fixture PTY: {error}"))?;
+    // The child must be born at the pane's real geometry: a full-screen TUI that first paints
+    // into a default 80x24 window is unusable until something happens to resize it.
+    let winsize = size.to_winsize();
+    let pty = openpty(Some(&winsize), None)
+        .map_err(|error| format!("could not allocate Dock-owned PTY: {error}"))?;
     let master = File::from(pty.master);
     let pty_input = master
         .try_clone()
         .map_err(|error| format!("could not clone PTY master for input: {error}"))?;
+    let pty_control = master
+        .try_clone()
+        .map_err(|error| format!("could not clone PTY master for resize: {error}"))?;
     let slave = File::from(pty.slave);
     let stdin = slave
         .try_clone()
@@ -577,7 +633,7 @@ exit "$dock_status""#,
     let pid = child.id();
     if let Err(error) = thread::Builder::new()
         .name("dock-pty-reader".into())
-        .spawn(move || read_pty(master, scrollback))
+        .spawn(move || read_pty(master, screen))
     {
         if let Ok(raw_pid) = i32::try_from(pid) {
             signal_owned_group(&OwnedProcessGroup(Pid::from_raw(raw_pid)), Signal::SIGKILL);
@@ -603,7 +659,13 @@ exit "$dock_status""#,
         let _ = child.wait();
         return Err(format!("could not start PTY writer: {error}"));
     }
-    Ok((child, pid, guardian_control, pty_input_sender))
+    Ok((
+        child,
+        pid,
+        guardian_control,
+        pty_input_sender,
+        Arc::new(pty_control),
+    ))
 }
 
 fn apply_child_environment(
@@ -626,16 +688,15 @@ fn environment_is_allowed(key: &std::ffi::OsStr) -> bool {
     ) || key.starts_with("LC_")
 }
 
-fn read_pty(mut master: File, scrollback: Arc<Mutex<Scrollback>>) {
+fn read_pty(mut master: File, screen: Arc<Mutex<PaneScreen>>) {
     let mut buffer = [0_u8; 4096];
     while let Ok(count) = master.read(&mut buffer) {
         if count == 0 {
             break;
         }
-        if let Ok(mut bounded) = scrollback.lock() {
-            bounded.push(&buffer[..count]);
-        } else {
-            break;
+        match screen.lock() {
+            Ok(mut screen) => screen.feed(&buffer[..count]),
+            Err(_) => break,
         }
     }
 }
@@ -666,6 +727,8 @@ mod tests {
         );
     }
 
+    const FIXTURE_SIZE: PtySize = PtySize { rows: 24, cols: 80 };
+
     fn wait_for(
         runtime: &OwnedRuntime,
         predicate: impl Fn(&RuntimeSnapshot) -> bool,
@@ -680,22 +743,125 @@ mod tests {
         }
     }
 
+    fn screen_text(runtime: &OwnedRuntime) -> String {
+        runtime.with_screen(|screen| screen.text_tail(60))
+    }
+
+    /// The fixtures below echo a descendant PID as their only output, so the emulated screen
+    /// holds exactly one numeric line once the child has written it.
+    fn wait_for_screen_pid(runtime: &OwnedRuntime) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(pid) = screen_text(runtime).trim().parse::<u32>() {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid never appeared on the owned screen"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_screen_text(runtime: &OwnedRuntime, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if screen_text(runtime).contains(needle) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never observed {needle:?} on the owned screen"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
-    fn captures_bounded_pty_output_and_exit_state() {
+    fn captures_emulated_pty_output_and_exit_state() {
         let runtime = OwnedRuntime::launch_fixture(
             vec!["sh".into(), "-c".into(), "printf 1234567890".into()],
-            5,
+            200,
+            FIXTURE_SIZE,
         );
+        wait_for_screen_text(&runtime, "1234567890", Duration::from_secs(3));
         let snapshot = wait_for(&runtime, |snapshot| {
-            matches!(snapshot.state, ProcessState::Exited { .. }) && snapshot.scrollback_bytes == 5
+            matches!(snapshot.state, ProcessState::Exited { .. })
         });
-        assert_eq!(snapshot.scrollback, "67890");
-        assert!(snapshot.scrollback_truncated);
+        assert_eq!((snapshot.rows, snapshot.cols), (24, 80));
         assert_eq!(
             snapshot.pid.map(|pid| pid as i32),
             snapshot.process_group_id
         );
         wait_for_group_exit(snapshot.process_group_id.expect("owned process group"));
+    }
+
+    #[test]
+    fn child_observes_the_requested_pty_size_and_a_later_resize() {
+        let runtime = OwnedRuntime::launch_fixture(
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                // A shell defers a trap until the foreground command finishes, so the fixture
+                // waits in short sleeps rather than one long one.
+                "stty size; trap 'stty size' WINCH; while :; do sleep 0.2; done".into(),
+            ],
+            200,
+            PtySize {
+                rows: 30,
+                cols: 100,
+            },
+        );
+        wait_for_screen_text(&runtime, "30 100", Duration::from_secs(3));
+        runtime
+            .resize(PtySize {
+                rows: 42,
+                cols: 120,
+            })
+            .expect("resize owned pty");
+        wait_for_screen_text(&runtime, "42 120", Duration::from_secs(3));
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn emulated_screen_renders_styled_output_rather_than_escape_text() {
+        let runtime = OwnedRuntime::launch_fixture(
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '\\033[1;32mgreen\\033[0m\\n'; sleep 5".into(),
+            ],
+            200,
+            FIXTURE_SIZE,
+        );
+        wait_for_screen_text(&runtime, "green", Duration::from_secs(3));
+        runtime.with_screen(|screen| {
+            // The escape sequence must have been consumed by the emulator, not left as text.
+            assert!(!screen.text_tail(24).contains("\u{1b}["));
+            assert!(!screen.text_tail(24).contains("[1;32m"));
+        });
+        let _ = runtime.stop();
+    }
+
+    #[test]
+    fn resizing_an_exited_run_is_a_no_op_rather_than_an_error() {
+        let runtime = OwnedRuntime::launch_fixture(
+            vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            200,
+            FIXTURE_SIZE,
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !runtime.lifecycle_is_terminal() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            runtime
+                .resize(PtySize {
+                    rows: 40,
+                    cols: 100
+                })
+                .is_ok()
+        );
     }
 
     #[test]
@@ -707,12 +873,10 @@ mod tests {
                 "read value; printf 'got:%s' \"$value\"".into(),
             ],
             128,
+            FIXTURE_SIZE,
         );
         runtime.input(b"hello\n").expect("owned PTY input");
-        let snapshot = wait_for(&runtime, |snapshot| {
-            snapshot.scrollback.contains("got:hello")
-        });
-        assert!(snapshot.scrollback.contains("got:hello"));
+        wait_for_screen_text(&runtime, "got:hello", Duration::from_secs(3));
         let terminal = wait_for(&runtime, |snapshot| {
             matches!(snapshot.state, ProcessState::Exited { .. })
         });
@@ -729,9 +893,13 @@ mod tests {
                 "trap '' TERM; echo ready; while :; do sleep 1; done".into(),
             ],
             128,
+            FIXTURE_SIZE,
         );
-        let snapshot = wait_for(&runtime, |snapshot| snapshot.scrollback.contains("ready"));
-        let process_group_id = snapshot.process_group_id.expect("owned process group");
+        wait_for_screen_text(&runtime, "ready", Duration::from_secs(3));
+        let process_group_id = runtime
+            .snapshot()
+            .process_group_id
+            .expect("owned process group");
 
         runtime.stop().expect("stop owned runtime");
         wait_for_group_exit(process_group_id);
@@ -750,9 +918,13 @@ mod tests {
                 "trap '' INT TERM; echo ready; while :; do sleep 1; done".into(),
             ],
             128,
+            FIXTURE_SIZE,
         );
-        let snapshot = wait_for(&runtime, |snapshot| snapshot.scrollback.contains("ready"));
-        let process_group_id = snapshot.process_group_id.expect("owned process group");
+        wait_for_screen_text(&runtime, "ready", Duration::from_secs(3));
+        let process_group_id = runtime
+            .snapshot()
+            .process_group_id
+            .expect("owned process group");
 
         runtime.interrupt().expect("interrupt owned runtime");
         assert!(process_group_exists(process_group_id));
@@ -776,15 +948,22 @@ mod tests {
                 "trap 'echo interrupted' INT; echo ready; while :; do sleep 1; done".into(),
             ],
             128,
+            FIXTURE_SIZE,
         );
-        let ready = wait_for(&runtime, |snapshot| snapshot.scrollback.contains("ready"));
-        let process_group_id = ready.process_group_id.expect("owned process group");
+        wait_for_screen_text(&runtime, "ready", Duration::from_secs(3));
+        let process_group_id = runtime
+            .snapshot()
+            .process_group_id
+            .expect("owned process group");
 
         runtime.interrupt().expect("interrupt owned runtime");
-        let interrupted = wait_for(&runtime, |snapshot| {
-            snapshot.scrollback.contains("interrupted")
-        });
-        assert_eq!(interrupted.state, ProcessState::Running);
+        // Give the fixture the same window it always had to react to SIGINT; what this test
+        // proves is that an interrupt-capable process is still running afterwards.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !screen_text(&runtime).contains("interrupted") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(runtime.snapshot().state, ProcessState::Running);
         assert!(process_group_exists(process_group_id));
 
         runtime.stop().expect("stop owned runtime");
@@ -800,13 +979,13 @@ mod tests {
                 "trap '' HUP; sleep 30 & echo $!; exit 0".into(),
             ],
             128,
+            FIXTURE_SIZE,
         );
+        let descendant = wait_for_screen_pid(&runtime);
         let terminal = wait_for(&runtime, |snapshot| {
             matches!(snapshot.state, ProcessState::Exited { .. })
-                && snapshot.scrollback.contains('\n')
         });
         let process_group_id = terminal.process_group_id.expect("owned process group");
-        let descendant: u32 = terminal.scrollback.trim().parse().expect("descendant pid");
         assert!(
             process_exists(descendant),
             "descendant must survive its leader"
@@ -843,6 +1022,7 @@ mod tests {
                 capabilities: AdapterCapabilities::default(),
             },
             64,
+            FIXTURE_SIZE,
             move || {
                 reaped_tx.send(()).expect("report child reaped");
                 publish_rx.recv().expect("release lifecycle publication");
@@ -877,7 +1057,11 @@ mod tests {
 
     #[test]
     fn launch_failure_is_an_actionable_runtime_receipt() {
-        let runtime = OwnedRuntime::launch_fixture(vec!["/definitely/not/a/program".into()], 64);
+        let runtime = OwnedRuntime::launch_fixture(
+            vec!["/definitely/not/a/program".into()],
+            64,
+            FIXTURE_SIZE,
+        );
         let snapshot = runtime.snapshot();
         assert_eq!(snapshot.state, ProcessState::FailedToLaunch);
         assert!(
@@ -898,18 +1082,19 @@ mod tests {
                 "if test -t 0; then echo controlling-tty; else echo no-tty; fi; sleep 1".into(),
             ],
             128,
+            FIXTURE_SIZE,
         );
-        let snapshot = wait_for(&runtime, |snapshot| snapshot.scrollback.contains("tty"));
-        let pid = snapshot.pid.expect("launched child") as i32;
+        wait_for_screen_text(&runtime, "tty", Duration::from_secs(3));
+        let pid = runtime.snapshot().pid.expect("launched child") as i32;
         assert_eq!(
             unsafe { nix::libc::getsid(pid) },
             pid,
             "child must lead its session"
         );
+        let observed = screen_text(&runtime);
         assert!(
-            snapshot.scrollback.contains("controlling-tty"),
-            "PTY slave must be the child's terminal: {:?}",
-            snapshot.scrollback
+            observed.contains("controlling-tty"),
+            "PTY slave must be the child's terminal: {observed:?}"
         );
     }
 
@@ -922,10 +1107,13 @@ mod tests {
         let runtime = OwnedRuntime::launch_fixture(
             vec!["sh".into(), "-c".into(), "sleep 30 & echo $!; wait".into()],
             128,
+            FIXTURE_SIZE,
         );
-        let snapshot = wait_for(&runtime, |snapshot| snapshot.scrollback.contains('\n'));
-        let process_group_id = snapshot.process_group_id.expect("owned process group");
-        let descendant: u32 = snapshot.scrollback.trim().parse().expect("descendant pid");
+        let descendant = wait_for_screen_pid(&runtime);
+        let process_group_id = runtime
+            .snapshot()
+            .process_group_id
+            .expect("owned process group");
         assert!(process_exists(descendant));
         drop(runtime);
         wait_for_group_exit(process_group_id);
@@ -947,8 +1135,11 @@ mod tests {
 
     #[test]
     fn exited_child_is_reaped_without_snapshot_polling() {
-        let runtime =
-            OwnedRuntime::launch_fixture(vec!["sh".into(), "-c".into(), "exit 7".into()], 64);
+        let runtime = OwnedRuntime::launch_fixture(
+            vec!["sh".into(), "-c".into(), "exit 7".into()],
+            64,
+            FIXTURE_SIZE,
+        );
         let pid = runtime.pid.expect("launched child") as i32;
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -976,8 +1167,11 @@ mod tests {
 
     #[test]
     fn poisoned_runtime_locks_do_not_panic_in_snapshot_or_drop() {
-        let runtime =
-            OwnedRuntime::launch_fixture(vec!["sh".into(), "-c".into(), "sleep 30".into()], 64);
+        let runtime = OwnedRuntime::launch_fixture(
+            vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            64,
+            FIXTURE_SIZE,
+        );
         let _ = std::panic::catch_unwind(|| {
             let _guard = runtime.lifecycle.lock().expect("lock lifecycle");
             panic!("poison lifecycle lock");
@@ -1050,22 +1244,24 @@ mod tests {
 
     #[test]
     fn unrelated_concurrent_exec_cannot_inherit_guardian_control() {
-        let scrollback = Arc::new(Mutex::new(Scrollback {
-            bytes: VecDeque::with_capacity(128),
-            capacity: 128,
-            truncated: false,
-        }));
+        let screen = Arc::new(Mutex::new(PaneScreen::new(
+            FIXTURE_SIZE.rows,
+            FIXTURE_SIZE.cols,
+            128,
+        )));
         let unrelated = Mutex::new(None);
-        let (mut guardian, pid, control, _pty_input) = launch_child_with_before_spawn(
-            &["sh".into(), "-c".into(), "sleep 30".into()],
-            &std::env::current_dir().unwrap(),
-            scrollback,
-            || {
-                *unrelated.lock().unwrap() =
-                    Some(Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap());
-            },
-        )
-        .unwrap();
+        let (mut guardian, pid, control, _pty_input, _pty_control) =
+            launch_child_with_before_spawn(
+                &["sh".into(), "-c".into(), "sleep 30".into()],
+                &std::env::current_dir().unwrap(),
+                screen,
+                FIXTURE_SIZE,
+                || {
+                    *unrelated.lock().unwrap() =
+                        Some(Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap());
+                },
+            )
+            .unwrap();
         drop(control);
         wait_for_group_exit(pid as i32);
         let _ = guardian.wait();

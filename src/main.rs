@@ -24,6 +24,7 @@ use crossterm::{
 };
 use dock::{
     client::Client,
+    client::{EventStream, StreamPoll},
     dashboard::{Dashboard, UiCommand},
     discovery::{AgentDiscovery, ProcessNameDiscovery},
     git::GitAdapter,
@@ -453,7 +454,7 @@ fn run_dashboard(
     // which the daemon turns into a one-way push channel and never reads again. Pane content
     // now arrives on it, which is what lets the timed Inspect poll below go away entirely: an
     // idle dashboard sends nothing and the daemon sends nothing back.
-    let events = Client::subscribe(socket)?;
+    let mut events = EventStream::subscribe(socket)?;
     refresh(client, &mut dashboard)?;
     loop {
         if let Ok((root, launches)) = catalog_rx.try_recv() {
@@ -462,8 +463,26 @@ fn run_dashboard(
         }
         // Drained without blocking: the reader thread owns the socket, so a quiet daemon costs
         // this loop nothing and a busy one cannot stall the next paint.
-        while let Ok(event) = events.try_recv() {
-            dashboard.apply_event(event);
+        loop {
+            match events.poll() {
+                StreamPoll::Event(event) => dashboard.apply_event(event),
+                StreamPoll::Idle => break,
+                StreamPoll::Reconnected => {
+                    // The replacement subscription re-attaches every live run from a full
+                    // snapshot and re-announces its process and agent state, so the refresh
+                    // this needs arrives through the normal event path on a later tick.
+                    dashboard.detach_screens();
+                    dashboard.error =
+                        Some("event stream dropped; re-subscribed to the daemon".into());
+                    break;
+                }
+                StreamPoll::Lost(error) => {
+                    // Reported rather than swallowed: nothing polls any more, so a dashboard
+                    // that ignored this would keep painting a frozen frame indefinitely.
+                    dashboard.error = Some(format!("event stream lost, retrying: {error}"));
+                    break;
+                }
+            }
         }
         if dashboard.take_refresh() {
             refresh(client, &mut dashboard)?;

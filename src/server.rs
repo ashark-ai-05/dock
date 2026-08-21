@@ -55,7 +55,9 @@ impl Drop for ClientPermit {
 use crate::{
     detect::{AgentKind, AgentState},
     dispatch::RuntimeRegistry,
-    protocol::{ErrorCode, Event, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, Request, Response},
+    protocol::{
+        ErrorCode, Event, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProcessState, Request, Response,
+    },
     terminal::ScreenSync,
 };
 
@@ -367,6 +369,12 @@ fn stream_events(
     // revision that moves backwards as a dropped frame and asks to re-attach, which would loop.
     let mut revisions: HashMap<String, u64> = HashMap::new();
     let mut states: HashMap<String, (Option<AgentKind>, AgentState)> = HashMap::new();
+    // Tracked separately from `states` because a plain shell has no agent: its identity stays
+    // `None` and its agent state stays `Idle` forever, so an exit would never reach a
+    // subscriber through `AgentStateChanged`. Its screen stops changing at the same moment,
+    // so no delta carries the news either. Without this the pane renders its dead last frame
+    // and reports Running until something else happens to issue a request.
+    let mut process_states: HashMap<String, ProcessState> = HashMap::new();
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(());
@@ -419,6 +427,20 @@ fn stream_events(
                     .sync
                     .apply(&delta);
                 revisions.insert(snapshot.run_id.clone(), revision);
+            }
+            if process_states.get(&snapshot.run_id) != Some(&snapshot.state) {
+                write_response(
+                    stream,
+                    &Response::Stream {
+                        event: Event::PaneState {
+                            run_id: snapshot.run_id.clone(),
+                            state: snapshot.state.clone(),
+                        },
+                    },
+                )?;
+                // Recorded only after the write succeeded, so a failed write cannot convince
+                // this loop that the subscriber already knows.
+                process_states.insert(snapshot.run_id.clone(), snapshot.state.clone());
             }
             let current = (snapshot.agent, snapshot.agent_state);
             if states.get(&snapshot.run_id) != Some(&current) {
@@ -617,6 +639,14 @@ mod tests {
     const TEST_STREAM_WINDOW: Duration = Duration::from_millis(400);
 
     fn exchange(lines: &[&str], runtime: &RuntimeRegistry) -> Vec<Response> {
+        exchange_within(lines, runtime, TEST_STREAM_WINDOW)
+    }
+
+    fn exchange_within(
+        lines: &[&str],
+        runtime: &RuntimeRegistry,
+        window: Duration,
+    ) -> Vec<Response> {
         let (mut client, mut server) = UnixStream::pair().expect("socket pair");
         std::thread::scope(|scope| {
             scope.spawn(move || {
@@ -624,7 +654,7 @@ mod tests {
                     &mut server,
                     runtime,
                     CLIENT_READ_TIMEOUT,
-                    Some(Instant::now() + TEST_STREAM_WINDOW),
+                    Some(Instant::now() + window),
                 )
                 .ok();
                 // Dropping the server end is what gives the client its EOF; without it the
@@ -964,6 +994,51 @@ mod tests {
         assert!(
             announcements <= 1,
             "a pane whose agent state never changes must be announced at most once, got {announcements}"
+        );
+    }
+
+    #[test]
+    fn an_exited_shell_is_announced_even_though_its_screen_stops_changing() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let shared = runtime.shared();
+        // Typed from another thread so the exit lands while this subscriber is attached. A
+        // shell that had already died before the stream opened would be reported by the very
+        // first frame and would prove nothing about noticing a *change*.
+        let typist = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            let _ = shared.pane_input("w1", "p1", b"exit\n");
+        });
+        let responses = exchange_within(
+            &[&hello(), &subscribe_line()],
+            &runtime,
+            Duration::from_millis(2500),
+        );
+        typist.join().expect("typist thread");
+
+        let announced: Vec<ProcessState> = collect_events(&responses)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::PaneState { state, .. } => Some(state),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            announced
+                .iter()
+                .any(|state| matches!(state, ProcessState::Exited { .. })),
+            "a shell that exits must reach the subscriber: its screen stops changing and a \
+             plain shell never changes agent state, so nothing else carries the news; got \
+             {announced:?}"
+        );
+        assert_eq!(
+            announced
+                .iter()
+                .filter(|state| matches!(state, ProcessState::Running))
+                .count(),
+            1,
+            "process state is change-gated, so Running must be announced once, not per tick: \
+             {announced:?}"
         );
     }
 

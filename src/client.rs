@@ -1,9 +1,10 @@
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc,
     thread,
+    time::{Duration, Instant},
 };
 
 use crate::protocol::{Event, HelloRequest, PROTOCOL_VERSION, Request, Response, SubscribeRequest};
@@ -56,6 +57,14 @@ impl Client {
     /// trip in front of every keystroke's paint, and there is nothing to wait for: the echo
     /// arrives on the event stream, not in this reply.
     pub fn send(&mut self, request: &Request) -> Result<(), String> {
+        // `unread_replies` assumes exactly one reply per request, in order. That holds for
+        // every request the daemon answers, but `Subscribe` is answered with nothing at all:
+        // sending it here would offset the counter permanently and mis-attribute every later
+        // reply, with nothing to resynchronise it. Use `subscribe` for that.
+        debug_assert!(
+            matches!(request, Request::PaneInput(_) | Request::PaneResize(_)),
+            "send() is only for requests the daemon acknowledges exactly once, not {request:?}"
+        );
         self.write_request(request)?;
         self.unread_replies += 1;
         Ok(())
@@ -123,15 +132,85 @@ impl Client {
     }
 }
 
+/// One poll of the event stream.
+#[derive(Debug)]
+pub enum StreamPoll {
+    Event(Event),
+    /// Nothing pending. Not the same as nothing left: see `Reconnected`.
+    Idle,
+    /// The stream died and a fresh subscription replaced it. Every replicated screen must be
+    /// dropped, because the daemon starts a new subscriber's sync map empty and re-attaches
+    /// each live run with a full snapshot.
+    Reconnected,
+    /// The stream died and could not be replaced yet. The dashboard is showing stale content.
+    Lost(String),
+}
+
+/// A subscription that notices its own death and re-establishes itself.
+///
+/// The dashboard's entire picture of pane content arrives here and nothing polls any more, so
+/// a stream that ends — daemon restart, admission eviction, write timeout, or any IO error in
+/// the reader thread — would otherwise freeze the UI on its last frame with no indication.
+/// Folding `Disconnected` into `Empty` is exactly that bug, so the two are kept apart.
+///
+/// Reconnecting also gives a client stuck behind a revision gap a real recovery path: a fresh
+/// subscription re-attaches every run from a full snapshot.
+pub struct EventStream {
+    socket: PathBuf,
+    receiver: mpsc::Receiver<Event>,
+    retry_at: Option<Instant>,
+}
+
+impl EventStream {
+    /// How long to wait before retrying a subscription that could not be re-established, so a
+    /// daemon that is down costs one connect attempt a second rather than one per frame.
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+    pub fn subscribe(socket: &Path) -> Result<Self, String> {
+        Ok(Self {
+            socket: socket.to_path_buf(),
+            receiver: Client::subscribe(socket)?,
+            retry_at: None,
+        })
+    }
+
+    /// Never blocks: the render loop drains this every frame.
+    pub fn poll(&mut self) -> StreamPoll {
+        match self.receiver.try_recv() {
+            Ok(event) => StreamPoll::Event(event),
+            Err(mpsc::TryRecvError::Empty) => StreamPoll::Idle,
+            Err(mpsc::TryRecvError::Disconnected) => self.resubscribe(),
+        }
+    }
+
+    fn resubscribe(&mut self) -> StreamPoll {
+        if self
+            .retry_at
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return StreamPoll::Idle;
+        }
+        match Client::subscribe(&self.socket) {
+            Ok(receiver) => {
+                self.receiver = receiver;
+                self.retry_at = None;
+                StreamPoll::Reconnected
+            }
+            Err(error) => {
+                self.retry_at = Some(Instant::now() + Self::RETRY_DELAY);
+                StreamPoll::Lost(error)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::{ErrorCode, InspectRequest, PaneInputRequest};
     use std::{
         os::unix::net::UnixListener,
-        path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
-        time::Duration,
     };
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -172,7 +251,34 @@ mod tests {
     }
 
     fn accept_handshake(listener: &UnixListener) -> (UnixStream, BufReader<UnixStream>) {
-        let (mut stream, _) = listener.accept().expect("accept");
+        accept_within(listener, Duration::from_secs(10)).expect("accept")
+    }
+
+    /// Accepts with a deadline. A regression that never re-subscribes must fail the test that
+    /// asserts it does, not wedge the whole suite in a blocking `accept`.
+    fn accept_within(
+        listener: &UnixListener,
+        timeout: Duration,
+    ) -> Option<(UnixStream, BufReader<UnixStream>)> {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let deadline = Instant::now() + timeout;
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        // macOS hands an accepted socket the listener's non-blocking flag; every read below is
+        // a blocking line read.
+        stream.set_nonblocking(false).expect("blocking stream");
         let mut reader = BufReader::new(stream.try_clone().expect("clone"));
         assert!(line(&mut reader).contains("hello"));
         write_line(
@@ -181,7 +287,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
             },
         );
-        (stream, reader)
+        Some((stream, reader))
     }
 
     #[test]
@@ -289,5 +395,130 @@ mod tests {
         );
         drop(client);
         daemon.join().expect("daemon thread");
+    }
+
+    fn attached(revision: u64) -> Event {
+        Event::PaneAttached {
+            run_id: "run_1".into(),
+            revision,
+            rows: 10,
+            cols: 40,
+            screen: String::new(),
+        }
+    }
+
+    /// Polls until `stop` says the test has seen what it needs, recording every outcome.
+    /// The reader thread notices EOF on its own schedule, so the disconnect cannot be
+    /// asserted on a fixed number of polls.
+    fn poll_until(
+        stream: &mut EventStream,
+        stop: impl Fn(&[StreamPoll]) -> bool,
+    ) -> Vec<StreamPoll> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline && !stop(&seen) {
+            match stream.poll() {
+                StreamPoll::Idle => thread::sleep(Duration::from_millis(5)),
+                outcome => seen.push(outcome),
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn a_dead_event_stream_is_noticed_and_replaced_rather_than_read_as_idle() {
+        let socket = socket_path("reconnect");
+        let listener = UnixListener::bind(&socket.0).expect("bind");
+        let daemon = thread::spawn(move || {
+            // One frame, then the daemon drops the connection: a restart, an admission
+            // eviction, and a write timeout all look exactly like this to the client.
+            let (mut stream, mut reader) = accept_handshake(&listener);
+            assert!(line(&mut reader).contains("subscribe"));
+            write_line(&mut stream, &Response::Stream { event: attached(1) });
+            drop((reader, stream));
+            // The replacement subscription, which the client must make entirely on its own.
+            let Some((mut stream, mut reader)) = accept_within(&listener, Duration::from_secs(5))
+            else {
+                return;
+            };
+            assert!(line(&mut reader).contains("subscribe"));
+            write_line(&mut stream, &Response::Stream { event: attached(2) });
+            drop((reader, stream));
+        });
+
+        let mut stream = EventStream::subscribe(&socket.0).expect("subscribe");
+        let seen = poll_until(&mut stream, |seen| {
+            seen.iter().any(|outcome| {
+                matches!(
+                    outcome,
+                    StreamPoll::Event(Event::PaneAttached { revision: 2, .. })
+                )
+            })
+        });
+        daemon.join().expect("daemon thread");
+
+        assert!(
+            seen.iter().any(|outcome| matches!(
+                outcome,
+                StreamPoll::Event(Event::PaneAttached { revision: 1, .. })
+            )),
+            "the first subscription's frame: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|outcome| matches!(outcome, StreamPoll::Reconnected)),
+            "a stream whose reader thread ended must be reported, not folded into idle, or \
+             the dashboard renders its last frame forever: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|outcome| matches!(
+                outcome,
+                StreamPoll::Event(Event::PaneAttached { revision: 2, .. })
+            )),
+            "the replacement subscription must actually deliver frames: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn an_event_stream_that_cannot_be_replaced_reports_the_loss_and_then_backs_off() {
+        let socket = socket_path("lost");
+        let listener = UnixListener::bind(&socket.0).expect("bind");
+        let daemon = thread::spawn(move || {
+            let (stream, mut reader) = accept_handshake(&listener);
+            assert!(line(&mut reader).contains("subscribe"));
+            // The listener goes too, so nothing is left to accept a replacement.
+            drop((reader, stream, listener));
+        });
+
+        let mut stream = EventStream::subscribe(&socket.0).expect("subscribe");
+        let seen = poll_until(&mut stream, |seen| !seen.is_empty());
+        daemon.join().expect("daemon thread");
+        assert!(
+            matches!(seen.first(), Some(StreamPoll::Lost(_))),
+            "a stream that cannot be replaced must say so: {seen:?}"
+        );
+        // Backed off: without this a down daemon would draw one connect attempt per rendered
+        // frame, which at the render loop's 16ms tick is a reconnect storm.
+        assert!(
+            matches!(stream.poll(), StreamPoll::Idle),
+            "a failed re-subscribe must not retry on the very next poll"
+        );
+    }
+
+    /// `unread_replies` self-corrects only because every request routed through `send` is
+    /// acknowledged exactly once. `Subscribe` is answered with nothing at all, so sending it
+    /// here would offset the counter permanently and mis-attribute every later reply.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "send() is only for requests the daemon acknowledges exactly once")]
+    fn send_refuses_a_request_the_daemon_never_acknowledges() {
+        let socket = socket_path("unacked");
+        let listener = UnixListener::bind(&socket.0).expect("bind");
+        thread::spawn(move || {
+            let (stream, reader) = accept_handshake(&listener);
+            drop((reader, stream, listener));
+        });
+        let mut client = Client::connect(&socket.0).expect("connect");
+        let _ = client.send(&Request::Subscribe(SubscribeRequest {}));
     }
 }

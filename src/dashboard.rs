@@ -178,6 +178,14 @@ impl Dashboard {
         }
     }
 
+    /// Drops every replicated screen, for use when the event stream is re-established. The
+    /// fresh subscription re-attaches every live run with a full snapshot, so anything not
+    /// re-attached belongs to a run that is gone and would otherwise be painted forever.
+    pub fn detach_screens(&mut self) {
+        self.screens.clear();
+        self.revisions.clear();
+    }
+
     /// True once when a pushed event invalidated the run list or layout. The render loop uses
     /// this instead of an unconditional timer poll, so an idle dashboard issues no requests.
     pub fn take_refresh(&mut self) -> bool {

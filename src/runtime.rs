@@ -1,11 +1,14 @@
 use std::{
     collections::VecDeque,
     fs::File,
-    io::{Error, Read},
+    io::{Error, Read, Write},
     os::unix::{io::AsRawFd, net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        mpsc::{SyncSender, TrySendError, sync_channel},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -67,6 +70,7 @@ pub struct OwnedRuntime {
     pid: Option<u32>,
     owned_process_group: Option<OwnedProcessGroup>,
     guardian_control: Option<UnixStream>,
+    pty_input: Option<SyncSender<Vec<u8>>>,
     scrollback: Arc<Mutex<Scrollback>>,
     launch_error: Option<String>,
 }
@@ -75,6 +79,8 @@ pub struct OwnedRuntime {
 /// It is deliberately private so callers can never ask the runtime to signal an arbitrary PID.
 #[derive(Debug)]
 struct OwnedProcessGroup(Pid);
+
+type ChildLaunch = (Child, u32, UnixStream, SyncSender<Vec<u8>>);
 
 #[derive(Debug)]
 enum LifecycleState {
@@ -107,7 +113,7 @@ impl OwnedRuntime {
             truncated: false,
         }));
         match launch_child(&command, &binding.worktree, Arc::clone(&scrollback)) {
-            Ok((child, pid, guardian_control)) => {
+            Ok((child, pid, guardian_control, pty_input_sender)) => {
                 let lifecycle = Arc::new(Mutex::new(LifecycleState::Running));
                 let reaper_lifecycle = Arc::clone(&lifecycle);
                 let child = Arc::new(Mutex::new(Some(child)));
@@ -147,6 +153,7 @@ impl OwnedRuntime {
                             .map(Pid::from_raw)
                             .map(OwnedProcessGroup),
                         guardian_control: Some(guardian_control),
+                        pty_input: Some(pty_input_sender),
                         scrollback,
                         launch_error: None,
                     },
@@ -166,6 +173,7 @@ impl OwnedRuntime {
                             .map(Pid::from_raw)
                             .map(OwnedProcessGroup),
                         guardian_control: Some(guardian_control),
+                        pty_input: Some(pty_input_sender),
                         scrollback,
                         launch_error: None,
                     },
@@ -182,6 +190,7 @@ impl OwnedRuntime {
                 pid: None,
                 owned_process_group: None,
                 guardian_control: None,
+                pty_input: None,
                 scrollback,
                 launch_error: Some(error),
             },
@@ -289,6 +298,28 @@ impl OwnedRuntime {
     }
     pub fn interrupt(&self) -> Result<(), String> {
         self.signal(Signal::SIGINT)
+    }
+    pub fn input(&self, input: &[u8]) -> Result<(), String> {
+        if input.is_empty() {
+            return Ok(());
+        }
+        if input.len() > 4096 {
+            return Err("pane input is limited to 4096 bytes per request".into());
+        }
+        if !matches!(
+            *self.lifecycle.lock().unwrap_or_else(|p| p.into_inner()),
+            LifecycleState::Running
+        ) {
+            return Err("pane input requires a running Dock-owned runtime".into());
+        }
+        self.pty_input
+            .as_ref()
+            .ok_or("run has no Dock-owned PTY input capability")?
+            .try_send(input.to_vec())
+            .map_err(|error| match error {
+                TrySendError::Full(_) => "Dock-owned PTY input queue is full".into(),
+                TrySendError::Disconnected(_) => "Dock-owned PTY input capability is closed".into(),
+            })
     }
     pub fn stop(&self) -> Result<(), String> {
         if let Some(group) = self.owned_process_group.as_ref() {
@@ -447,7 +478,7 @@ fn launch_child(
     command: &[String],
     worktree: &Path,
     scrollback: Arc<Mutex<Scrollback>>,
-) -> Result<(Child, u32, UnixStream), String> {
+) -> Result<ChildLaunch, String> {
     launch_child_with_before_spawn(command, worktree, scrollback, || {})
 }
 
@@ -456,13 +487,16 @@ fn launch_child_with_before_spawn(
     worktree: &Path,
     scrollback: Arc<Mutex<Scrollback>>,
     before_spawn: impl FnOnce(),
-) -> Result<(Child, u32, UnixStream), String> {
+) -> Result<ChildLaunch, String> {
     let Some(program) = command.first() else {
         return Err("fixture command is required".into());
     };
     let pty =
         openpty(None, None).map_err(|error| format!("could not allocate fixture PTY: {error}"))?;
     let master = File::from(pty.master);
+    let pty_input = master
+        .try_clone()
+        .map_err(|error| format!("could not clone PTY master for input: {error}"))?;
     let slave = File::from(pty.slave);
     let stdin = slave
         .try_clone()
@@ -548,7 +582,25 @@ exit "$dock_status""#,
         let _ = child.wait();
         return Err(format!("could not start PTY reader: {error}"));
     }
-    Ok((child, pid, guardian_control))
+    let (pty_input_sender, pty_input_receiver) = sync_channel::<Vec<u8>>(64);
+    if let Err(error) = thread::Builder::new()
+        .name("dock-pty-writer".into())
+        .spawn(move || {
+            let mut pty_input = pty_input;
+            while let Ok(input) = pty_input_receiver.recv() {
+                if pty_input.write_all(&input).is_err() {
+                    break;
+                }
+            }
+        })
+    {
+        if let Ok(raw_pid) = i32::try_from(pid) {
+            signal_owned_group(&OwnedProcessGroup(Pid::from_raw(raw_pid)), Signal::SIGKILL);
+        }
+        let _ = child.wait();
+        return Err(format!("could not start PTY writer: {error}"));
+    }
+    Ok((child, pid, guardian_control, pty_input_sender))
 }
 
 fn apply_child_environment(
@@ -641,6 +693,28 @@ mod tests {
             snapshot.process_group_id
         );
         wait_for_group_exit(snapshot.process_group_id.expect("owned process group"));
+    }
+
+    #[test]
+    fn input_uses_only_live_owned_pty_and_is_rejected_after_exit() {
+        let runtime = OwnedRuntime::launch_fixture(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "read value; printf 'got:%s' \"$value\"".into(),
+            ],
+            128,
+        );
+        runtime.input(b"hello\n").expect("owned PTY input");
+        let snapshot = wait_for(&runtime, |snapshot| {
+            snapshot.scrollback.contains("got:hello")
+        });
+        assert!(snapshot.scrollback.contains("got:hello"));
+        let terminal = wait_for(&runtime, |snapshot| {
+            matches!(snapshot.state, ProcessState::Exited { .. })
+        });
+        assert!(matches!(terminal.state, ProcessState::Exited { .. }));
+        assert!(runtime.input(b"again\n").unwrap_err().contains("running"));
     }
 
     #[test]
@@ -978,7 +1052,7 @@ mod tests {
             truncated: false,
         }));
         let unrelated = Mutex::new(None);
-        let (mut guardian, pid, control) = launch_child_with_before_spawn(
+        let (mut guardian, pid, control, _pty_input) = launch_child_with_before_spawn(
             &["sh".into(), "-c".into(), "sleep 30".into()],
             &std::env::current_dir().unwrap(),
             scrollback,

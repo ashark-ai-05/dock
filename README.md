@@ -8,17 +8,27 @@ Dock gives coding-agent work a safe local home: owned workspaces and panes, prov
 
 ### 1. Start Dock
 
-In one terminal, from this repository:
+From a repository, launch the foreground dashboard; it reconnects to the private daemon or starts
+one automatically:
 
 ```bash
-cargo run --bin dockd
+cargo run --bin dock
 ```
 
-Leave it running. Dock starts empty and creates its local socket automatically.
+The separate `cargo run --bin dockd` command remains supported for explicit daemon operation.
 
-### 2. Create a workspace
+### 2. Create a workspace and owned run in the dashboard
 
-In another terminal:
+Press `n` to create a workspace, then `l` to launch the explicit Dock-owned fixture path. The pane
+shows the authoritative repository, task, run, workspace, and pane binding returned by the runtime;
+an empty pane labels each fact as unbound. Press `i` to send input to a selected owned run.
+
+Discovered existing agent processes are display-only and say `external/read-only`. Press `d` or
+click `dismiss all` to remove those candidates from the view. Launching never adopts a discovered
+process.
+
+The direct noninteractive workspace commands remain available for scripts and compatibility, but
+they are not the normal user or Slice 6.1 smoke path:
 
 ```bash
 cargo run --bin dock-workspace -- create daily "Daily work" editor
@@ -34,7 +44,7 @@ cargo run --bin dock-workspace -- resize daily agent 650
 cargo run --bin dock-workspace -- rename-pane daily agent "Coding agent"
 ```
 
-### 3. Run an agent
+### 3. Use direct runtime commands when scripting
 
 Use `fixture` to prove the runtime before using a real provider:
 
@@ -83,6 +93,11 @@ cargo run --bin dock-programme
 ### Safety by default
 
 - Dock never automatically stages, commits, rebases, merges, pushes, deploys, creates worktrees, or mutates task systems.
+- By default Dock intentionally creates private durable runtime state and records under
+  `.dock/local` in the current repository. That directory is ignored by this repository's
+  `.gitignore`; its no-follow directories and files are restricted to modes 0700 and 0600. This
+  expected local state does not change Git history, the index, tracked worktree content, or task
+  truth. Use `--state-dir=...` when the state must live elsewhere.
 - Dock never discovers, imports, or controls arbitrary processes.
 - Durable state is private. Semantic layout metadata contains only bounded workspace/pane topology
   and labels: never credentials, terminal output, commands, repository/worktree paths, run bindings,
@@ -94,7 +109,7 @@ cargo run --bin dock-programme
 
 ## What is not here yet
 
-Dock is not yet a full terminal multiplexer. Themes, mouse support, zoom, tabs/workspace navigation, notifications, and durable transcript replay are deferred. Bounded live scrollback is shipped: each daemon-owned runtime retains only its configured byte limit in memory for reconnects to that same daemon, truncating the oldest bytes as new output arrives; it is never written to layout or restored after daemon restart. See the [terminal-runtime parity matrix](docs/terminal-runtime-parity.md) for the exact status.
+Dock is not yet a full terminal multiplexer. Themes, zoom, notifications, and durable transcript replay are deferred. Bounded live scrollback is shipped: each daemon-owned runtime retains only its configured byte limit in memory for reconnects to that same daemon, truncating the oldest bytes as new output arrives; it is never written to layout or restored after daemon restart. See the [terminal-runtime parity matrix](docs/terminal-runtime-parity.md) for the exact status.
 
 ## Verify a change
 
@@ -104,6 +119,7 @@ cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 scripts/smoke-slice5-macos.sh
 scripts/smoke-slice6-macos.sh
+scripts/smoke-slice61-macos.sh
 ```
 
 See the [implementation breakdown](docs/implementation-breakdown.md) for planned work and acceptance evidence.

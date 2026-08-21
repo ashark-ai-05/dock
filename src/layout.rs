@@ -71,7 +71,7 @@ pub struct WorkspaceLayout {
     pub root: LayoutNode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LayoutSnapshot {
     pub workspaces: Vec<WorkspaceLayout>,
@@ -548,6 +548,19 @@ impl LayoutRegistry {
                 ));
             }
             None => {}
+        }
+        Ok(())
+    }
+    pub fn check_launch_target(&self, workspace_id: &str, pane_id: &str) -> Result<(), String> {
+        let pane = self
+            .workspaces
+            .get(workspace_id)
+            .ok_or("workspace not found")?
+            .panes
+            .get(pane_id)
+            .ok_or("pane not found")?;
+        if pane.run_id.is_some() {
+            return Err("pane already has a run; close it before launching another".into());
         }
         Ok(())
     }

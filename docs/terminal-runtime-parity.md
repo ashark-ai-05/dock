@@ -6,7 +6,7 @@ Status reflects the initial Slice 6 vertical slice, not complete terminal-emulat
 |---|---|---|
 | Multiple workspaces and panes | Shipped | Dynamic daemon-owned model and protocol v6 CLI |
 | Horizontal/vertical split | Shipped | Deterministic bounded binary layout tree |
-| Focus, resize, rename, close | Shipped | Strict socket operations and `dock-workspace` |
+| Focus, resize, rename, close | Shipped | Foreground `dock` dashboard with keyboard/mouse actions; strict socket commands remain compatible |
 | Layout persistence | Shipped | Owner-only atomic topology and labels |
 | Bounded pane admission | Shipped | 64 panes per workspace; atomic refusal precedes receipt, pane, PTY, and process creation; explicit close reaps the owned runtime and frees the slot |
 | Client reconnect | Shipped | Live daemon state remains authoritative |

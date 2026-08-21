@@ -1,10 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::CString,
     fs::{self, File, OpenOptions},
     io::Write,
     os::unix::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        io::{AsRawFd, FromRawFd},
     },
     path::{Component, Path, PathBuf},
     process::Command,
@@ -47,11 +49,15 @@ pub struct RuntimeRegistry {
     #[cfg(test)]
     after_launch_before_receipt_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    before_runtime_launch_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
     before_save_receipt_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     release_commit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     portfolio_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    pane_input_before_final_validation_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     workspace_stop_failure: Mutex<Option<String>>,
     #[cfg(test)]
@@ -290,11 +296,15 @@ impl RuntimeRegistry {
             #[cfg(test)]
             after_launch_before_receipt_hook: Mutex::new(None),
             #[cfg(test)]
+            before_runtime_launch_hook: Mutex::new(None),
+            #[cfg(test)]
             before_save_receipt_hook: Mutex::new(None),
             #[cfg(test)]
             release_commit_hook: Mutex::new(None),
             #[cfg(test)]
             portfolio_capture_hook: Mutex::new(None),
+            #[cfg(test)]
+            pane_input_before_final_validation_hook: Mutex::new(None),
             #[cfg(test)]
             workspace_stop_failure: Mutex::new(None),
             #[cfg(test)]
@@ -308,7 +318,16 @@ impl RuntimeRegistry {
         &self,
         request: DispatchRequest,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
-        self.dispatch_with_gate_authorization(request, false)
+        self.dispatch_with_gate_authorization(request, false, None)
+    }
+
+    pub fn launch_into_pane(
+        &self,
+        request: DispatchRequest,
+        workspace_id: String,
+        pane_id: String,
+    ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
+        self.dispatch_with_gate_authorization(request, false, Some((workspace_id, pane_id)))
     }
 
     pub fn layout(&self) -> LayoutSnapshot {
@@ -590,9 +609,14 @@ impl RuntimeRegistry {
         &self,
         request: DispatchRequest,
         gate_release_authorized: bool,
+        launch_target: Option<(String, String)>,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
         self.reconcile_failed_dispatches();
-        let binding = validate_binding(&request).map_err(|m| (ErrorCode::InvalidBinding, m))?;
+        let mut binding = validate_binding(&request).map_err(|m| (ErrorCode::InvalidBinding, m))?;
+        if let Some((workspace_id, pane_id)) = &launch_target {
+            binding.workspace_id = workspace_id.clone();
+            binding.pane_id = pane_id.clone();
+        }
         // Reject an already gated identity before adapter discovery. This is repeated under the
         // run lock below so a concurrent queue cannot cross the dispatch admission boundary.
         {
@@ -626,6 +650,11 @@ impl RuntimeRegistry {
         }
         self.check_capacity(&runs, &binding.repository_root)?;
         let mut layout = self.layout.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((workspace_id, pane_id)) = &launch_target {
+            layout
+                .check_launch_target(workspace_id, pane_id)
+                .map_err(layout_error)?;
+        }
         layout
             .check_bind_capacity(&binding.workspace_id, &binding.pane_id)
             .map_err(|message| (ErrorCode::CapacityExceeded, message))?;
@@ -662,6 +691,15 @@ impl RuntimeRegistry {
         drop(programme);
         drop(layout);
         drop(runs);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .before_runtime_launch_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            hook();
+        }
         let runtime = Arc::new(OwnedRuntime::launch(
             binding,
             adapter,
@@ -690,7 +728,17 @@ impl RuntimeRegistry {
         {
             hook();
         }
-        if let Err(message) = save_receipt(&receipt, &snapshot) {
+        let commit_error = if snapshot.state == crate::protocol::ProcessState::FailedToLaunch {
+            Some(
+                snapshot
+                    .diagnostic
+                    .clone()
+                    .unwrap_or_else(|| "adapter process failed to launch".into()),
+            )
+        } else {
+            save_receipt(&receipt, &snapshot).err()
+        };
+        if let Some(message) = commit_error {
             #[cfg(test)]
             let stop = if let Some(message) = self
                 .receipt_stop_failure
@@ -785,7 +833,12 @@ impl RuntimeRegistry {
             } else {
                 format!("{message}; {}", failures.join("; "))
             };
-            return Err((ErrorCode::Internal, detail));
+            let code = if snapshot.state == crate::protocol::ProcessState::FailedToLaunch {
+                ErrorCode::AdapterUnavailable
+            } else {
+                ErrorCode::Internal
+            };
+            return Err((code, detail));
         }
         let run_id = snapshot.run_id.clone();
         let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
@@ -968,7 +1021,7 @@ impl RuntimeRegistry {
                 .remove(downstream_run_id);
             return Err((ErrorCode::Internal, message));
         }
-        match self.dispatch_with_gate_authorization(request, true) {
+        match self.dispatch_with_gate_authorization(request, true, None) {
             Ok(snapshot) => {
                 // Dispatch and its durable receipt are the commit point. Failure to remove this
                 // claim must not turn a launched run into a retryable release; startup reconciles
@@ -1439,6 +1492,73 @@ impl RuntimeRegistry {
         Ok(snapshots)
     }
 
+    pub fn pane_input(
+        &self,
+        workspace_id: &str,
+        pane_id: &str,
+        input: &[u8],
+    ) -> Result<usize, (ErrorCode, String)> {
+        let run_id = self
+            .layout
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pane_run(workspace_id, pane_id)
+            .ok_or_else(|| {
+                (
+                    ErrorCode::InvalidBinding,
+                    "pane is not bound to a live Dock-owned run".into(),
+                )
+            })?;
+        let entry = self
+            .runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&run_id)
+            .and_then(RuntimeSlot::active)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    ErrorCode::InvalidBinding,
+                    "pane binding has no live authority in this daemon".into(),
+                )
+            })?;
+        let binding = entry.runtime.binding();
+        if binding.workspace_id != workspace_id || binding.pane_id != pane_id {
+            return Err((
+                ErrorCode::InvalidBinding,
+                "pane binding does not match the exact Dock-owned runtime".into(),
+            ));
+        }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .pane_input_before_final_validation_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            hook();
+        }
+        // Input is enqueued, rather than written here, so this exact-authority critical section
+        // cannot block on a PTY. All binding mutations use runs -> layout in the same order.
+        let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+        let layout = self.layout.lock().unwrap_or_else(|p| p.into_inner());
+        let exact_runtime = runs
+            .get(&run_id)
+            .and_then(RuntimeSlot::active)
+            .is_some_and(|current| Arc::ptr_eq(&current.runtime, &entry.runtime));
+        if !exact_runtime || layout.pane_run(workspace_id, pane_id).as_deref() != Some(&run_id) {
+            return Err((
+                ErrorCode::InvalidBinding,
+                "pane binding changed before input reached the exact Dock-owned runtime".into(),
+            ));
+        }
+        entry
+            .runtime
+            .input(input)
+            .map_err(|message| (ErrorCode::UnsupportedOperation, message))?;
+        Ok(input.len())
+    }
+
     pub fn submit_handoff(
         &self,
         packet: HandoffPacket,
@@ -1606,23 +1726,141 @@ fn likely_contains_secret(value: &str) -> bool {
 }
 
 fn ensure_private_directory(path: &Path, label: &str) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(path)
-                .map_err(|e| format!("could not create {label} directory: {e}"))?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("could not secure {label} directory: {e}"))?;
-        }
-        Err(error) => return Err(format!("could not inspect {label} directory: {error}")),
+    // macOS exposes its standard temporary directory as the root-owned `/tmp` symlink to
+    // `/private/tmp`.  Resolve that one platform alias before the no-follow component walk so
+    // absolute mktemp paths remain usable; all caller-controlled symlink ancestors are still
+    // rejected by openat/fstatat below.
+    let traversal_path = if path.is_absolute() && path.starts_with("/tmp") {
+        fs::canonicalize("/tmp")
+            .map(|temporary| temporary.join(path.strip_prefix("/tmp").unwrap()))
+            .map_err(|error| format!("could not resolve system temporary directory: {error}"))?
+    } else {
+        path.to_path_buf()
+    };
+    let components = traversal_path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(Ok(name)),
+            Component::RootDir | Component::CurDir => None,
+            Component::ParentDir | Component::Prefix(_) => Some(Err(format!(
+                "refusing untrusted {label} directory {}: parent and platform-prefix components are not allowed",
+                path.display()
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if components.is_empty() {
+        return Err(format!("refusing empty {label} directory path"));
     }
 
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|e| format!("could not inspect {label} directory: {e}"))?;
-    // SAFETY: geteuid(2) has no preconditions and does not access memory.
+    let start = if traversal_path.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    };
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(start)
+        .map_err(|error| format!("could not open {label} directory traversal root: {error}"))?;
     let effective_uid = unsafe { nix::libc::geteuid() };
-    if !metadata.file_type().is_dir()
-        || metadata.uid() != effective_uid
+
+    for (index, component) in components.iter().enumerate() {
+        let name = CString::new(component.as_bytes())
+            .map_err(|_| format!("refusing {label} directory with a NUL path component"))?;
+        let is_final = index + 1 == components.len();
+        let mut created = false;
+        let mut fd = unsafe {
+            nix::libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                nix::libc::O_RDONLY
+                    | nix::libc::O_DIRECTORY
+                    | nix::libc::O_CLOEXEC
+                    | nix::libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            let open_error = std::io::Error::last_os_error();
+            if open_error.kind() != std::io::ErrorKind::NotFound {
+                let mut metadata = std::mem::MaybeUninit::<nix::libc::stat>::uninit();
+                let inspect_result = unsafe {
+                    nix::libc::fstatat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        metadata.as_mut_ptr(),
+                        nix::libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if inspect_result == 0 {
+                    return Err(format!(
+                        "refusing untrusted {label} directory {}: could not open a real directory component without following symlinks: {open_error}",
+                        path.display()
+                    ));
+                }
+                let inspect_error = std::io::Error::last_os_error();
+                if inspect_error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "refusing untrusted {label} directory {}: could not safely inspect a directory component after open failed ({open_error}): {inspect_error}",
+                        path.display()
+                    ));
+                }
+            }
+            let result = unsafe { nix::libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            if result != 0 {
+                let create_error = std::io::Error::last_os_error();
+                if create_error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(format!(
+                        "could not create {label} directory component in {}: {create_error}",
+                        path.display()
+                    ));
+                }
+            } else {
+                created = true;
+            }
+            fd = unsafe {
+                nix::libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    nix::libc::O_RDONLY
+                        | nix::libc::O_DIRECTORY
+                        | nix::libc::O_CLOEXEC
+                        | nix::libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(format!(
+                    "refusing untrusted {label} directory {}: could not verify a directory component after creation without following symlinks: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                ));
+            }
+            // A competing creator is acceptable only when it produced the same kind of private
+            // directory we would have created. Verify before using it as a traversal root.
+            if !created {
+                let raced_directory = unsafe { File::from_raw_fd(fd) };
+                verify_private_directory(&raced_directory, effective_uid, path, label)?;
+                directory = raced_directory;
+                continue;
+            }
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+        if created || is_final {
+            verify_private_directory(&directory, effective_uid, path, label)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_private_directory(
+    directory: &File,
+    effective_uid: u32,
+    path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let metadata = directory
+        .metadata()
+        .map_err(|error| format!("could not inspect {label} directory: {error}"))?;
+    if metadata.uid() != effective_uid
         || metadata.mode() & 0o700 != 0o700
         || metadata.mode() & 0o077 != 0
     {
@@ -2127,6 +2365,218 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    #[test]
+    fn launch_into_pane_binds_the_exact_empty_target_and_refuses_to_replace_it() {
+        let repo = Repo::new("launch-into-pane");
+        let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "ui_workspace".into(),
+                name: "UI workspace".into(),
+                pane_id: "ui_pane".into(),
+            })
+            .unwrap();
+
+        let snapshot = registry
+            .launch_into_pane(
+                repo.request("dock_ui_target"),
+                "ui_workspace".into(),
+                "ui_pane".into(),
+            )
+            .unwrap();
+        assert_eq!(snapshot.workspace_id, "ui_workspace");
+        assert_eq!(snapshot.pane_id, "ui_pane");
+        assert_eq!(
+            registry
+                .layout
+                .lock()
+                .unwrap()
+                .pane_run("ui_workspace", "ui_pane")
+                .as_deref(),
+            Some("dock_ui_target")
+        );
+
+        let refused = repo.request("dock_ui_replacement");
+        assert!(matches!(
+            registry.launch_into_pane(refused.clone(), "ui_workspace".into(), "ui_pane".into()),
+            Err((ErrorCode::InvalidLayout, _))
+        ));
+        assert!(!registry.receipt_path(&refused.run_id).unwrap().exists());
+        assert!(!registry.runs.lock().unwrap().contains_key(&refused.run_id));
+    }
+
+    #[test]
+    fn launch_into_pane_failed_exec_restores_exact_topology_and_all_authority() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = Repo::new("launch-into-pane-failed-exec");
+        let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "ui_workspace".into(),
+                name: "UI workspace".into(),
+                pane_id: "selected_pane".into(),
+            })
+            .unwrap();
+        registry
+            .workspace(WorkspaceRequest::Split {
+                workspace_id: "ui_workspace".into(),
+                pane_id: "selected_pane".into(),
+                new_pane_id: "launch_target".into(),
+                axis: crate::layout::SplitAxis::Vertical,
+            })
+            .unwrap();
+        registry
+            .workspace(WorkspaceRequest::Focus {
+                workspace_id: "ui_workspace".into(),
+                pane_id: "selected_pane".into(),
+            })
+            .unwrap();
+        let before = registry.layout();
+
+        // The executable passes adapter discovery, then disappears at the exact launch boundary.
+        // This deterministically exercises OwnedRuntime's FailedToLaunch result without a race.
+        let broken = repo.root.join("broken-executable");
+        fs::write(&broken, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&broken, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut request = repo.request("dock_failed_exec_atomic");
+        request.adapter = crate::adapter::AdapterSelection {
+            id: crate::adapter::AdapterId::Generic,
+            executable: Some(broken.display().to_string()),
+            arguments: Vec::new(),
+        };
+        *registry.before_runtime_launch_hook.lock().unwrap() = Some(Arc::new({
+            let broken = broken.clone();
+            move || fs::remove_file(&broken).unwrap()
+        }));
+
+        assert!(matches!(
+            registry.launch_into_pane(
+                request.clone(),
+                "ui_workspace".into(),
+                "launch_target".into()
+            ),
+            Err((ErrorCode::AdapterUnavailable, _))
+        ));
+        assert_eq!(registry.layout(), before);
+        assert!(registry.runs.lock().unwrap().is_empty());
+        assert!(!registry.receipt_path(&request.run_id).unwrap().exists());
+        assert_eq!(registry.inspect_programme().global_active, 0);
+
+        request.adapter = crate::adapter::AdapterSelection {
+            id: crate::adapter::AdapterId::Fixture,
+            executable: None,
+            arguments: vec!["-c".into(), "exit 0".into()],
+        };
+        let retry = registry
+            .launch_into_pane(request, "ui_workspace".into(), "launch_target".into())
+            .unwrap();
+        assert_eq!(retry.run_id, "dock_failed_exec_atomic");
+    }
+
+    #[test]
+    fn pane_input_requires_exact_live_bound_runtime_and_restores_no_authority() {
+        let repo = Repo::new("pane-input-authority");
+        let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
+        assert!(matches!(
+            registry.pane_input("missing", "missing", b"x"),
+            Err((ErrorCode::InvalidBinding, _))
+        ));
+        let mut request = repo.request("dock_pane_input");
+        request.adapter.arguments = vec![
+            "-c".into(),
+            "read value; printf 'got:%s' \"$value\"; sleep 30".into(),
+        ];
+        let snapshot = registry.dispatch(request).unwrap();
+        assert_eq!(
+            registry
+                .pane_input(&snapshot.workspace_id, &snapshot.pane_id, b"hello\n")
+                .unwrap(),
+            6
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !registry.inspect(Some(&snapshot.run_id)).unwrap()[0]
+            .scrollback
+            .contains("got:hello")
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            registry.inspect(Some(&snapshot.run_id)).unwrap()[0]
+                .scrollback
+                .contains("got:hello")
+        );
+        registry
+            .lifecycle(&snapshot.run_id, LifecycleOperation::Stop)
+            .unwrap();
+        assert!(
+            registry
+                .pane_input(&snapshot.workspace_id, &snapshot.pane_id, b"again\n")
+                .is_err()
+        );
+        drop(registry);
+
+        let restored = RuntimeRegistry::new(&repo.state, 256).unwrap();
+        assert!(matches!(
+            restored.pane_input(&snapshot.workspace_id, &snapshot.pane_id, b"again\n"),
+            Err((ErrorCode::InvalidBinding, _))
+        ));
+    }
+
+    #[test]
+    fn pane_input_revalidates_binding_after_concurrent_rebind_before_enqueue() {
+        let repo = Repo::new("pane-input-concurrent-rebind");
+        let registry = Arc::new(RuntimeRegistry::new(&repo.state, 256).unwrap());
+        let mut request = repo.request("dock_pane_input_race");
+        request.adapter.arguments = vec![
+            "-c".into(),
+            "read value; printf 'stale:%s' \"$value\"; sleep 30".into(),
+        ];
+        let snapshot = registry.dispatch(request).unwrap();
+        let (selected_tx, selected_rx) = std::sync::mpsc::channel();
+        let (rebound_tx, rebound_rx) = std::sync::mpsc::channel();
+        let rebound_rx = Mutex::new(rebound_rx);
+        *registry
+            .pane_input_before_final_validation_hook
+            .lock()
+            .unwrap() = Some(Arc::new(move || {
+            selected_tx.send(()).unwrap();
+            rebound_rx.lock().unwrap().recv().unwrap();
+        }));
+        let input_registry = Arc::clone(&registry);
+        let workspace_id = snapshot.workspace_id.clone();
+        let pane_id = snapshot.pane_id.clone();
+        let input =
+            thread::spawn(move || input_registry.pane_input(&workspace_id, &pane_id, b"wrong\n"));
+        selected_rx.recv().unwrap();
+        registry
+            .layout
+            .lock()
+            .unwrap()
+            .bind_run(
+                &snapshot.workspace_id,
+                &snapshot.pane_id,
+                "replacement_run".into(),
+                PaneRuntime::Running,
+            )
+            .unwrap();
+        rebound_tx.send(()).unwrap();
+        assert!(matches!(
+            input.join().unwrap(),
+            Err((ErrorCode::InvalidBinding, message)) if message.contains("changed")
+        ));
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !registry.inspect(Some(&snapshot.run_id)).unwrap()[0]
+                .scrollback
+                .contains("stale:wrong")
+        );
+        registry
+            .lifecycle(&snapshot.run_id, LifecycleOperation::Stop)
+            .unwrap();
     }
 
     fn packet(snapshot: &RuntimeSnapshot) -> HandoffPacket {
@@ -3274,7 +3724,7 @@ mod tests {
                 .releasing
                 .insert(downstream_id.clone());
             registry
-                .dispatch_with_gate_authorization(request, true)
+                .dispatch_with_gate_authorization(request, true, None)
                 .unwrap();
         }
 
@@ -4359,13 +4809,99 @@ mod tests {
         let repo = Repo::new("state-permissions");
         fs::create_dir(&repo.state).unwrap();
         fs::set_permissions(&repo.state, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(repo.state.join("keep"), "untouched\n").unwrap();
 
         assert!(
             RuntimeRegistry::new(&repo.state, 64)
                 .err()
                 .is_some_and(|message| message.contains("refusing untrusted state directory"))
         );
+        assert_eq!(
+            fs::read_to_string(repo.state.join("keep")).unwrap(),
+            "untouched\n"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&repo.state)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
         assert!(!repo.state.join("dispatches").exists());
+    }
+
+    #[test]
+    fn rejects_a_symlinked_state_ancestor_without_mutating_its_target() {
+        let repo = Repo::new("state-symlink-ancestor");
+        let target = repo.root.join("outside-state-target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), "untouched\n").unwrap();
+        let substituted = repo.root.join("substituted-state-parent");
+        symlink(&target, &substituted).unwrap();
+        let state = substituted.join("local");
+
+        let error = RuntimeRegistry::new(&state, 64)
+            .err()
+            .expect("symlink ancestor must fail");
+
+        assert!(error.contains("without following symlinks"), "{error}");
+        assert_eq!(
+            fs::read_to_string(target.join("keep")).unwrap(),
+            "untouched\n"
+        );
+        assert!(!target.join("local").exists());
+        assert!(
+            fs::symlink_metadata(substituted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn creates_every_missing_nested_state_directory_with_private_permissions() {
+        let repo = Repo::new("nested-state-creation");
+        let first = repo.root.join("missing-state-parent");
+        let second = first.join("nested");
+        let state = second.join("local");
+
+        let registry = RuntimeRegistry::new(&state, 64).unwrap();
+        drop(registry);
+
+        for directory in [&first, &second, &state, &state.join("dispatches")] {
+            let metadata = fs::symlink_metadata(directory).unwrap();
+            assert!(
+                metadata.is_dir(),
+                "{} was not a directory",
+                directory.display()
+            );
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o700,
+                "{} was not owner-only",
+                directory.display()
+            );
+        }
+    }
+
+    #[test]
+    fn creates_missing_final_state_component_on_slice5_absolute_tmp_path() {
+        let smoke_dir = PathBuf::from(format!(
+            "/tmp/dock-slice5.test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&smoke_dir).unwrap();
+        fs::set_permissions(&smoke_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let state = smoke_dir.join("state");
+
+        ensure_private_directory(&state, "state").unwrap();
+
+        let metadata = fs::symlink_metadata(&state).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        fs::remove_dir_all(smoke_dir).unwrap();
     }
 
     #[test]

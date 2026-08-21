@@ -1,4 +1,7 @@
 pub mod adapter;
+pub mod client;
+pub mod dashboard;
+pub mod discovery;
 pub mod dispatch;
 pub mod git;
 pub mod layout;

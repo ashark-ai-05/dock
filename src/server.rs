@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Read, Write},
     os::unix::{
@@ -10,8 +11,11 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -49,9 +53,16 @@ impl Drop for ClientPermit {
 }
 
 use crate::{
+    detect::{AgentKind, AgentState},
     dispatch::RuntimeRegistry,
-    protocol::{ErrorCode, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, Request, Response},
+    protocol::{ErrorCode, Event, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, Request, Response},
+    terminal::ScreenSync,
 };
+
+/// How often the streaming loop samples the live emulators. Fast enough that a keystroke
+/// echoes without a perceptible lag, and free when nothing changed because an unchanged
+/// screen yields an empty delta and therefore no frame.
+const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 pub struct Server {
     listener: UnixListener,
@@ -136,13 +147,16 @@ impl Drop for Server {
 }
 
 fn handle_connection(mut stream: UnixStream, runtime: &RuntimeRegistry) -> Result<(), String> {
-    handle_connection_with_timeout(&mut stream, runtime, CLIENT_READ_TIMEOUT)
+    // `None`: a real subscriber streams until it disconnects. A deadline here would silently
+    // stop the push loop and freeze the dashboard with no error to explain it.
+    handle_connection_with_timeout(&mut stream, runtime, CLIENT_READ_TIMEOUT, None)
 }
 
 fn handle_connection_with_timeout(
     stream: &mut UnixStream,
     runtime: &RuntimeRegistry,
     read_timeout: Duration,
+    stream_deadline: Option<Instant>,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(read_timeout))
@@ -280,37 +294,44 @@ fn handle_connection_with_timeout(
                 Ok(workspace) => write_response(stream, &Response::WorkspaceChanged { workspace })?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
-            Ok(Request::PaneInput(request)) => match runtime.pane_input(
-                &request.workspace_id,
-                &request.pane_id,
-                request.input.as_bytes(),
-            ) {
-                Ok(bytes) => write_response(
+            // `input` has carried base64 since protocol v7 so escape sequences and high bytes
+            // survive JSON transport; decoding here is what makes the daemon actually speak it.
+            Ok(Request::PaneInput(request)) => match request.decode() {
+                Ok(input) => {
+                    match runtime.pane_input(&request.workspace_id, &request.pane_id, &input) {
+                        Ok(bytes) => write_response(
+                            stream,
+                            &Response::PaneInputAccepted {
+                                workspace_id: request.workspace_id,
+                                pane_id: request.pane_id,
+                                bytes,
+                            },
+                        )?,
+                        Err((code, message)) => {
+                            write_response(stream, &Response::Error { code, message })?
+                        }
+                    }
+                }
+                Err(message) => write_response(
                     stream,
-                    &Response::PaneInputAccepted {
-                        workspace_id: request.workspace_id,
-                        pane_id: request.pane_id,
-                        bytes,
+                    &Response::Error {
+                        code: ErrorCode::InvalidBinding,
+                        message,
                     },
                 )?,
+            },
+            Ok(Request::PaneResize(request)) => match runtime.pane_resize(
+                &request.workspace_id,
+                &request.pane_id,
+                request.rows,
+                request.cols,
+            ) {
+                Ok(()) => write_response(stream, &Response::Ack)?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
-            // PaneResize and Subscribe routing land in Task 10 (server stream mode and
-            // resize routing); Task 7 only needs the match to stay exhaustive.
-            Ok(Request::PaneResize(_)) => write_response(
-                stream,
-                &Response::Error {
-                    code: ErrorCode::UnsupportedOperation,
-                    message: "pane resize is not yet supported".into(),
-                },
-            )?,
-            Ok(Request::Subscribe(_)) => write_response(
-                stream,
-                &Response::Error {
-                    code: ErrorCode::UnsupportedOperation,
-                    message: "subscribe is not yet supported".into(),
-                },
-            )?,
+            // Subscribing converts the connection into a one-way push channel: the client
+            // sends nothing more on it, so this handler never returns to the request loop.
+            Ok(Request::Subscribe(_)) => return stream_events(stream, runtime, stream_deadline),
             Ok(Request::Hello(_)) => {
                 write_response(
                     stream,
@@ -323,6 +344,109 @@ fn handle_connection_with_timeout(
             }
             Err(error) if error == "connection closed" => return Ok(()),
             Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Pushes screen deltas to one subscriber until it disconnects.
+///
+/// Each run gets a `ScreenSync` recording what *this* subscriber has already been sent, so
+/// the loop transmits only the difference against that view: an unchanged pane produces an
+/// empty delta and therefore no frame at all, which is the entire point of pushing instead
+/// of answering `Inspect` polls with every run's full scrollback.
+///
+/// `deadline` is `None` in production. Tests pass a short one because the loop is otherwise
+/// unbounded and a test driving it through a fixed request list would never observe an end.
+fn stream_events(
+    stream: &mut UnixStream,
+    runtime: &RuntimeRegistry,
+    deadline: Option<Instant>,
+) -> Result<(), String> {
+    let mut syncs: HashMap<String, SubscriberView> = HashMap::new();
+    let mut states: HashMap<String, (Option<AgentKind>, AgentState)> = HashMap::new();
+    loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(());
+        }
+        for snapshot in runtime.inspect(None).unwrap_or_default() {
+            // A resize invalidates the row-by-row diff (vt100 zips the two grids, so rows
+            // beyond the smaller one would never be transmitted). Re-seed from a full frame
+            // instead of diffing across a geometry change.
+            if syncs
+                .get(&snapshot.run_id)
+                .is_some_and(|view| view.size != (snapshot.rows, snapshot.cols))
+            {
+                syncs.remove(&snapshot.run_id);
+            }
+            let attached = syncs.contains_key(&snapshot.run_id);
+            // Borrowed immutably: the sync must not advance until the bytes are on the wire.
+            let delta = runtime.with_run_screen(&snapshot.run_id, |screen| {
+                match syncs.get(&snapshot.run_id) {
+                    Some(view) => view.sync.delta_from(screen),
+                    None => screen.state_bytes(),
+                }
+            });
+            // No live runtime to read: leave this run unattached so it still gets a full
+            // snapshot rather than a delta if it becomes readable later.
+            let Some(delta) = delta else { continue };
+            if !delta.is_empty() {
+                let view = syncs
+                    .entry(snapshot.run_id.clone())
+                    .or_insert_with(|| SubscriberView::new(snapshot.rows, snapshot.cols));
+                let revision = view.revision + 1;
+                let encoded = STANDARD.encode(&delta);
+                let event = if attached {
+                    Event::PaneDelta {
+                        run_id: snapshot.run_id.clone(),
+                        revision,
+                        bytes: encoded,
+                    }
+                } else {
+                    Event::PaneAttached {
+                        run_id: snapshot.run_id.clone(),
+                        revision,
+                        screen: encoded,
+                    }
+                };
+                // Advance this subscriber's view only once the write succeeded, so a failed
+                // write leaves it consistent with what the client actually received.
+                write_response(stream, &Response::Stream { event })?;
+                view.sync.apply(&delta);
+                view.revision = revision;
+            }
+            let current = (snapshot.agent, snapshot.agent_state);
+            if states.get(&snapshot.run_id) != Some(&current) {
+                write_response(
+                    stream,
+                    &Response::Stream {
+                        event: Event::AgentStateChanged {
+                            run_id: snapshot.run_id.clone(),
+                            agent: current.0,
+                            state: current.1,
+                        },
+                    },
+                )?;
+                states.insert(snapshot.run_id, current);
+            }
+        }
+        thread::sleep(STREAM_POLL_INTERVAL);
+    }
+}
+
+/// What one subscriber has already been sent for one run.
+struct SubscriberView {
+    sync: ScreenSync,
+    /// Monotonic per run so a client can detect a dropped frame as a gap.
+    revision: u64,
+    size: (u16, u16),
+}
+
+impl SubscriberView {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            sync: ScreenSync::new(rows, cols),
+            revision: 0,
+            size: (rows, cols),
         }
     }
 }
@@ -385,6 +509,7 @@ fn write_response(stream: &mut UnixStream, response: &Response) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{HelloRequest, PaneInputRequest, PaneResizeRequest, SubscribeRequest};
     use std::{
         net::Shutdown,
         path::PathBuf,
@@ -394,19 +519,52 @@ mod tests {
 
     static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    fn registry() -> RuntimeRegistry {
-        RuntimeRegistry::new(
-            std::env::current_dir()
-                .unwrap()
-                .join("target")
-                .join(format!(
-                    "dock-registry-test-{}-{}",
-                    std::process::id(),
-                    SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-                )),
-            64,
-        )
-        .expect("test registry")
+    /// Every pane auto-launches a real `$SHELL` process group and `RuntimeRegistry` does not
+    /// reap on drop, so a bare registry would leak a login shell per pane that outlives the
+    /// test binary. This guard retires every run it still owns and removes its state directory.
+    struct TestRegistry {
+        registry: Arc<RuntimeRegistry>,
+        state: PathBuf,
+    }
+
+    impl std::ops::Deref for TestRegistry {
+        type Target = RuntimeRegistry;
+        fn deref(&self) -> &Self::Target {
+            &self.registry
+        }
+    }
+
+    impl TestRegistry {
+        fn shared(&self) -> Arc<RuntimeRegistry> {
+            Arc::clone(&self.registry)
+        }
+    }
+
+    impl Drop for TestRegistry {
+        fn drop(&mut self) {
+            for snapshot in self.registry.inspect(None).unwrap_or_default() {
+                let _ = self
+                    .registry
+                    .lifecycle(&snapshot.run_id, crate::protocol::LifecycleOperation::Stop);
+            }
+            let _ = fs::remove_dir_all(&self.state);
+        }
+    }
+
+    fn registry() -> TestRegistry {
+        let state = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "dock-registry-test-{}-{}",
+                std::process::id(),
+                SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+        let registry = RuntimeRegistry::new(&state, 64).expect("test registry");
+        TestRegistry {
+            registry: Arc::new(registry),
+            state,
+        }
     }
 
     fn socket_path() -> PathBuf {
@@ -450,14 +608,27 @@ mod tests {
             .collect()
     }
 
+    /// How long a subscribed exchange is allowed to stream before the loop returns. Production
+    /// passes `None` here; a test cannot, because `exchange` waits for the server side to close.
+    const TEST_STREAM_WINDOW: Duration = Duration::from_millis(400);
+
     fn exchange(lines: &[&str], runtime: &RuntimeRegistry) -> Vec<Response> {
-        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
         std::thread::scope(|scope| {
-            scope.spawn(|| {
-                handle_connection(server, runtime).ok();
+            scope.spawn(move || {
+                handle_connection_with_timeout(
+                    &mut server,
+                    runtime,
+                    CLIENT_READ_TIMEOUT,
+                    Some(Instant::now() + TEST_STREAM_WINDOW),
+                )
+                .ok();
+                // Dropping the server end is what gives the client its EOF; without it the
+                // collecting reader below would wait out its own read timeout instead.
+                drop(server);
             });
             client
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read timeout");
             for line in lines {
                 client.write_all(line.as_bytes()).expect("write request");
@@ -536,7 +707,8 @@ mod tests {
                     handle_connection_with_timeout(
                         &mut server,
                         &runtime,
-                        Duration::from_millis(25)
+                        Duration::from_millis(25),
+                        None
                     ),
                     Err("request timed out".into())
                 );
@@ -628,8 +800,8 @@ mod tests {
                 & 0o777,
             0o600
         );
-        let runtime = Arc::new(registry());
-        let server_runtime = Arc::clone(&runtime);
+        let runtime = registry();
+        let server_runtime = runtime.shared();
         let server_thread = std::thread::spawn(move || {
             server
                 .serve_connections(server_runtime, Some(3))
@@ -659,6 +831,261 @@ mod tests {
             "socket must be removed when listener drops"
         );
         drop(runtime);
+    }
+
+    fn collect_events(responses: &[Response]) -> Vec<Event> {
+        responses
+            .iter()
+            .filter_map(|response| match response {
+                Response::Stream { event } => Some(event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn hello() -> String {
+        serde_json::to_string(&Request::Hello(HelloRequest { version: 7 })).unwrap()
+    }
+
+    fn create_workspace(runtime: &RuntimeRegistry) {
+        runtime
+            .workspace(crate::protocol::WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Daily".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+    }
+
+    #[test]
+    fn subscribe_streams_an_attach_snapshot_then_deltas() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let responses = exchange(
+            &[
+                &hello(),
+                &serde_json::to_string(&Request::Subscribe(SubscribeRequest {})).unwrap(),
+            ],
+            &runtime,
+        );
+        let events = collect_events(&responses);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::PaneAttached { .. })),
+            "first frame for a bound pane must be a full attach snapshot"
+        );
+        let screen_frames: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, Event::PaneAttached { .. } | Event::PaneDelta { .. }))
+            .collect();
+        assert!(
+            matches!(screen_frames[0], Event::PaneAttached { .. }),
+            "the attach snapshot must precede any delta"
+        );
+        assert!(
+            screen_frames[1..]
+                .iter()
+                .all(|event| matches!(event, Event::PaneDelta { .. })),
+            "every frame after the attach snapshot must be a delta"
+        );
+        let revisions: Vec<u64> = screen_frames
+            .iter()
+            .map(|event| match event {
+                Event::PaneAttached { revision, .. } | Event::PaneDelta { revision, .. } => {
+                    *revision
+                }
+                other => panic!("unexpected frame {other:?}"),
+            })
+            .collect();
+        assert!(
+            revisions.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "revisions must be gapless and monotonic per run: {revisions:?}"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_pane_costs_the_subscriber_nothing() {
+        // With no runs at all the loop has nothing to diff, so a subscriber that polls for the
+        // whole window must still receive zero bytes. This is the push model's whole argument.
+        let runtime = registry();
+        let responses = exchange(
+            &[
+                &hello(),
+                &serde_json::to_string(&Request::Subscribe(SubscribeRequest {})).unwrap(),
+            ],
+            &runtime,
+        );
+        assert_eq!(
+            collect_events(&responses),
+            vec![],
+            "an idle daemon must push nothing"
+        );
+
+        // With a live pane the shell writes a prompt and then falls silent. A polling server
+        // would emit one frame per tick; the push server must emit far fewer than there were
+        // ticks, which is only possible if unchanged ticks produced no event at all.
+        let runtime = registry();
+        create_workspace(&runtime);
+        let responses = exchange(
+            &[
+                &hello(),
+                &serde_json::to_string(&Request::Subscribe(SubscribeRequest {})).unwrap(),
+            ],
+            &runtime,
+        );
+        let ticks = TEST_STREAM_WINDOW.as_millis() / STREAM_POLL_INTERVAL.as_millis();
+        let frames = collect_events(&responses).len() as u128;
+        assert!(
+            frames * 2 < ticks,
+            "expected most of the {ticks} ticks to be silent, got {frames} frames"
+        );
+    }
+
+    #[test]
+    fn only_a_real_agent_state_change_is_announced() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let responses = exchange(
+            &[
+                &hello(),
+                &serde_json::to_string(&Request::Subscribe(SubscribeRequest {})).unwrap(),
+            ],
+            &runtime,
+        );
+        let announcements = collect_events(&responses)
+            .into_iter()
+            .filter(|event| matches!(event, Event::AgentStateChanged { .. }))
+            .count();
+        assert!(
+            announcements <= 1,
+            "a pane whose agent state never changes must be announced at most once, got {announcements}"
+        );
+    }
+
+    #[test]
+    fn resize_request_is_routed_to_the_registry() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let responses = exchange(
+            &[
+                &hello(),
+                &serde_json::to_string(&Request::PaneResize(PaneResizeRequest {
+                    workspace_id: "w1".into(),
+                    pane_id: "p1".into(),
+                    rows: 40,
+                    cols: 120,
+                }))
+                .unwrap(),
+            ],
+            &runtime,
+        );
+        assert!(!matches!(responses[1], Response::Error { .. }));
+        assert!(matches!(responses[1], Response::Ack));
+        let snapshot = runtime
+            .inspect(None)
+            .expect("inspect")
+            .into_iter()
+            .find(|run| run.pane_id == "p1")
+            .expect("bound run");
+        assert_eq!((snapshot.rows, snapshot.cols), (40, 120));
+    }
+
+    #[test]
+    fn an_unresizable_pane_is_refused_rather_than_acknowledged() {
+        let runtime = registry();
+        let responses = exchange(
+            &[
+                &hello(),
+                &serde_json::to_string(&Request::PaneResize(PaneResizeRequest {
+                    workspace_id: "missing".into(),
+                    pane_id: "p1".into(),
+                    rows: 40,
+                    cols: 120,
+                }))
+                .unwrap(),
+            ],
+            &runtime,
+        );
+        assert!(matches!(
+            responses[1],
+            Response::Error {
+                code: ErrorCode::InvalidBinding,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pane_input_is_base64_decoded_before_it_reaches_the_runtime() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        // An arrow key: the escape byte and a high byte, neither of which survives being
+        // forwarded as raw UTF-8 text.
+        let raw = [0x1b_u8, 0x5b, 0x41, 0xff];
+        let encoded = PaneInputRequest::encode(&raw);
+        let responses = exchange(
+            &[
+                &hello(),
+                &serde_json::to_string(&Request::PaneInput(PaneInputRequest {
+                    workspace_id: "w1".into(),
+                    pane_id: "p1".into(),
+                    input: encoded.clone(),
+                }))
+                .unwrap(),
+            ],
+            &runtime,
+        );
+        match &responses[1] {
+            Response::PaneInputAccepted { bytes, .. } => assert_eq!(
+                *bytes,
+                raw.len(),
+                "the runtime must receive the decoded bytes, not the {} base64 characters",
+                encoded.len()
+            ),
+            other => panic!("expected pane input to be accepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pane_input_that_is_not_base64_is_refused_not_forwarded() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let responses = exchange(
+            &[
+                &hello(),
+                &serde_json::to_string(&Request::PaneInput(PaneInputRequest {
+                    workspace_id: "w1".into(),
+                    pane_id: "p1".into(),
+                    input: "not base64!!".into(),
+                }))
+                .unwrap(),
+            ],
+            &runtime,
+        );
+        assert!(matches!(
+            responses[1],
+            Response::Error {
+                code: ErrorCode::InvalidBinding,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn version_six_clients_are_refused_with_an_actionable_message() {
+        let runtime = registry();
+        let responses = exchange(
+            &[&serde_json::to_string(&Request::Hello(HelloRequest { version: 6 })).unwrap()],
+            &runtime,
+        );
+        match &responses[0] {
+            Response::Error { code, message } => {
+                assert_eq!(*code, ErrorCode::ProtocolMismatch);
+                assert!(message.contains("7"));
+            }
+            other => panic!("expected protocol mismatch, got {other:?}"),
+        }
     }
 
     #[test]

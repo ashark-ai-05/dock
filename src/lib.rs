@@ -14,3 +14,4 @@ pub mod runtime;
 pub mod server;
 pub mod storage;
 pub mod terminal;
+pub mod theme;

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
@@ -11,12 +12,14 @@ use ratatui::{
 
 use crate::{
     adapter::{AdapterId, AdapterSelection},
+    detect::{AgentKind, AgentState},
     discovery::ExternalAgentCandidate,
     layout::{LayoutNode, LayoutSnapshot, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout},
     protocol::{
-        BindingKind, DashboardProfile, DispatchRequest, LaunchIntoPaneRequest, PaneInputRequest,
-        Request, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
+        BindingKind, DashboardProfile, DispatchRequest, Event, LaunchIntoPaneRequest,
+        PaneInputRequest, Request, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
     },
+    terminal::PaneScreen,
 };
 
 const MIN_PANE_WIDTH: u16 = 8;
@@ -25,6 +28,10 @@ const MIN_PANE_HEIGHT: u16 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Request(Box<Request>),
+    /// Raw bytes bound for the focused pane's PTY. Kept apart from `Request` because the render
+    /// loop must send it without waiting for a reply: the echo comes back on the event stream,
+    /// so blocking here would put a daemon round trip in front of every keystroke's paint.
+    PaneInput(Vec<u8>),
     LoadCatalog,
     Refresh,
     Quit,
@@ -42,6 +49,14 @@ pub struct Dashboard {
     pub workspace_index: usize,
     pub error: Option<String>,
     pub input_mode: bool,
+    /// This client's own emulator for each run, advanced by pushed deltas. The daemon holds the
+    /// authoritative screen; this is the local replica the dashboard actually paints from.
+    pub screens: HashMap<String, PaneScreen>,
+    /// Latest agent identity and state per run, as pushed by the daemon.
+    pub agents: HashMap<String, (Option<AgentKind>, AgentState)>,
+    revisions: HashMap<String, u64>,
+    needs_refresh: bool,
+    pending_resizes: Vec<(String, String, u16, u16)>,
     pane_areas: HashMap<String, Rect>,
     dividers: Vec<Divider>,
     dragging: Option<DragTarget>,
@@ -107,6 +122,80 @@ impl Dashboard {
         {
             form.repository_mode = false;
         }
+    }
+
+    /// Feeds a pushed event into this client's own emulator.
+    ///
+    /// `PaneAttached` is always a (re-)seed: the daemon sends it when a run is first seen and
+    /// again whenever the pane's geometry changes, so the parser is rebuilt at the announced
+    /// `rows`/`cols` rather than reused. Keeping the old parser would silently render the
+    /// snapshot at the wrong width.
+    ///
+    /// A non-contiguous revision means this client missed bytes, so the screen is dropped
+    /// rather than advanced into a corrupted grid.
+    pub fn apply_event(&mut self, event: Event) {
+        match event {
+            Event::PaneAttached {
+                run_id,
+                revision,
+                rows,
+                cols,
+                screen,
+            } => {
+                let mut terminal = PaneScreen::new(rows, cols, 0);
+                if let Ok(bytes) = STANDARD.decode(&screen) {
+                    terminal.feed(&bytes);
+                }
+                self.screens.insert(run_id.clone(), terminal);
+                self.revisions.insert(run_id, revision);
+            }
+            Event::PaneDelta {
+                run_id,
+                revision,
+                bytes,
+            } => {
+                let expected = self.revisions.get(&run_id).map(|value| value + 1);
+                if expected != Some(revision) {
+                    self.screens.remove(&run_id);
+                    self.revisions.remove(&run_id);
+                    return;
+                }
+                if let (Some(terminal), Ok(decoded)) =
+                    (self.screens.get_mut(&run_id), STANDARD.decode(&bytes))
+                {
+                    terminal.feed(&decoded);
+                    self.revisions.insert(run_id, revision);
+                }
+            }
+            Event::AgentStateChanged {
+                run_id,
+                agent,
+                state,
+            } => {
+                self.agents.insert(run_id, (agent, state));
+            }
+            Event::PaneState { .. } | Event::LayoutChanged => self.needs_refresh = true,
+        }
+    }
+
+    /// True once when a pushed event invalidated the run list or layout. The render loop uses
+    /// this instead of an unconditional timer poll, so an idle dashboard issues no requests.
+    pub fn take_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.needs_refresh)
+    }
+
+    /// Pane geometry changes the render pass discovered, as `(workspace_id, pane_id, rows, cols)`.
+    /// Rendering is Task 12's, so nothing queues into this yet and the queue is always empty.
+    pub fn take_pending_resizes(&mut self) -> Vec<(String, String, u16, u16)> {
+        std::mem::take(&mut self.pending_resizes)
+    }
+
+    /// The visible text of a run's replicated screen, sized from the parser's own geometry so a
+    /// re-attach at a smaller pane does not read rows that no longer exist.
+    pub fn screen_text(&self, run_id: &str) -> Option<String> {
+        self.screens
+            .get(run_id)
+            .map(|screen| screen.text_tail(screen.size().0))
     }
 
     pub fn workspace(&self) -> Option<&WorkspaceLayout> {
@@ -482,7 +571,9 @@ impl Dashboard {
             return UiCommand::Request(Box::new(Request::PaneInput(PaneInputRequest {
                 workspace_id: workspace.workspace_id.clone(),
                 pane_id: workspace.focused_pane_id.clone(),
-                input,
+                // Protocol v7 carries pane input base64-encoded; raw text is rejected by the
+                // daemon's decode and would corrupt any control byte that did get through.
+                input: PaneInputRequest::encode(input.as_bytes()),
             })));
         }
         match key.code {
@@ -1746,5 +1837,119 @@ mod tests {
                 "{key} silently no-op'd"
             );
         }
+    }
+
+    #[test]
+    fn attach_then_delta_events_reconstruct_the_pane_screen() {
+        let mut dashboard = dashboard();
+        let mut source = crate::terminal::VtTerminal::new(24, 80, 0);
+        source.feed(b"first line\r\n");
+        dashboard.apply_event(Event::PaneAttached {
+            run_id: "run_1".into(),
+            revision: 1,
+            rows: 24,
+            cols: 80,
+            screen: STANDARD.encode(source.state_bytes()),
+        });
+        let mut sync = crate::terminal::ScreenSync::new(24, 80);
+        sync.apply(&source.state_bytes());
+        source.feed(b"second line\r\n");
+        let delta = sync.delta_from(&source);
+        dashboard.apply_event(Event::PaneDelta {
+            run_id: "run_1".into(),
+            revision: 2,
+            bytes: STANDARD.encode(&delta),
+        });
+        let rendered = dashboard.screen_text("run_1").expect("screen present");
+        assert!(rendered.contains("first line"), "{rendered:?}");
+        assert!(rendered.contains("second line"), "{rendered:?}");
+    }
+
+    #[test]
+    fn a_revision_gap_drops_the_screen_so_the_client_re_attaches() {
+        let mut dashboard = dashboard();
+        dashboard.apply_event(Event::PaneAttached {
+            run_id: "run_1".into(),
+            revision: 1,
+            rows: 24,
+            cols: 80,
+            screen: String::new(),
+        });
+        dashboard.apply_event(Event::PaneDelta {
+            run_id: "run_1".into(),
+            revision: 9,
+            bytes: String::new(),
+        });
+        assert!(dashboard.screen_text("run_1").is_none());
+    }
+
+    #[test]
+    fn a_re_attach_for_a_known_run_rebuilds_the_parser_at_the_announced_geometry() {
+        let mut dashboard = dashboard();
+        dashboard.apply_event(Event::PaneAttached {
+            run_id: "run_1".into(),
+            revision: 1,
+            rows: 24,
+            cols: 80,
+            screen: String::new(),
+        });
+        let mut source = crate::terminal::VtTerminal::new(10, 40, 0);
+        source.feed(b"seed\r\n");
+        dashboard.apply_event(Event::PaneAttached {
+            run_id: "run_1".into(),
+            revision: 7,
+            rows: 10,
+            cols: 40,
+            screen: STANDARD.encode(source.state_bytes()),
+        });
+        assert_eq!(dashboard.screens["run_1"].size(), (10, 40));
+
+        // Fifteen lines is more than the new ten-row screen holds, so a parser rebuilt at the
+        // announced geometry scrolls the earliest ones off. One still sized twenty-four rows
+        // would keep every line, which is what makes this distinguish geometry rather than
+        // merely content: a shorter screen cannot be told from a taller one until the output
+        // exceeds the shorter of the two heights.
+        let mut lines = Vec::new();
+        for index in 1..=15 {
+            lines.extend_from_slice(format!("line {index:02}\r\n").as_bytes());
+        }
+        dashboard.apply_event(Event::PaneDelta {
+            run_id: "run_1".into(),
+            revision: 8,
+            bytes: STANDARD.encode(&lines),
+        });
+        let rendered = dashboard.screen_text("run_1").expect("screen present");
+        assert!(rendered.contains("line 15"), "{rendered:?}");
+        assert!(
+            !rendered.contains("line 01"),
+            "a ten-row screen cannot still be holding the first of fifteen lines: {rendered:?}"
+        );
+
+        // The re-seed adopted the daemon's revision, which never restarts across a re-seed, so
+        // the deltas above were contiguous rather than read as a gap and dropped.
+        assert_eq!(dashboard.revisions.get("run_1"), Some(&8));
+    }
+
+    #[test]
+    fn agent_state_events_are_recorded_and_layout_events_ask_for_one_refresh() {
+        let mut dashboard = dashboard();
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_1".into(),
+            agent: Some(crate::detect::AgentKind::Claude),
+            state: crate::detect::AgentState::Working,
+        });
+        assert_eq!(
+            dashboard.agents.get("run_1"),
+            Some(&(
+                Some(crate::detect::AgentKind::Claude),
+                crate::detect::AgentState::Working
+            ))
+        );
+
+        assert!(!dashboard.take_refresh());
+        dashboard.apply_event(Event::LayoutChanged);
+        assert!(dashboard.take_refresh());
+        assert!(!dashboard.take_refresh(), "refresh must not latch on");
+        assert!(dashboard.take_pending_resizes().is_empty());
     }
 }

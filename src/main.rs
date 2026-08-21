@@ -28,7 +28,10 @@ use dock::{
     discovery::{AgentDiscovery, ProcessNameDiscovery},
     git::GitAdapter,
     paths,
-    protocol::{InspectRequest, ProcessState, Request, Response, WorkspaceRequest},
+    protocol::{
+        InspectRequest, PaneInputRequest, PaneResizeRequest, ProcessState, Request, Response,
+        WorkspaceRequest,
+    },
     storage::LocalStore,
 };
 use nix::libc;
@@ -74,6 +77,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let external = ProcessNameDiscovery.discover(&runtime_directory);
     run_dashboard(
         &mut client,
+        &socket,
         external,
         runtime_directory.to_string_lossy().into_owned(),
     )?;
@@ -432,6 +436,7 @@ impl Drop for TerminalGuard {
 
 fn run_dashboard(
     client: &mut Client,
+    socket: &Path,
     external: Vec<dock::discovery::ExternalAgentCandidate>,
     runtime_directory: String,
 ) -> Result<(), String> {
@@ -444,20 +449,43 @@ fn run_dashboard(
     let (catalog_tx, catalog_rx) = mpsc::channel();
     let mut catalog_loading = false;
     let mut test_events = test_events()?;
+    // A running dashboard holds two daemon connections: `client` for requests, and this one,
+    // which the daemon turns into a one-way push channel and never reads again. Pane content
+    // now arrives on it, which is what lets the timed Inspect poll below go away entirely: an
+    // idle dashboard sends nothing and the daemon sends nothing back.
+    let events = Client::subscribe(socket)?;
     refresh(client, &mut dashboard)?;
     loop {
         if let Ok((root, launches)) = catalog_rx.try_recv() {
             dashboard.set_repository_catalog(root, launches);
             catalog_loading = false;
         }
+        // Drained without blocking: the reader thread owns the socket, so a quiet daemon costs
+        // this loop nothing and a busy one cannot stall the next paint.
+        while let Ok(event) = events.try_recv() {
+            dashboard.apply_event(event);
+        }
+        if dashboard.take_refresh() {
+            refresh(client, &mut dashboard)?;
+        }
         terminal
             .draw(|frame| dashboard.render(frame))
             .map_err(|e| e.to_string())?;
+        for (workspace_id, pane_id, rows, cols) in dashboard.take_pending_resizes() {
+            let _ = client.request(&Request::PaneResize(PaneResizeRequest {
+                workspace_id,
+                pane_id,
+                rows,
+                cols,
+            }));
+        }
+        if let Some(message) = client.take_deferred_error() {
+            dashboard.error = Some(message);
+        }
         let event = if let Some(event) = test_events.pop_front() {
             event
         } else {
-            if !event::poll(Duration::from_millis(200)).map_err(|e| e.to_string())? {
-                refresh(client, &mut dashboard)?;
+            if !event::poll(Duration::from_millis(16)).map_err(|e| e.to_string())? {
                 continue;
             }
             event::read().map_err(|e| e.to_string())?
@@ -509,6 +537,20 @@ fn run_dashboard(
                         .draw(|frame| dashboard.render(frame))
                         .map_err(|e| e.to_string())?;
                 }
+            }
+            UiCommand::PaneInput(bytes) => {
+                let Some(workspace) = dashboard.workspace() else {
+                    continue;
+                };
+                let request = Request::PaneInput(PaneInputRequest {
+                    workspace_id: workspace.workspace_id.clone(),
+                    pane_id: workspace.focused_pane_id.clone(),
+                    input: PaneInputRequest::encode(&bytes),
+                });
+                // Deliberately not `request`: the keystroke's visible result is the pane echo
+                // that arrives on the event stream, so waiting for an acknowledgement here
+                // would add a daemon round trip to every keypress-to-paint.
+                client.send(&request)?;
             }
             UiCommand::Refresh => refresh(client, &mut dashboard)?,
             UiCommand::LoadCatalog => {

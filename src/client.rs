@@ -2,13 +2,20 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::Path,
+    sync::mpsc,
+    thread,
 };
 
-use crate::protocol::{HelloRequest, PROTOCOL_VERSION, Request, Response};
+use crate::protocol::{Event, HelloRequest, PROTOCOL_VERSION, Request, Response, SubscribeRequest};
 
 pub struct Client {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
+    /// Replies to fire-and-forget sends that nobody has read yet. They sit in the socket
+    /// buffer, so the next request must discard exactly this many lines before reading its
+    /// own reply or it would answer with an earlier keystroke's acknowledgement.
+    unread_replies: usize,
+    deferred_error: Option<String>,
 }
 
 impl Client {
@@ -16,7 +23,12 @@ impl Client {
         let stream = UnixStream::connect(path)
             .map_err(|error| format!("could not connect to {}: {error}", path.display()))?;
         let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-        let mut client = Self { stream, reader };
+        let mut client = Self {
+            stream,
+            reader,
+            unread_replies: 0,
+            deferred_error: None,
+        };
         match client.request(&Request::Hello(HelloRequest {
             version: PROTOCOL_VERSION,
         }))? {
@@ -27,8 +39,40 @@ impl Client {
     }
 
     pub fn request(&mut self, request: &Request) -> Result<Response, String> {
+        while self.unread_replies > 0 {
+            let reply = self.read_reply()?;
+            self.unread_replies -= 1;
+            if let Response::Error { message, .. } = reply {
+                self.deferred_error = Some(message);
+            }
+        }
+        self.write_request(request)?;
+        self.read_reply()
+    }
+
+    /// Writes a request and returns immediately without reading its reply.
+    ///
+    /// This is the pane input path. Waiting for the acknowledgement would put a daemon round
+    /// trip in front of every keystroke's paint, and there is nothing to wait for: the echo
+    /// arrives on the event stream, not in this reply.
+    pub fn send(&mut self, request: &Request) -> Result<(), String> {
+        self.write_request(request)?;
+        self.unread_replies += 1;
+        Ok(())
+    }
+
+    /// An error the daemon reported for a fire-and-forget send, noticed when its reply was
+    /// finally drained. Surfaced late rather than not at all.
+    pub fn take_deferred_error(&mut self) -> Option<String> {
+        self.deferred_error.take()
+    }
+
+    fn write_request(&mut self, request: &Request) -> Result<(), String> {
         serde_json::to_writer(&mut self.stream, request).map_err(|e| e.to_string())?;
-        self.stream.write_all(b"\n").map_err(|e| e.to_string())?;
+        self.stream.write_all(b"\n").map_err(|e| e.to_string())
+    }
+
+    fn read_reply(&mut self) -> Result<Response, String> {
         let mut line = String::new();
         if self
             .reader
@@ -39,5 +83,211 @@ impl Client {
             return Err("daemon closed the connection".into());
         }
         serde_json::from_str(&line).map_err(|e| format!("invalid daemon response: {e}"))
+    }
+
+    /// Opens a connection dedicated to pushed events and returns a receiver fed by a reader
+    /// thread, so the render loop drains events without ever blocking on the socket.
+    ///
+    /// Subscribing is one-way: the daemon stops reading this connection and sends no
+    /// acknowledgement, so the request is written without awaiting a reply. Reading one would
+    /// block until the first pane frame arrived and then consume it as if it were the reply,
+    /// and a swallowed attach frame makes every later delta look like a revision gap.
+    ///
+    /// This is a whole connection of its own, so a dashboard holds two: one for requests and
+    /// this one for events. Both count against the daemon's admission limit.
+    pub fn subscribe(socket: &Path) -> Result<mpsc::Receiver<Event>, String> {
+        let Self {
+            mut stream, reader, ..
+        } = Self::connect(socket)?;
+        serde_json::to_writer(&mut stream, &Request::Subscribe(SubscribeRequest {}))
+            .map_err(|e| e.to_string())?;
+        stream.write_all(b"\n").map_err(|e| e.to_string())?;
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("dock-event-reader".into())
+            .spawn(move || {
+                let mut reader = reader;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if let Ok(Response::Stream { event }) = serde_json::from_str(&line)
+                        && sender.send(event).is_err()
+                    {
+                        // The dashboard is gone; dropping the reader closes the subscription.
+                        break;
+                    }
+                    line.clear();
+                }
+            })
+            .map_err(|error| format!("could not start event reader: {error}"))?;
+        Ok(receiver)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ErrorCode, InspectRequest, PaneInputRequest};
+    use std::{
+        os::unix::net::UnixListener,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
+    };
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    /// A socket that removes itself, so a failing assertion cannot leave a stale path behind
+    /// that makes the next run of this test fail for the wrong reason.
+    struct TestSocket(PathBuf);
+
+    impl Drop for TestSocket {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn socket_path(label: &str) -> TestSocket {
+        let path = std::env::current_dir()
+            .expect("current directory")
+            .join("target")
+            .join(format!(
+                "dock-client-test-{label}-{}-{}.sock",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+        let _ = std::fs::remove_file(&path);
+        TestSocket(path)
+    }
+
+    fn line(stream: &mut BufReader<UnixStream>) -> String {
+        let mut buffer = String::new();
+        stream.read_line(&mut buffer).expect("read line");
+        buffer
+    }
+
+    fn write_line(stream: &mut UnixStream, response: &Response) {
+        let encoded = serde_json::to_string(response).expect("encode response");
+        stream.write_all(encoded.as_bytes()).expect("write");
+        stream.write_all(b"\n").expect("write newline");
+    }
+
+    fn accept_handshake(listener: &UnixListener) -> (UnixStream, BufReader<UnixStream>) {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+        assert!(line(&mut reader).contains("hello"));
+        write_line(
+            &mut stream,
+            &Response::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        );
+        (stream, reader)
+    }
+
+    #[test]
+    fn subscribing_reads_every_pushed_event_including_the_first() {
+        let socket = socket_path("subscribe");
+        let listener = UnixListener::bind(&socket.0).expect("bind");
+        let daemon = thread::spawn(move || {
+            let (mut stream, mut reader) = accept_handshake(&listener);
+            assert!(line(&mut reader).contains("subscribe"));
+            // A subscribed connection is one-way: the daemon acknowledges nothing and never
+            // reads again. A client that waited for a reply here would consume this first
+            // frame as if it were one, and a lost attach frame turns every later delta into
+            // an apparent revision gap.
+            write_line(
+                &mut stream,
+                &Response::Stream {
+                    event: Event::PaneAttached {
+                        run_id: "run_1".into(),
+                        revision: 4,
+                        rows: 10,
+                        cols: 40,
+                        screen: String::new(),
+                    },
+                },
+            );
+            write_line(
+                &mut stream,
+                &Response::Stream {
+                    event: Event::PaneDelta {
+                        run_id: "run_1".into(),
+                        revision: 5,
+                        bytes: String::new(),
+                    },
+                },
+            );
+            // Dropping the stream here ends the subscription. Waiting for the client to
+            // close first would deadlock: its reader thread is parked in `read_line` and only
+            // notices a dropped receiver on the next frame, which would never arrive.
+            drop(reader);
+        });
+
+        let events = Client::subscribe(&socket.0).expect("subscribe");
+        let first = events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("attach frame");
+        assert!(matches!(
+            first,
+            Event::PaneAttached {
+                revision: 4,
+                rows: 10,
+                cols: 40,
+                ..
+            }
+        ));
+        let second = events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delta frame");
+        assert!(matches!(second, Event::PaneDelta { revision: 5, .. }));
+        drop(events);
+        daemon.join().expect("daemon thread");
+    }
+
+    #[test]
+    fn a_fire_and_forget_send_does_not_desync_the_next_request() {
+        let socket = socket_path("send");
+        let listener = UnixListener::bind(&socket.0).expect("bind");
+        let daemon = thread::spawn(move || {
+            let (mut stream, mut reader) = accept_handshake(&listener);
+            let input = line(&mut reader);
+            assert!(input.contains("pane_input"), "{input}");
+            write_line(
+                &mut stream,
+                &Response::Error {
+                    code: ErrorCode::MalformedRequest,
+                    message: "no such pane".into(),
+                },
+            );
+            assert!(line(&mut reader).contains("inspect"));
+            write_line(&mut stream, &Response::Snapshots { snapshots: vec![] });
+            drop(reader);
+        });
+
+        let mut client = Client::connect(&socket.0).expect("connect");
+        client
+            .send(&Request::PaneInput(PaneInputRequest {
+                workspace_id: "w".into(),
+                pane_id: "a".into(),
+                input: PaneInputRequest::encode(b"\x1b[A"),
+            }))
+            .expect("send");
+        assert_eq!(client.take_deferred_error(), None, "nothing drained yet");
+
+        // The unread acknowledgement is discarded first, so this reads its own reply rather
+        // than the keystroke's.
+        let response = client
+            .request(&Request::Inspect(InspectRequest { run_id: None }))
+            .expect("request");
+        assert!(
+            matches!(response, Response::Snapshots { .. }),
+            "{response:?}"
+        );
+        assert_eq!(
+            client.take_deferred_error().as_deref(),
+            Some("no such pane")
+        );
+        drop(client);
+        daemon.join().expect("daemon thread");
     }
 }

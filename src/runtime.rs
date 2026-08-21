@@ -255,7 +255,11 @@ impl OwnedRuntime {
                 }
             }
         };
-        let (rows, cols) = self.with_screen(|screen| screen.size());
+        // One pass over the screen lock for every fact it owns.
+        let (rows, cols, title, cwd) = self.with_screen(|screen| {
+            let (rows, cols) = screen.size();
+            (rows, cols, screen.title(), screen.cwd())
+        });
         RuntimeSnapshot {
             binding_kind: self.binding.binding_kind,
             repository_root: self.binding.repository_root.display().to_string(),
@@ -287,12 +291,12 @@ impl OwnedRuntime {
             },
             rows,
             cols,
-            // Agent detection and title/cwd reporting land in Task 9's registry wiring; Task 7
-            // only needs the struct to compile with placeholder values here.
+            // Agent identity needs the process table, which only the registry reads; it fills
+            // these in over this snapshot.
             agent: None,
             agent_state: crate::detect::AgentState::Idle,
-            title: None,
-            cwd: None,
+            title,
+            cwd,
             diagnostic: self.launch_error.clone().or(runtime_diagnostic),
         }
     }

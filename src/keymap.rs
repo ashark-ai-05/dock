@@ -1,0 +1,204 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::{
+    layout::SplitAxis,
+    terminal::{KeyEncoding, encode_key},
+};
+
+/// `Ctrl+B`, matching tmux and Herdr so the binding is the least surprising available.
+const PREFIX: u8 = 0x02;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusDirection {
+    Next,
+    Previous,
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneCommand {
+    NewWorkspace,
+    Split(SplitAxis),
+    Focus(FocusDirection),
+    Resize(i16),
+    Zoom,
+    Rename,
+    Close,
+    Launch,
+    Detach,
+    Help,
+    Quit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyOutcome {
+    Passthrough(Vec<u8>),
+    Command(PaneCommand),
+    PendingPrefix,
+    Ignored,
+}
+
+#[derive(Debug, Default)]
+pub struct Keymap {
+    pending: bool,
+}
+
+impl Keymap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    pub fn handle(&mut self, key: KeyEvent, encoding: KeyEncoding) -> KeyOutcome {
+        if self.pending {
+            self.pending = false;
+            // A second prefix means the user wants a literal Ctrl+B in the pane.
+            if is_prefix(key) {
+                return KeyOutcome::Passthrough(vec![PREFIX]);
+            }
+            return match command_for(key) {
+                Some(command) => KeyOutcome::Command(command),
+                None => KeyOutcome::Ignored,
+            };
+        }
+        if is_prefix(key) {
+            self.pending = true;
+            return KeyOutcome::PendingPrefix;
+        }
+        match encode_key(key, encoding) {
+            Some(bytes) => KeyOutcome::Passthrough(bytes),
+            None => KeyOutcome::Ignored,
+        }
+    }
+
+    /// The published binding table. Rendered as a which-key hint bar while the prefix is
+    /// pending, which is the discoverability property Zellij is consistently praised for.
+    pub fn hints() -> &'static [(&'static str, &'static str)] {
+        &[
+            ("n", "workspace"),
+            ("h", "split ⇋"),
+            ("v", "split ⇵"),
+            ("←↑→↓", "focus"),
+            ("+/-", "resize"),
+            ("z", "zoom"),
+            ("r", "rename"),
+            ("x", "close"),
+            ("l", "launch"),
+            ("d", "detach"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    }
+}
+
+fn is_prefix(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b')
+}
+
+fn command_for(key: KeyEvent) -> Option<PaneCommand> {
+    Some(match key.code {
+        KeyCode::Char('n') => PaneCommand::NewWorkspace,
+        KeyCode::Char('h') => PaneCommand::Split(SplitAxis::Horizontal),
+        KeyCode::Char('v') => PaneCommand::Split(SplitAxis::Vertical),
+        KeyCode::Char('z') => PaneCommand::Zoom,
+        KeyCode::Char('r') => PaneCommand::Rename,
+        KeyCode::Char('x') => PaneCommand::Close,
+        KeyCode::Char('l') => PaneCommand::Launch,
+        KeyCode::Char('d') => PaneCommand::Detach,
+        KeyCode::Char('?') => PaneCommand::Help,
+        KeyCode::Char('q') => PaneCommand::Quit,
+        KeyCode::Char('+') => PaneCommand::Resize(50),
+        KeyCode::Char('-') => PaneCommand::Resize(-50),
+        KeyCode::Tab => PaneCommand::Focus(FocusDirection::Next),
+        KeyCode::Left => PaneCommand::Focus(FocusDirection::Left),
+        KeyCode::Right => PaneCommand::Focus(FocusDirection::Right),
+        KeyCode::Up => PaneCommand::Focus(FocusDirection::Up),
+        KeyCode::Down => PaneCommand::Focus(FocusDirection::Down),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn prefix() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+    }
+
+    fn plain(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn ordinary_keys_pass_straight_through_to_the_pane() {
+        let mut keymap = Keymap::new();
+        assert_eq!(
+            keymap.handle(plain('q'), KeyEncoding::default()),
+            KeyOutcome::Passthrough(b"q".to_vec())
+        );
+        assert!(!keymap.is_pending());
+    }
+
+    #[test]
+    fn escape_is_forwarded_and_never_intercepted() {
+        let mut keymap = Keymap::new();
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            keymap.handle(escape, KeyEncoding::default()),
+            KeyOutcome::Passthrough(vec![0x1b])
+        );
+    }
+
+    #[test]
+    fn prefix_then_command_produces_a_command_and_clears_pending() {
+        let mut keymap = Keymap::new();
+        assert_eq!(
+            keymap.handle(prefix(), KeyEncoding::default()),
+            KeyOutcome::PendingPrefix
+        );
+        assert!(keymap.is_pending());
+        assert_eq!(
+            keymap.handle(plain('q'), KeyEncoding::default()),
+            KeyOutcome::Command(PaneCommand::Quit)
+        );
+        assert!(!keymap.is_pending());
+    }
+
+    #[test]
+    fn double_prefix_sends_a_literal_control_b_to_the_pane() {
+        let mut keymap = Keymap::new();
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(prefix(), KeyEncoding::default()),
+            KeyOutcome::Passthrough(vec![0x02])
+        );
+        assert!(!keymap.is_pending());
+    }
+
+    #[test]
+    fn unknown_key_after_prefix_is_ignored_and_clears_pending() {
+        let mut keymap = Keymap::new();
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(plain('§'), KeyEncoding::default()),
+            KeyOutcome::Ignored
+        );
+        assert!(!keymap.is_pending());
+    }
+
+    #[test]
+    fn published_hints_cover_every_documented_binding() {
+        let keys: Vec<&str> = Keymap::hints().iter().map(|(key, _)| *key).collect();
+        for expected in ["n", "h", "v", "z", "r", "x", "l", "d", "?", "q"] {
+            assert!(keys.contains(&expected), "missing hint for {expected}");
+        }
+    }
+}

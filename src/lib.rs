@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod discovery;
 pub mod dispatch;
 pub mod git;
+pub mod keymap;
 pub mod layout;
 pub mod model;
 pub mod paths;

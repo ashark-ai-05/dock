@@ -132,18 +132,20 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
         return text.as_bytes().to_vec();
     }
     let mut bytes = b"\x1b[200~".to_vec();
-    // Filter out the terminator sequence to prevent paste injection attacks.
-    let text_bytes = text.as_bytes();
-    let terminator = b"\x1b[201~";
-    let mut i = 0;
-    while i < text_bytes.len() {
-        if text_bytes[i..].starts_with(terminator) {
-            i += terminator.len();
-        } else {
-            bytes.push(text_bytes[i]);
-            i += 1;
+    // Filter terminator sequences from the payload. A single forward pass can miss
+    // terminators formed by fragments recombining after removal, so re-check after
+    // each byte. This fixed-point approach guarantees no terminator can survive.
+    const PASTE_END: &[u8] = b"\x1b[201~";
+    let mut cleaned = Vec::with_capacity(text.len());
+    for &byte in text.as_bytes() {
+        cleaned.push(byte);
+        // Re-check after every byte: removing one terminator can leave fragments that
+        // concatenate into another, so a single forward pass is bypassable.
+        if cleaned.ends_with(PASTE_END) {
+            cleaned.truncate(cleaned.len() - PASTE_END.len());
         }
     }
+    bytes.extend_from_slice(&cleaned);
     bytes.extend_from_slice(b"\x1b[201~");
     bytes
 }
@@ -296,21 +298,47 @@ mod tests {
         assert_eq!(encode_paste("hi", false), b"hi".to_vec());
     }
 
-    #[test]
-    fn bracketed_paste_filters_terminator() {
-        // Paste content with embedded terminator sequence must not allow injection.
-        let result = encode_paste("safe\x1b[201~rm -rf /", true);
+    // Helper to verify bracketed paste contains exactly one terminator at the end.
+    fn assert_paste_safe(result: &[u8]) {
         let terminator = b"\x1b[201~";
         let occurrences = result
             .windows(terminator.len())
             .filter(|w| *w == terminator)
             .count();
         assert_eq!(occurrences, 1, "Should have exactly one terminator");
-        assert_eq!(
-            &result[result.len() - terminator.len()..],
-            terminator,
+        assert!(
+            result.ends_with(terminator),
             "Terminator should be the final bytes"
         );
+    }
+
+    #[test]
+    fn bracketed_paste_filters_single_terminator() {
+        // Single terminator embedded in payload.
+        let result = encode_paste("safe\x1b[201~rm -rf /", true);
+        assert_paste_safe(&result);
+    }
+
+    #[test]
+    fn bracketed_paste_filters_fragment_reconstruction_attack() {
+        // Split terminator: removing the interior match leaves fragments that
+        // recombine into a fresh terminator. The fixed-point algorithm catches this.
+        let result = encode_paste("\x1b[20\x1b[201~1~", true);
+        assert_paste_safe(&result);
+    }
+
+    #[test]
+    fn bracketed_paste_filters_fragment_reconstruction_mid_payload() {
+        // Same fragment reconstruction attack but embedded mid-payload.
+        let result = encode_paste("AAA\x1b[20\x1b[201~1~BBB", true);
+        assert_paste_safe(&result);
+    }
+
+    #[test]
+    fn bracketed_paste_filters_multiple_adjacent_terminators() {
+        // Several adjacent terminator sequences.
+        let result = encode_paste("\x1b[201~\x1b[201~\x1b[201~", true);
+        assert_paste_safe(&result);
     }
 
     #[test]

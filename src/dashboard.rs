@@ -673,7 +673,8 @@ impl Dashboard {
             Line::from("Ctrl+B is the only key Dock keeps; Ctrl+B Ctrl+B sends a literal one."),
             Line::styled("AFTER Ctrl+B", heading),
             Line::from("n new workspace   h/v split   z zoom"),
-            Line::from("r rename   x close   l launch   d detach   q quit"),
+            Line::from("r rename   x close   l launch   q quit   [/] workspace"),
+            Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
             Line::styled("FORMS", heading),
             Line::from("type to filter/edit   ↑/↓ or j/k select   Enter review/confirm"),
@@ -744,7 +745,12 @@ impl Dashboard {
         match self.keymap.handle(key, encoding) {
             // Deliberately not a `Request`: pane input is fire-and-forget, and routing it
             // through the request arm would put two daemon round trips in front of the echo.
-            KeyOutcome::Passthrough(bytes) => UiCommand::PaneInput(bytes),
+            // Dropped outright when the pane has no run: there is no PTY to receive it, and
+            // sending anyway earns one daemon error per character straight into the footer.
+            KeyOutcome::Passthrough(bytes) if self.focused_run_id().is_some() => {
+                UiCommand::PaneInput(bytes)
+            }
+            KeyOutcome::Passthrough(_) => UiCommand::None,
             KeyOutcome::Command(command) => self.run_command(command),
             KeyOutcome::PendingPrefix | KeyOutcome::Ignored => UiCommand::None,
         }
@@ -768,6 +774,7 @@ impl Dashboard {
                 direction,
                 FocusDirection::Previous | FocusDirection::Left | FocusDirection::Up
             )),
+            PaneCommand::Workspace(delta) => self.select_workspace(delta),
             PaneCommand::Resize(delta) => self.resize_keyboard(delta),
             PaneCommand::Zoom => self.zoom(),
             PaneCommand::Rename => self.rename(),
@@ -785,6 +792,29 @@ impl Dashboard {
                 UiCommand::None
             }
         }
+    }
+
+    /// Moves the visible workspace, saturating at both ends rather than wrapping: `]` on the
+    /// last workspace is a mis-press, and jumping silently back to the first would move the
+    /// user somewhere they did not ask to go.
+    ///
+    /// Purely local, like zoom — the daemon has no notion of which workspace this client is
+    /// looking at, so there is nothing to tell it.
+    fn select_workspace(&mut self, delta: i8) -> UiCommand {
+        let Some(last) = self.layout.workspaces.len().checked_sub(1) else {
+            self.error = Some("workspace unavailable: create a workspace first".into());
+            return UiCommand::None;
+        };
+        self.workspace_index = if delta < 0 {
+            self.workspace_index
+                .saturating_sub(usize::from(delta.unsigned_abs()))
+        } else {
+            self.workspace_index
+                .saturating_add(usize::from(delta.unsigned_abs()))
+                .min(last)
+        };
+        self.error = None;
+        UiCommand::None
     }
 
     /// Toggles a full-area view of the focused pane. Zoom is local to this client: the
@@ -1617,6 +1647,30 @@ mod tests {
     const PANE_ROWS: u16 = 24;
     const PANE_COLS: u16 = 33;
 
+    /// A second, single-pane workspace so switching has somewhere to go. Its pane is bound so
+    /// the switch has a PTY whose geometry must be announced.
+    fn two_workspace_dashboard() -> Dashboard {
+        let mut dashboard = bound_dashboard();
+        dashboard.layout.workspaces.push(WorkspaceLayout {
+            workspace_id: "w2".into(),
+            name: "Deploy".into(),
+            focused_pane_id: "c".into(),
+            panes: BTreeMap::from([(
+                "c".into(),
+                PaneLayout {
+                    pane_id: "c".into(),
+                    name: "deploy".into(),
+                    run_id: Some("run_2".into()),
+                    runtime: PaneRuntime::Running,
+                },
+            )]),
+            root: LayoutNode::Pane {
+                pane_id: "c".into(),
+            },
+        });
+        dashboard
+    }
+
     fn bound_dashboard() -> Dashboard {
         let mut dashboard = dashboard();
         dashboard.layout.workspaces[0]
@@ -1818,10 +1872,10 @@ mod tests {
             provider: "Codex CLI".into(),
             repository_match: false,
         });
-        // `d` is a pane keystroke now, so it must reach the PTY rather than clear the list.
-        assert!(matches!(
+        // `d` is a pane keystroke now, so it must never clear the list.
+        assert!(!matches!(
             dashboard.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
-            UiCommand::PaneInput(bytes) if bytes == b"d"
+            UiCommand::Request(_)
         ));
         assert_eq!(dashboard.external.len(), 1);
         dashboard.external.clear();
@@ -1943,8 +1997,8 @@ mod tests {
             "r rename",
             "x close",
             "l launch",
-            "d detach",
             "q quit",
+            "runs keep running",
         ] {
             assert!(text.contains(key), "missing published mnemonic: {key}");
         }
@@ -2104,7 +2158,7 @@ mod tests {
 
     #[test]
     fn keys_reach_the_pane_and_the_prefix_opens_command_mode() {
-        let mut dashboard = dashboard();
+        let mut dashboard = bound_dashboard();
         let outcome = dashboard.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(matches!(outcome, UiCommand::PaneInput(bytes) if bytes == b"x"));
         let pending = dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
@@ -2126,7 +2180,16 @@ mod tests {
         assert!(quiet.contains("Ctrl+B ? help"), "{quiet:?}");
         prefix(&mut dashboard);
         let pending = render_to_string(&mut dashboard, 100, 30);
-        for hint in ["split", "zoom", "detach", "focus prev"] {
+        // "quit" is the last entry in the table, so asserting it proves the whole bar fits
+        // inside the two-row footer rather than being silently clipped.
+        for hint in [
+            "split",
+            "zoom",
+            "runs keep running",
+            "focus prev",
+            "workspace",
+            "quit",
+        ] {
             assert!(pending.contains(hint), "missing which-key hint {hint}");
         }
     }
@@ -2209,6 +2272,129 @@ mod tests {
             dashboard.take_pending_resizes(),
             vec![("w".to_owned(), "a".to_owned(), PANE_ROWS, PANE_COLS)]
         );
+    }
+
+    #[test]
+    fn workspace_cycling_moves_the_rendered_workspace_and_saturates_at_both_ends() {
+        let mut dashboard = two_workspace_dashboard();
+        let first = render_to_string(&mut dashboard, 100, 30);
+        assert!(first.contains("editor"));
+        assert!(
+            !first.contains("deploy"),
+            "only the selected workspace is rendered"
+        );
+        assert_eq!(command(&mut dashboard, KeyCode::Char(']')), UiCommand::None);
+        assert_eq!(dashboard.workspace_index, 1);
+        let second = render_to_string(&mut dashboard, 100, 30);
+        assert!(second.contains("Deploy"), "{second:?}");
+        assert!(
+            second.contains("deploy · run_2"),
+            "the second workspace is not rendered"
+        );
+        assert!(
+            !second.contains("editor"),
+            "the first workspace is still on screen"
+        );
+        // Saturating rather than wrapping: `]` at the last workspace is a mis-press, and
+        // silently jumping to the first would move the user somewhere they did not ask for.
+        assert_eq!(command(&mut dashboard, KeyCode::Char(']')), UiCommand::None);
+        assert_eq!(dashboard.workspace_index, 1);
+        assert_eq!(command(&mut dashboard, KeyCode::Char('[')), UiCommand::None);
+        assert_eq!(dashboard.workspace_index, 0);
+        assert_eq!(command(&mut dashboard, KeyCode::Char('[')), UiCommand::None);
+        assert_eq!(dashboard.workspace_index, 0);
+        assert!(render_to_string(&mut dashboard, 100, 30).contains("editor"));
+    }
+
+    #[test]
+    fn cycling_with_no_workspace_explains_itself_rather_than_panicking() {
+        let mut dashboard = Dashboard::default();
+        assert_eq!(command(&mut dashboard, KeyCode::Char(']')), UiCommand::None);
+        assert_eq!(dashboard.workspace_index, 0);
+        assert!(
+            dashboard
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("unavailable"))
+        );
+    }
+
+    #[test]
+    fn a_workspace_switch_announces_the_newly_visible_pane_geometry() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        assert_eq!(
+            dashboard.take_pending_resizes(),
+            vec![("w".to_owned(), "a".to_owned(), PANE_ROWS, PANE_COLS)]
+        );
+        command(&mut dashboard, KeyCode::Char(']'));
+        render_to_string(&mut dashboard, 100, 30);
+        // The second workspace is a single pane, so it owns the whole 72-column body.
+        assert_eq!(
+            dashboard.take_pending_resizes(),
+            vec![("w2".to_owned(), "c".to_owned(), PANE_ROWS, 70)],
+            "a pane shown for the first time must be told its size"
+        );
+    }
+
+    #[test]
+    fn the_cursor_is_drawn_only_in_the_focused_pane() {
+        let mut dashboard = bound_dashboard();
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("b")
+            .unwrap()
+            .run_id = Some("run_2".into());
+        // Both screens end on a newline, so each cursor sits on a blank cell and tui-term
+        // draws its block symbol there rather than merely reversing an occupied cell.
+        dashboard.apply_event(attach_event("run_1", b"left pane\r\n"));
+        dashboard.apply_event(attach_event("run_2", b"right pane\r\n"));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        let focused = dashboard.pane_areas["a"];
+        let unfocused = dashboard.pane_areas["b"];
+        assert_eq!(dashboard.workspace().unwrap().focused_pane_id, "a");
+        assert!(
+            draws_cursor(&terminal, focused),
+            "the focused pane must show where typing lands"
+        );
+        assert!(
+            !draws_cursor(&terminal, unfocused),
+            "a cursor in every pane makes focus unreadable"
+        );
+    }
+
+    fn draws_cursor(terminal: &Terminal<TestBackend>, area: Rect) -> bool {
+        let buffer = terminal.backend().buffer();
+        for y in area.y + 1..area.bottom() - 1 {
+            for x in area.x + 1..area.right() - 1 {
+                if buffer[(x, y)].symbol() == "\u{2588}" {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn typing_into_a_pane_with_no_run_is_dropped_rather_than_sent() {
+        let mut dashboard = dashboard();
+        // Pane "a" has no run, so there is no PTY to receive this and the daemon would answer
+        // every character with an error that flickers through the footer.
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(dashboard.error.is_none(), "a dropped key must not shout");
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("a")
+            .unwrap()
+            .run_id = Some("run_1".into());
+        assert!(matches!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            UiCommand::PaneInput(bytes) if bytes == b"x"
+        ));
     }
 
     #[test]

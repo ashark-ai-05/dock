@@ -23,6 +23,8 @@ pub enum PaneCommand {
     NewWorkspace,
     Split(SplitAxis),
     Focus(FocusDirection),
+    /// Move the visible workspace by this many places. Negative is earlier.
+    Workspace(i8),
     Resize(i16),
     Zoom,
     Rename,
@@ -87,12 +89,13 @@ impl Keymap {
             ("Tab", "focus next"),
             ("S-Tab", "focus prev"),
             ("←↑→↓", "focus"),
+            ("[/]", "workspace"),
             ("+/-", "resize"),
             ("z", "zoom"),
             ("r", "rename"),
             ("x", "close"),
             ("l", "launch"),
-            ("d", "detach"),
+            ("d", "leave · runs keep running"),
             ("?", "help"),
             ("q", "quit"),
         ]
@@ -115,6 +118,8 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Char('d') => PaneCommand::Detach,
         KeyCode::Char('?') => PaneCommand::Help,
         KeyCode::Char('q') => PaneCommand::Quit,
+        KeyCode::Char('[') => PaneCommand::Workspace(-1),
+        KeyCode::Char(']') => PaneCommand::Workspace(1),
         KeyCode::Char('+') => PaneCommand::Resize(50),
         KeyCode::Char('-') => PaneCommand::Resize(-50),
         KeyCode::Tab => PaneCommand::Focus(FocusDirection::Next),
@@ -214,10 +219,25 @@ mod tests {
     }
 
     #[test]
+    fn bracket_keys_after_the_prefix_cycle_workspaces() {
+        let mut keymap = Keymap::new();
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(plain(']'), KeyEncoding::default()),
+            KeyOutcome::Command(PaneCommand::Workspace(1))
+        );
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(plain('['), KeyEncoding::default()),
+            KeyOutcome::Command(PaneCommand::Workspace(-1))
+        );
+    }
+
+    #[test]
     fn published_hints_cover_every_documented_binding() {
         let keys: Vec<&str> = Keymap::hints().iter().map(|(key, _)| *key).collect();
         for expected in [
-            "n", "h", "v", "z", "r", "x", "l", "d", "?", "q", "Tab", "S-Tab",
+            "n", "h", "v", "z", "r", "x", "l", "d", "?", "q", "Tab", "S-Tab", "[/]",
         ] {
             assert!(keys.contains(&expected), "missing hint for {expected}");
         }

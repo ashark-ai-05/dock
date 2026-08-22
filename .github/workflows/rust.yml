@@ -15,6 +15,8 @@ env:
   # locally becomes a coin flip here. Scaling every budget buys headroom without weakening a
   # single assertion.
   DOCK_TEST_TIMEOUT_SCALE: "4"
+  # CI-only failures are the ones hardest to reproduce; make the runner give up its evidence.
+  RUST_BACKTRACE: "1"
 
 # A superseded push has nothing left to prove; let the newer one have the runner.
 concurrency:
@@ -25,6 +27,9 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A deadlocked test would otherwise hold the runner for GitHub's six-hour default. Dock's suite
+    # finishes in about a minute, so anything past this is a hang, not slow hardware.
+    timeout-minutes: 30
     strategy:
       # Dock is developed on macOS and deployed on both. A red Linux job must never hide a red
       # macOS one, so neither cancels the other.

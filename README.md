@@ -167,6 +167,18 @@ scripts/smoke-slice62-nongit-macos.sh
 
 Dock speaks protocol v8 — stop any older daemon before connecting.
 
+CI runs the same three gates plus a build on Linux and macOS. Many tests drive
+real PTYs, subprocesses, and signals, so they wait on a wall clock; those
+deadlines exist so a regression fails with a message instead of hanging, not to
+assert how fast Dock is. `DOCK_TEST_TIMEOUT_SCALE` multiplies every one of them
+when a machine needs more patience than a developer laptop — CI uses `4`:
+
+```bash
+DOCK_TEST_TIMEOUT_SCALE=4 cargo test --all-targets
+```
+
+The smoke scripts are macOS-only and are not part of CI.
+
 ## Licence
 
 MIT

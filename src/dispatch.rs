@@ -5764,9 +5764,19 @@ mod tests {
             })
         };
         entered.wait();
+        // The barrier pair is what proves the point: the restart is parked inside its hook holding
+        // whatever preparation locks it takes, and `release` is only reached below, after this
+        // inspection returns. An inspection that really were blocked behind those locks would
+        // therefore hang here forever rather than merely run late. This bound exists to turn that
+        // hang into a message, so it is a generous backstop and not a latency budget — tightening
+        // it cannot detect blocking the barrier does not already prove, and only converts
+        // scheduler jitter on a loaded machine into a false failure.
         let started = Instant::now();
         let during = registry.inspect(Some("dock_nonblocking")).unwrap();
-        assert!(started.elapsed() < crate::testing::budget_millis(250));
+        assert!(
+            started.elapsed() < crate::testing::budget(5),
+            "registry inspection never returned while a restart held its preparation locks"
+        );
         assert_eq!(during.len(), 1);
         release.wait();
         restarting.join().unwrap().unwrap();
@@ -5836,7 +5846,7 @@ mod tests {
             })
         };
         let (inspected, unrelated_id) = received
-            .recv_timeout(crate::testing::budget(2))
+            .recv_timeout(crate::testing::budget(10))
             .expect("unrelated inspect/dispatch/lifecycle/layout blocked behind restart reap");
         assert_eq!(inspected, 1);
 
@@ -5920,7 +5930,7 @@ mod tests {
             })
         };
         let (unrelated_id, workspace_count) = received
-            .recv_timeout(crate::testing::budget(2))
+            .recv_timeout(crate::testing::budget(10))
             .expect("unrelated registry/layout work blocked behind close reap");
         assert!(!closing.is_finished());
         assert!(!registry.layout().workspaces.is_empty());

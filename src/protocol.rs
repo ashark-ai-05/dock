@@ -8,7 +8,7 @@ use crate::{
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +42,11 @@ pub struct TerminalLaunchRequest {
     pub run_id: String,
     pub profile: DashboardProfile,
     pub runtime_directory: String,
+    /// Extra arguments for the launched agent, which is how a resume asks it to continue its most
+    /// recent session rather than start a new one. Empty for an ordinary launch, and defaulted so
+    /// every existing caller and stored request stays valid.
+    #[serde(default)]
+    pub arguments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +58,26 @@ pub enum DashboardProfile {
     CodexCli,
     GithubCopilotCli,
     Shell,
+}
+
+/// The profile a terminal launch names for an adapter, where one exists.
+///
+/// Not every adapter has one: `Generic` and the shell are launched by other routes and are not
+/// offered as dashboard profiles, so resuming them is not a thing a terminal launch can express.
+impl TryFrom<AdapterId> for DashboardProfile {
+    type Error = ();
+
+    fn try_from(value: AdapterId) -> Result<Self, Self::Error> {
+        Ok(match value {
+            AdapterId::Fixture => Self::Fixture,
+            AdapterId::Amp => Self::Amp,
+            AdapterId::ClaudeCode => Self::ClaudeCode,
+            AdapterId::CodexCli => Self::CodexCli,
+            AdapterId::GithubCopilotCli => Self::GithubCopilotCli,
+            AdapterId::Shell => Self::Shell,
+            AdapterId::Generic => return Err(()),
+        })
+    }
 }
 
 impl From<DashboardProfile> for AdapterId {
@@ -500,7 +525,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_eight() {
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]

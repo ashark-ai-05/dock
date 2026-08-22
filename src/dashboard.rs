@@ -981,6 +981,7 @@ impl Dashboard {
             Line::from("r rename   R restart shell   x close   l launch   q quit"),
             Line::from("w pick a workspace by name   1-9 jump to one   ,/. previous/next"),
             Line::from("f find a file here and type its path into the pane"),
+            Line::from("a resume the agent that last ran here, continuing its own session"),
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
@@ -1093,6 +1094,7 @@ impl Dashboard {
             PaneCommand::Workspace(delta) => self.select_workspace(delta),
             PaneCommand::WorkspacePicker => self.open_workspace_picker(),
             PaneCommand::FilePicker => self.open_file_picker(),
+            PaneCommand::ResumeAgent => self.resume_agent(),
             PaneCommand::WorkspaceJump(position) => self.jump_to_workspace(position),
             PaneCommand::Resize(delta) => self.resize_keyboard(delta),
             PaneCommand::Zoom => self.zoom(),
@@ -1136,6 +1138,78 @@ impl Dashboard {
         self.picker = Some((PickerPurpose::Workspace, Picker::new(items)));
         self.error = None;
         UiCommand::None
+    }
+
+    /// Relaunches the agent that last ran in this pane, telling it to continue its most recent
+    /// session rather than start a new one.
+    ///
+    /// The agent is a Dock-launched process either way, which is the point: Dock's owned-process
+    /// invariant survives intact, because it still only ever signals groups it created and never
+    /// adopts one it did not. What persists across the relaunch is the agent's own transcript,
+    /// which it stores itself and finds again from the working directory — so this outlives the
+    /// pane's process dying, the daemon restarting, and the machine rebooting, none of which
+    /// adopting a live process could have survived.
+    fn resume_agent(&mut self) -> UiCommand {
+        let Some(workspace) = self.workspace() else {
+            self.error = Some("resume unavailable: create a workspace first".into());
+            return UiCommand::None;
+        };
+        let workspace_id = workspace.workspace_id.clone();
+        let pane_id = workspace.focused_pane_id.clone();
+        // The pane keeps its run binding after the run exits, which is exactly the case this
+        // command exists for: the agent is gone and its conversation is what remains.
+        let Some(run) = self
+            .focused_run_id()
+            .and_then(|run_id| self.runs.iter().find(|run| run.run_id == run_id))
+            .cloned()
+        else {
+            self.error = Some("resume unavailable: no agent has run in this pane".into());
+            return UiCommand::None;
+        };
+        let Some(arguments) = run.adapter.resume_arguments() else {
+            self.error = Some(format!("{} cannot be resumed", run.adapter.label()));
+            return UiCommand::None;
+        };
+        let arguments: Vec<String> = arguments.iter().map(|a| (*a).to_string()).collect();
+        let run_id = self.next_unique_id("dock_ui");
+        self.error = None;
+        match run.binding_kind {
+            // A repository-bound run carries the task and worktree its conversation belongs to,
+            // so the resumed run is bound to exactly the same ones.
+            BindingKind::Repository => {
+                UiCommand::Request(Box::new(Request::LaunchIntoPane(LaunchIntoPaneRequest {
+                    workspace_id,
+                    pane_id,
+                    dispatch: DispatchRequest {
+                        repository_root: run.repository_root.clone(),
+                        external_task_ref: run.external_task_ref.clone(),
+                        run_id,
+                        worktree: run.worktree.clone(),
+                        adapter: AdapterSelection {
+                            id: run.adapter.clone(),
+                            executable: None,
+                            arguments,
+                        },
+                    },
+                })))
+            }
+            // An unbound run has no task, only a directory — and the directory is the whole of
+            // what the agent needs, since that is where it filed the conversation.
+            BindingKind::Terminal => {
+                let Ok(profile) = DashboardProfile::try_from(run.adapter.clone()) else {
+                    self.error = Some(format!("{} cannot be resumed", run.adapter.label()));
+                    return UiCommand::None;
+                };
+                UiCommand::Request(Box::new(Request::TerminalLaunch(TerminalLaunchRequest {
+                    workspace_id,
+                    pane_id,
+                    run_id,
+                    profile,
+                    runtime_directory: run.worktree.clone(),
+                    arguments,
+                })))
+            }
+        }
     }
 
     /// Opens the file chooser, rooted where the focused pane actually is.
@@ -1733,6 +1807,7 @@ impl Dashboard {
                 run_id,
                 profile,
                 runtime_directory: self.runtime_directory.clone(),
+                arguments: Vec::new(),
             })));
         }
         let Some(option) = self.repository_launches.first() else {
@@ -3228,7 +3303,7 @@ mod tests {
             "split",
             "zoom",
             "runs keep running",
-            "focus prev",
+            "focus",
             "workspace",
             // The newest hint, and therefore the one nearest the point where the bar stops
             // fitting the two-row footer.
@@ -3542,6 +3617,89 @@ mod tests {
         assert_eq!(
             dashboard.error.as_deref(),
             Some("file picker unavailable: this pane has no directory")
+        );
+    }
+
+    #[test]
+    fn resuming_an_unbound_agent_relaunches_it_asking_to_continue_its_own_session() {
+        let mut dashboard = bound_dashboard();
+        let mut run = snapshot();
+        run.run_id = "run_1".into();
+        run.binding_kind = BindingKind::Terminal;
+        run.adapter = AdapterId::ClaudeCode;
+        run.external_task_ref = String::new();
+        run.worktree = "/somewhere/notes".into();
+        dashboard.runs = vec![run];
+        render_to_string(&mut dashboard, 100, 30);
+
+        let request = command(&mut dashboard, KeyCode::Char('a'));
+        let UiCommand::Request(request) = request else {
+            panic!("resume must issue a launch, got {request:?}");
+        };
+        match *request {
+            Request::TerminalLaunch(launch) => {
+                // Continuing is asked for by argument, so the agent finds its own transcript.
+                assert_eq!(launch.arguments, vec!["--continue".to_owned()]);
+                // In the directory the conversation was filed under, not the dashboard's own.
+                assert_eq!(launch.runtime_directory, "/somewhere/notes");
+                assert_eq!(launch.pane_id, "a");
+            }
+            other => panic!("an unbound run resumes as a terminal launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resuming_a_repository_bound_agent_keeps_the_task_and_worktree_its_session_belongs_to() {
+        let mut dashboard = bound_dashboard();
+        let mut run = snapshot();
+        run.run_id = "run_1".into();
+        run.binding_kind = BindingKind::Repository;
+        run.adapter = AdapterId::CodexCli;
+        dashboard.runs = vec![run];
+        render_to_string(&mut dashboard, 100, 30);
+
+        let UiCommand::Request(request) = command(&mut dashboard, KeyCode::Char('a')) else {
+            panic!("resume must issue a launch");
+        };
+        match *request {
+            Request::LaunchIntoPane(launch) => {
+                assert_eq!(
+                    launch.dispatch.adapter.arguments,
+                    vec!["resume".to_owned(), "--last".to_owned()]
+                );
+                assert_eq!(launch.dispatch.external_task_ref, "TASK-61");
+                assert_eq!(launch.dispatch.worktree, "/repo/real");
+            }
+            other => panic!("a bound run resumes into its pane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_agent_with_no_verified_recipe_says_so_rather_than_starting_a_fresh_session() {
+        let mut dashboard = bound_dashboard();
+        let mut run = snapshot();
+        run.run_id = "run_1".into();
+        run.adapter = AdapterId::GithubCopilotCli;
+        dashboard.runs = vec![run];
+        render_to_string(&mut dashboard, 100, 30);
+
+        // Silently launching without the flag would look like a resume and quietly discard the
+        // conversation the user meant to continue, so nothing is sent at all.
+        assert_eq!(command(&mut dashboard, KeyCode::Char('a')), UiCommand::None);
+        assert_eq!(
+            dashboard.error.as_deref(),
+            Some("GitHub Copilot CLI cannot be resumed")
+        );
+    }
+
+    #[test]
+    fn resuming_a_pane_nothing_has_run_in_explains_itself() {
+        let mut dashboard = dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        assert_eq!(command(&mut dashboard, KeyCode::Char('a')), UiCommand::None);
+        assert_eq!(
+            dashboard.error.as_deref(),
+            Some("resume unavailable: no agent has run in this pane")
         );
     }
 

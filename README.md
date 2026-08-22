@@ -50,6 +50,7 @@ pane**, `Esc` is never intercepted, and `Ctrl+B` twice sends a literal `Ctrl+B`.
 | `n` | new workspace | `z` | zoom pane |
 | `,` `.` | previous / next workspace | `r` | rename |
 | `w` | pick a workspace by name | `f` | find a file, type its path |
+| `a` | resume the agent here | | |
 | `1`–`9` | jump to a workspace | | |
 | `h` `v` | split ⇋ / ⇵ | `R` | restart a pane whose shell exited |
 | arrows, `Tab`/`S-Tab` | focus | `x` | close pane |
@@ -64,6 +65,15 @@ by the digit that jumps there; tabs and picker rows are clickable.
 shell's `cd`, and honouring `.gitignore` inside a repository. Taking one types
 its path into the pane rather than opening it, so `vim ` first opens the file
 and reaching for it mid-sentence hands an agent the path.
+
+`Ctrl+B a` relaunches the agent that last ran in the focused pane, asking it to
+continue its most recent session — `claude --continue`, `codex resume --last`,
+`amp threads continue --last`. Dock never adopts a process it did not start, so
+what survives is the agent's own transcript, not its pid: resume works after the
+pane's process died, after the daemon restarted, and after a reboot. Two panes
+running the same agent in the same directory share a "most recent", so resuming
+one can land on the other's session. An agent whose resume flag Dock has not
+verified reports that it cannot be resumed rather than silently starting fresh.
 
 Pasting is bracketed — a multi-line paste arrives as one payload instead of
 executing line by line.
@@ -175,7 +185,7 @@ scripts/smoke-slice61-macos.sh
 scripts/smoke-slice62-nongit-macos.sh
 ```
 
-Dock speaks protocol v8 — stop any older daemon before connecting.
+Dock speaks protocol v9 — stop any older daemon before connecting.
 
 CI runs the same three gates plus a build on Linux and macOS. Many tests drive
 real PTYs, subprocesses, and signals, so they wait on a wall clock; those

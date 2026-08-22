@@ -275,6 +275,7 @@ fn handle_connection_with_timeout(
                 request.run_id,
                 request.profile,
                 request.runtime_directory,
+                request.arguments,
             ) {
                 Ok(snapshot) => write_response(stream, &Response::Dispatched { snapshot })?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
@@ -908,7 +909,7 @@ mod tests {
         assert!(matches!(
             exchange(
                 &[
-                    r#"{"type":"hello","version":8,"future":true}"#,
+                    &format!(r#"{{"type":"hello","version":{PROTOCOL_VERSION},"future":true}}"#),
                     r#"{"type":"inspect","future":true}"#
                 ],
                 &runtime
@@ -1158,16 +1159,16 @@ mod tests {
                 },
             }))
             .unwrap();
-        let hello = r#"{"type":"hello","version":8}"#;
-        let dispatched = exchange(&[hello, &dispatch], &runtime);
+        let hello = format!(r#"{{"type":"hello","version":{PROTOCOL_VERSION}}}"#);
+        let dispatched = exchange(&[&hello, &dispatch], &runtime);
         let pid = match &dispatched[1] {
             Response::Dispatched { snapshot } => snapshot.pid,
             response => panic!("unexpected response: {response:?}"),
         };
         assert!(pid.is_some());
         let inspect = r#"{"type":"inspect","run_id":"dock_socket_reconnect"}"#;
-        let first = exchange(&[hello, inspect], &runtime);
-        let second = exchange(&[hello, inspect], &runtime);
+        let first = exchange(&[&hello, inspect], &runtime);
+        let second = exchange(&[&hello, inspect], &runtime);
         let inspected_pid = |responses: &[Response]| match &responses[1] {
             Response::Snapshot { snapshot } => snapshot.pid,
             response => panic!("unexpected response: {response:?}"),
@@ -1210,7 +1211,8 @@ mod tests {
                 ..
             }]
         ));
-        let requests = [r#"{"type":"hello","version":8}"#, r#"{"type":"inspect"}"#];
+        let hello = format!(r#"{{"type":"hello","version":{PROTOCOL_VERSION}}}"#);
+        let requests = [hello.as_str(), r#"{"type":"inspect"}"#];
         let first = socket_exchange(&socket, &requests);
         let second = socket_exchange(&socket, &requests);
         let snapshot_count = |responses: &[Response]| match &responses[1] {
@@ -2162,7 +2164,7 @@ mod tests {
         let runtime = registry();
         let responses = exchange(
             &[
-                r#"{"type":"hello","version":8}"#,
+                &format!(r#"{{"type":"hello","version":{PROTOCOL_VERSION}}}"#),
                 r#"{"type":"workspace","operation":"create","workspace_id":"daily","name":"Daily","pane_id":"pane_one"}"#,
                 r#"{"type":"workspace","operation":"split","workspace_id":"daily","pane_id":"pane_one","new_pane_id":"pane_two","axis":"vertical"}"#,
                 r#"{"type":"workspace","operation":"focus","workspace_id":"daily","pane_id":"pane_one"}"#,

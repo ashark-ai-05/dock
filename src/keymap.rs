@@ -29,6 +29,8 @@ pub enum PaneCommand {
     WorkspacePicker,
     /// Complete a path from the focused pane's directory into that pane.
     FilePicker,
+    /// Relaunch the agent that last ran here, continuing its most recent session.
+    ResumeAgent,
     /// Jump straight to the workspace in this 1-based position, if it exists.
     WorkspaceJump(u8),
     Resize(i16),
@@ -97,10 +99,12 @@ impl Keymap {
             // Paired rather than listed separately: the bar has two rows and every column spent
             // repeating the word "split" is a column the last binding needs to stay visible.
             ("h/v", "split ⇋⇵"),
-            ("Tab", "focus next"),
-            ("S-Tab ←↑→↓", "focus prev"),
+            // One entry for the focus keys: Shift reversing a cycle and arrows being directional
+            // are both obvious, and spelling them out cost the columns the last binding needs.
+            ("Tab/S-Tab ←↑→↓", "focus"),
             (",/. w 1-9", "workspace"),
             ("f", "file"),
+            ("a", "resume"),
             ("[", "copy mode"),
             ("+/-", "resize"),
             ("z", "zoom"),
@@ -144,6 +148,10 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         // `f` for file. The picker completes a path into the pane rather than deciding what to do
         // with it, so `vim ` first opens it and an agent prompt simply gains the path.
         KeyCode::Char('f') => PaneCommand::FilePicker,
+        // `a` for agent. Distinct from `R`, which always gives a plain shell: Dock records
+        // explicit decisions rather than inferring them, so continuing a conversation is asked
+        // for by name and never guessed at from what happened to be running.
+        KeyCode::Char('a') => PaneCommand::ResumeAgent,
         // Cycling is fine for two workspaces and miserable for eight. A digit is the only way to
         // reach a distant workspace in constant time. `0` is deliberately unbound: the positions
         // are 1-based on screen, so binding it would place a tenth workspace under a key that
@@ -292,9 +300,9 @@ mod tests {
             "d",
             "?",
             "q",
-            "Tab",
-            "S-Tab ←↑→↓",
+            "Tab/S-Tab ←↑→↓",
             "f",
+            "a",
             "[",
             // The three ways to reach a workspace share one entry: the footer is two rows, and
             // listing them separately pushed the last published binding off the end of it.

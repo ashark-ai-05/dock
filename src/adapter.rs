@@ -135,6 +135,50 @@ impl AdapterId {
         }
     }
 
+    /// How this agent is told to continue its most recent session, or `None` if Dock has no
+    /// verified way to ask it.
+    ///
+    /// Every recipe here was read from the CLI's own `--help`, not assumed. That matters more than
+    /// it looks: a wrong flag does not fail loudly, it starts a brand new session while the user
+    /// believes they resumed one, and the work they were continuing is simply not there. An agent
+    /// whose recipe has not been checked is therefore left as `None` and reported as unable to
+    /// resume, which is a true statement about Dock rather than a guess about the agent.
+    ///
+    /// All three recipes resume *the most recent session for this working directory*, which is
+    /// what makes them survive a daemon restart or a reboot: the agent stores the transcript
+    /// itself and finds it again from where it is run. The cost of that convenience is ambiguity —
+    /// two panes running the same agent in the same directory share a "most recent", so resuming
+    /// one of them can land on the other's session.
+    pub const fn resume_arguments(&self) -> Option<&'static [&'static str]> {
+        match self {
+            // `-c, --continue  Continue the most recent conversation in <cwd>`
+            Self::ClaudeCode => Some(&["--continue"]),
+            // `resume  Resume a previous interactive session (picker by default; --last to
+            // continue the most recent)`
+            Self::CodexCli => Some(&["resume", "--last"]),
+            // `threads continue [threadId]  ... --last  Continue the last thread for the current
+            // mode directly`
+            Self::Amp => Some(&["threads", "continue", "--last"]),
+            // Not installed anywhere its flags could be read, so nothing is claimed for it.
+            Self::GithubCopilotCli => None,
+            // A shell, a bare command, and the test fixture hold no session to continue.
+            Self::Fixture | Self::Generic | Self::Shell => None,
+        }
+    }
+
+    /// The agent's name as a person would say it, for messages about what could not be done.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Fixture => "the fixture",
+            Self::Amp => "Amp",
+            Self::ClaudeCode => "Claude Code",
+            Self::CodexCli => "Codex CLI",
+            Self::GithubCopilotCli => "GitHub Copilot CLI",
+            Self::Generic => "this command",
+            Self::Shell => "a shell",
+        }
+    }
+
     /// Provider-native claims are enumerated per profile. None of the current CLIs has a verified
     /// provider lifecycle contract; Dock-owned process controls are declared separately.
     pub const fn declared_capabilities(&self) -> AdapterCapabilities {
@@ -266,5 +310,37 @@ mod tests {
     #[test]
     fn shell_adapter_declares_no_provider_lifecycle() {
         assert!(!AdapterId::Shell.declared_capabilities().provider_lifecycle);
+    }
+
+    #[test]
+    fn resume_recipes_match_what_each_cli_documents() {
+        // Read from each CLI's own --help. A wrong flag would not fail loudly: it would start a
+        // fresh session while the user believed they had continued one.
+        assert_eq!(
+            AdapterId::ClaudeCode.resume_arguments(),
+            Some(&["--continue"][..])
+        );
+        assert_eq!(
+            AdapterId::CodexCli.resume_arguments(),
+            Some(&["resume", "--last"][..])
+        );
+        assert_eq!(
+            AdapterId::Amp.resume_arguments(),
+            Some(&["threads", "continue", "--last"][..])
+        );
+    }
+
+    #[test]
+    fn an_adapter_with_no_verified_recipe_claims_nothing() {
+        // Nothing here holds a session to continue, or has had its flags checked. Claiming a
+        // recipe on a guess is worse than admitting Dock cannot resume it.
+        for adapter in [
+            AdapterId::GithubCopilotCli,
+            AdapterId::Fixture,
+            AdapterId::Generic,
+            AdapterId::Shell,
+        ] {
+            assert_eq!(adapter.resume_arguments(), None, "{adapter:?}");
+        }
     }
 }

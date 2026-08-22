@@ -360,12 +360,17 @@ impl RuntimeRegistry {
         run_id: String,
         profile: DashboardProfile,
         runtime_directory: String,
+        supplied_arguments: Vec<String>,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
         validate_external_run_id(&run_id).map_err(|m| (ErrorCode::InvalidBinding, m))?;
         let directory = canonical_terminal_directory(Path::new(&runtime_directory))
             .map_err(|m| (ErrorCode::InvalidBinding, m))?;
         let adapter_id = crate::adapter::AdapterId::from(profile);
-        let arguments = if adapter_id == crate::adapter::AdapterId::Fixture {
+        // Supplied arguments win, which is how a resume reaches the agent. The fixture keeps its
+        // built-in script when nothing is supplied, so an ordinary launch is unchanged.
+        let arguments = if !supplied_arguments.is_empty() {
+            supplied_arguments
+        } else if adapter_id == crate::adapter::AdapterId::Fixture {
             vec![
                 "-c".into(),
                 "printf 'Dock-owned fixture ready\\n'; sleep 30".into(),
@@ -3134,6 +3139,7 @@ mod tests {
                 "dock_taken".into(),
                 DashboardProfile::Fixture,
                 directory.clone(),
+                Vec::new(),
             )
             .expect("first launch claims the run id");
 
@@ -3143,6 +3149,7 @@ mod tests {
             "dock_taken".into(),
             DashboardProfile::Fixture,
             directory,
+            Vec::new(),
         );
         assert!(matches!(refused, Err((ErrorCode::DuplicateRunId, _))));
 
@@ -3157,6 +3164,46 @@ mod tests {
         assert_eq!(pane.runtime, PaneRuntime::Running);
         let snapshot = registry.inspect(Some(&shell_run_id)).expect("shell run");
         assert_eq!(snapshot[0].state, crate::protocol::ProcessState::Running);
+    }
+
+    #[test]
+    fn a_terminal_launch_passes_supplied_arguments_and_they_displace_the_built_in_ones() {
+        let registry = registry();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Workspace".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+        // This is the shape a resume takes on the unbound path: the same profile, launched with
+        // the agent's own "continue where you left off" arguments.
+        let snapshot = registry
+            .terminal_launch(
+                "w1".into(),
+                "p1".into(),
+                "dock_resumed".into(),
+                DashboardProfile::Fixture,
+                registry.state.display().to_string(),
+                vec!["-c".into(), "printf resumed".into()],
+            )
+            .expect("launch with supplied arguments");
+        assert!(
+            snapshot.command.contains(&"printf resumed".to_owned()),
+            "supplied arguments must reach the agent: {:?}",
+            snapshot.command
+        );
+        assert!(
+            !snapshot
+                .command
+                .iter()
+                .any(|argument| argument.contains("Dock-owned fixture ready")),
+            "supplied arguments must displace the built-in ones rather than joining them: {:?}",
+            snapshot.command
+        );
+        registry
+            .lifecycle("dock_resumed", LifecycleOperation::Stop)
+            .expect("stop the resumed run");
     }
 
     /// Ruling R20: capacity bounds concurrent agent work, so the terminals a user opens must
@@ -3206,6 +3253,7 @@ mod tests {
                 "dock_agent_run".into(),
                 DashboardProfile::Fixture,
                 registry.state.display().to_string(),
+                Vec::new(),
             )
             .expect("agent dispatch must still be admitted with three panes open");
         assert_eq!(registry.inspect_programme().global_active, 1);
@@ -3228,6 +3276,7 @@ mod tests {
                 pane_shell_run_id("w1", "p1"),
                 DashboardProfile::Fixture,
                 registry.state.display().to_string(),
+                Vec::new(),
             )
             .expect_err("a caller must not mint a pane-shell identity");
         assert_eq!(error.0, ErrorCode::InvalidBinding);
@@ -3299,6 +3348,7 @@ mod tests {
                 "dock_replacement".into(),
                 DashboardProfile::Fixture,
                 registry.state.display().to_string(),
+                Vec::new(),
             )
             .expect("launch replaces the pane shell");
         assert!(
@@ -3429,6 +3479,7 @@ mod tests {
                 "dock_terminal_1".into(),
                 DashboardProfile::Fixture,
                 runtime_dir.display().to_string(),
+                Vec::new(),
             )
             .unwrap();
         assert_eq!(snapshot.binding_kind, BindingKind::Terminal);

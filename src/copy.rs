@@ -118,20 +118,35 @@ impl CopySession {
 
 /// Every occurrence of `query` across the visible rows, in reading order. Case-sensitive,
 /// matching what a user typing an exact string expects.
+///
+/// Columns are **character offsets**, not byte offsets — computed by counting `chars()` up to
+/// the match, converting from `str::find`'s byte position. This is exact for ASCII and narrow
+/// accented Latin (e.g. "héllo"), but it is still not true terminal cell width: CJK ideographs
+/// and most emoji occupy two cells, so a row containing wide characters before a match reports
+/// a column short by the count of those wide characters. Getting true cell width would need a
+/// width table (e.g. `unicode-width`), which this crate does not carry. Box-drawing characters
+/// (U+2500 block) are narrow in virtually every terminal font, so TUI borders never trigger
+/// this; the realistic triggers are emoji status glyphs in agent output and accented paths.
 pub fn find_matches(rows: &[String], query: &str) -> Vec<(u16, u16)> {
     if query.is_empty() {
         return Vec::new();
     }
     let mut matches = Vec::new();
     for (index, row) in rows.iter().enumerate() {
+        // A row index that cannot be represented as u16 could not be reported to the caller
+        // (whose coordinates are u16 throughout) anyway, and no realistic scrollback or pane
+        // gets anywhere near 65,536 rows, so the remaining rows are dropped rather than panic.
         let Ok(row_index) = u16::try_from(index) else {
             break;
         };
         let mut from = 0;
         while let Some(found) = row[from..].find(query) {
             let column = from + found;
-            if let Ok(column) = u16::try_from(column) {
-                matches.push((row_index, column));
+            // Same rationale as the row-index guard: a column past u16::MAX cannot be
+            // reported, and no realistic terminal width approaches that, so this one match
+            // is skipped (not the whole row) while the scan continues past it.
+            if let Ok(char_column) = u16::try_from(row[..column].chars().count()) {
+                matches.push((row_index, char_column));
             }
             from = column + query.len();
         }
@@ -203,6 +218,16 @@ mod tests {
             find_matches(&rows(), ""),
             Vec::new(),
             "an empty query matches nothing"
+        );
+    }
+
+    #[test]
+    fn find_matches_reports_character_columns_not_byte_offsets() {
+        // "é" is 2 bytes in UTF-8 but a single narrow terminal cell; the match column must
+        // count characters (6), not bytes (7), or a caller positioning a cursor lands wrong.
+        assert_eq!(
+            find_matches(&["héllo beta".to_string()], "beta"),
+            vec![(0, 6)]
         );
     }
 

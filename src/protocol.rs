@@ -8,7 +8,7 @@ use crate::{
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +19,7 @@ pub enum Request {
     Dispatch(DispatchRequest),
     Lifecycle(LifecycleRequest),
     SubmitHandoff(SubmitHandoffRequest),
+    ReportAgentState(ReportAgentStateRequest),
     ReviewInbox(ReviewInboxRequest),
     Decide(DecideRequest),
     QueueGated(QueueGatedRequest),
@@ -224,6 +225,20 @@ pub struct SubmitHandoffRequest {
     pub packet: HandoffPacket,
 }
 
+/// An agent saying what it is doing, rather than Dock working it out from the screen.
+///
+/// Every agent CLI worth integrating has an event system — Claude Code fires `UserPromptSubmit`
+/// when a turn starts, `Stop` when it ends, `PermissionRequest` when it needs a decision — and a
+/// hook wired to those knows exactly what a pattern can only infer. A reported state is sticky:
+/// it holds until the agent reports something else, because "finished" stays true until the next
+/// turn starts, and a timeout would invent a transition nobody observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportAgentStateRequest {
+    pub run_id: String,
+    pub state: AgentState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewInboxRequest {}
@@ -332,6 +347,8 @@ pub enum Response {
     ReviewInbox {
         items: Vec<HandoffRecord>,
     },
+    /// A report accepted. Carries nothing: the agent is telling Dock something, not asking.
+    AgentStateRecorded {},
     DecisionRecorded {
         decision: ReviewDecision,
     },
@@ -525,7 +542,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_eight() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     #[test]

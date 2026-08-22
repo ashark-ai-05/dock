@@ -57,6 +57,10 @@ pub struct RuntimeRegistry {
     /// Agent state per run, keyed by the exact output the screen was built from. Classification is
     /// a pure function of that screen, so nothing but new bytes can change its answer.
     agent_states: Mutex<HashMap<String, ClassifiedAgent>>,
+    /// What each agent has said about itself, where a hook is wired to report it. Preferred over
+    /// anything read from the screen: an agent firing its own turn-start and turn-end events knows
+    /// what a pattern can only infer.
+    reported_states: Mutex<HashMap<String, AgentState>>,
     /// When each run's output last grew. Not memoisable the way classification is: the answer it
     /// feeds changes with the passage of time rather than with new bytes, so it is read afresh.
     output_marks: Mutex<HashMap<String, OutputMark>>,
@@ -323,6 +327,7 @@ impl RuntimeRegistry {
             process_table: Mutex::new(None),
             agent_states: Mutex::new(HashMap::new()),
             output_marks: Mutex::new(HashMap::new()),
+            reported_states: Mutex::new(HashMap::new()),
             #[cfg(test)]
             suppress_pane_shells: Mutex::new(false),
             #[cfg(test)]
@@ -1920,6 +1925,17 @@ impl RuntimeRegistry {
         let quiet_for = entry.1.elapsed();
         drop(marks);
 
+        // What the agent said about itself beats anything read off its screen. A hook fires on the
+        // agent's own turn boundaries, so it knows; everything below is inference from bytes.
+        if let Some(reported) = self
+            .reported_states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(run_id)
+            .copied()
+        {
+            return reported;
+        }
         // A question outranks everything: an agent asking one has stopped, however recently it
         // printed the question itself.
         if from_screen == AgentState::Blocked {
@@ -1932,6 +1948,34 @@ impl RuntimeRegistry {
             return AgentState::Working;
         }
         AgentState::Done
+    }
+
+    /// Records what an agent says it is doing.
+    ///
+    /// Sticky by design: it holds until the agent reports something else. "Finished" stays true
+    /// until the next turn begins, and expiring it after some interval would invent a transition
+    /// nobody observed — which is the whole failing of guessing from a screen.
+    pub fn report_agent_state(
+        &self,
+        run_id: &str,
+        state: AgentState,
+    ) -> Result<(), (ErrorCode, String)> {
+        if !self
+            .runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(run_id)
+        {
+            return Err((
+                ErrorCode::RunNotFound,
+                format!("no Dock-owned run {run_id}"),
+            ));
+        }
+        self.reported_states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(run_id.to_owned(), state);
+        Ok(())
     }
 
     /// The process table, taken afresh only when the last snapshot has aged out.
@@ -3343,6 +3387,66 @@ mod tests {
         registry
             .lifecycle("dock_resumed", LifecycleOperation::Stop)
             .expect("stop the resumed run");
+    }
+
+    #[test]
+    fn what_an_agent_says_about_itself_beats_what_its_screen_looks_like() {
+        let registry = registry();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "W".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+        let run_id = pane_shell_run_id("w1", "p1");
+
+        // A hook fires on the agent's own turn boundaries, so it knows what a pattern can only
+        // infer — and a freshly launched shell writing its prompt would otherwise read as working.
+        registry
+            .report_agent_state(&run_id, AgentState::Done)
+            .expect("report");
+        let reported = registry
+            .inspect(Some(&run_id))
+            .expect("inspect")
+            .remove(0)
+            .agent_state;
+        assert_eq!(reported, AgentState::Done);
+
+        // Sticky: it holds until the agent says otherwise, because "finished" stays true until the
+        // next turn starts and a timeout would invent a transition nobody observed.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            registry
+                .inspect(Some(&run_id))
+                .expect("inspect")
+                .remove(0)
+                .agent_state,
+            AgentState::Done
+        );
+        registry
+            .report_agent_state(&run_id, AgentState::Working)
+            .expect("report again");
+        assert_eq!(
+            registry
+                .inspect(Some(&run_id))
+                .expect("inspect")
+                .remove(0)
+                .agent_state,
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn a_report_for_a_run_that_is_not_ours_is_refused() {
+        let registry = registry();
+        // The socket is reachable from inside any pane, so a report naming someone else's run has
+        // to be refused rather than recorded against nothing.
+        assert!(
+            registry
+                .report_agent_state("dock_not_mine", AgentState::Working)
+                .is_err()
+        );
     }
 
     /// Ruling R20: capacity bounds concurrent agent work, so the terminals a user opens must

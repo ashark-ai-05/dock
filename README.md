@@ -151,6 +151,22 @@ A dispatched agent is also told how to close the loop: its prompt ends with
 task because an agent *looks* finished — "looks finished" is a regex over a
 screen, and the board is the durable record of what happened.
 
+### Exact state, from the agent itself
+
+Screen-reading is the fallback. Where an agent has its own event system, Dock
+uses that instead — it knows, where a pattern can only infer:
+
+```bash
+dock hooks              # print the Claude Code hook config
+dock hooks --install    # merge it into .claude/settings.json
+```
+
+That wires `UserPromptSubmit` → working, `Stop` → your turn,
+`PermissionRequest`/`Notification` → needs you, `SessionEnd` → idle. A reported
+state is sticky: it holds until the agent reports something else, because
+"finished" stays true until the next turn begins. Merging is per event and
+repeatable — your own hooks on those events are left alone.
+
 Agent states are distinct on purpose: **needs you** means the agent asked
 something and cannot continue (a permission prompt, a chooser); **your turn**
 means it finished and will wait indefinitely. Reporting the second as the first
@@ -301,7 +317,7 @@ scripts/smoke-slice61-macos.sh
 scripts/smoke-slice62-nongit-macos.sh
 ```
 
-Dock speaks protocol v9 — stop any older daemon before connecting.
+Dock speaks protocol v10 — stop any older daemon before connecting.
 
 CI runs the same three gates plus a build on Linux and macOS. Many tests drive
 real PTYs, subprocesses, and signals, so they wait on a wall clock; those

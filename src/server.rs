@@ -292,6 +292,14 @@ fn handle_connection_with_timeout(
                 )?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
+            Ok(Request::ReportAgentState(request)) => {
+                match runtime.report_agent_state(&request.run_id, request.state) {
+                    Ok(()) => write_response(stream, &Response::AgentStateRecorded {})?,
+                    Err((code, message)) => {
+                        write_response(stream, &Response::Error { code, message })?
+                    }
+                }
+            }
             Ok(Request::SubmitHandoff(request)) => match runtime.submit_handoff(request.packet) {
                 Ok(record) => write_response(stream, &Response::HandoffSubmitted { record })?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,

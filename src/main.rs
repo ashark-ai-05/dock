@@ -30,6 +30,7 @@ use dock::{
     client::Client,
     client::{EventStream, StreamPoll},
     dashboard::{Dashboard, TaskDispatch, UiCommand},
+    detect::AgentState,
     git::GitAdapter,
     paths,
     protocol::{
@@ -96,6 +97,14 @@ fn run_noninteractive_legacy(args: &[String]) -> Result<bool, Box<dyn Error>> {
         .iter()
         .find_map(|argument| argument.strip_prefix("--dock-dir=").map(str::to_owned))
         .unwrap_or_else(|| ".dock/local".into());
+    if args.first().is_some_and(|first| first == "agent-state") {
+        agent_state_command(&args[1..])?;
+        return Ok(true);
+    }
+    if args.first().is_some_and(|first| first == "hooks") {
+        hooks_command(&args[1..])?;
+        return Ok(true);
+    }
     if args.first().is_some_and(|first| first == "handoff") {
         handoff_command(&args[1..])?;
         return Ok(true);
@@ -822,6 +831,114 @@ fn dispatch_task(
             "dispatched into its existing worktree"
         }
     ));
+    Ok(())
+}
+
+/// `dock agent-state <working|blocked|done|idle>` — what a hook reports.
+///
+/// Small on purpose: it is called from an agent's own event hooks, several times a turn, and any
+/// latency here is latency the agent pays. Silent on failure for the same reason — a dashboard
+/// that is not running, or a pane Dock did not launch, must never make an agent's hook fail and
+/// interrupt the work it was reporting on.
+fn agent_state_command(args: &[String]) -> io::Result<()> {
+    let Some(word) = args.iter().find(|argument| !argument.starts_with("--")) else {
+        return Err(io::Error::other(
+            "dock agent-state <working|blocked|done|idle>",
+        ));
+    };
+    let state = match word.as_str() {
+        "working" => AgentState::Working,
+        "blocked" | "needs-you" => AgentState::Blocked,
+        "done" => AgentState::Done,
+        "idle" => AgentState::Idle,
+        other => {
+            return Err(io::Error::other(format!(
+                "unknown state {other:?}; expected working, blocked, done or idle"
+            )));
+        }
+    };
+    let (Ok(run_id), Ok(socket)) = (std::env::var("DOCK_RUN"), std::env::var("DOCK_SOCKET")) else {
+        // Not in a Dock pane. Nothing to report to, and nothing worth failing over.
+        return Ok(());
+    };
+    let Ok(mut stream) = UnixStream::connect(&socket) else {
+        return Ok(());
+    };
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(clone) => clone,
+        Err(_) => return Ok(()),
+    });
+    for request in [
+        serde_json::to_string(&Request::Hello(dock::protocol::HelloRequest {
+            version: dock::protocol::PROTOCOL_VERSION,
+        }))?,
+        serde_json::to_string(&Request::ReportAgentState(
+            dock::protocol::ReportAgentStateRequest { run_id, state },
+        ))?,
+    ] {
+        if stream.write_all(request.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
+            return Ok(());
+        }
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+    }
+    Ok(())
+}
+
+/// `dock hooks` — the Claude Code hook configuration that makes state exact.
+///
+/// Printed rather than installed by default. This writes into a file the user shares with every
+/// other tool that reads it, and a program that edits your settings because you asked it a
+/// question is not one you leave installed.
+fn hooks_command(args: &[String]) -> io::Result<()> {
+    let hooks = serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "dock agent-state working"}]}],
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "dock agent-state working"}]}],
+            "PermissionRequest": [{"hooks": [{"type": "command", "command": "dock agent-state blocked"}]}],
+            "Notification": [{"hooks": [{"type": "command", "command": "dock agent-state blocked"}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": "dock agent-state done"}]}],
+            "SessionEnd": [{"hooks": [{"type": "command", "command": "dock agent-state idle"}]}]
+        }
+    });
+    let pretty = serde_json::to_string_pretty(&hooks)?;
+    if !args.iter().any(|argument| argument == "--install") {
+        println!("{pretty}");
+        eprintln!(
+            "\nAdd this to .claude/settings.json, or run `dock hooks --install` to merge it in."
+        );
+        return Ok(());
+    }
+    let path = PathBuf::from(".claude").join("settings.json");
+    fs::create_dir_all(".claude")?;
+    let mut settings: serde_json::Value = match fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)?,
+        _ => serde_json::json!({}),
+    };
+    // Merged per event rather than wholesale: whatever else is hooked to these events is somebody
+    // else's and stays. Dock's entry is skipped where it is already present, so this is repeatable.
+    let existing = settings
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("settings.json is not an object"))?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let existing = existing
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("settings.json \"hooks\" is not an object"))?;
+    for (event, entry) in hooks["hooks"].as_object().expect("hook events") {
+        let slot = existing
+            .entry(event.clone())
+            .or_insert_with(|| serde_json::json!([]));
+        let Some(list) = slot.as_array_mut() else {
+            continue;
+        };
+        let ours = entry.as_array().expect("hook entries")[0].clone();
+        if !list.contains(&ours) {
+            list.push(ours);
+        }
+    }
+    fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
+    println!("merged Dock's hooks into {}", path.display());
     Ok(())
 }
 

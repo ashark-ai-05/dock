@@ -36,13 +36,6 @@ const COPY_HINTS: &str =
 const MIN_PANE_WIDTH: u16 = 8;
 const MIN_PANE_HEIGHT: u16 = 3;
 
-/// Scrollback capacity for this client's own `VtTerminal` replica of each pane, seeded on
-/// `PaneAttached`. Mirrors `dockd`'s own `--scrollback-rows` default (see `src/bin/dockd.rs`),
-/// but the attach frame carries no capacity field, so a daemon started with a non-default
-/// `--scrollback-rows` desyncs silently from this constant: the client can never retain more
-/// history than this, even if the daemon retains more (or less).
-const DEFAULT_CLIENT_SCROLLBACK_ROWS: usize = 2000;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Request(Box<Request>),
@@ -188,13 +181,15 @@ impl Dashboard {
                 revision,
                 rows,
                 cols,
+                scrollback_rows,
                 screen,
             } => {
-                // A zero capacity here would leave `vt100` unable to retain any scrolled-off
-                // rows at all (that capacity is fixed for the terminal's lifetime), so the wheel
-                // (`Dashboard::mouse`'s `ScrollUp`/`ScrollDown` arm) would have nothing to scroll
-                // into no matter how much output the pane produced.
-                let mut terminal = PaneScreen::new(rows, cols, DEFAULT_CLIENT_SCROLLBACK_ROWS);
+                // The daemon's own retention, so this replica holds exactly the history the
+                // daemon holds. The capacity is fixed for a `vt100` terminal's lifetime, and a
+                // replica built with none would leave the wheel (`Dashboard::mouse`'s
+                // `ScrollUp`/`ScrollDown` arm) nothing to scroll into however much the pane
+                // produced.
+                let mut terminal = PaneScreen::new(rows, cols, scrollback_rows as usize);
                 if let Ok(bytes) = STANDARD.decode(&screen) {
                     terminal.feed(&bytes);
                 }
@@ -1080,8 +1075,10 @@ impl Dashboard {
             KeyCode::Char('j') | KeyCode::Down => self.copy_move(&mut session, 1, 0, bounds),
             KeyCode::Char('k') | KeyCode::Up => self.copy_move(&mut session, -1, 0, bounds),
             KeyCode::Char('l') | KeyCode::Right => self.copy_move(&mut session, 0, 1, bounds),
-            // Top and bottom of what the replica actually holds: the client's own grid has no
-            // scrollback of its own yet, so these are the visible extremes rather than history.
+            // Deliberately the top and bottom of the *viewport*, not of history: `g` in a pane
+            // scrolled back must reach the row above the cursor, not jump the user thousands of
+            // rows away from what they are reading. `k` past the top edge walks into history a
+            // row at a time (see `copy_move`).
             KeyCode::Char('g') => session.set_cursor((0, 0), bounds),
             KeyCode::Char('G') => session.set_cursor((bounds.0.saturating_sub(1), 0), bounds),
             KeyCode::Char('v') => session.begin_selection(),
@@ -2238,6 +2235,7 @@ mod tests {
             revision: 1,
             rows: PANE_ROWS,
             cols: PANE_COLS,
+            scrollback_rows: 2000,
             screen: STANDARD.encode(source.state_bytes()),
         }
     }
@@ -3107,6 +3105,7 @@ mod tests {
             revision: 1,
             rows: 24,
             cols: 80,
+            scrollback_rows: 2000,
             screen: STANDARD.encode(source.state_bytes()),
         });
         let mut sync = crate::terminal::ScreenSync::new(24, 80);
@@ -3131,6 +3130,7 @@ mod tests {
             revision: 1,
             rows: 24,
             cols: 80,
+            scrollback_rows: 2000,
             screen: String::new(),
         });
         dashboard.apply_event(Event::PaneDelta {
@@ -3149,6 +3149,7 @@ mod tests {
             revision: 1,
             rows: 24,
             cols: 80,
+            scrollback_rows: 2000,
             screen: String::new(),
         });
         let mut source = crate::terminal::VtTerminal::new(10, 40, 0);
@@ -3158,6 +3159,7 @@ mod tests {
             revision: 7,
             rows: 10,
             cols: 40,
+            scrollback_rows: 2000,
             screen: STANDARD.encode(source.state_bytes()),
         });
         assert_eq!(dashboard.screens["run_1"].size(), (10, 40));
@@ -3360,6 +3362,81 @@ mod tests {
                 .count(),
             1,
             "{rows:#?}"
+        );
+    }
+
+    /// The client half of the same defect: history has to arrive through the event stream.
+    /// The daemon now sends the child's own bytes, so feeding a delta must scroll the replica
+    /// exactly as feeding the pane's PTY scrolls the daemon's.
+    #[test]
+    fn a_delta_of_the_childs_own_bytes_gives_the_wheel_history_to_scroll_into() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        let mut written = Vec::new();
+        for index in 1..=60 {
+            written.extend_from_slice(format!("line {index}\r\n").as_bytes());
+        }
+        dashboard.apply_event(Event::PaneDelta {
+            run_id: "run_1".into(),
+            revision: 2,
+            bytes: STANDARD.encode(&written),
+        });
+        let live = render_to_string(&mut dashboard, 100, 30);
+        assert!(live.contains("line 60"), "{live}");
+        assert!(
+            !live.contains("line 05"),
+            "the pane is not tall enough for this to prove anything"
+        );
+
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        for _ in 0..20 {
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: area.x + 2,
+                row: area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert!(
+            dashboard.screens["run_1"].is_scrolled(),
+            "a delta of raw output must leave the replica with history to scroll into"
+        );
+        let scrolled = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            !scrolled.contains("line 60"),
+            "the viewport never moved: {scrolled}"
+        );
+    }
+
+    /// The attach frame carries the daemon's own retention, so the replica keeps exactly what
+    /// the daemon keeps. A client guessing at the default would silently retain a different
+    /// amount than the pane it is mirroring.
+    #[test]
+    fn the_replica_retains_exactly_the_history_the_attach_frame_announced() {
+        let mut dashboard = dashboard();
+        dashboard.apply_event(Event::PaneAttached {
+            run_id: "run_1".into(),
+            revision: 1,
+            rows: 5,
+            cols: 20,
+            scrollback_rows: 3,
+            screen: String::new(),
+        });
+        let mut written = Vec::new();
+        for index in 1..=40 {
+            written.extend_from_slice(format!("line {index}\r\n").as_bytes());
+        }
+        dashboard.apply_event(Event::PaneDelta {
+            run_id: "run_1".into(),
+            revision: 2,
+            bytes: STANDARD.encode(&written),
+        });
+        let screen = dashboard.screens.get_mut("run_1").expect("screen present");
+        screen.scroll_by(9_999);
+        assert_eq!(
+            screen.scroll_offset(),
+            3,
+            "the replica must retain the announced three rows, no more and no fewer"
         );
     }
 

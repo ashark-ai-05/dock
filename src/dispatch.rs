@@ -29,7 +29,7 @@ use crate::{
     },
     runtime::{OwnedRuntime, PtySize, RunBinding},
     storage::LocalStore,
-    terminal::PaneScreen,
+    terminal::{PaneOutput, PaneScreen},
 };
 
 pub struct RuntimeRegistry {
@@ -2057,6 +2057,17 @@ impl RuntimeRegistry {
         run_id: &str,
         apply: impl FnOnce(&PaneScreen) -> T,
     ) -> Option<T> {
+        self.with_run_output(run_id, |output| apply(output.screen()))
+    }
+
+    /// The pane's screen and its undelivered raw output, under one lock. The streaming path
+    /// needs both in one look: bytes handed out and the screen they reach must come from the
+    /// same instant, or the next poll would forward bytes the subscriber already has.
+    pub fn with_run_output<T>(
+        &self,
+        run_id: &str,
+        apply: impl FnOnce(&PaneOutput) -> T,
+    ) -> Option<T> {
         let entry = self
             .runs
             .lock()
@@ -2064,7 +2075,13 @@ impl RuntimeRegistry {
             .get(run_id)
             .and_then(RuntimeSlot::active)
             .cloned()?;
-        Some(entry.runtime.with_screen(apply))
+        Some(entry.runtime.with_output(apply))
+    }
+
+    /// Scrollback rows every pane's terminal retains. Announced to subscribers so a client's
+    /// replica retains exactly what the daemon does rather than guessing at the default.
+    pub fn scrollback_rows(&self) -> usize {
+        self.scrollback_rows
     }
 
     fn pane_size(&self, workspace_id: &str, pane_id: &str) -> PtySize {

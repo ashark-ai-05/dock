@@ -309,6 +309,7 @@ mod tests {
                         revision: 4,
                         rows: 10,
                         cols: 40,
+                        scrollback_rows: 2000,
                         screen: String::new(),
                     },
                 },
@@ -403,6 +404,7 @@ mod tests {
             revision,
             rows: 10,
             cols: 40,
+            scrollback_rows: 2000,
             screen: String::new(),
         }
     }

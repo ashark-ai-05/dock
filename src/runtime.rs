@@ -21,7 +21,7 @@ use nix::{
 use crate::{
     adapter::{AdapterCapabilities, AdapterId, ProcessCapabilities, ResolvedAdapter},
     protocol::{BindingKind, ProcessState, ProviderState, RuntimeSnapshot},
-    terminal::PaneScreen,
+    terminal::{PANE_OUTPUT_LOG_BYTES, PaneOutput, PaneScreen},
 };
 
 #[derive(Debug, Clone)]
@@ -72,7 +72,9 @@ pub struct OwnedRuntime {
     /// writer threads each own their own clone.
     pty_control: Option<Arc<File>>,
     size: Mutex<PtySize>,
-    screen: Arc<Mutex<PaneScreen>>,
+    /// The pane's screen and the raw bytes that produced it, under one lock so a subscriber
+    /// can be handed bytes and reconciled against the screen those exact bytes reach.
+    output: Arc<Mutex<PaneOutput>>,
     launch_error: Option<String>,
 }
 
@@ -123,12 +125,13 @@ impl OwnedRuntime {
         let command = adapter.command;
         let adapter_id = adapter.id;
         let adapter_capabilities = adapter.capabilities;
-        let screen = Arc::new(Mutex::new(PaneScreen::new(
+        let output = Arc::new(Mutex::new(PaneOutput::new(
             size.rows,
             size.cols,
             scrollback_rows,
+            PANE_OUTPUT_LOG_BYTES,
         )));
-        match launch_child(&command, &binding.worktree, Arc::clone(&screen), size) {
+        match launch_child(&command, &binding.worktree, Arc::clone(&output), size) {
             Ok((child, pid, guardian_control, pty_input_sender, pty_control)) => {
                 let lifecycle = Arc::new(Mutex::new(LifecycleState::Running));
                 let reaper_lifecycle = Arc::clone(&lifecycle);
@@ -172,7 +175,7 @@ impl OwnedRuntime {
                         pty_input: Some(pty_input_sender),
                         pty_control: Some(pty_control),
                         size: Mutex::new(size),
-                        screen,
+                        output,
                         launch_error: None,
                     },
                     Err(error) => Self {
@@ -194,7 +197,7 @@ impl OwnedRuntime {
                         pty_input: Some(pty_input_sender),
                         pty_control: Some(pty_control),
                         size: Mutex::new(size),
-                        screen,
+                        output,
                         launch_error: None,
                     },
                 }
@@ -213,7 +216,7 @@ impl OwnedRuntime {
                 pty_input: None,
                 pty_control: None,
                 size: Mutex::new(size),
-                screen,
+                output,
                 launch_error: Some(error),
             },
         }
@@ -339,9 +342,10 @@ impl OwnedRuntime {
             }
             *current = size;
         }
-        self.screen
+        self.output
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .screen_mut()
             .resize(size.rows, size.cols);
         if self.lifecycle_is_terminal() {
             return Ok(());
@@ -370,8 +374,12 @@ impl OwnedRuntime {
         self.signal(Signal::SIGWINCH)
     }
     pub fn with_screen<T>(&self, apply: impl FnOnce(&PaneScreen) -> T) -> T {
-        let screen = self.screen.lock().unwrap_or_else(|p| p.into_inner());
-        apply(&screen)
+        self.with_output(|output| apply(output.screen()))
+    }
+
+    pub fn with_output<T>(&self, apply: impl FnOnce(&PaneOutput) -> T) -> T {
+        let output = self.output.lock().unwrap_or_else(|p| p.into_inner());
+        apply(&output)
     }
     pub fn input(&self, input: &[u8]) -> Result<(), String> {
         if input.is_empty() {
@@ -551,16 +559,16 @@ fn wait_for_owned_group_exit(group: &OwnedProcessGroup, timeout: Duration) -> bo
 fn launch_child(
     command: &[String],
     worktree: &Path,
-    screen: Arc<Mutex<PaneScreen>>,
+    output: Arc<Mutex<PaneOutput>>,
     size: PtySize,
 ) -> Result<ChildLaunch, String> {
-    launch_child_with_before_spawn(command, worktree, screen, size, || {})
+    launch_child_with_before_spawn(command, worktree, output, size, || {})
 }
 
 fn launch_child_with_before_spawn(
     command: &[String],
     worktree: &Path,
-    screen: Arc<Mutex<PaneScreen>>,
+    output: Arc<Mutex<PaneOutput>>,
     size: PtySize,
     before_spawn: impl FnOnce(),
 ) -> Result<ChildLaunch, String> {
@@ -664,7 +672,7 @@ exec "$@" 3<&-"#,
     let pid = child.id();
     if let Err(error) = thread::Builder::new()
         .name("dock-pty-reader".into())
-        .spawn(move || read_pty(master, screen))
+        .spawn(move || read_pty(master, output))
     {
         if let Ok(raw_pid) = i32::try_from(pid) {
             signal_owned_group(&OwnedProcessGroup(Pid::from_raw(raw_pid)), Signal::SIGKILL);
@@ -719,14 +727,14 @@ fn environment_is_allowed(key: &std::ffi::OsStr) -> bool {
     ) || key.starts_with("LC_")
 }
 
-fn read_pty(mut master: File, screen: Arc<Mutex<PaneScreen>>) {
+fn read_pty(mut master: File, output: Arc<Mutex<PaneOutput>>) {
     let mut buffer = [0_u8; 4096];
     while let Ok(count) = master.read(&mut buffer) {
         if count == 0 {
             break;
         }
-        match screen.lock() {
-            Ok(mut screen) => screen.feed(&buffer[..count]),
+        match output.lock() {
+            Ok(mut output) => output.feed(&buffer[..count]),
             Err(_) => break,
         }
     }
@@ -1523,17 +1531,18 @@ mod tests {
 
     #[test]
     fn unrelated_concurrent_exec_cannot_inherit_guardian_control() {
-        let screen = Arc::new(Mutex::new(PaneScreen::new(
+        let output = Arc::new(Mutex::new(PaneOutput::new(
             FIXTURE_SIZE.rows,
             FIXTURE_SIZE.cols,
             128,
+            PANE_OUTPUT_LOG_BYTES,
         )));
         let unrelated = Mutex::new(None);
         let (mut guardian, pid, control, _pty_input, _pty_control) =
             launch_child_with_before_spawn(
                 &["sh".into(), "-c".into(), "sleep 30".into()],
                 &std::env::current_dir().unwrap(),
-                screen,
+                output,
                 FIXTURE_SIZE,
                 || {
                     *unrelated.lock().unwrap() =

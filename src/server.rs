@@ -102,7 +102,7 @@ use crate::{
     protocol::{
         ErrorCode, Event, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProcessState, Request, Response,
     },
-    terminal::ScreenSync,
+    terminal::{PaneOutput, ScreenSync},
 };
 
 /// How often the streaming loop samples the live emulators. Fast enough that a keystroke
@@ -393,12 +393,17 @@ fn handle_connection_with_timeout(
     }
 }
 
-/// Pushes screen deltas to one subscriber until it disconnects.
+/// Pushes screen frames to one subscriber until it disconnects.
 ///
-/// Each run gets a `ScreenSync` recording what *this* subscriber has already been sent, so
-/// the loop transmits only the difference against that view: an unchanged pane produces an
-/// empty delta and therefore no frame at all, which is the entire point of pushing instead
-/// of answering `Inspect` polls with every run's full scrollback.
+/// Each run gets a `SubscriberView` recording how far into that pane's raw output this
+/// subscriber has read. A frame carries the child's own bytes from that point on, so the
+/// client's parser scrolls exactly as the daemon's did and accumulates the same history. The
+/// earlier scheme sent `state_diff` repaints, which are cursor-addressed and therefore never
+/// scroll: a client fed them could never hold a single row of scrollback, so the mouse wheel
+/// had nothing to scroll into and copy mode had no history to search.
+///
+/// An idle pane writes no bytes, so it produces no frame at all — the entire point of pushing
+/// instead of answering `Inspect` polls with every run's full scrollback.
 ///
 /// `deadline` is `None` in production. Tests pass a short one because the loop is otherwise
 /// unbounded and a test driving it through a fixed request list would never observe an end.
@@ -432,44 +437,65 @@ fn stream_events(
             {
                 syncs.remove(&snapshot.run_id);
             }
-            let attached = syncs.contains_key(&snapshot.run_id);
-            // Borrowed immutably: the sync must not advance until the bytes are on the wire.
-            let delta = runtime.with_run_screen(&snapshot.run_id, |screen| {
-                match syncs.get(&snapshot.run_id) {
-                    Some(view) => view.sync.delta_from(screen),
-                    None => screen.state_bytes(),
+            let scrollback_rows = u32::try_from(runtime.scrollback_rows()).unwrap_or(u32::MAX);
+            let frame = runtime.with_run_output(&snapshot.run_id, |output| {
+                match syncs.get_mut(&snapshot.run_id) {
+                    Some(view) => view.next_delta(output),
+                    // Falls through to a seed below, exactly as a view that has fallen behind
+                    // the retained output does.
+                    None => None,
                 }
+                .map_or_else(
+                    || {
+                        StreamFrame::Seed(Box::new(SubscriberView::seeded(
+                            output,
+                            snapshot.rows,
+                            snapshot.cols,
+                        )))
+                    },
+                    StreamFrame::Delta,
+                )
             });
             // No live runtime to read: leave this run unattached so it still gets a full
             // snapshot rather than a delta if it becomes readable later.
-            let Some(delta) = delta else { continue };
-            if !delta.is_empty() {
-                let revision = revisions.get(&snapshot.run_id).copied().unwrap_or(0) + 1;
-                let encoded = STANDARD.encode(&delta);
-                let event = if attached {
-                    Event::PaneDelta {
-                        run_id: snapshot.run_id.clone(),
-                        revision,
-                        bytes: encoded,
-                    }
-                } else {
-                    Event::PaneAttached {
-                        run_id: snapshot.run_id.clone(),
-                        revision,
-                        rows: snapshot.rows,
-                        cols: snapshot.cols,
-                        screen: encoded,
-                    }
-                };
-                // Advance this subscriber's view only once the write succeeded, so a failed
-                // write leaves it consistent with what the client actually received.
-                write_response(stream, &Response::Stream { event })?;
-                syncs
-                    .entry(snapshot.run_id.clone())
-                    .or_insert_with(|| SubscriberView::new(snapshot.rows, snapshot.cols))
-                    .sync
-                    .apply(&delta);
-                revisions.insert(snapshot.run_id.clone(), revision);
+            let Some(frame) = frame else { continue };
+            match frame {
+                StreamFrame::Delta(bytes) if bytes.is_empty() => {}
+                StreamFrame::Delta(bytes) => {
+                    let revision = revisions.get(&snapshot.run_id).copied().unwrap_or(0) + 1;
+                    write_response(
+                        stream,
+                        &Response::Stream {
+                            event: Event::PaneDelta {
+                                run_id: snapshot.run_id.clone(),
+                                revision,
+                                bytes: STANDARD.encode(&bytes),
+                            },
+                        },
+                    )?;
+                    revisions.insert(snapshot.run_id.clone(), revision);
+                }
+                StreamFrame::Seed(seed) => {
+                    let (view, bytes) = *seed;
+                    let revision = revisions.get(&snapshot.run_id).copied().unwrap_or(0) + 1;
+                    write_response(
+                        stream,
+                        &Response::Stream {
+                            event: Event::PaneAttached {
+                                run_id: snapshot.run_id.clone(),
+                                revision,
+                                rows: snapshot.rows,
+                                cols: snapshot.cols,
+                                scrollback_rows,
+                                screen: STANDARD.encode(&bytes),
+                            },
+                        },
+                    )?;
+                    // Recorded only once the seed is on the wire, so a failed write cannot
+                    // leave this loop believing the subscriber is attached.
+                    syncs.insert(snapshot.run_id.clone(), view);
+                    revisions.insert(snapshot.run_id.clone(), revision);
+                }
             }
             if process_states.get(&snapshot.run_id) != Some(&snapshot.state) {
                 write_response(
@@ -504,19 +530,85 @@ fn stream_events(
     }
 }
 
-/// The screen one subscriber has already been sent for one run, and the geometry that view
-/// was built at. Revisions live outside this so dropping it to re-seed cannot reset them.
+/// What one poll owes one subscriber for one run.
+enum StreamFrame {
+    /// The child's own bytes since this subscriber's last frame, with any repaint needed to
+    /// erase drift appended. Empty when the pane has been silent, which is the common case.
+    Delta(Vec<u8>),
+    /// A full snapshot and the view that replaces this subscriber's, for a run it has never
+    /// seen, one whose geometry changed, or one whose output it has fallen behind.
+    /// Boxed only to keep the common `Delta` frame small: a view carries two parsers.
+    Seed(Box<(SubscriberView, Vec<u8>)>),
+}
+
+/// How far into one run's raw output this subscriber has read, a replica of what it should
+/// now be showing, and the geometry the view was built at. Revisions live outside this so
+/// dropping it to re-seed cannot reset them.
 struct SubscriberView {
     sync: ScreenSync,
     size: (u16, u16),
+    /// Sequence of the first byte of this pane's output this subscriber has not been sent.
+    offset: u64,
+    /// Which byte stream that sequence belongs to. A restarted run keeps its id but gets a
+    /// fresh terminal whose sequence starts over, so without this a stale offset would be
+    /// served bytes from the middle of the replacement.
+    epoch: u64,
 }
 
 impl SubscriberView {
-    fn new(rows: u16, cols: u16) -> Self {
-        Self {
+    /// A snapshot of `output`'s screen and the view a subscriber sent it will then have.
+    ///
+    /// The snapshot is a repaint, which restores the visible grid but says nothing about
+    /// which buffer that grid is. A pane already in the alternate screen must therefore say
+    /// so first, or the client would paint a full-screen program's window onto its primary
+    /// buffer — scrolling the user's real history away and leaving the client on the wrong
+    /// buffer when the program exits.
+    fn seeded(output: &PaneOutput, rows: u16, cols: u16) -> (Self, Vec<u8>) {
+        let mut bytes = Vec::new();
+        if output.screen().alternate_screen() {
+            bytes.extend_from_slice(b"\x1b[?1049h");
+        }
+        bytes.extend_from_slice(&output.screen().state_bytes());
+        let mut view = Self {
             sync: ScreenSync::new(rows, cols),
             size: (rows, cols),
+            offset: output.log().end(),
+            epoch: output.log().epoch(),
+        };
+        view.sync.apply(&bytes);
+        (view, bytes)
+    }
+
+    /// The bytes owed to this subscriber, or `None` if it has fallen further behind than the
+    /// pane retains and must be re-seeded instead.
+    ///
+    /// The view advances here rather than after the write, because the correction below has to
+    /// be computed against the screen those exact bytes reach. Reading the screen again after
+    /// the write would diff against a screen that had moved on, and the client would then be
+    /// repainted with output it was about to be sent as bytes — printing it twice. A failed
+    /// write ends the connection and discards every view with it, so nothing survives to be
+    /// left inconsistent by advancing early.
+    fn next_delta(&mut self, output: &PaneOutput) -> Option<Vec<u8>> {
+        if output.log().epoch() != self.epoch {
+            return None;
         }
+        let mut pending = output.log().since(self.offset)?;
+        if pending.is_empty() {
+            return Some(pending);
+        }
+        self.offset += pending.len() as u64;
+        self.sync.apply(&pending);
+        // Replaying the child's bytes reproduces the daemon's screen for everything the
+        // subscriber witnessed, but not for state it never saw — a scroll region set before it
+        // attached, say. This erases whatever difference is left, and is empty in the ordinary
+        // case. It is cursor-addressed, so it repaints without disturbing the history the
+        // bytes above just built.
+        let correction = self.sync.delta_from(output.screen());
+        if !correction.is_empty() {
+            self.sync.apply(&correction);
+            pending.extend_from_slice(&correction);
+        }
+        Some(pending)
     }
 }
 
@@ -807,7 +899,7 @@ mod tests {
         assert!(matches!(
             exchange(
                 &[
-                    r#"{"type":"hello","version":7,"future":true}"#,
+                    r#"{"type":"hello","version":8,"future":true}"#,
                     r#"{"type":"inspect","future":true}"#
                 ],
                 &runtime
@@ -1057,7 +1149,7 @@ mod tests {
                 },
             }))
             .unwrap();
-        let hello = r#"{"type":"hello","version":7}"#;
+        let hello = r#"{"type":"hello","version":8}"#;
         let dispatched = exchange(&[hello, &dispatch], &runtime);
         let pid = match &dispatched[1] {
             Response::Dispatched { snapshot } => snapshot.pid,
@@ -1109,7 +1201,7 @@ mod tests {
                 ..
             }]
         ));
-        let requests = [r#"{"type":"hello","version":7}"#, r#"{"type":"inspect"}"#];
+        let requests = [r#"{"type":"hello","version":8}"#, r#"{"type":"inspect"}"#];
         let first = socket_exchange(&socket, &requests);
         let second = socket_exchange(&socket, &requests);
         let snapshot_count = |responses: &[Response]| match &responses[1] {
@@ -1138,7 +1230,10 @@ mod tests {
     }
 
     fn hello() -> String {
-        serde_json::to_string(&Request::Hello(HelloRequest { version: 7 })).unwrap()
+        serde_json::to_string(&Request::Hello(HelloRequest {
+            version: PROTOCOL_VERSION,
+        }))
+        .unwrap()
     }
 
     fn create_workspace(runtime: &RuntimeRegistry) {
@@ -1361,12 +1456,15 @@ mod tests {
                     run_id: id,
                     rows,
                     cols,
+                    scrollback_rows,
                     screen: bytes,
                     ..
                 } if id == run_id => {
                     // The whole point of the geometry fields: this client never saw the
-                    // resize request and has no other source for the new size.
-                    let mut fresh = crate::terminal::VtTerminal::new(*rows, *cols, 0);
+                    // resize request and has no other source for the new size — nor for how
+                    // much history the daemon keeps, which decides how far back it can scroll.
+                    let mut fresh =
+                        crate::terminal::VtTerminal::new(*rows, *cols, *scrollback_rows as usize);
                     fresh.feed(&STANDARD.decode(bytes).expect("attach screen is base64"));
                     screen = Some(fresh);
                 }
@@ -1392,6 +1490,189 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The defect this whole path exists to prevent: a client fed cursor-addressed repaints
+    /// renders correctly and still has no history, because addressing a cell never scrolls a
+    /// row into scrollback. So this drives real output from a real child through the real
+    /// stream and then scrolls the replica the stream built. Filling a replica with `feed()`
+    /// would exercise the client's own scroll path and prove nothing about the transport.
+    #[test]
+    fn a_subscriber_scrolls_back_through_the_history_the_stream_itself_built() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let run_id = runtime
+            .inspect(None)
+            .expect("inspect")
+            .into_iter()
+            .find(|run| run.pane_id == "p1")
+            .expect("bound run")
+            .run_id;
+        let deadline = Instant::now() + CONVERGENCE_BACKSTOP;
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        let shared = runtime.shared();
+        std::thread::spawn(move || {
+            handle_connection_with_timeout(
+                &mut server,
+                &shared,
+                ReadTimeouts::PRODUCTION,
+                Some(deadline),
+            )
+            .ok();
+        });
+
+        let registry_ref: &RuntimeRegistry = &runtime;
+        let events = std::thread::scope(|scope| {
+            let ready_ref = &ready;
+            let reader = scope.spawn(move || {
+                for line in [hello(), subscribe_line()] {
+                    client.write_all(line.as_bytes()).expect("write request");
+                    client.write_all(b"\n").expect("write newline");
+                }
+                client.shutdown(Shutdown::Write).expect("finish requests");
+                drain_until_quiet(client, ready_ref)
+            });
+            // Let the subscriber attach before any of the output below exists, so every line
+            // it can scroll back to reached it as a delta rather than in the attach snapshot.
+            thread::sleep(Duration::from_millis(250));
+            let typed = exchange(
+                &[
+                    &hello(),
+                    &serde_json::to_string(&Request::PaneInput(PaneInputRequest {
+                        workspace_id: "w1".into(),
+                        pane_id: "p1".into(),
+                        input: PaneInputRequest::encode(b"seq 1 200\n"),
+                    }))
+                    .unwrap(),
+                ],
+                registry_ref,
+            );
+            assert!(matches!(typed[1], Response::PaneInputAccepted { .. }));
+            while !registry_ref
+                .with_run_screen(&run_id, |screen| screen.text_tail(2))
+                .expect("live screen")
+                .contains("200")
+            {
+                assert!(
+                    Instant::now() + QUIET + Duration::from_millis(600) < deadline,
+                    "the shell never produced the requested output"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+            ready_ref.store(true, Ordering::Release);
+            reader.join().expect("subscriber")
+        });
+
+        let attached = events
+            .iter()
+            .find_map(|event| match event {
+                Event::PaneAttached {
+                    scrollback_rows, ..
+                } => Some(*scrollback_rows),
+                _ => None,
+            })
+            .expect("an attach frame");
+        assert_eq!(
+            attached as usize,
+            runtime.scrollback_rows(),
+            "the attach frame must carry the daemon's real retention, not a client-side guess"
+        );
+
+        let mut replayed = replay(&events, &run_id);
+        let expected = runtime
+            .with_run_screen(&run_id, |screen| screen.state_bytes())
+            .expect("live screen");
+        assert_eq!(
+            String::from_utf8_lossy(&replayed.state_bytes()),
+            String::from_utf8_lossy(&expected),
+            "the subscriber did not converge on the daemon's live screen"
+        );
+
+        let visible = |terminal: &crate::terminal::VtTerminal| {
+            let (rows, _) = terminal.size();
+            (0..rows)
+                .map(|row| terminal.visible_row(row))
+                .collect::<Vec<_>>()
+        };
+        // The lowest number `seq` printed that is still on screen. Comparing these rather than
+        // fixed line numbers keeps the assertion independent of the pane's height.
+        let earliest = |view: &[String]| {
+            view.iter()
+                .filter_map(|row| row.trim().parse::<u64>().ok())
+                .min()
+                .expect("the pane is showing numbered output")
+        };
+        let live_view = visible(&replayed);
+        assert!(!replayed.is_scrolled());
+        replayed.scroll_by(30);
+        assert!(
+            replayed.is_scrolled(),
+            "the replica the stream built retained no history at all, so the wheel does nothing"
+        );
+        let scrolled_view = visible(&replayed);
+        assert!(
+            earliest(&scrolled_view) < earliest(&live_view),
+            "scrolling back showed nothing older: {:?} then {:?}",
+            earliest(&live_view),
+            earliest(&scrolled_view)
+        );
+        replayed.scroll_to_live();
+        assert_eq!(
+            visible(&replayed),
+            live_view,
+            "returning to the bottom must resume following live output"
+        );
+    }
+
+    /// A subscriber slow enough to fall past the retained window must be re-seeded. Serving it
+    /// whatever bytes survive would skip the rest, and a mirror missing a run of bytes looks
+    /// exactly like a rendering bug with nothing to attribute it to.
+    #[test]
+    fn a_subscriber_that_falls_behind_the_retained_output_is_re_seeded_rather_than_skipped() {
+        let mut output = PaneOutput::new(5, 20, 100, 16);
+        output.feed(b"first\r\n");
+        let (mut view, seed) = SubscriberView::seeded(&output, 5, 20);
+        let mut client = crate::terminal::VtTerminal::new(5, 20, 100);
+        client.feed(&seed);
+        assert_eq!(client.state_bytes(), output.screen().state_bytes());
+
+        // Keeping up: the child's own bytes are forwarded and the replica tracks them.
+        output.feed(b"second\r\n");
+        let delta = view.next_delta(&output).expect("still retained");
+        client.feed(&delta);
+        assert_eq!(client.state_bytes(), output.screen().state_bytes());
+        assert_eq!(
+            view.next_delta(&output).as_deref(),
+            Some(b"".as_slice()),
+            "a silent pane owes a caught-up subscriber nothing"
+        );
+
+        // Falling behind: far more arrives than the pane retains undelivered.
+        for _ in 0..10 {
+            output.feed(b"a longer burst\r\n");
+        }
+        assert!(
+            view.next_delta(&output).is_none(),
+            "falling behind must be reported, not silently partially served"
+        );
+        let (mut recovered, reseed) = SubscriberView::seeded(&output, 5, 20);
+        client.feed(&reseed);
+        assert_eq!(
+            client.state_bytes(),
+            output.screen().state_bytes(),
+            "the re-seed must put the subscriber back on the daemon's screen"
+        );
+
+        // A restart keeps the run id but replaces its terminal, so the sequence starts over.
+        // A view holding an offset from the old stream must not be served bytes from the
+        // middle of the new one — which is exactly what a bare offset comparison would do.
+        let mut restarted = PaneOutput::new(5, 20, 100, 4096);
+        restarted.feed(b"a replacement terminal wrote this\r\n");
+        assert!(
+            recovered.next_delta(&restarted).is_none(),
+            "a restarted run's output must not be read as a continuation of the old run's"
+        );
     }
 
     #[test]
@@ -1667,16 +1948,16 @@ mod tests {
     }
 
     #[test]
-    fn version_six_clients_are_refused_with_an_actionable_message() {
+    fn version_seven_clients_are_refused_with_an_actionable_message() {
         let runtime = registry();
         let responses = exchange(
-            &[&serde_json::to_string(&Request::Hello(HelloRequest { version: 6 })).unwrap()],
+            &[&serde_json::to_string(&Request::Hello(HelloRequest { version: 7 })).unwrap()],
             &runtime,
         );
         match &responses[0] {
             Response::Error { code, message } => {
                 assert_eq!(*code, ErrorCode::ProtocolMismatch);
-                assert!(message.contains("7"));
+                assert!(message.contains("8"), "{message}");
             }
             other => panic!("expected protocol mismatch, got {other:?}"),
         }
@@ -1687,7 +1968,7 @@ mod tests {
         let runtime = registry();
         let responses = exchange(
             &[
-                r#"{"type":"hello","version":7}"#,
+                r#"{"type":"hello","version":8}"#,
                 r#"{"type":"workspace","operation":"create","workspace_id":"daily","name":"Daily","pane_id":"pane_one"}"#,
                 r#"{"type":"workspace","operation":"split","workspace_id":"daily","pane_id":"pane_one","new_pane_id":"pane_two","axis":"vertical"}"#,
                 r#"{"type":"workspace","operation":"focus","workspace_id":"daily","pane_id":"pane_one"}"#,

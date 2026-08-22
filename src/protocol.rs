@@ -8,7 +8,7 @@ use crate::{
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,17 +116,27 @@ pub struct SubscribeRequest {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
-    /// A full screen snapshot, sent when a subscriber first sees a run and again whenever
-    /// the pane's geometry changes. `rows`/`cols` are carried so a client that did not
+    /// A full screen snapshot, sent when a subscriber first sees a run, again whenever the
+    /// pane's geometry changes, and again if a subscriber ever falls further behind the pane's
+    /// output than the daemon retains. `rows`/`cols` are carried so a client that did not
     /// originate the resize can size its parser from this frame alone: without them a
     /// subscriber keeps its old geometry and renders only the tail rows of the snapshot.
+    ///
+    /// `scrollback_rows` is the daemon's own retention, so the replica this frame seeds keeps
+    /// exactly the history the daemon keeps. A client cannot infer it: it is a `dockd` option,
+    /// and a client that assumed the default would silently retain a different amount.
     PaneAttached {
         run_id: String,
         revision: u64,
         rows: u16,
         cols: u16,
+        scrollback_rows: u32,
         screen: String,
     },
+    /// The raw bytes the pane's child wrote since this subscriber's last frame, so the
+    /// client's parser scrolls exactly as the daemon's did and accumulates the same history.
+    /// A repaint-style diff could never do that: it is cursor-addressed, and addressing a cell
+    /// never scrolls a row into scrollback.
     PaneDelta {
         run_id: String,
         revision: u64,
@@ -489,8 +499,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_seven() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+    fn protocol_version_is_eight() {
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     #[test]
@@ -537,11 +547,13 @@ mod tests {
             revision: 4,
             rows: 40,
             cols: 120,
+            scrollback_rows: 2000,
             screen: "AA==".into(),
         };
         let wire = serde_json::to_string(&event).expect("serialise attach event");
         assert!(wire.contains(r#""rows":40"#), "{wire}");
         assert!(wire.contains(r#""cols":120"#), "{wire}");
+        assert!(wire.contains(r#""scrollback_rows":2000"#), "{wire}");
         assert_eq!(
             serde_json::from_str::<Event>(&wire).expect("round trip"),
             event
@@ -553,9 +565,17 @@ mod tests {
             )
             .is_err()
         );
+        // A subscriber must not be able to size its replica's history from a frame that omits
+        // the daemon's retention either.
         assert!(
             serde_json::from_str::<Event>(
-                r#"{"event":"pane_attached","run_id":"r1","revision":4,"rows":40,"cols":120,"screen":"AA==","extra":1}"#
+                r#"{"event":"pane_attached","run_id":"r1","revision":4,"rows":40,"cols":120,"screen":"AA=="}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Event>(
+                r#"{"event":"pane_attached","run_id":"r1","revision":4,"rows":40,"cols":120,"scrollback_rows":2000,"screen":"AA==","extra":1}"#
             )
             .is_err(),
             "the event shape must stay closed"

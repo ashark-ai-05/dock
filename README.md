@@ -80,13 +80,16 @@ fails. The notice after a yank names which route was used, because OSC 52 is
 disabled by default in some terminals and a silent no-op would look
 identical to a working copy.
 
-**The mouse wheel does not scroll history yet.** Dock's client only ever
-receives cursor-addressed screen repaints from the daemon, never the raw
-output stream, so its own scrollback buffer never accumulates rows to scroll
-into — the wheel is currently a no-op. Copy mode, `g`/`G`, and `/` search
-therefore all operate on the visible screen only, not on a pane's full
-history. This is a known gap, tracked as a follow-up at the protocol layer;
-see the [parity matrix](docs/terminal-runtime-parity.md) for details.
+The mouse wheel scrolls a pane's history, and scrolling back to the bottom
+resumes following live output. The daemon streams each pane's raw output to
+the client, so the client's own terminal scrolls exactly as the daemon's does
+and retains the same number of rows (`dockd --scrollback-rows`, default
+2000). In copy mode, `k`/`↑` past the top row walks into that history a row
+at a time; `g`/`G` jump to the top and bottom of the current viewport, and
+`/` search covers the rows on screen, so scrolling back first widens what it
+searches. History is per-connection: a pane accumulates it from the moment
+this client attached, the way it does in tmux, and it is not restored across
+a daemon restart.
 
 ## Agent awareness
 
@@ -138,14 +141,13 @@ multi-repository capacity and dependency gates.
 ## Status
 
 Shipped: VT emulation, PTY resize, shell panes, push-based streaming, agent
-state detection, zoom, bracketed paste, `Ctrl+C` signal delivery, and copy
-mode (keyboard and mouse-drag selection, search, OSC 52 clipboard).
+state detection, zoom, bracketed paste, `Ctrl+C` signal delivery, wheel
+scrollback, and copy mode (keyboard and mouse-drag selection, search, OSC 52
+clipboard).
 
 Deferred: pane swap, alternative theme palettes, notifications, and durable
 transcript replay. Scrollback is bounded per pane (default 2000 rows,
-`dockd --scrollback-rows`) and is not restored across a daemon restart. The
-mouse wheel does not scroll a pane's history yet (see "Copy and scrollback"
-above), so copy mode's own reach is limited to the visible screen.
+`dockd --scrollback-rows`) and is not restored across a daemon restart.
 
 The [parity matrix](docs/terminal-runtime-parity.md) states the exact status of
 every capability, including known limitations.
@@ -163,7 +165,7 @@ scripts/smoke-slice61-macos.sh
 scripts/smoke-slice62-nongit-macos.sh
 ```
 
-Dock speaks protocol v7 — stop any older daemon before connecting.
+Dock speaks protocol v8 — stop any older daemon before connecting.
 
 ## Licence
 

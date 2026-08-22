@@ -8,7 +8,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use tui_term::widget::{Cursor, PseudoTerminal};
 
@@ -20,6 +20,7 @@ use crate::{
     discovery::ExternalAgentCandidate,
     keymap::{FocusDirection, KeyOutcome, Keymap, PaneCommand},
     layout::{LayoutNode, LayoutSnapshot, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout},
+    picker::{Picker, PickerItem},
     protocol::{
         BindingKind, DashboardProfile, DispatchRequest, Event, LaunchIntoPaneRequest,
         PROTOCOL_VERSION, Request, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
@@ -100,8 +101,20 @@ pub struct Dashboard {
     /// Enter has closed the editor.
     copy_searching: bool,
     rename_form: Option<String>,
+    /// The open chooser, if any, and what taking a row from it will do. Client-local: filtering a
+    /// list the daemon already sent costs the daemon nothing.
+    picker: Option<(PickerPurpose, Picker)>,
+    picker_row_areas: Vec<Rect>,
+    /// Where each workspace's tab landed, so the strip is clickable like every other chrome.
+    tab_areas: Vec<(String, Rect)>,
     last_launch_profile: usize,
     last_repository_mode: bool,
+}
+
+/// What an open picker does with the row the user takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerPurpose {
+    Workspace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +301,8 @@ impl Dashboard {
         self.launch_profile_areas.clear();
         self.launch_confirm_area = None;
         self.launch_mode_area = None;
+        self.picker_row_areas.clear();
+        self.tab_areas.clear();
         let area = frame.area();
         // Painted first so every widget that leaves cells untouched still sits on the theme's
         // surface rather than whatever the host terminal happens to use.
@@ -302,11 +317,15 @@ impl Dashboard {
         }
         let header = Rect::new(area.x, area.y, area.width, 2);
         let footer = Rect::new(area.x, area.bottom().saturating_sub(2), area.width, 2);
+        // The strip costs a row, so it is only taken when there is more than one workspace to
+        // choose between. With a single workspace it would be a row spent saying "you are here".
+        let tabs_height = u16::from(self.layout.workspaces.len() > 1);
+        let tabs = Rect::new(area.x, area.y + 2, area.width, tabs_height);
         let body = Rect::new(
             area.x,
-            area.y + 2,
+            area.y + 2 + tabs_height,
             area.width,
-            area.height.saturating_sub(4),
+            area.height.saturating_sub(4 + tabs_height),
         );
         let sidebar_width = body.width.min(28);
         let sidebar = Rect::new(body.x, body.y, sidebar_width, body.height);
@@ -317,6 +336,9 @@ impl Dashboard {
             body.height,
         );
         self.render_header(frame, header);
+        if tabs_height > 0 {
+            self.render_tabs(frame, tabs);
+        }
         self.render_sidebar(frame, sidebar);
         if let Some(workspace) = self.workspace().cloned() {
             let zoomed = self
@@ -359,6 +381,9 @@ impl Dashboard {
         }
         if self.rename_form.is_some() {
             self.render_rename(frame, area);
+        }
+        if self.picker.is_some() {
+            self.render_picker(frame, area);
         }
         frame.render_widget(
             Paragraph::new(self.footer_line()).wrap(Wrap { trim: true }),
@@ -446,6 +471,127 @@ impl Dashboard {
                     .border_style(Style::default().fg(self.theme.border)),
             ),
             area,
+        );
+    }
+
+    /// The workspace strip: one tab per workspace, numbered by the digit that jumps to it.
+    ///
+    /// Tabs are laid out left to right and simply stop when the row runs out, rather than
+    /// scrolling. The numbers stay meaningful because they are positions, not labels, and a
+    /// workspace pushed off the end is still reachable by name through `Ctrl+B w`.
+    fn render_tabs(&mut self, frame: &mut Frame, area: Rect) {
+        let mut x = area.x.saturating_add(1);
+        for (index, workspace) in self.layout.workspaces.iter().enumerate() {
+            let active = index == self.workspace_index;
+            let label = format!(" {} {} ", index + 1, workspace.name);
+            let width = label.chars().count() as u16;
+            if x.saturating_add(width) > area.right() {
+                break;
+            }
+            let tab = Rect::new(x, area.y, width, 1);
+            let style = if active {
+                Style::default()
+                    .bg(self.theme.accent)
+                    .fg(self.theme.surface)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(self.theme.muted)
+            };
+            frame.render_widget(Paragraph::new(Line::styled(label, style)), tab);
+            self.tab_areas.push((workspace.workspace_id.clone(), tab));
+            x = x.saturating_add(width).saturating_add(1);
+        }
+    }
+
+    /// The chooser overlay: a query line, then the matching rows, best first.
+    fn render_picker(&mut self, frame: &mut Frame, area: Rect) {
+        let Some((purpose, picker)) = self.picker.as_ref() else {
+            return;
+        };
+        let title = match purpose {
+            PickerPurpose::Workspace => " WORKSPACES ",
+        };
+        let width = area.width.min(58);
+        let height = area.height.min(14);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        // The overlay floats above live panes, so its own background has to be painted or their
+        // text shows through the gaps between its rows.
+        frame.render_widget(Clear, popup);
+
+        let rows = usize::from(height.saturating_sub(4));
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    "› ",
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}█", picker.query()),
+                    Style::default().fg(self.theme.text),
+                ),
+            ]),
+            Line::from(""),
+        ];
+        if picker.is_empty() {
+            lines.push(Line::styled(
+                "  no match",
+                Style::default().fg(self.theme.muted),
+            ));
+        }
+        // The detail column is right-aligned against the popup's inner width so the counts form a
+        // column rather than trailing each name at a different offset.
+        let inner = usize::from(width.saturating_sub(4));
+        // The first row sits below the border, the query line, and the blank after it.
+        let mut row_y = popup.y.saturating_add(3);
+        let mut row_areas = Vec::new();
+        for (item, selected) in picker.visible().take(rows) {
+            row_areas.push(Rect::new(
+                popup.x.saturating_add(1),
+                row_y,
+                width.saturating_sub(2),
+                1,
+            ));
+            row_y = row_y.saturating_add(1);
+            let gap =
+                inner.saturating_sub(item.label.chars().count() + item.detail.chars().count() + 2);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(self.theme.accent),
+                ),
+                Span::styled(
+                    item.label.clone(),
+                    if selected {
+                        Style::default()
+                            .fg(self.theme.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(self.theme.text)
+                    },
+                ),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(item.detail.clone(), Style::default().fg(self.theme.muted)),
+            ]));
+        }
+        self.picker_row_areas = row_areas;
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().fg(self.theme.text).bg(self.theme.surface))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(Theme::border_type())
+                        .border_style(Style::default().fg(self.theme.border_focused))
+                        .title(title),
+                ),
+            popup,
         );
     }
 
@@ -829,11 +975,12 @@ impl Dashboard {
             Line::from("Ctrl+B is the only key Dock keeps; Ctrl+B Ctrl+B sends a literal one."),
             Line::styled("AFTER Ctrl+B", heading),
             Line::from("n new workspace   h/v split   z zoom"),
-            Line::from("r rename   R restart shell   x close   l launch   q quit   ,/. workspace"),
+            Line::from("r rename   R restart shell   x close   l launch   q quit"),
+            Line::from("w pick a workspace by name   1-9 jump to one   ,/. previous/next"),
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
-            Line::styled("FORMS", heading),
+            Line::styled("FORMS AND PICKERS", heading),
             Line::from("type to filter/edit   ↑/↓ or j/k select   Enter review/confirm"),
             Line::from("Esc cancels a form rather than reaching the pane while one is open."),
             Line::styled("CURRENT", heading),
@@ -898,6 +1045,11 @@ impl Dashboard {
         if self.launch_form.is_some() {
             return self.launch_key(key);
         }
+        // Ahead of the keymap for the same reason copy mode is: an open picker is taking a query,
+        // so every printable key belongs to the query rather than to the PTY or to a binding.
+        if self.picker.is_some() {
+            return self.picker_key(key);
+        }
         // Ahead of the keymap on purpose: copy mode owns every key while it is active, so its
         // motions (`h`, `j`, `k`, `l`) and its verbs (`v`, `y`) can never be forwarded to the
         // PTY as ordinary input.
@@ -935,6 +1087,8 @@ impl Dashboard {
                 FocusDirection::Previous | FocusDirection::Left | FocusDirection::Up
             )),
             PaneCommand::Workspace(delta) => self.select_workspace(delta),
+            PaneCommand::WorkspacePicker => self.open_workspace_picker(),
+            PaneCommand::WorkspaceJump(position) => self.jump_to_workspace(position),
             PaneCommand::Resize(delta) => self.resize_keyboard(delta),
             PaneCommand::Zoom => self.zoom(),
             PaneCommand::Rename => self.rename(),
@@ -951,6 +1105,94 @@ impl Dashboard {
             PaneCommand::Help => {
                 self.error = None;
                 self.help_open = true;
+                UiCommand::None
+            }
+        }
+    }
+
+    /// Opens the workspace chooser. Cycling is fine for two workspaces and miserable for eight;
+    /// this is how a distant one is reached without walking past every workspace in between.
+    fn open_workspace_picker(&mut self) -> UiCommand {
+        if self.layout.workspaces.is_empty() {
+            self.error = Some("workspace unavailable: create a workspace first".into());
+            return UiCommand::None;
+        }
+        let items = self
+            .layout
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| PickerItem {
+                key: workspace.workspace_id.clone(),
+                label: workspace.name.clone(),
+                detail: format!("{}  ·  {}", index + 1, pane_count(workspace.panes.len())),
+            })
+            .collect();
+        self.picker = Some((PickerPurpose::Workspace, Picker::new(items)));
+        self.error = None;
+        UiCommand::None
+    }
+
+    /// Jumps to a workspace by its 1-based position, the one shown on its tab.
+    fn jump_to_workspace(&mut self, position: u8) -> UiCommand {
+        let index = usize::from(position).saturating_sub(1);
+        if index >= self.layout.workspaces.len() {
+            self.error = Some(format!("no workspace {position}"));
+            return UiCommand::None;
+        }
+        self.workspace_index = index;
+        self.error = None;
+        UiCommand::None
+    }
+
+    fn picker_key(&mut self, key: KeyEvent) -> UiCommand {
+        let Some((purpose, picker)) = self.picker.as_mut() else {
+            return UiCommand::None;
+        };
+        match key.code {
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Up => picker.move_selection(-1),
+            KeyCode::Down => picker.move_selection(1),
+            KeyCode::Backspace => picker.pop(),
+            KeyCode::Enter => {
+                let taken = picker.selected().map(|item| (*purpose, item.key.clone()));
+                self.picker = None;
+                if let Some((purpose, key)) = taken {
+                    return self.take_picked(purpose, &key);
+                }
+            }
+            // Every printable character is query text. Only the chording modifiers are excluded —
+            // SHIFT must not be, because crossterm reports it on every capital letter and a
+            // workspace named `API` has to be reachable by typing it.
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                picker.push(character)
+            }
+            _ => {}
+        }
+        UiCommand::None
+    }
+
+    fn take_picked(&mut self, purpose: PickerPurpose, key: &str) -> UiCommand {
+        match purpose {
+            PickerPurpose::Workspace => {
+                // A workspace can close between opening the picker and taking a row, so this
+                // looks the id up again rather than trusting the position it had when listed.
+                match self
+                    .layout
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.workspace_id == key)
+                {
+                    Some(index) => {
+                        self.workspace_index = index;
+                        self.error = None;
+                    }
+                    None => self.error = Some("that workspace is gone".into()),
+                }
                 UiCommand::None
             }
         }
@@ -1714,6 +1956,29 @@ impl Dashboard {
     }
 
     pub fn mouse(&mut self, event: MouseEvent) -> UiCommand {
+        // An open picker is modal: clicking a row takes it, and clicking anywhere else is
+        // swallowed rather than reaching the panes underneath, which are not what is being
+        // pointed at while an overlay covers them.
+        if self.picker.is_some() {
+            if event.kind == MouseEventKind::Down(MouseButton::Left)
+                && let Some(row) = self
+                    .picker_row_areas
+                    .iter()
+                    .position(|area| contains(*area, event.column, event.row))
+            {
+                let taken = self.picker.as_ref().and_then(|(purpose, picker)| {
+                    picker
+                        .visible()
+                        .nth(row)
+                        .map(|(item, _)| (*purpose, item.key.clone()))
+                });
+                self.picker = None;
+                if let Some((purpose, key)) = taken {
+                    return self.take_picked(purpose, &key);
+                }
+            }
+            return UiCommand::None;
+        }
         if self.launch_form.is_some() {
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
                 if self
@@ -1761,6 +2026,14 @@ impl Dashboard {
                 // A fresh press ends any previous gesture, whatever swallowed its release.
                 // Without this a stale arming would hijack the next divider drag.
                 self.pane_drag = None;
+                if let Some(workspace_id) = self
+                    .tab_areas
+                    .iter()
+                    .find(|(_, area)| contains(*area, event.column, event.row))
+                    .map(|(workspace_id, _)| workspace_id.clone())
+                {
+                    return self.take_picked(PickerPurpose::Workspace, &workspace_id);
+                }
                 if self
                     .dismiss_external_area
                     .is_some_and(|area| contains(area, event.column, event.row))
@@ -2111,6 +2384,15 @@ fn composed(key: KeyEvent) -> bool {
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
+/// "1 pane" / "3 panes", so the picker's detail column never reads "1 panes".
+fn pane_count(panes: usize) -> String {
+    if panes == 1 {
+        "1 pane".into()
+    } else {
+        format!("{panes} panes")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2253,6 +2535,9 @@ mod tests {
     /// columns, whose even vertical split gives the left pane 35; borders take one cell on
     /// each side of both axes.
     const PANE_ROWS: u16 = 24;
+    /// A layout with more than one workspace spends a row on the tab strip, so its panes are
+    /// exactly one row shorter than the single-workspace constant above.
+    const TABBED_PANE_ROWS: u16 = PANE_ROWS - 1;
     const PANE_COLS: u16 = 33;
 
     /// A second, single-pane workspace so switching has somewhere to go. Its pane is bound so
@@ -3013,6 +3298,147 @@ mod tests {
     }
 
     #[test]
+    fn the_workspace_picker_jumps_by_name_instead_of_walking_past_everything_between() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        assert_eq!(dashboard.workspace_index, 0);
+
+        assert_eq!(command(&mut dashboard, KeyCode::Char('w')), UiCommand::None);
+        let overlay = render_to_string(&mut dashboard, 100, 30);
+        assert!(overlay.contains("WORKSPACES"), "{overlay:?}");
+        // Both workspaces are offered, each with the digit that would reach it directly.
+        assert!(overlay.contains("Daily"), "{overlay:?}");
+        assert!(overlay.contains("Deploy"), "{overlay:?}");
+        assert!(overlay.contains("1 pane"), "{overlay:?}");
+
+        for character in "Dep".chars() {
+            dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        let narrowed = render_to_string(&mut dashboard, 100, 30);
+        // Only the overlay's own listing is asserted on: "Daily" also names the tab behind it,
+        // so its absence from the whole frame would never be true.
+        let listing = narrowed
+            .split("WORKSPACES ─")
+            .nth(1)
+            .expect("the overlay is on screen");
+        assert!(
+            !listing.contains("Daily"),
+            "the query should have hidden the non-matching workspace: {listing:?}"
+        );
+        assert!(listing.contains("Deploy"), "{listing:?}");
+        dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(dashboard.workspace_index, 1);
+        assert!(dashboard.picker.is_none(), "taking a row closes the picker");
+        assert!(render_to_string(&mut dashboard, 100, 30).contains("deploy · run_2"));
+    }
+
+    #[test]
+    fn an_open_picker_swallows_every_key_so_none_reaches_the_pane() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        assert_eq!(command(&mut dashboard, KeyCode::Char('w')), UiCommand::None);
+        // `x` closes a pane and `q` quits when the picker is not up. While it is, both are
+        // query text and neither may reach the keymap or the PTY.
+        for character in ['x', 'q'] {
+            assert_eq!(
+                dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                UiCommand::None
+            );
+        }
+        assert_eq!(
+            dashboard.picker.as_ref().expect("picker open").1.query(),
+            "xq"
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(dashboard.picker.is_none(), "Esc closes the picker");
+        assert_eq!(dashboard.workspace_index, 0, "cancelling moves nothing");
+    }
+
+    #[test]
+    fn a_capital_letter_is_query_text_rather_than_a_swallowed_modifier() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        command(&mut dashboard, KeyCode::Char('w'));
+        // crossterm reports SHIFT on every capital, so excluding it would make a workspace whose
+        // name starts with one unreachable by typing that name.
+        dashboard.key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        assert_eq!(
+            dashboard.picker.as_ref().expect("picker open").1.query(),
+            "D"
+        );
+    }
+
+    #[test]
+    fn a_digit_jumps_to_that_tab_and_a_position_that_is_not_there_reports_instead() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        assert_eq!(command(&mut dashboard, KeyCode::Char('2')), UiCommand::None);
+        assert_eq!(dashboard.workspace_index, 1);
+        assert_eq!(command(&mut dashboard, KeyCode::Char('1')), UiCommand::None);
+        assert_eq!(dashboard.workspace_index, 0);
+
+        assert_eq!(command(&mut dashboard, KeyCode::Char('9')), UiCommand::None);
+        assert_eq!(
+            dashboard.workspace_index, 0,
+            "an absent position moves nothing"
+        );
+        assert_eq!(dashboard.error.as_deref(), Some("no workspace 9"));
+    }
+
+    #[test]
+    fn the_tab_strip_only_costs_a_row_once_there_is_a_choice_to_make() {
+        let mut single = bound_dashboard();
+        render_to_string(&mut single, 100, 30);
+        assert!(
+            single.tab_areas.is_empty(),
+            "one workspace is not a choice, so the strip must not take a row"
+        );
+
+        let mut dashboard = two_workspace_dashboard();
+        let frame = render_to_string(&mut dashboard, 100, 30);
+        assert_eq!(dashboard.tab_areas.len(), 2);
+        assert!(frame.contains("1 Daily"), "{frame:?}");
+        assert!(frame.contains("2 Deploy"), "{frame:?}");
+    }
+
+    #[test]
+    fn clicking_a_tab_switches_to_it() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        let (_, second) = dashboard.tab_areas[1];
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: second.x,
+                row: second.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None
+        );
+        assert_eq!(dashboard.workspace_index, 1);
+    }
+
+    #[test]
+    fn taking_a_workspace_that_closed_while_the_picker_was_open_reports_rather_than_moving() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        command(&mut dashboard, KeyCode::Char('w'));
+        for character in "Dep".chars() {
+            dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        // The daemon owns workspaces, so one can be closed from another client between the
+        // picker listing it and the user taking it. Positions listed earlier are therefore not
+        // trustworthy, which is why the id is looked up again on the way out.
+        dashboard
+            .layout
+            .workspaces
+            .retain(|w| w.workspace_id != "w2");
+        dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(dashboard.workspace_index, 0);
+        assert_eq!(dashboard.error.as_deref(), Some("that workspace is gone"));
+    }
+
+    #[test]
     fn cycling_with_no_workspace_explains_itself_rather_than_panicking() {
         let mut dashboard = Dashboard::default();
         assert_eq!(command(&mut dashboard, KeyCode::Char('.')), UiCommand::None);
@@ -3031,14 +3457,14 @@ mod tests {
         render_to_string(&mut dashboard, 100, 30);
         assert_eq!(
             dashboard.take_pending_resizes(),
-            vec![("w".to_owned(), "a".to_owned(), PANE_ROWS, PANE_COLS)]
+            vec![("w".to_owned(), "a".to_owned(), TABBED_PANE_ROWS, PANE_COLS)]
         );
         command(&mut dashboard, KeyCode::Char('.'));
         render_to_string(&mut dashboard, 100, 30);
         // The second workspace is a single pane, so it owns the whole 72-column body.
         assert_eq!(
             dashboard.take_pending_resizes(),
-            vec![("w2".to_owned(), "c".to_owned(), PANE_ROWS, 70)],
+            vec![("w2".to_owned(), "c".to_owned(), TABBED_PANE_ROWS, 70)],
             "a pane shown for the first time must be told its size"
         );
     }

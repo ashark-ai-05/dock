@@ -25,6 +25,10 @@ pub enum PaneCommand {
     Focus(FocusDirection),
     /// Move the visible workspace by this many places. Negative is earlier.
     Workspace(i8),
+    /// Show every workspace at once and jump to one by name.
+    WorkspacePicker,
+    /// Jump straight to the workspace in this 1-based position, if it exists.
+    WorkspaceJump(u8),
     Resize(i16),
     Zoom,
     Rename,
@@ -93,7 +97,7 @@ impl Keymap {
             ("Tab", "focus next"),
             ("S-Tab", "focus prev"),
             ("←↑→↓", "focus"),
-            (",/.", "workspace"),
+            (",/. w 1-9", "workspace"),
             ("[", "copy mode"),
             ("+/-", "resize"),
             ("z", "zoom"),
@@ -132,6 +136,13 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Char('[') => PaneCommand::CopyMode,
         KeyCode::Char(',') => PaneCommand::Workspace(-1),
         KeyCode::Char('.') => PaneCommand::Workspace(1),
+        // `w` is tmux's window list, and a workspace is the nearest thing Dock has to a window.
+        KeyCode::Char('w') => PaneCommand::WorkspacePicker,
+        // Cycling is fine for two workspaces and miserable for eight. A digit is the only way to
+        // reach a distant workspace in constant time. `0` is deliberately unbound: the positions
+        // are 1-based on screen, so binding it would place a tenth workspace under a key that
+        // reads as the first.
+        KeyCode::Char(position @ '1'..='9') => PaneCommand::WorkspaceJump(position as u8 - b'0'),
         KeyCode::Char('+') => PaneCommand::Resize(50),
         KeyCode::Char('-') => PaneCommand::Resize(-50),
         KeyCode::Tab => PaneCommand::Focus(FocusDirection::Next),
@@ -265,9 +276,54 @@ mod tests {
     fn published_hints_cover_every_documented_binding() {
         let keys: Vec<&str> = Keymap::hints().iter().map(|(key, _)| *key).collect();
         for expected in [
-            "n", "h", "v", "z", "r", "R", "x", "l", "d", "?", "q", "Tab", "S-Tab", ",/.", "[",
+            "n",
+            "h",
+            "v",
+            "z",
+            "r",
+            "R",
+            "x",
+            "l",
+            "d",
+            "?",
+            "q",
+            "Tab",
+            "S-Tab",
+            "[",
+            // The three ways to reach a workspace share one entry: the footer is two rows, and
+            // listing them separately pushed the last published binding off the end of it.
+            ",/. w 1-9",
         ] {
             assert!(keys.contains(&expected), "missing hint for {expected}");
         }
+    }
+
+    #[test]
+    fn a_digit_jumps_to_a_workspace_by_position_and_zero_stays_unbound() {
+        let mut keymap = Keymap::new();
+        for (character, position) in [('1', 1_u8), ('5', 5), ('9', 9)] {
+            keymap.handle(prefix(), KeyEncoding::default());
+            assert_eq!(
+                keymap.handle(plain(character), KeyEncoding::default()),
+                KeyOutcome::Command(PaneCommand::WorkspaceJump(position))
+            );
+        }
+        // Positions are 1-based on screen, so `0` would put a tenth workspace under a key that
+        // reads as the first. It reaches the pane as ordinary input instead.
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(plain('0'), KeyEncoding::default()),
+            KeyOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn w_opens_the_workspace_picker() {
+        let mut keymap = Keymap::new();
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(plain('w'), KeyEncoding::default()),
+            KeyOutcome::Command(PaneCommand::WorkspacePicker)
+        );
     }
 }

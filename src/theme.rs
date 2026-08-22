@@ -14,6 +14,11 @@ pub struct Theme {
     pub text: Color,
     /// Background for the copy-mode selection run. A background token rather than a
     /// foreground one, so highlighted text keeps whatever colour the program gave it.
+    ///
+    /// Chosen against two contrast floors, not by eye: the band's own edge against
+    /// `surface` is 3.01:1 (WCAG's 3:1 minimum for non-text contrast, so the highlighted
+    /// region is discernible as a region), and `text` on top of it is 4.64:1 (above AA, so
+    /// the selected characters stay readable).
     pub selection: Color,
     pub blocked: Color,
     pub working: Color,
@@ -32,7 +37,7 @@ impl Theme {
             border: Color::Rgb(58, 56, 54),
             border_focused: Color::Rgb(232, 168, 88),
             text: Color::Rgb(226, 222, 214),
-            selection: Color::Rgb(58, 84, 102),
+            selection: Color::Rgb(70, 100, 124),
             blocked: Color::Rgb(226, 106, 94),
             working: Color::Rgb(226, 184, 96),
             done: Color::Rgb(122, 176, 214),

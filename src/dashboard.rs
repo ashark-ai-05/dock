@@ -2176,8 +2176,12 @@ mod tests {
     }
 
     fn render_to_string(dashboard: &mut Dashboard, width: u16, height: u16) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        rendered(&render_terminal(dashboard, width, height))
+    }
+
+    /// The whole frame as text, which is all most tests need. Style is deliberately dropped
+    /// here — anything asserting on colour must read the buffer, not this string.
+    fn rendered(terminal: &Terminal<TestBackend>) -> String {
         terminal
             .backend()
             .buffer()
@@ -2185,6 +2189,43 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn render_terminal(
+        dashboard: &mut Dashboard,
+        width: u16,
+        height: u16,
+    ) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        terminal
+    }
+
+    /// One row of the buffer, bounded to a rect's columns. The pane title lives on the
+    /// border row, so a whole-frame string cannot tell it apart from the footer.
+    fn row_text(terminal: &Terminal<TestBackend>, area: Rect, row: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        (area.x..area.right())
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
+    }
+
+    /// Every cell of a pane's body carrying `background`, in grid coordinates.
+    fn cells_with_background(
+        terminal: &Terminal<TestBackend>,
+        area: Rect,
+        background: ratatui::style::Color,
+    ) -> Vec<(u16, u16)> {
+        let buffer = terminal.backend().buffer();
+        let mut found = Vec::new();
+        for row in area.y + 1..area.bottom() - 1 {
+            for column in area.x + 1..area.right() - 1 {
+                if buffer[(column, row)].bg == background {
+                    found.push((row - area.y - 1, column - area.x - 1));
+                }
+            }
+        }
+        found
     }
 
     /// A full-screen seed for `run_id`, sized to the inner geometry a 100x30 dashboard gives
@@ -3583,13 +3624,27 @@ mod tests {
     fn copy_mode_is_visibly_signalled_in_the_pane_and_footer() {
         let mut dashboard = bound_dashboard();
         dashboard.apply_event(attach_event("run_1", b"visible text\r\n"));
+        let before = render_terminal(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        assert!(
+            !row_text(&before, area, area.y).contains("COPY"),
+            "the title must not claim copy mode before it is entered"
+        );
+
         dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
         dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
-        let rendered = render_to_string(&mut dashboard, 100, 30);
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+
+        // REVIEW FINDING 2: asserting `COPY` against the whole frame was passed entirely by
+        // the footer's own indicator, so the title prefix had no coverage at all. The pane
+        // title lives on the pane's top border row, so scope the search to exactly that.
+        let title = row_text(&terminal, area, area.y);
         assert!(
-            rendered.contains("COPY"),
-            "the pane must say it is in copy mode"
+            title.contains("COPY"),
+            "the pane title must say it is in copy mode, got {title:?}"
         );
+
+        let rendered = rendered(&terminal);
         // The brief asked for `contains('y')`, which every ordinary word in the UI already
         // satisfies; only a distinctive slice of the copy footer proves it actually changed.
         assert!(
@@ -3599,6 +3654,92 @@ mod tests {
         assert!(
             !rendered.contains("keys go to the focused pane"),
             "the live-pane hint is wrong while every key is being swallowed"
+        );
+    }
+
+    // REVIEW FINDING 1: `render_to_string` keeps only `cell.symbol()`, so deleting the whole
+    // selection overlay left every test green. These two read the buffer's styles instead,
+    // which is the only way this task's headline deliverable is guarded at all.
+    #[test]
+    fn the_selection_and_copy_cursor_are_painted_only_while_copy_mode_is_active() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"hello world\r\n"));
+        let selection = dashboard.theme.selection;
+        let accent = dashboard.theme.accent;
+        let surface = dashboard.theme.surface;
+
+        let quiet = render_terminal(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        assert!(
+            cells_with_background(&quiet, area, selection).is_empty(),
+            "a pane that is not in copy mode must carry no selection highlight"
+        );
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        for _ in 0..3 {
+            dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            dashboard.copy.as_ref().and_then(CopySession::selection),
+            Some(((0, 0), (0, 3)))
+        );
+
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        // The cursor cell is the fourth of the run and is painted as the cursor rather than
+        // as selection, so the highlight is exactly the three cells behind it — and nothing
+        // anywhere else in the pane.
+        assert_eq!(
+            cells_with_background(&terminal, area, selection),
+            vec![(0, 0), (0, 1), (0, 2)],
+            "the highlight must cover the selection and only the selection"
+        );
+        let buffer = terminal.backend().buffer();
+        let cursor = &buffer[(area.x + 1 + 3, area.y + 1)];
+        assert_eq!(cursor.bg, accent, "the copy cursor must be findable");
+        assert_eq!(cursor.fg, surface, "and legible against its own block");
+        assert_ne!(
+            buffer[(area.x + 1 + 4, area.y + 1)].bg,
+            selection,
+            "the cell past the cursor is outside the selection"
+        );
+
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let after = render_terminal(&mut dashboard, 100, 30);
+        assert!(
+            cells_with_background(&after, area, selection).is_empty(),
+            "leaving copy mode must take the highlight with it"
+        );
+    }
+
+    #[test]
+    fn the_ptys_own_cursor_yields_to_the_copy_cursor_and_returns_afterwards() {
+        let mut dashboard = bound_dashboard();
+        // Ends on a newline, so the PTY cursor sits on a blank cell and tui-term draws its
+        // block symbol there — which is what `draws_cursor` looks for.
+        dashboard.apply_event(attach_event("run_1", b"hello world\r\n"));
+        let live = render_terminal(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        assert!(
+            draws_cursor(&live, area),
+            "the focused live pane shows where typing lands"
+        );
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        let copying = render_terminal(&mut dashboard, 100, 30);
+        assert!(
+            !draws_cursor(&copying, area),
+            "two cursor blocks make it ambiguous which one the keys are moving"
+        );
+
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let back = render_terminal(&mut dashboard, 100, 30);
+        assert!(
+            draws_cursor(&back, area),
+            "leaving copy mode gives the pane its own cursor back"
         );
     }
 

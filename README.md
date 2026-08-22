@@ -51,7 +51,7 @@ pane**, `Esc` is never intercepted, and `Ctrl+B` twice sends a literal `Ctrl+B`.
 | `,` `.` | previous / next workspace | `r` | rename |
 | `w` | pick a workspace by name | `f` | find a file, type its path |
 | `a` | resume the agent here | `i` | review agent handoffs |
-| `k` | task board — dispatch one | | |
+| `k` | task board — dispatch one | `g` | what changed here |
 | `1`–`9` | jump to a workspace | | |
 | `h` `v` | split ⇋ / ⇵ | `R` | restart a pane whose shell exited |
 | arrows, `Tab`/`S-Tab` | focus | `x` | close pane |
@@ -81,6 +81,10 @@ verified reports that it cannot be resumed rather than silently starting fresh.
 own beside your repository, on a `dock/task-<id>` branch, and launches your
 last-used agent there. Dispatching the same task again lands in the worktree the
 first dispatch made. See **Safety** for exactly what that touches.
+
+`Ctrl+B g` shows what changed in the focused pane's worktree — branch, counts,
+and the diff, coloured with Dock's own palette. No `delta` or `lazygit` needed;
+`j`/`k` scroll and `g`/`G` jump to either end.
 
 `Ctrl+B i` opens the review queue: the handoffs agents submitted with
 `dock-handoff --submit` and are waiting on a person for. Each shows what the

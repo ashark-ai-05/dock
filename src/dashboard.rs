@@ -20,6 +20,7 @@ use crate::{
     detect::{AgentKind, AgentState},
     discovery::ExternalAgentCandidate,
     files,
+    git::GitFacts,
     keymap::{FocusDirection, KeyOutcome, Keymap, PaneCommand},
     layout::{LayoutNode, LayoutSnapshot, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout},
     model::{HandoffRecord, ReviewRoute},
@@ -54,6 +55,8 @@ pub enum UiCommand {
     LoadReviewInbox,
     /// Asks for the task board, which lives in the repository rather than the daemon.
     LoadBoard,
+    /// Asks what Git says about the focused pane's worktree.
+    LoadGit,
     /// Gives a task somewhere isolated to be worked on and launches an agent there. Carries the
     /// task rather than a worktree: the worktree may not exist yet, and making it is the point.
     DispatchTask(TaskDispatch),
@@ -122,11 +125,21 @@ pub struct Dashboard {
     /// The board as last read from the repository, kept so a taken row can be resolved back to the
     /// task it named.
     board_tasks: Vec<BoardTask>,
+    /// The Git overlay, if open.
+    git: Option<GitOverlay>,
     picker_row_areas: Vec<Rect>,
     /// Where each workspace's tab landed, so the strip is clickable like every other chrome.
     tab_areas: Vec<(String, Rect)>,
     last_launch_profile: usize,
     last_repository_mode: bool,
+}
+
+/// What Git says about a worktree, and how far into the diff the reader is.
+#[derive(Debug, Clone)]
+pub struct GitOverlay {
+    pub facts: GitFacts,
+    pub diff: Vec<String>,
+    pub scroll: usize,
 }
 
 /// Everything needed to give a task a worktree and put an agent on it.
@@ -432,6 +445,30 @@ impl Dashboard {
         if self.review.is_some() {
             self.render_review(frame, area);
         }
+        if self.git.is_some() {
+            self.render_git(frame, area);
+        }
+        // The which-key bar publishes every binding, and there are now more bindings than two rows
+        // can hold. Rather than shaving words off the table until the last entry fits — which
+        // silently truncates and reads as a missing binding — it is drawn over the bottom of the
+        // body while the prefix is held, and gives the rows back the moment it is released.
+        let footer = if self.keymap.is_pending() {
+            let wanted = footer.height.max(4).min(area.height);
+            let taller = Rect::new(
+                area.x,
+                area.bottom().saturating_sub(wanted),
+                area.width,
+                wanted,
+            );
+            frame.render_widget(Clear, taller);
+            frame.render_widget(
+                Block::default().style(Style::default().bg(self.theme.surface)),
+                taller,
+            );
+            taller
+        } else {
+            footer
+        };
         frame.render_widget(
             Paragraph::new(self.footer_line()).wrap(Wrap { trim: true }),
             footer,
@@ -1030,6 +1067,7 @@ impl Dashboard {
             Line::from("a resume the agent that last ran here, continuing its own session"),
             Line::from("i review handoffs agents are waiting on: a accept · c request changes"),
             Line::from("k task board — dispatching one gives it a worktree and an agent"),
+            Line::from("g what changed in this pane's worktree · j/k scroll · g/G ends"),
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
@@ -1106,6 +1144,9 @@ impl Dashboard {
         if self.review.is_some() {
             return self.review_key(key);
         }
+        if self.git.is_some() {
+            return self.git_key(key);
+        }
         // Ahead of the keymap on purpose: copy mode owns every key while it is active, so its
         // motions (`h`, `j`, `k`, `l`) and its verbs (`v`, `y`) can never be forwarded to the
         // PTY as ordinary input.
@@ -1154,6 +1195,10 @@ impl Dashboard {
                 self.error = None;
                 UiCommand::LoadBoard
             }
+            PaneCommand::Git => {
+                self.error = None;
+                UiCommand::LoadGit
+            }
             PaneCommand::WorkspaceJump(position) => self.jump_to_workspace(position),
             PaneCommand::Resize(delta) => self.resize_keyboard(delta),
             PaneCommand::Zoom => self.zoom(),
@@ -1197,6 +1242,123 @@ impl Dashboard {
         self.picker = Some((PickerPurpose::Workspace, Picker::new(items)));
         self.error = None;
         UiCommand::None
+    }
+
+    /// Receives what Git says about the focused pane's worktree and opens the overlay over it.
+    pub fn set_git(&mut self, facts: GitFacts, diff: String) {
+        self.git = Some(GitOverlay {
+            facts,
+            diff: diff.lines().map(str::to_owned).collect(),
+            scroll: 0,
+        });
+        self.error = None;
+    }
+
+    fn git_key(&mut self, key: KeyEvent) -> UiCommand {
+        let Some(git) = self.git.as_mut() else {
+            return UiCommand::None;
+        };
+        // Paging is bounded by the diff itself rather than by the visible height, which the key
+        // handler does not know: scrolling past the end would show a blank overlay and read as a
+        // broken render rather than as the end of the diff.
+        let last = git.diff.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.git = None,
+            KeyCode::Char('j') | KeyCode::Down => git.scroll = (git.scroll + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => git.scroll = git.scroll.saturating_sub(1),
+            KeyCode::PageDown => git.scroll = (git.scroll + 10).min(last),
+            KeyCode::PageUp => git.scroll = git.scroll.saturating_sub(10),
+            KeyCode::Char('g') => git.scroll = 0,
+            KeyCode::Char('G') => git.scroll = last,
+            _ => {}
+        }
+        UiCommand::None
+    }
+
+    /// What has changed in the focused pane's worktree, painted with Dock's own palette.
+    ///
+    /// `delta` is not used here even when it is installed: it emits ANSI, and the overlay would
+    /// have to un-escape that text only to style it again.
+    fn render_git(&self, frame: &mut Frame, area: Rect) {
+        let Some(git) = self.git.as_ref() else {
+            return;
+        };
+        let width = area.width.min(96);
+        let height = area.height.min(26);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+        let heading = Style::default()
+            .fg(self.theme.accent)
+            .add_modifier(Modifier::BOLD);
+        let muted = Style::default().fg(self.theme.muted);
+
+        let facts = &git.facts;
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(facts.branch.clone(), heading),
+                Span::styled(
+                    format!(
+                        "   {} files  +{} −{}   {} uncommitted",
+                        facts.changed_files,
+                        facts.insertions,
+                        facts.deletions,
+                        facts.status_entries
+                    ),
+                    muted,
+                ),
+            ]),
+            Line::from(""),
+        ];
+        if git.diff.is_empty() {
+            lines.push(Line::styled("nothing changed here", muted));
+        }
+        // Two rows of chrome above and two below, so the diff never paints over its own border.
+        let rows = usize::from(height.saturating_sub(6));
+        for line in git.diff.iter().skip(git.scroll).take(rows) {
+            let style = if line.starts_with("+++") || line.starts_with("---") {
+                Style::default()
+                    .fg(self.theme.text)
+                    .add_modifier(Modifier::BOLD)
+            } else if line.starts_with("diff ") || line.starts_with("index ") {
+                muted
+            } else if line.starts_with("@@") {
+                Style::default().fg(self.theme.accent)
+            } else if line.starts_with('+') {
+                Style::default().fg(self.theme.done)
+            } else if line.starts_with('-') {
+                Style::default().fg(self.theme.blocked)
+            } else {
+                Style::default().fg(self.theme.text)
+            };
+            lines.push(Line::styled(line.clone(), style));
+        }
+        let more = git.diff.len().saturating_sub(git.scroll + rows);
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            if more > 0 {
+                format!("j/k scroll · g/G ends · {more} more lines · Esc closes")
+            } else {
+                "j/k scroll · g/G ends · Esc closes".to_owned()
+            },
+            muted,
+        ));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().fg(self.theme.text).bg(self.theme.surface))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(Theme::border_type())
+                        .border_style(Style::default().fg(self.theme.border_focused))
+                        .title(" GIT "),
+                ),
+            popup,
+        );
     }
 
     /// Receives the board and opens the task chooser over it.
@@ -1429,11 +1591,7 @@ impl Dashboard {
         let pane_id = workspace.focused_pane_id.clone();
         // The pane keeps its run binding after the run exits, which is exactly the case this
         // command exists for: the agent is gone and its conversation is what remains.
-        let Some(run) = self
-            .focused_run_id()
-            .and_then(|run_id| self.runs.iter().find(|run| run.run_id == run_id))
-            .cloned()
-        else {
+        let Some(run) = self.focused_run().cloned() else {
             self.error = Some("resume unavailable: no agent has run in this pane".into());
             return UiCommand::None;
         };
@@ -1950,6 +2108,12 @@ impl Dashboard {
                 application_cursor: screen.screen().application_cursor(),
             })
             .unwrap_or_default()
+    }
+
+    /// The run bound to the focused pane, if it has one.
+    pub fn focused_run(&self) -> Option<&RuntimeSnapshot> {
+        let run_id = self.focused_run_id()?;
+        self.runs.iter().find(|run| run.run_id == run_id)
     }
 
     fn focused_run_id(&self) -> Option<&str> {
@@ -4233,6 +4397,119 @@ mod tests {
             dashboard.error.as_deref(),
             Some("no task board found: expected kanban/tasks in this repository")
         );
+    }
+
+    fn git_facts() -> GitFacts {
+        GitFacts {
+            worktree: std::path::PathBuf::from("/repo/real"),
+            branch: "dock/task-12".into(),
+            base_sha: "abc".into(),
+            head_sha: "def".into(),
+            status_entries: 2,
+            changed_files: 1,
+            insertions: 3,
+            deletions: 1,
+        }
+    }
+
+    /// Built with `concat!` rather than line continuations: `cargo fmt` collapses a continued
+    /// literal onto one line and bakes the indentation into the string, which silently turns every
+    /// diff line into a context line.
+    const SAMPLE_DIFF: &str = concat!(
+        "diff --git a/src/lib.rs b/src/lib.rs\n",
+        "index 111..222 100644\n",
+        "--- a/src/lib.rs\n",
+        "+++ b/src/lib.rs\n",
+        "@@ -1,3 +1,5 @@\n",
+        "+added line\n",
+        "-removed line\n",
+        " context line\n",
+    );
+
+    #[test]
+    fn the_git_key_asks_for_the_worktrees_state_rather_than_reading_it_inline() {
+        let mut dashboard = bound_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        assert_eq!(
+            command(&mut dashboard, KeyCode::Char('g')),
+            UiCommand::LoadGit
+        );
+    }
+
+    #[test]
+    fn the_git_overlay_shows_the_branch_its_counts_and_the_diff() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_git(git_facts(), SAMPLE_DIFF.into());
+        let frame = render_to_string(&mut dashboard, 110, 34);
+        assert!(frame.contains("GIT"), "{frame:?}");
+        assert!(frame.contains("dock/task-12"), "{frame:?}");
+        assert!(frame.contains("+3"), "{frame:?}");
+        assert!(frame.contains("added line"), "{frame:?}");
+        assert!(frame.contains("@@ -1,3 +1,5 @@"), "{frame:?}");
+    }
+
+    #[test]
+    fn added_and_removed_lines_are_coloured_by_dock_rather_than_by_an_external_renderer() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_git(git_facts(), SAMPLE_DIFF.into());
+        let mut terminal = Terminal::new(TestBackend::new(110, 34)).unwrap();
+        terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        let theme = Theme::warm();
+        let buffer = terminal.backend().buffer();
+        // Find the two rows by their first cell's glyph, then assert the palette they were
+        // painted with is Dock's own.
+        let mut added = None;
+        let mut removed = None;
+        for y in 0..34 {
+            for x in 0..109 {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "+" && buffer[(x + 1, y)].symbol() == "a" {
+                    added = Some(cell.fg);
+                }
+                if cell.symbol() == "-" && buffer[(x + 1, y)].symbol() == "r" {
+                    removed = Some(cell.fg);
+                }
+            }
+        }
+        assert_eq!(added, Some(theme.done), "an added line uses the done token");
+        assert_eq!(
+            removed,
+            Some(theme.blocked),
+            "a removed line uses the blocked token"
+        );
+        assert_ne!(theme.done, theme.blocked);
+    }
+
+    #[test]
+    fn scrolling_the_diff_saturates_at_both_ends() {
+        let mut dashboard = bound_dashboard();
+        let long: String = (0..50).map(|n| format!("+line {n}\n")).collect();
+        dashboard.set_git(git_facts(), long);
+        render_to_string(&mut dashboard, 110, 34);
+        dashboard.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(
+            dashboard.git.as_ref().unwrap().scroll,
+            0,
+            "already at the top"
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        assert_eq!(dashboard.git.as_ref().unwrap().scroll, 49);
+        dashboard.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            dashboard.git.as_ref().unwrap().scroll,
+            49,
+            "scrolling past the end would paint a blank overlay"
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(dashboard.git.is_none());
+    }
+
+    #[test]
+    fn a_clean_worktree_says_so_rather_than_showing_an_empty_box() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_git(git_facts(), String::new());
+        let frame = render_to_string(&mut dashboard, 110, 34);
+        assert!(frame.contains("nothing changed here"), "{frame:?}");
     }
 
     #[test]

@@ -609,6 +609,27 @@ fn run_dashboard(
                     }
                 }
             }
+            UiCommand::LoadGit => {
+                // The focused pane's own worktree, so a pane dispatched onto a task shows that
+                // task's changes rather than the repository the dashboard was started in.
+                let worktree = dashboard
+                    .focused_run()
+                    .map(|run| run.worktree.clone())
+                    .filter(|worktree| !worktree.is_empty())
+                    .unwrap_or_else(|| dashboard.repository_root.clone());
+                if worktree.is_empty() {
+                    dashboard.error = Some("no worktree here to inspect".into());
+                    continue;
+                }
+                let adapter = GitAdapter::new(&worktree);
+                match adapter
+                    .facts("HEAD")
+                    .and_then(|facts| adapter.diff("HEAD").map(|diff| (facts, diff)))
+                {
+                    Ok((facts, diff)) => dashboard.set_git(facts, diff),
+                    Err(message) => dashboard.error = Some(message),
+                }
+            }
             UiCommand::LoadBoard => {
                 let root = PathBuf::from(dashboard.repository_root.clone());
                 dashboard.set_board_tasks(dock::board::load(&root));

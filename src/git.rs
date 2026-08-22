@@ -176,6 +176,16 @@ impl GitAdapter {
         })
     }
 
+    /// The plain diff against `base`, with no external renderer.
+    ///
+    /// [`render_diff`](Self::render_diff) prefers `delta` for terminal output, but the dashboard
+    /// overlay paints the diff with Dock's own palette — piping through `delta` first would only
+    /// bury ANSI escapes inside text that then has to be un-escaped to be styled again.
+    pub fn diff(&self, base: &str) -> Result<String, String> {
+        let base_sha = self.git(["rev-parse", base])?;
+        self.git(["diff", "--no-ext-diff", &base_sha])
+    }
+
     pub fn render_diff(&self, base: &str) -> Result<(String, bool), String> {
         let base_sha = self.git(["rev-parse", base])?;
         let raw = self.git(["diff", "--no-ext-diff", &base_sha])?;

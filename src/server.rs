@@ -1363,22 +1363,71 @@ mod tests {
     fn an_exited_shell_is_announced_even_though_its_screen_stops_changing() {
         let runtime = registry();
         create_workspace(&runtime);
+        let deadline = Instant::now() + CONVERGENCE_BACKSTOP;
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
         let shared = runtime.shared();
-        // Typed from another thread so the exit lands while this subscriber is attached. A
-        // shell that had already died before the stream opened would be reported by the very
-        // first frame and would prove nothing about noticing a *change*.
-        let typist = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(250));
-            let _ = shared.pane_input("w1", "p1", b"exit\n");
+        // Detached: a quiet stream never writes, so the handler cannot notice this client
+        // leaving and would otherwise hold the test open until its backstop expires.
+        std::thread::spawn(move || {
+            handle_connection_with_timeout(
+                &mut server,
+                &shared,
+                ReadTimeouts::PRODUCTION,
+                Some(deadline),
+            )
+            .ok();
         });
-        let responses = exchange_within(
-            &[&hello(), &subscribe_line()],
-            &runtime,
-            Duration::from_millis(2500),
-        );
-        typist.join().expect("typist thread");
+        for line in [hello(), subscribe_line()] {
+            client.write_all(line.as_bytes()).expect("write request");
+            client.write_all(b"\n").expect("write newline");
+        }
+        client.shutdown(Shutdown::Write).expect("finish requests");
+        client
+            .set_read_timeout(Some(DRAIN_POLL))
+            .expect("read timeout");
+        let mut reader = BufReader::new(client);
+        let mut pending = String::new();
+        let mut events: Vec<Event> = Vec::new();
 
-        let announced: Vec<ProcessState> = collect_events(&responses)
+        let running = |events: &[Event]| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    Event::PaneState {
+                        state: ProcessState::Running,
+                        ..
+                    }
+                )
+            })
+        };
+        // The exit must land while this subscriber is attached *and* has already been told the
+        // shell is running: a shell that had died before the stream opened would be reported by
+        // the very first frame and would prove nothing about noticing a *change*. Waiting for
+        // that announcement rather than sleeping a fixed 250 ms is what makes the ordering
+        // certain — under load the old sleep could elapse before the subscriber had attached at
+        // all, and the fixed 2.5 s window after it could close before the shell had died.
+        read_events_until(&mut reader, &mut pending, &mut events, deadline, running);
+        assert!(
+            running(&events),
+            "the subscriber was never told the shell was running, so nothing here could \
+             demonstrate noticing a change: {events:?}"
+        );
+        runtime
+            .pane_input("w1", "p1", b"exit\n")
+            .expect("type exit into the pane");
+        read_events_until(&mut reader, &mut pending, &mut events, deadline, |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    Event::PaneState {
+                        state: ProcessState::Exited { .. },
+                        ..
+                    }
+                )
+            })
+        });
+
+        let announced: Vec<ProcessState> = events
             .into_iter()
             .filter_map(|event| match event {
                 Event::PaneState { state, .. } => Some(state),
@@ -1431,13 +1480,19 @@ mod tests {
     /// `ready` still gates when checking begins, because a freshly attached subscriber agrees
     /// with the live screen trivially — before the resize or the output the test is about to
     /// produce has happened at all.
+    ///
+    /// Returns the frames *and the exact live screen they were found to match*. The caller must
+    /// assert against that returned screen and never re-read the daemon afterwards: the pane
+    /// keeps painting — oh-my-zsh emits further prompt segments — so a fresh read taken after
+    /// this returns describes a later screen than the one convergence was decided on, and the
+    /// comparison would then report a divergence that is only the gap between the two reads.
     fn drain_until_converged(
         client: UnixStream,
         run_id: &str,
         ready: &std::sync::atomic::AtomicBool,
         live: impl Fn() -> Vec<u8>,
         deadline: Instant,
-    ) -> Vec<Event> {
+    ) -> (Vec<Event>, Vec<u8>) {
         client
             .set_read_timeout(Some(DRAIN_POLL))
             .expect("read timeout");
@@ -1446,13 +1501,20 @@ mod tests {
         // Held across iterations: a read that times out part-way through a frame must resume
         // rather than discard the bytes it already has.
         let mut pending = String::new();
-        let converged = |responses: &[Response]| {
+        // Yields the live screen that was matched, so the caller asserts against the very
+        // bytes this comparison used rather than against a later read of a still-painting pane.
+        let converged = |responses: &[Response]| -> Option<Vec<u8>> {
             let events = collect_events(responses);
-            events
+            if !events
                 .iter()
                 .any(|event| matches!(event, Event::PaneAttached { .. }))
-                && replay(&events, run_id).state_bytes() == live()
+            {
+                return None;
+            }
+            let matched = live();
+            (replay(&events, run_id).state_bytes() == matched).then_some(matched)
         };
+        let mut matched = None;
         loop {
             if Instant::now() >= deadline {
                 break;
@@ -1464,7 +1526,10 @@ mod tests {
                         let response: Response = serde_json::from_str(&pending).expect("response");
                         responses.push(response);
                         pending.clear();
-                        if ready.load(Ordering::Acquire) && converged(&responses) {
+                        if ready.load(Ordering::Acquire)
+                            && let Some(screen) = converged(&responses)
+                        {
+                            matched = Some(screen);
                             break;
                         }
                     }
@@ -1475,15 +1540,62 @@ mod tests {
                         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                     ) =>
                 {
-                    if ready.load(Ordering::Acquire) && pending.is_empty() && converged(&responses)
+                    if ready.load(Ordering::Acquire)
+                        && pending.is_empty()
+                        && let Some(screen) = converged(&responses)
                     {
+                        matched = Some(screen);
                         break;
                     }
                 }
                 Err(error) => panic!("subscriber read failed: {error}"),
             }
         }
-        collect_events(&responses)
+        // Never converged: hand back a final read so the caller's assertion can show the two
+        // screens side by side. That assertion is going to fail, which is the correct outcome.
+        (collect_events(&responses), matched.unwrap_or_else(live))
+    }
+
+    /// Reads pushed frames until `stop` is satisfied, or the backstop expires.
+    ///
+    /// The stop condition is the property the caller is waiting for, never elapsed time. A real
+    /// `$SHELL` under load can take longer to start, to echo, or to die than any fixed window,
+    /// and a window that closes early makes the assertion after it describe the test's
+    /// impatience rather than the daemon's behaviour.
+    ///
+    /// `pending` is threaded through so consecutive waits share one buffer: a read that times
+    /// out part-way through a frame must resume, not discard the bytes it already has.
+    fn read_events_until(
+        reader: &mut BufReader<UnixStream>,
+        pending: &mut String,
+        events: &mut Vec<Event>,
+        deadline: Instant,
+        stop: impl Fn(&[Event]) -> bool,
+    ) {
+        loop {
+            if stop(events) || Instant::now() >= deadline {
+                return;
+            }
+            match reader.read_line(pending) {
+                Ok(0) => return,
+                Ok(_) => {
+                    if pending.ends_with('\n') {
+                        if let Response::Stream { event } =
+                            serde_json::from_str(pending).expect("response")
+                        {
+                            events.push(event);
+                        }
+                        pending.clear();
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => panic!("subscriber read failed: {error}"),
+            }
+        }
     }
 
     /// Replays what one subscriber received into a terminal of its own, exactly as a client
@@ -1572,7 +1684,10 @@ mod tests {
                 .with_run_screen(run_id_ref, |screen| screen.state_bytes())
                 .expect("live screen")
         };
-        let events = std::thread::scope(|scope| {
+        // `expected` is the screen the subscriber was found to agree with, captured inside the
+        // drain. Re-reading the daemon here instead would describe a later screen — the shell
+        // keeps painting its prompt — and the assertion would report that gap as a divergence.
+        let (events, expected) = std::thread::scope(|scope| {
             let ready_ref = &ready;
             let reader = scope.spawn(move || {
                 for line in [hello(), subscribe_line()] {
@@ -1635,9 +1750,6 @@ mod tests {
         );
 
         let mut replayed = replay(&events, &run_id);
-        let expected = runtime
-            .with_run_screen(&run_id, |screen| screen.state_bytes())
-            .expect("live screen");
         assert_eq!(
             String::from_utf8_lossy(&replayed.state_bytes()),
             String::from_utf8_lossy(&expected),
@@ -1861,10 +1973,10 @@ mod tests {
             (first, second)
         });
 
-        let expected = runtime
-            .with_run_screen(&run_id, |screen| screen.state_bytes())
-            .expect("live screen");
-        for (label, events) in [("first", &first), ("second", &second)] {
+        // Each subscriber is asserted against the screen *it* was found to agree with, captured
+        // inside its own drain. One shared read taken here would be a later screen than either
+        // convergence was decided on, and both comparisons would race the shell's next repaint.
+        for (label, (events, expected)) in [("first", &first), ("second", &second)] {
             let attached: Vec<_> = events
                 .iter()
                 .filter(|event| matches!(event, Event::PaneAttached { .. }))
@@ -1901,7 +2013,7 @@ mod tests {
             );
             assert_eq!(
                 String::from_utf8_lossy(&replayed.state_bytes()),
-                String::from_utf8_lossy(&expected),
+                String::from_utf8_lossy(expected),
                 "{label} subscriber did not converge on the daemon's live screen"
             );
             let revisions = screen_revisions(events);

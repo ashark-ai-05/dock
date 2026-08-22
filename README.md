@@ -60,7 +60,11 @@ pane**, `Esc` is never intercepted, and `Ctrl+B` twice sends a literal `Ctrl+B`.
 | `?` | help | `q` | quit |
 
 With more than one workspace open, a tab strip names them all and numbers them
-by the digit that jumps there; tabs and picker rows are clickable.
+by the digit that jumps there. Most of Dock is reachable with the mouse: click
+a tab to switch, `✎` on the active tab to rename the workspace, `+` to add one,
+and `⇋ ⇵ ×` on the focused pane's lower border to split or close it. Dragging a
+divider resizes; dragging inside a pane selects. Every one of these mirrors a
+published key rather than being reachable only by pointer.
 
 `Ctrl+B f` lists the files where the focused pane actually is — following the
 shell's `cd`, and honouring `.gitignore` inside a repository. Taking one types

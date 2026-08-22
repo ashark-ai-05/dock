@@ -115,7 +115,7 @@ pub struct Dashboard {
     /// than inside `CopySession` because the query outlives the prompt: `n`/`N` reuse it once
     /// Enter has closed the editor.
     copy_searching: bool,
-    rename_form: Option<String>,
+    rename_form: Option<(RenameTarget, String)>,
     /// The open chooser, if any, and what taking a row from it will do. Client-local: filtering a
     /// list the daemon already sent costs the daemon nothing.
     picker: Option<(PickerPurpose, Picker)>,
@@ -130,8 +130,31 @@ pub struct Dashboard {
     picker_row_areas: Vec<Rect>,
     /// Where each workspace's tab landed, so the strip is clickable like every other chrome.
     tab_areas: Vec<(String, Rect)>,
+    /// The `+` at the end of the tab strip, and the rename affordance on the active tab.
+    new_workspace_area: Option<Rect>,
+    rename_workspace_area: Option<Rect>,
+    /// Split and close controls on the focused pane's own border.
+    pane_control_areas: Vec<(PaneControl, Rect)>,
     last_launch_profile: usize,
     last_repository_mode: bool,
+}
+
+/// A control drawn on the focused pane's border. Each mirrors a published key, so the mouse
+/// reaches what the keyboard reaches rather than growing its own vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneControl {
+    SplitHorizontal,
+    SplitVertical,
+    Close,
+}
+
+/// What a rename form is editing. The protocol already distinguishes these — `Rename` takes an
+/// optional `pane_id` — but the keyboard path only ever renamed panes, so nothing produced the
+/// workspace form until tabs became clickable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameTarget {
+    Pane,
+    Workspace,
 }
 
 /// What Git says about a worktree, and how far into the diff the reader is.
@@ -360,6 +383,9 @@ impl Dashboard {
         self.launch_mode_area = None;
         self.picker_row_areas.clear();
         self.tab_areas.clear();
+        self.new_workspace_area = None;
+        self.rename_workspace_area = None;
+        self.pane_control_areas.clear();
         let area = frame.area();
         // Painted first so every widget that leaves cells untouched still sits on the theme's
         // surface rather than whatever the host terminal happens to use.
@@ -583,7 +609,24 @@ impl Dashboard {
             };
             frame.render_widget(Paragraph::new(Line::styled(label, style)), tab);
             self.tab_areas.push((workspace.workspace_id.clone(), tab));
-            x = x.saturating_add(width).saturating_add(1);
+            x = x.saturating_add(width);
+            // The rename affordance rides only on the active tab. On every tab it would be
+            // clutter, and on none of them renaming would stay keyboard-only.
+            if active && x.saturating_add(3) <= area.right() {
+                let pencil = Rect::new(x, area.y, 3, 1);
+                frame.render_widget(Paragraph::new(Line::styled(" ✎ ", style)), pencil);
+                self.rename_workspace_area = Some(pencil);
+                x = x.saturating_add(3);
+            }
+            x = x.saturating_add(1);
+        }
+        if x.saturating_add(3) <= area.right() {
+            let plus = Rect::new(x, area.y, 3, 1);
+            frame.render_widget(
+                Paragraph::new(Line::styled(" + ", Style::default().fg(self.theme.accent))),
+                plus,
+            );
+            self.new_workspace_area = Some(plus);
         }
     }
 
@@ -869,6 +912,34 @@ impl Dashboard {
                     ]),
                     None => Line::from(title),
                 };
+                // Measured before the block takes ownership: the controls sit on the same border
+                // row as the title, so they are only drawn when they cannot land on top of it.
+                // The exited title carries the key that brings the pane back, and burying that
+                // under a close button would be the worst possible trade.
+                // Split and close ride on the focused pane's own border, on the right where a
+                // window's controls live. Rendered as a right-aligned title so ratatui lays them
+                // out rather than being painted over the border afterwards, which is how they
+                // first landed on top of the exited pane's recovery hint.
+                // An exited pane offers only close: splitting a dead pane is a strange thing to
+                // ask for, and its title is carrying the key that brings it back, so the controls
+                // take as little of that row as they can.
+                const LIVE_CONTROLS: [(PaneControl, &str); 3] = [
+                    (PaneControl::SplitHorizontal, " ⇋ "),
+                    (PaneControl::SplitVertical, " ⇵ "),
+                    (PaneControl::Close, " × "),
+                ];
+                const EXITED_CONTROLS: [(PaneControl, &str); 1] = [(PaneControl::Close, " × ")];
+                let controls: &[(PaneControl, &str)] = if exited {
+                    &EXITED_CONTROLS
+                } else {
+                    &LIVE_CONTROLS
+                };
+                let controls_width = 3 * controls.len() as u16;
+                // On the bottom border, not the top. The top border is already carrying the pane's
+                // identity and, when it has exited, the key that brings it back — and the first
+                // attempt at this truncated that hint to "Ctrl+B R resta ×". The bottom border is
+                // empty on every pane, so the controls cost nothing to put there.
+                let show_controls = focused && area.width >= controls_width + 4;
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(Theme::border_type())
@@ -879,10 +950,44 @@ impl Dashboard {
                     } else {
                         self.theme.border
                     }));
+                let block = if show_controls {
+                    block.title_bottom(
+                        Line::from(
+                            controls
+                                .iter()
+                                .map(|(control, glyph)| {
+                                    Span::styled(
+                                        *glyph,
+                                        Style::default().fg(if *control == PaneControl::Close {
+                                            self.theme.blocked
+                                        } else {
+                                            self.theme.muted
+                                        }),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .right_aligned(),
+                    )
+                } else {
+                    block
+                };
                 let inner = block.inner(area);
                 self.queue_resize(&workspace.workspace_id, pane_id, run_id.as_deref(), inner);
                 frame.render_widget(block, area);
                 self.pane_inner_areas.insert(pane_id.clone(), inner);
+                if show_controls {
+                    // The rectangles are derived from the right edge rather than measured from
+                    // the render, because the title is laid out by ratatui and never reports back
+                    // where it put anything.
+                    let mut x = area.right().saturating_sub(1 + controls_width);
+                    let row = area.bottom().saturating_sub(1);
+                    for (control, _) in controls {
+                        self.pane_control_areas
+                            .push((*control, Rect::new(x, row, 3, 1)));
+                        x = x.saturating_add(3);
+                    }
+                }
                 match run_id.as_deref().and_then(|id| self.screens.get(id)) {
                     Some(screen) => {
                         // The cursor belongs to whichever pane is taking keystrokes; drawing
@@ -1125,10 +1230,19 @@ impl Dashboard {
             width,
             5,
         );
-        let value = self.rename_form.as_deref().unwrap_or_default();
+        let (target, value) = match self.rename_form.as_ref() {
+            Some((target, value)) => (*target, value.as_str()),
+            None => (RenameTarget::Pane, ""),
+        };
+        // The form says what it is renaming: the same box now reaches panes and workspaces, and
+        // a rename that lands on the wrong one is invisible until something else looks wrong.
+        let subject = match target {
+            RenameTarget::Pane => "Pane",
+            RenameTarget::Workspace => "Workspace",
+        };
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(format!("Name: {value}█")),
+                Line::from(format!("{subject} name: {value}█")),
                 Line::from("Enter saves · Esc cancels"),
             ])
             .style(Style::default().fg(self.theme.text))
@@ -2491,7 +2605,21 @@ impl Dashboard {
             self.error = Some("rename unavailable: create a workspace first".into());
             return UiCommand::None;
         };
-        self.rename_form = Some(workspace.panes[&workspace.focused_pane_id].name.clone());
+        self.rename_form = Some((
+            RenameTarget::Pane,
+            workspace.panes[&workspace.focused_pane_id].name.clone(),
+        ));
+        self.error = None;
+        UiCommand::None
+    }
+
+    /// Opens the rename form on the visible workspace rather than the focused pane.
+    fn rename_workspace(&mut self) -> UiCommand {
+        let Some(workspace) = self.workspace() else {
+            self.error = Some("rename unavailable: create a workspace first".into());
+            return UiCommand::None;
+        };
+        self.rename_form = Some((RenameTarget::Workspace, workspace.name.clone()));
         self.error = None;
         UiCommand::None
     }
@@ -2515,23 +2643,19 @@ impl Dashboard {
                 UiCommand::None
             }
             KeyCode::Backspace => {
-                self.rename_form.as_mut().expect("rename form").pop();
+                self.rename_form.as_mut().expect("rename form").1.pop();
                 UiCommand::None
             }
             KeyCode::Char(character) if !character.is_control() => {
-                let value = self.rename_form.as_mut().expect("rename form");
+                let (_, value) = self.rename_form.as_mut().expect("rename form");
                 if value.chars().count() < 80 {
                     value.push(character);
                 }
                 UiCommand::None
             }
             KeyCode::Enter => {
-                let name = self
-                    .rename_form
-                    .as_ref()
-                    .expect("rename form")
-                    .trim()
-                    .to_owned();
+                let (target, value) = self.rename_form.as_ref().expect("rename form");
+                let (target, name) = (*target, value.trim().to_owned());
                 if name.is_empty() {
                     self.error = Some("rename unavailable: name cannot be empty".into());
                     return UiCommand::None;
@@ -2541,16 +2665,27 @@ impl Dashboard {
                     .expect("workspace retained while form open");
                 let workspace_id = workspace.workspace_id.clone();
                 let pane_id = workspace.focused_pane_id.clone();
-                self.layout.workspaces[self.workspace_index]
-                    .panes
-                    .get_mut(&pane_id)
-                    .expect("focused pane")
-                    .name = name.clone();
+                // Painted locally before the request, like every other command here, so the new
+                // name is on screen before the daemon has answered.
+                let pane_id = match target {
+                    RenameTarget::Pane => {
+                        self.layout.workspaces[self.workspace_index]
+                            .panes
+                            .get_mut(&pane_id)
+                            .expect("focused pane")
+                            .name = name.clone();
+                        Some(pane_id)
+                    }
+                    RenameTarget::Workspace => {
+                        self.layout.workspaces[self.workspace_index].name = name.clone();
+                        None
+                    }
+                };
                 self.rename_form = None;
                 self.error = None;
                 UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Rename {
                     workspace_id,
-                    pane_id: Some(pane_id),
+                    pane_id,
                     name,
                 })))
             }
@@ -2652,6 +2787,20 @@ impl Dashboard {
                 // A fresh press ends any previous gesture, whatever swallowed its release.
                 // Without this a stale arming would hijack the next divider drag.
                 self.pane_drag = None;
+                // Tab-strip chrome first: these sit beside the tabs, so testing tabs first would
+                // swallow clicks that landed on the controls.
+                if self
+                    .new_workspace_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    return self.run_command(PaneCommand::NewWorkspace);
+                }
+                if self
+                    .rename_workspace_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    return self.rename_workspace();
+                }
                 if let Some(workspace_id) = self
                     .tab_areas
                     .iter()
@@ -2659,6 +2808,20 @@ impl Dashboard {
                     .map(|(workspace_id, _)| workspace_id.clone())
                 {
                     return self.take_picked(PickerPurpose::Workspace, &workspace_id);
+                }
+                // Pane controls sit on the border, which is outside the pane body, so they can be
+                // tested before the body hit-test without stealing a click meant for the pane.
+                if let Some(control) = self
+                    .pane_control_areas
+                    .iter()
+                    .find(|(_, area)| contains(*area, event.column, event.row))
+                    .map(|(control, _)| *control)
+                {
+                    return self.run_command(match control {
+                        PaneControl::SplitHorizontal => PaneCommand::Split(SplitAxis::Horizontal),
+                        PaneControl::SplitVertical => PaneCommand::Split(SplitAxis::Vertical),
+                        PaneControl::Close => PaneCommand::Close,
+                    });
                 }
                 if self
                     .dismiss_external_area
@@ -4552,6 +4715,126 @@ mod tests {
         let blocked = rows.find("needs you").expect("blocked row");
         let working = rows.find("working").expect("working row");
         assert!(blocked < working, "blocked must sort first: {rows:?}");
+    }
+
+    fn click(dashboard: &mut Dashboard, area: Rect) -> UiCommand {
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn the_tab_strip_can_add_and_rename_a_workspace_without_the_keyboard() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 110, 30);
+
+        let plus = dashboard.new_workspace_area.expect("the + is drawn");
+        let UiCommand::Request(request) = click(&mut dashboard, plus) else {
+            panic!("the + must create a workspace");
+        };
+        assert!(matches!(
+            *request,
+            Request::Workspace(WorkspaceRequest::Create { .. })
+        ));
+
+        render_to_string(&mut dashboard, 110, 30);
+        let pencil = dashboard
+            .rename_workspace_area
+            .expect("the active tab carries a rename affordance");
+        assert_eq!(click(&mut dashboard, pencil), UiCommand::None);
+        // The form opens on the workspace, not the focused pane — the protocol has always
+        // distinguished them, but nothing produced the workspace form until tabs were clickable.
+        assert_eq!(
+            dashboard.rename_form.as_ref().map(|(target, _)| *target),
+            Some(RenameTarget::Workspace)
+        );
+        assert!(render_to_string(&mut dashboard, 110, 30).contains("Workspace name:"));
+    }
+
+    #[test]
+    fn renaming_a_workspace_sends_no_pane_id_and_repaints_the_tab_immediately() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 110, 30);
+        let pencil = dashboard.rename_workspace_area.expect("rename affordance");
+        click(&mut dashboard, pencil);
+        for _ in 0..40 {
+            dashboard.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for character in "release".chars() {
+            dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        let UiCommand::Request(request) =
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter must send the rename");
+        };
+        match *request {
+            Request::Workspace(WorkspaceRequest::Rename { pane_id, name, .. }) => {
+                assert_eq!(pane_id, None, "a workspace rename carries no pane");
+                assert_eq!(name, "release");
+            }
+            other => panic!("expected a rename, got {other:?}"),
+        }
+        assert!(render_to_string(&mut dashboard, 110, 30).contains("release"));
+    }
+
+    #[test]
+    fn the_focused_pane_can_be_split_and_closed_from_its_own_border() {
+        let mut dashboard = bound_dashboard();
+        render_to_string(&mut dashboard, 110, 30);
+        let controls: Vec<PaneControl> = dashboard
+            .pane_control_areas
+            .iter()
+            .map(|(control, _)| *control)
+            .collect();
+        assert_eq!(
+            controls,
+            vec![
+                PaneControl::SplitHorizontal,
+                PaneControl::SplitVertical,
+                PaneControl::Close
+            ]
+        );
+        let (_, close) = dashboard
+            .pane_control_areas
+            .iter()
+            .find(|(control, _)| *control == PaneControl::Close)
+            .copied()
+            .expect("a close control");
+        let UiCommand::Request(request) = click(&mut dashboard, close) else {
+            panic!("the close control must close the pane");
+        };
+        assert!(matches!(
+            *request,
+            Request::Workspace(WorkspaceRequest::Close { .. })
+        ));
+    }
+
+    #[test]
+    fn pane_controls_never_paint_over_a_title_that_needs_reading() {
+        let mut dashboard = bound_dashboard();
+        // An exited pane's title carries the key that brings it back. Burying that under a close
+        // button would be the worst trade available, so the controls yield instead.
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("a")
+            .unwrap()
+            .runtime = PaneRuntime::Exited;
+        let frame = render_to_string(&mut dashboard, 140, 24);
+        assert!(frame.contains("Ctrl+B R restarts"), "{frame:?}");
+        // An exited pane offers close only: splitting a dead pane makes no sense, and the row it
+        // would have taken belongs to the hint that brings the pane back.
+        assert_eq!(
+            dashboard
+                .pane_control_areas
+                .iter()
+                .map(|(control, _)| *control)
+                .collect::<Vec<_>>(),
+            vec![PaneControl::Close]
+        );
     }
 
     #[test]

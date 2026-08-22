@@ -37,34 +37,76 @@ const STATUS_ORDER: [&str; 5] = ["in-progress", "review", "backlog", "todo", "do
 ///
 /// Returns `None` only when neither a repository nor a home directory can be determined, which
 /// leaves nowhere a board could sensibly live.
-pub fn tasks_dir(repository_root: &str) -> Option<PathBuf> {
+pub fn tasks_dir(repository_root: &str, workspace_id: &str) -> Option<PathBuf> {
     let repository = repository_root.trim();
     if !repository.is_empty() {
         return Some(Path::new(repository).join("kanban").join("tasks"));
     }
-    personal_tasks_dir()
+    workspace_tasks_dir(workspace_id)
 }
 
-/// The personal board: `~/.dock/board/tasks`.
-pub fn personal_tasks_dir() -> Option<PathBuf> {
+/// A workspace's own board, under `~/.dock/boards/<workspace>/tasks`.
+///
+/// Per workspace rather than one board for everything, because a workspace is already the unit a
+/// person keeps a piece of work in: its panes, its layout, and now its list. One shared list would
+/// mix a side project's tasks into whatever is in front of you.
+///
+/// Keyed by workspace id rather than name: names are renameable, and a board that moved every time
+/// its workspace was retitled would lose its tasks exactly when someone was tidying up.
+pub fn workspace_tasks_dir(workspace_id: &str) -> Option<PathBuf> {
+    let workspace = workspace_id.trim();
+    let name = if workspace.is_empty() {
+        "default".to_owned()
+    } else {
+        workspace
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    };
+    Some(dock_boards_dir()?.join(name).join("tasks"))
+}
+
+/// `~/.dock/boards`, the root every workspace board lives under.
+pub fn dock_boards_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     if home.is_empty() {
         return None;
     }
-    Some(
-        PathBuf::from(home)
-            .join(".dock")
-            .join("board")
-            .join("tasks"),
-    )
+    Some(PathBuf::from(home).join(".dock").join("boards"))
 }
 
-/// Whether this directory is the personal board rather than a repository's.
+/// Whether this directory is one of Dock's own boards rather than a repository's.
 ///
-/// Dock writes tasks only to its own board. A repository's board is owned by `kanban-md` and by
-/// whoever else commits to it, and creating files in someone else's board is not Dock's to do.
+/// Dock writes tasks only to its own. A repository's board is owned by `kanban-md` and by whoever
+/// else commits to it, and creating files in someone else's board is not Dock's to do.
 pub fn is_personal(directory: &Path) -> bool {
-    personal_tasks_dir().is_some_and(|personal| personal == directory)
+    dock_boards_dir().is_some_and(|root| directory.starts_with(root))
+}
+
+/// Every board Dock holds, as `(name, tasks directory)`, so one workspace can look at another's.
+pub fn boards() -> Vec<(String, PathBuf)> {
+    let Some(root) = dock_boards_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name, entry.path().join("tasks"))
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 /// Writes a new task onto a board and returns it.
@@ -362,16 +404,32 @@ mod tests {
     }
 
     #[test]
-    fn a_board_outside_a_repository_is_the_personal_one() {
-        // Without a repository the board still has to live somewhere, and it is the same place
-        // regardless of which directory the dashboard was opened in.
-        let personal = personal_tasks_dir().expect("HOME is set in the test environment");
-        assert_eq!(tasks_dir("").as_deref(), Some(personal.as_path()));
-        assert!(is_personal(&personal));
-        // A repository's board is its own, and is never treated as Dock's to write to.
-        let repository = tasks_dir("/repo/real").expect("a repository board");
+    fn each_workspace_gets_its_own_board_outside_a_repository() {
+        // A workspace is already the unit a person keeps one piece of work in, so its list is
+        // kept there too rather than pooled with every other workspace's.
+        let one = tasks_dir("", "workspace_1").expect("HOME is set in the test environment");
+        let two = tasks_dir("", "workspace_2").expect("a second board");
+        assert_ne!(one, two);
+        assert!(one.ends_with("workspace_1/tasks"), "{one:?}");
+        assert!(is_personal(&one) && is_personal(&two));
+
+        // A repository's board is its own, shared by every workspace open on it, and is never
+        // treated as Dock's to write to.
+        let repository = tasks_dir("/repo/real", "workspace_1").expect("a repository board");
         assert_eq!(repository, Path::new("/repo/real/kanban/tasks"));
         assert!(!is_personal(&repository));
+    }
+
+    #[test]
+    fn a_workspace_id_that_is_not_a_filename_still_gets_a_board() {
+        let awkward = tasks_dir("", "../../etc/passwd").expect("a board");
+        // Nothing in the id may escape the boards directory: the id reaches this from the daemon,
+        // and a board is a directory Dock creates.
+        assert!(
+            awkward.starts_with(dock_boards_dir().unwrap()),
+            "{awkward:?}"
+        );
+        assert!(!awkward.to_string_lossy().contains(".."), "{awkward:?}");
     }
 
     #[test]

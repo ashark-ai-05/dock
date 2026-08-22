@@ -679,10 +679,25 @@ impl Dashboard {
             Line::from(""),
         ];
         if picker.is_empty() {
-            lines.push(Line::styled(
-                "  no match",
-                Style::default().fg(self.theme.muted),
-            ));
+            // A board says what to do about being empty; the other pickers have nothing to offer
+            // but the fact. An empty board is the normal first state of every board.
+            let query = picker.query().trim().to_owned();
+            let hint = match (purpose, query.is_empty(), self.board_is_personal) {
+                (PickerPurpose::Task, true, true) => {
+                    "  nothing here yet — type a title and press Enter".to_owned()
+                }
+                (PickerPurpose::Task, false, true) => {
+                    format!("  Enter writes it down: {query}")
+                }
+                (PickerPurpose::Task, true, false) => {
+                    "  nothing here yet — kanban-md owns this board".to_owned()
+                }
+                (PickerPurpose::Task, false, false) => {
+                    "  no match · this board is the repository's".to_owned()
+                }
+                _ => "  no match".to_owned(),
+            };
+            lines.push(Line::styled(hint, Style::default().fg(self.theme.muted)));
         }
         // The detail column is right-aligned against the popup's inner width so the counts form a
         // column rather than trailing each name at a different offset.
@@ -720,6 +735,17 @@ impl Dashboard {
             ]));
         }
         self.picker_row_areas = row_areas;
+        if *purpose == PickerPurpose::Task
+            && let Some(directory) = self.board_dir.as_ref()
+        {
+            // Which board this is, said plainly: a workspace's board and a repository's look
+            // identical once open, and adding a task to the wrong one is quietly annoying.
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!("  {}", directory.display()),
+                Style::default().fg(self.theme.muted),
+            ));
+        }
         frame.render_widget(
             Paragraph::new(lines)
                 .style(Style::default().fg(self.theme.text).bg(self.theme.surface))
@@ -1543,21 +1569,11 @@ impl Dashboard {
     /// The directory is kept because an empty board is not an error — it is a board with nothing
     /// on it yet — and the only useful thing to say about one is where it is and how to add to it.
     pub fn set_board_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
+        // An empty board opens like any other. The previous behaviour refused to open and printed
+        // "type a title and press Ctrl+N" into the footer — an instruction with nowhere to follow
+        // it, since the thing you would type into is the overlay that did not open. A board with
+        // no tasks is the normal first state of every board, not an error.
         self.board_is_personal = crate::board::is_personal(&directory);
-        if tasks.is_empty() {
-            self.picker = None;
-            self.error = Some(format!(
-                "no tasks yet in {}{}",
-                directory.display(),
-                if self.board_is_personal {
-                    " — type a title and press Ctrl+N to add one"
-                } else {
-                    ""
-                }
-            ));
-            self.board_dir = Some(directory);
-            return;
-        }
         self.board_dir = Some(directory);
         let items = tasks
             .iter()
@@ -1897,9 +1913,19 @@ impl Dashboard {
             KeyCode::Backspace => picker.pop(),
             KeyCode::Enter => {
                 let taken = picker.selected().map(|item| (*purpose, item.key.clone()));
-                self.picker = None;
-                if let Some((purpose, key)) = taken {
-                    return self.take_picked(purpose, &key);
+                match taken {
+                    Some((purpose, key)) => {
+                        self.picker = None;
+                        return self.take_picked(purpose, &key);
+                    }
+                    // Nothing matched what was typed. On a board that is not a dead end — it is
+                    // the ordinary way a task gets written down, so Enter means "make it".
+                    None if *purpose == PickerPurpose::Task => {
+                        let title = picker.query().to_owned();
+                        self.picker = None;
+                        return self.create_task(&title);
+                    }
+                    None => self.picker = None,
                 }
             }
             // Ctrl+N turns what has been typed into a task. It is the one key the query does not
@@ -2309,6 +2335,12 @@ impl Dashboard {
                 application_cursor: screen.screen().application_cursor(),
             })
             .unwrap_or_default()
+    }
+
+    /// The visible workspace's id, which is what its board is keyed by.
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.workspace()
+            .map(|workspace| workspace.workspace_id.as_str())
     }
 
     /// The run bound to the focused pane, if it has one.
@@ -4635,19 +4667,36 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_board_says_where_it_looked_rather_than_calling_it_an_error() {
+    fn an_empty_board_opens_and_offers_to_write_the_first_task_down() {
+        let mut dashboard = bound_dashboard();
+        let personal = crate::board::tasks_dir("", "workspace_1").expect("a workspace board");
+        dashboard.set_board_tasks(Vec::new(), personal);
+        // The old behaviour refused to open and printed "type a title and press Ctrl+N" into the
+        // footer — an instruction with nowhere to follow it, because the thing you would type
+        // into was the overlay that did not open.
+        assert!(dashboard.picker.is_some(), "an empty board still opens");
+        assert_eq!(dashboard.error, None, "an empty board is not an error");
+
+        let frame = render_to_string(&mut dashboard, 110, 30);
+        assert!(frame.contains("nothing here yet"), "{frame:?}");
+        assert!(frame.contains("press Enter"), "{frame:?}");
+
+        for character in "buy milk".chars() {
+            dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        let offering = render_to_string(&mut dashboard, 110, 30);
+        assert!(offering.contains("buy milk"), "{offering:?}");
+    }
+
+    #[test]
+    fn a_repository_board_says_who_owns_it_instead_of_offering_to_write() {
         let mut dashboard = bound_dashboard();
         dashboard.set_board_tasks(Vec::new(), "/repo/real/kanban/tasks".into());
-        assert!(dashboard.picker.is_none());
-        // A board with nothing on it is not a missing board. Naming the directory is the only
-        // useful thing to say, because it is the thing the user would otherwise have to guess.
-        assert_eq!(
-            dashboard.error.as_deref(),
-            Some("no tasks yet in /repo/real/kanban/tasks")
-        );
-        // The invitation to add one appears only on Dock's own board: a repository's belongs to
-        // kanban-md and to whoever commits to it.
-        assert!(!dashboard.board_is_personal);
+        assert!(dashboard.picker.is_some());
+        let frame = render_to_string(&mut dashboard, 110, 30);
+        // Dock does not write into a repository's board, so the empty state says why rather than
+        // inviting something that would be refused.
+        assert!(frame.contains("kanban-md owns this board"), "{frame:?}");
     }
 
     #[test]

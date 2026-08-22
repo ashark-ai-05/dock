@@ -626,7 +626,10 @@ fn run_dashboard(
                     Err(message) => dashboard.error = Some(message),
                 }
             }
-            UiCommand::LoadBoard => match dock::board::tasks_dir(&dashboard.repository_root) {
+            UiCommand::LoadBoard => match dock::board::tasks_dir(
+                &dashboard.repository_root,
+                dashboard.workspace_id().unwrap_or_default(),
+            ) {
                 Some(directory) => {
                     let tasks = dock::board::load(&directory);
                     dashboard.set_board_tasks(tasks, directory);

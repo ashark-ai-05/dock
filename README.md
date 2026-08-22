@@ -81,10 +81,16 @@ one can land on the other's session. An agent whose resume flag Dock has not
 verified reports that it cannot be resumed rather than silently starting fresh.
 
 `Ctrl+B k` opens the task board, read straight from Markdown front matter — no
-`kanban-md` binary needed to see it. In a repository that's `kanban/tasks/`;
-outside one it's your personal board at `~/.dock/board/tasks`, so there is
-always somewhere to track work. Type a title and `Ctrl+N` adds a task to the
-personal board.
+`kanban-md` binary needed to see it. **Every workspace has one.** In a
+repository it's that repository's `kanban/tasks/`, shared by every workspace
+open on it; otherwise it's the workspace's own board under
+`~/.dock/boards/<workspace>/tasks`, created the first time you add something.
+
+An empty board opens like any other and invites the first task: type a title
+and press `Enter` (or `Ctrl+N`). Typing filters what's there; if nothing
+matches, `Enter` writes down what you typed. The board names its own directory
+along the bottom, so a workspace board and a repository board are never
+confused.
 
 Choosing a task puts an agent on it. In a repository it gets a worktree of its
 own on a `dock/task-<id>` branch, and dispatching the same task again lands in
@@ -191,10 +197,11 @@ multi-repository capacity and dependency gates.
   carries `external_task_completed: false` and `git_mutated: false`; accepting
   scope is a note, not a merge. Claiming a task through `kanban-md` moves it to
   in-progress and is the only status Dock will ever set.
-- Dock writes task files **only to its own board**, `~/.dock/board/tasks`. A
+- Dock writes task files **only under `~/.dock/boards/`**, its own boards. A
   repository's board belongs to `kanban-md` and to whoever commits to it, so
-  `Ctrl+N` is refused there and says why. Reading any board is always safe: it
+  adding is refused there and says why. Reading any board is always safe: it
   parses the Markdown front matter directly and never runs `kanban-md` to look.
+  Dock never deletes a board or a task.
 - Durable state lives in `.dock/local` at `0700`/`0600`. Layout records hold
   topology and labels only — never terminal output, commands, credentials, PIDs,
   or process-group IDs. Use `--state-dir=` to relocate it.

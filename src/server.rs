@@ -1404,30 +1404,59 @@ mod tests {
         );
     }
 
-    /// Backstop only: the subscribers below stop as soon as the daemon has demonstrably gone
-    /// quiet, so this bound is never reached unless something has genuinely wedged.
-    const CONVERGENCE_BACKSTOP: Duration = Duration::from_millis(5000);
-    /// How long a subscriber must receive nothing before it calls the daemon quiescent. The
-    /// comparison against the live screen is taken immediately after that, so this is the
-    /// window in which a late write could still race the assertion.
-    const QUIET: Duration = Duration::from_millis(400);
+    /// Backstop only: the subscribers below stop the moment their replica agrees with the
+    /// daemon's live screen, so this bound is reached only when convergence never happens —
+    /// which is a genuine failure, not a slow machine. It is generous for that reason: a
+    /// subscriber that has converged returns immediately regardless of how large this is.
+    const CONVERGENCE_BACKSTOP: Duration = Duration::from_millis(15_000);
+    /// How long a subscriber waits for a frame before re-checking whether it has converged.
+    /// Only a polling interval: nothing is concluded from silence.
+    const DRAIN_POLL: Duration = Duration::from_millis(100);
 
     fn subscribe_line() -> String {
         serde_json::to_string(&Request::Subscribe(SubscribeRequest {})).unwrap()
     }
 
-    /// Reads pushed frames until the daemon has been silent for `QUIET` *and* the test has
-    /// signalled that it is done making changes. Stopping on proven silence rather than on a
-    /// clock is what lets the assertion compare against the live screen without racing it:
-    /// anything the daemon wrote, this subscriber has already received.
-    fn drain_until_quiet(client: UnixStream, ready: &std::sync::atomic::AtomicBool) -> Vec<Event> {
-        client.set_read_timeout(Some(QUIET)).expect("read timeout");
+    /// Reads pushed frames until this subscriber's replay of them matches the daemon's live
+    /// screen, once the test has signalled that it is done making changes.
+    ///
+    /// Stops on the property under test rather than on a proxy for it. Silence is not a sound
+    /// proxy: a real `$SHELL` writes on its own schedule, and oh-my-zsh repaints its prompt
+    /// when an asynchronous `git status` returns, which can land after any fixed quiet window.
+    /// Measured on this suite: a subscriber that drained on 400 ms of quiet held `➜  dock `
+    /// while the daemon had already repainted `➜  dock git:(slice/a1-copy-mode) ✗`, and the
+    /// convergence assertion then reported a divergence the daemon was about to close by
+    /// itself. Waiting for agreement instead cannot stop early *or* wait longer than it must.
+    ///
+    /// `ready` still gates when checking begins, because a freshly attached subscriber agrees
+    /// with the live screen trivially — before the resize or the output the test is about to
+    /// produce has happened at all.
+    fn drain_until_converged(
+        client: UnixStream,
+        run_id: &str,
+        ready: &std::sync::atomic::AtomicBool,
+        live: impl Fn() -> Vec<u8>,
+        deadline: Instant,
+    ) -> Vec<Event> {
+        client
+            .set_read_timeout(Some(DRAIN_POLL))
+            .expect("read timeout");
         let mut reader = BufReader::new(client);
         let mut responses = Vec::new();
         // Held across iterations: a read that times out part-way through a frame must resume
         // rather than discard the bytes it already has.
         let mut pending = String::new();
+        let converged = |responses: &[Response]| {
+            let events = collect_events(responses);
+            events
+                .iter()
+                .any(|event| matches!(event, Event::PaneAttached { .. }))
+                && replay(&events, run_id).state_bytes() == live()
+        };
         loop {
+            if Instant::now() >= deadline {
+                break;
+            }
             match reader.read_line(&mut pending) {
                 Ok(0) => break,
                 Ok(_) => {
@@ -1435,6 +1464,9 @@ mod tests {
                         let response: Response = serde_json::from_str(&pending).expect("response");
                         responses.push(response);
                         pending.clear();
+                        if ready.load(Ordering::Acquire) && converged(&responses) {
+                            break;
+                        }
                     }
                 }
                 Err(error)
@@ -1443,7 +1475,8 @@ mod tests {
                         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                     ) =>
                 {
-                    if ready.load(Ordering::Acquire) && pending.is_empty() {
+                    if ready.load(Ordering::Acquire) && pending.is_empty() && converged(&responses)
+                    {
                         break;
                     }
                 }
@@ -1530,6 +1563,15 @@ mod tests {
         });
 
         let registry_ref: &RuntimeRegistry = &runtime;
+        // `&str` rather than `&String` so a `move` reader closure copies the reference instead
+        // of moving the owned value the outer test still needs.
+        let run_id_ref: &str = &run_id;
+        // Captures only shared references, so each reader thread gets its own copy.
+        let live = || {
+            registry_ref
+                .with_run_screen(run_id_ref, |screen| screen.state_bytes())
+                .expect("live screen")
+        };
         let events = std::thread::scope(|scope| {
             let ready_ref = &ready;
             let reader = scope.spawn(move || {
@@ -1538,7 +1580,7 @@ mod tests {
                     client.write_all(b"\n").expect("write newline");
                 }
                 client.shutdown(Shutdown::Write).expect("finish requests");
-                drain_until_quiet(client, ready_ref)
+                drain_until_converged(client, run_id_ref, ready_ref, live, deadline)
             });
             // Let the subscriber attach before any of the output below exists, so every line
             // it can scroll back to reached it as a delta rather than in the attach snapshot.
@@ -1568,7 +1610,7 @@ mod tests {
                 .contains("DONEMARK")
             {
                 assert!(
-                    Instant::now() + QUIET + Duration::from_millis(600) < deadline,
+                    Instant::now() + Duration::from_secs(1) < deadline,
                     "the shell never produced the requested output"
                 );
                 thread::sleep(Duration::from_millis(50));
@@ -1721,6 +1763,15 @@ mod tests {
         }
 
         let registry_ref: &RuntimeRegistry = &runtime;
+        // `&str` rather than `&String` so a `move` reader closure copies the reference instead
+        // of moving the owned value the outer test still needs.
+        let run_id_ref: &str = &run_id;
+        // Captures only shared references, so each reader thread gets its own copy.
+        let live = || {
+            registry_ref
+                .with_run_screen(run_id_ref, |screen| screen.state_bytes())
+                .expect("live screen")
+        };
         let (first, second) = std::thread::scope(|scope| {
             let mut readers = Vec::new();
             for mut client in clients {
@@ -1731,18 +1782,13 @@ mod tests {
                         client.write_all(b"\n").expect("write newline");
                     }
                     client.shutdown(Shutdown::Write).expect("finish requests");
-                    drain_until_quiet(client, ready)
+                    drain_until_converged(client, run_id_ref, ready, live, deadline)
                 }));
             }
 
-            let live = || {
-                registry_ref
-                    .with_run_screen(&run_id, |screen| screen.state_bytes())
-                    .expect("live screen")
-            };
             let headroom = |what: &str| {
                 assert!(
-                    Instant::now() + QUIET + Duration::from_millis(600) < deadline,
+                    Instant::now() + Duration::from_secs(1) < deadline,
                     "{what} did not happen inside the stream window"
                 );
             };
@@ -1770,29 +1816,44 @@ mod tests {
             // prompt, and vt100 elides trailing blank rows, so an undersized replay would
             // still produce byte-identical `state_formatted` output and the comparison below
             // would pass vacuously.
-            let before = live();
+            //
+            // The readiness gate below waits for the marker's *output*, not for the screen to
+            // change at all. "Changed at all" is satisfied by the shell echoing the command
+            // line, which happens within a few tens of milliseconds — long before `seq` has
+            // printed anything. `ready` would then be set while the pane was still silent for
+            // reasons of its own, the drain would take that silence for the daemon
+            // having finished, and both subscribers would be asserted against a screen the
+            // daemon had not sent them yet. Measured: the gate fired at +330 ms and the drain
+            // stopped 400 ms later holding six frames, with four and a half seconds of
+            // backstop still unused. Quoting the marker keeps the echo (`DONE""MARK`) from
+            // matching what only the output (`DONEMARK`) contains.
             let typed = exchange(
                 &[
                     &hello(),
                     &serde_json::to_string(&Request::PaneInput(PaneInputRequest {
                         workspace_id: "w1".into(),
                         pane_id: "p1".into(),
-                        input: PaneInputRequest::encode(b"seq 1 50\n"),
+                        input: PaneInputRequest::encode(b"seq 1 50; echo DONE\"\"MARK\n"),
                     }))
                     .unwrap(),
                 ],
                 registry_ref,
             );
             assert!(matches!(typed[1], Response::PaneInputAccepted { .. }));
-            while live() == before {
-                headroom("the shell never echoed the typed command");
+            while !registry_ref
+                .with_run_screen(&run_id, |screen| screen.text_tail(2))
+                .expect("live screen")
+                .contains("DONEMARK")
+            {
+                headroom("the shell never produced the requested output");
                 thread::sleep(Duration::from_millis(50));
             }
             headroom("the screen filled too late");
 
-            // Nothing else will change the pane. Whatever the shell still emits — a late
-            // asynchronous prompt segment, say — the subscribers keep receiving until they
-            // have seen `QUIET` of silence, so they cannot be left behind the live screen.
+            // Nothing else will change the pane on the test's account. Whatever the shell
+            // still emits on its own — a late asynchronous prompt segment, say — the
+            // subscribers keep receiving until their replica actually matches the live
+            // screen, so they cannot be left behind it.
             ready.store(true, Ordering::Release);
             let mut done = readers.into_iter();
             let first = done.next().unwrap().join().expect("first subscriber");

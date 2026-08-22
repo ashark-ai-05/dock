@@ -50,7 +50,7 @@ pane**, `Esc` is never intercepted, and `Ctrl+B` twice sends a literal `Ctrl+B`.
 | `n` | new workspace | `z` | zoom pane |
 | `,` `.` | previous / next workspace | `r` | rename |
 | `w` | pick a workspace by name | `f` | find a file, type its path |
-| `a` | resume the agent here | | |
+| `a` | resume the agent here | `i` | review agent handoffs |
 | `1`–`9` | jump to a workspace | | |
 | `h` `v` | split ⇋ / ⇵ | `R` | restart a pane whose shell exited |
 | arrows, `Tab`/`S-Tab` | focus | `x` | close pane |
@@ -74,6 +74,13 @@ pane's process died, after the daemon restarted, and after a reboot. Two panes
 running the same agent in the same directory share a "most recent", so resuming
 one can land on the other's session. An agent whose resume flag Dock has not
 verified reports that it cannot be resumed rather than silently starting fresh.
+
+`Ctrl+B i` opens the review queue: the handoffs agents submitted with
+`dock-handoff --submit` and are waiting on a person for. Each shows what the
+agent claimed beside what Dock measured — changed files, insertions, deletions,
+branch — so a claim and the evidence for it are read together. `a` accepts the
+scope, `c` requests changes, and either needs a note saying why. **A decision is
+recorded, never merged**: Dock does not touch Git, and does not close the task.
 
 Pasting is bracketed — a multi-line paste arrives as one payload instead of
 executing line by line.

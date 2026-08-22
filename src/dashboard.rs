@@ -21,10 +21,12 @@ use crate::{
     files,
     keymap::{FocusDirection, KeyOutcome, Keymap, PaneCommand},
     layout::{LayoutNode, LayoutSnapshot, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout},
+    model::{HandoffRecord, ReviewRoute},
     picker::{Picker, PickerItem},
     protocol::{
-        BindingKind, DashboardProfile, DispatchRequest, Event, LaunchIntoPaneRequest,
-        PROTOCOL_VERSION, Request, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
+        BindingKind, DashboardProfile, DecideRequest, DispatchRequest, Event,
+        LaunchIntoPaneRequest, PROTOCOL_VERSION, Request, RuntimeSnapshot, TerminalLaunchRequest,
+        WorkspaceRequest,
     },
     terminal::{KeyEncoding, PaneScreen, encode_paste},
     theme::Theme,
@@ -46,6 +48,9 @@ pub enum UiCommand {
     /// so blocking here would put a daemon round trip in front of every keystroke's paint.
     PaneInput(Vec<u8>),
     LoadCatalog,
+    /// Asks the daemon for the pending handoffs. Distinct from `Request` because its response is
+    /// the point: everything else only needs to know whether the daemon objected.
+    LoadReviewInbox,
     Refresh,
     Quit,
     None,
@@ -105,11 +110,25 @@ pub struct Dashboard {
     /// The open chooser, if any, and what taking a row from it will do. Client-local: filtering a
     /// list the daemon already sent costs the daemon nothing.
     picker: Option<(PickerPurpose, Picker)>,
+    /// The review overlay, if open. Holds the handoffs an agent submitted and is waiting on a
+    /// human for, which is the one queue in Dock that a person rather than a process drains.
+    review: Option<ReviewOverlay>,
     picker_row_areas: Vec<Rect>,
     /// Where each workspace's tab landed, so the strip is clickable like every other chrome.
     tab_areas: Vec<(String, Rect)>,
     last_launch_profile: usize,
     last_repository_mode: bool,
+}
+
+/// The pending handoffs and where the reviewer is inside them.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewOverlay {
+    pub items: Vec<HandoffRecord>,
+    pub selected: usize,
+    /// The route chosen and the note being typed for it. A decision without a note is refused by
+    /// `ReviewDecision::new`, so the note is collected before anything is sent rather than after
+    /// the daemon rejects it.
+    pub pending: Option<(ReviewRoute, String)>,
 }
 
 /// What an open picker does with the row the user takes.
@@ -386,6 +405,9 @@ impl Dashboard {
         }
         if self.picker.is_some() {
             self.render_picker(frame, area);
+        }
+        if self.review.is_some() {
+            self.render_review(frame, area);
         }
         frame.render_widget(
             Paragraph::new(self.footer_line()).wrap(Wrap { trim: true }),
@@ -982,6 +1004,7 @@ impl Dashboard {
             Line::from("w pick a workspace by name   1-9 jump to one   ,/. previous/next"),
             Line::from("f find a file here and type its path into the pane"),
             Line::from("a resume the agent that last ran here, continuing its own session"),
+            Line::from("i review handoffs agents are waiting on: a accept · c request changes"),
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
@@ -1055,6 +1078,9 @@ impl Dashboard {
         if self.picker.is_some() {
             return self.picker_key(key);
         }
+        if self.review.is_some() {
+            return self.review_key(key);
+        }
         // Ahead of the keymap on purpose: copy mode owns every key while it is active, so its
         // motions (`h`, `j`, `k`, `l`) and its verbs (`v`, `y`) can never be forwarded to the
         // PTY as ordinary input.
@@ -1095,6 +1121,10 @@ impl Dashboard {
             PaneCommand::WorkspacePicker => self.open_workspace_picker(),
             PaneCommand::FilePicker => self.open_file_picker(),
             PaneCommand::ResumeAgent => self.resume_agent(),
+            PaneCommand::Review => {
+                self.error = None;
+                UiCommand::LoadReviewInbox
+            }
             PaneCommand::WorkspaceJump(position) => self.jump_to_workspace(position),
             PaneCommand::Resize(delta) => self.resize_keyboard(delta),
             PaneCommand::Zoom => self.zoom(),
@@ -1138,6 +1168,197 @@ impl Dashboard {
         self.picker = Some((PickerPurpose::Workspace, Picker::new(items)));
         self.error = None;
         UiCommand::None
+    }
+
+    /// Receives the pending handoffs and opens the review overlay over them.
+    pub fn set_review_inbox(&mut self, items: Vec<HandoffRecord>) {
+        if items.is_empty() {
+            self.review = None;
+            self.error = Some("review inbox is empty: no agent is waiting on a decision".into());
+            return;
+        }
+        self.review = Some(ReviewOverlay {
+            items,
+            selected: 0,
+            pending: None,
+        });
+        self.error = None;
+    }
+
+    fn review_key(&mut self, key: KeyEvent) -> UiCommand {
+        let Some(review) = self.review.as_mut() else {
+            return UiCommand::None;
+        };
+        // While a note is being typed every printable key belongs to it, so the route keys are
+        // live only before one is started. Esc unwinds a level at a time, as copy mode does:
+        // abandoning a half-typed note should not also close the queue behind it.
+        if let Some((route, note)) = review.pending.as_mut() {
+            match key.code {
+                KeyCode::Esc => review.pending = None,
+                KeyCode::Backspace => {
+                    note.pop();
+                }
+                KeyCode::Enter => {
+                    if note.trim().is_empty() {
+                        self.error =
+                            Some("a decision needs a note saying why, however short".into());
+                        return UiCommand::None;
+                    }
+                    let route = *route;
+                    let note = note.clone();
+                    let run_id = review.items[review.selected].packet.run_id.clone();
+                    // The overlay closes on send. Whether the decision stuck is the daemon's to
+                    // say, and it is re-read from the inbox rather than assumed here.
+                    self.review = None;
+                    return UiCommand::Request(Box::new(Request::Decide(DecideRequest {
+                        run_id,
+                        route,
+                        note,
+                    })));
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    note.push(character)
+                }
+                _ => {}
+            }
+            return UiCommand::None;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.review = None,
+            KeyCode::Up => review.selected = review.selected.saturating_sub(1),
+            KeyCode::Down => {
+                review.selected = (review.selected + 1).min(review.items.len().saturating_sub(1))
+            }
+            KeyCode::Char('a') => review.pending = Some((ReviewRoute::AcceptScope, String::new())),
+            KeyCode::Char('c') => {
+                review.pending = Some((ReviewRoute::RequestChange, String::new()))
+            }
+            _ => {}
+        }
+        UiCommand::None
+    }
+
+    /// The review overlay: what an agent handed back, and the two things a human can say about it.
+    fn render_review(&self, frame: &mut Frame, area: Rect) {
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        let width = area.width.min(72);
+        let height = area.height.min(20);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+        let heading = Style::default()
+            .fg(self.theme.accent)
+            .add_modifier(Modifier::BOLD);
+        let muted = Style::default().fg(self.theme.muted);
+
+        let mut lines = Vec::new();
+        for (index, record) in review.items.iter().enumerate() {
+            let selected = index == review.selected;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "> " } else { "  " },
+                    Style::default().fg(self.theme.accent),
+                ),
+                Span::styled(
+                    format!("{}  ", record.packet.task_id),
+                    if selected { heading } else { muted },
+                ),
+                Span::styled(record.packet.run_id.clone(), muted),
+            ]));
+            if !selected {
+                continue;
+            }
+            lines.push(Line::styled(
+                format!("    {}", record.packet.summary),
+                Style::default().fg(self.theme.text),
+            ));
+            if let Some(question) = &record.packet.question {
+                lines.push(Line::styled(format!("    ? {question}"), heading));
+            }
+            if !record.packet.checks.is_empty() {
+                let checks = record
+                    .packet
+                    .checks
+                    .iter()
+                    .map(|check| {
+                        format!(
+                            "{} {}",
+                            check.name,
+                            if check.passed { "ok" } else { "failed" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("   ");
+                lines.push(Line::styled(format!("    {checks}"), muted));
+            }
+            // Evidence the daemon measured, not anything the agent asserted about itself.
+            lines.push(Line::styled(
+                format!(
+                    "    {} files  +{} -{}  on {}",
+                    record.evidence.changed_files,
+                    record.evidence.insertions,
+                    record.evidence.deletions,
+                    record.evidence.branch
+                ),
+                muted,
+            ));
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(""));
+        lines.push(match review.pending.as_ref() {
+            Some((route, note)) => Line::from(vec![
+                Span::styled(
+                    match route {
+                        ReviewRoute::AcceptScope => "accept · why: ",
+                        ReviewRoute::RequestChange => "request changes · why: ",
+                    },
+                    heading,
+                ),
+                Span::styled(
+                    format!("{note}\u{2588}"),
+                    Style::default().fg(self.theme.text),
+                ),
+            ]),
+            None => Line::styled(
+                "a accept scope · c request changes · up/down select · Esc close",
+                muted,
+            ),
+        });
+        if review.pending.is_some() {
+            lines.push(Line::styled(
+                "Enter records the decision · Esc keeps the queue open",
+                muted,
+            ));
+        } else {
+            // The invariant this whole queue exists to protect, said where it is acted on.
+            lines.push(Line::styled(
+                "A decision is recorded, never merged: Dock does not touch Git or close the task.",
+                muted,
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(self.theme.text).bg(self.theme.surface))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(Theme::border_type())
+                        .border_style(Style::default().fg(self.theme.border_focused))
+                        .title(" REVIEW "),
+                ),
+            popup,
+        );
     }
 
     /// Relaunches the agent that last ran in this pane, telling it to continue its most recent
@@ -3700,6 +3921,139 @@ mod tests {
         assert_eq!(
             dashboard.error.as_deref(),
             Some("resume unavailable: no agent has run in this pane")
+        );
+    }
+
+    fn handoff(run_id: &str, task_id: &str) -> HandoffRecord {
+        HandoffRecord {
+            packet: crate::model::HandoffPacket {
+                schema_version: 1,
+                run_id: run_id.into(),
+                task_id: task_id.into(),
+                workspace_id: "w".into(),
+                pane_id: "a".into(),
+                worktree: "/repo/real".into(),
+                branch: "dock/fixture".into(),
+                base_sha: "abc".into(),
+                summary: "Retry added; one bounded decision remains.".into(),
+                question: Some("Accept V0.1 scope?".into()),
+                checks: vec![crate::model::Check {
+                    name: "cargo test".into(),
+                    passed: true,
+                }],
+            },
+            evidence: crate::model::HandoffEvidence {
+                branch: "dock/fixture".into(),
+                base_sha: "abc".into(),
+                head_sha: "def".into(),
+                status_entries: 2,
+                changed_files: 4,
+                insertions: 12,
+                deletions: 3,
+            },
+        }
+    }
+
+    #[test]
+    fn the_review_key_asks_the_daemon_for_the_queue_rather_than_guessing_at_it() {
+        let mut dashboard = bound_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        assert_eq!(
+            command(&mut dashboard, KeyCode::Char('i')),
+            UiCommand::LoadReviewInbox
+        );
+    }
+
+    #[test]
+    fn an_open_review_shows_the_agents_claim_beside_the_evidence_for_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_review_inbox(vec![handoff("dock_01J9", "DOCK-7")]);
+        let frame = render_to_string(&mut dashboard, 100, 30);
+        assert!(frame.contains("REVIEW"), "{frame:?}");
+        assert!(frame.contains("DOCK-7"), "{frame:?}");
+        assert!(frame.contains("one bounded decision remains"), "{frame:?}");
+        assert!(frame.contains("Accept V0.1 scope?"), "{frame:?}");
+        // The measured evidence sits beside the agent's own summary, so a claim and what the
+        // daemon actually observed are read together rather than one standing in for the other.
+        assert!(frame.contains("4 files"), "{frame:?}");
+        assert!(frame.contains("+12"), "{frame:?}");
+        // The invariant is stated where the decision is taken, not only in the docs.
+        assert!(frame.contains("never merged"), "{frame:?}");
+    }
+
+    #[test]
+    fn a_decision_carries_the_route_and_the_note_that_justifies_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_review_inbox(vec![handoff("dock_01J9", "DOCK-7")]);
+        dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        for character in "scope ok".chars() {
+            dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        let UiCommand::Request(request) =
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("a completed decision must be sent");
+        };
+        match *request {
+            Request::Decide(decide) => {
+                assert_eq!(decide.run_id, "dock_01J9");
+                assert_eq!(decide.route, ReviewRoute::AcceptScope);
+                assert_eq!(decide.note, "scope ok");
+            }
+            other => panic!("expected a decision, got {other:?}"),
+        }
+        assert!(dashboard.review.is_none(), "sending closes the queue");
+    }
+
+    #[test]
+    fn a_decision_without_a_note_is_refused_before_the_daemon_ever_sees_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_review_inbox(vec![handoff("dock_01J9", "DOCK-7")]);
+        dashboard.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        // ReviewDecision::new refuses an empty note, so the note is collected here rather than
+        // sending something the daemon will only bounce back.
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(dashboard.review.is_some(), "the queue stays open");
+        assert_eq!(
+            dashboard.error.as_deref(),
+            Some("a decision needs a note saying why, however short")
+        );
+    }
+
+    #[test]
+    fn escape_abandons_the_note_before_it_abandons_the_queue() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_review_inbox(vec![handoff("dock_01J9", "DOCK-7")]);
+        dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            dashboard
+                .review
+                .as_ref()
+                .expect("still open")
+                .pending
+                .is_none(),
+            "the first Esc drops the half-typed note"
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            dashboard.review.is_none(),
+            "the second Esc closes the queue"
+        );
+    }
+
+    #[test]
+    fn an_empty_queue_says_so_rather_than_opening_an_empty_window() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_review_inbox(Vec::new());
+        assert!(dashboard.review.is_none());
+        assert_eq!(
+            dashboard.error.as_deref(),
+            Some("review inbox is empty: no agent is waiting on a decision")
         );
     }
 

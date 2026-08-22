@@ -31,6 +31,8 @@ pub enum PaneCommand {
     FilePicker,
     /// Relaunch the agent that last ran here, continuing its most recent session.
     ResumeAgent,
+    /// Show the handoffs agents are waiting on a human decision for.
+    Review,
     /// Jump straight to the workspace in this 1-based position, if it exists.
     WorkspaceJump(u8),
     Resize(i16),
@@ -105,6 +107,7 @@ impl Keymap {
             (",/. w 1-9", "workspace"),
             ("f", "file"),
             ("a", "resume"),
+            ("i", "review"),
             ("[", "copy mode"),
             ("+/-", "resize"),
             ("z", "zoom"),
@@ -152,6 +155,8 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         // explicit decisions rather than inferring them, so continuing a conversation is asked
         // for by name and never guessed at from what happened to be running.
         KeyCode::Char('a') => PaneCommand::ResumeAgent,
+        // `i` for inbox. The one queue in Dock a person rather than a process drains.
+        KeyCode::Char('i') => PaneCommand::Review,
         // Cycling is fine for two workspaces and miserable for eight. A digit is the only way to
         // reach a distant workspace in constant time. `0` is deliberately unbound: the positions
         // are 1-based on screen, so binding it would place a tenth workspace under a key that
@@ -303,6 +308,7 @@ mod tests {
             "Tab/S-Tab ←↑→↓",
             "f",
             "a",
+            "i",
             "[",
             // The three ways to reach a workspace share one entry: the footer is two rows, and
             // listing them separately pushed the last published binding off the end of it.

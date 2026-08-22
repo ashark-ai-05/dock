@@ -34,7 +34,7 @@ use dock::{
     paths,
     protocol::{
         InspectRequest, PaneInputRequest, PaneResizeRequest, ProcessState, Request, Response,
-        WorkspaceRequest,
+        ReviewInboxRequest, WorkspaceRequest,
     },
     storage::LocalStore,
 };
@@ -592,6 +592,21 @@ fn run_dashboard(
                 // that arrives on the event stream, so waiting for an acknowledgement here
                 // would add a daemon round trip to every keypress-to-paint.
                 client.send(&request)?;
+            }
+            UiCommand::LoadReviewInbox => {
+                // Painted before the round trip like every other command, so the keypress is
+                // visibly acknowledged even when the daemon is slow to answer.
+                terminal
+                    .draw(|frame| dashboard.render(frame))
+                    .map_err(|e| e.to_string())?;
+                match client.request(&Request::ReviewInbox(ReviewInboxRequest {}))? {
+                    Response::ReviewInbox { items } => dashboard.set_review_inbox(items),
+                    Response::Error { message, .. } => dashboard.error = Some(message),
+                    other => {
+                        dashboard.error =
+                            Some(format!("unexpected review inbox response: {other:?}"))
+                    }
+                }
             }
             UiCommand::Refresh => refresh(client, &mut dashboard)?,
             UiCommand::LoadCatalog => {

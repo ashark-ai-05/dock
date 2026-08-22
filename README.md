@@ -102,6 +102,8 @@ It's drawn as a board — a column per status, cards inside them:
 
 `←`/`→` picks a column, `↑`/`↓` a card, `<`/`>` moves the card itself between
 columns, `n` starts a new task, and `Enter` puts an agent on the selected one.
+The footer names the agent `Enter` will use — the last one you launched from
+`Ctrl+B l`, or otherwise the first installed agent that can be handed the task.
 The board names its own directory along the bottom, so a workspace board and a
 repository board are never confused — and a repository's board is shown but
 never altered, since `kanban-md` owns it.

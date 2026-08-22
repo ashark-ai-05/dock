@@ -1672,10 +1672,26 @@ impl Dashboard {
                     Style::default().fg(self.theme.muted),
                 ),
             ]),
-            None if board.writable => Line::styled(
-                "←/→ column · ↑/↓ card · </> move it · n new · Enter put an agent on it · Esc close",
-                Style::default().fg(self.theme.muted),
-            ),
+            // The agent is named, because a dispatch that silently picks one is how every task on
+            // this board ended up in-progress with a test stub behind it.
+            None if board.writable => Line::from(vec![
+                Span::styled(
+                    "←/→ column · ↑/↓ card · </> move it · n new · Esc close · Enter → ",
+                    Style::default().fg(self.theme.muted),
+                ),
+                match self.dispatch_adapter() {
+                    Some(adapter) => Span::styled(
+                        adapter.label(),
+                        Style::default()
+                            .fg(self.theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    None => Span::styled(
+                        "no agent installed",
+                        Style::default().fg(self.theme.blocked),
+                    ),
+                },
+            ]),
             None => Line::styled(
                 "←/→ column · ↑/↓ card · Enter put an agent on it · Esc close · kanban-md owns this board",
                 Style::default().fg(self.theme.muted),
@@ -2352,15 +2368,13 @@ impl Dashboard {
                     return UiCommand::None;
                 };
                 let (task_id, title) = (task.id, task.title.clone());
-                let profile = PROFILES[self.last_launch_profile.min(PROFILES.len() - 1)].0;
-                let adapter = AdapterId::from(profile);
-                if !crate::adapter::builtin_available(&adapter) {
-                    self.error = Some(format!(
-                        "cannot dispatch: {} is not installed",
-                        adapter.label()
-                    ));
+                let Some(adapter) = self.dispatch_adapter() else {
+                    self.error = Some(
+                        "cannot dispatch: no agent is installed (claude, codex, amp or copilot)"
+                            .into(),
+                    );
                     return UiCommand::None;
-                }
+                };
                 self.error = None;
                 let run_id = self.next_unique_id("dock_task");
                 self.dispatched_tasks.insert(run_id.clone(), task_id);
@@ -2697,6 +2711,39 @@ impl Dashboard {
                 application_cursor: screen.screen().application_cursor(),
             })
             .unwrap_or_default()
+    }
+
+    /// The agent a dispatch will put on a task.
+    ///
+    /// Never the fixture. It is a test stub that prints one line and exits, and it sat at the
+    /// front of the profile list, so a dashboard whose launch form had never been opened
+    /// dispatched every task to it — the tasks moved to in-progress, nothing worked on them, and
+    /// the pane said "exited". A product default has no business pointing at a test double.
+    ///
+    /// The last agent launched from the form wins, so an explicit choice is remembered; otherwise
+    /// the first one actually installed. `None` means none of them are.
+    pub fn dispatch_adapter(&self) -> Option<AdapterId> {
+        let chosen = PROFILES
+            .get(self.last_launch_profile)
+            .map(|(profile, _)| AdapterId::from(*profile))
+            .filter(|adapter| *adapter != AdapterId::Fixture)
+            .filter(crate::adapter::builtin_available);
+        chosen.or_else(|| {
+            let installed = || {
+                PROFILES
+                    .iter()
+                    .map(|(profile, _)| AdapterId::from(*profile))
+                    .filter(|adapter| *adapter != AdapterId::Fixture)
+                    .filter(crate::adapter::builtin_available)
+            };
+            // An agent that can be handed the task beats one that cannot. Dispatch exists to put
+            // an agent on a specific piece of work, and an agent with no prompt positional — amp
+            // takes `[options] [command]` — opens in the right place knowing nothing about why.
+            // Falling back to profile order alone would pick that one first, purely alphabetically.
+            installed()
+                .find(|adapter| !adapter.prompt_arguments("probe").is_empty())
+                .or_else(|| installed().next())
+        })
     }
 
     /// The visible workspace's id, which is what its board is keyed by.
@@ -4967,6 +5014,43 @@ mod tests {
     }
 
     #[test]
+    fn a_dispatch_never_lands_on_the_test_fixture_and_says_who_it_will_land_on() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(
+            vec![board_task(1, "do the thing", "backlog")],
+            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+        );
+        dashboard.board.as_mut().unwrap().writable = true;
+        // The fixture sits first in the profile list and last_launch_profile starts at zero, so a
+        // dashboard whose launch form was never opened used to send every task to a stub that
+        // prints one line and exits — the task moved to in-progress and nothing worked on it.
+        assert_ne!(dashboard.dispatch_adapter(), Some(AdapterId::Fixture));
+        // And of the agents present, one that can actually be handed the task wins: dispatch is
+        // for putting an agent on a specific piece of work, not merely opening one somewhere.
+        if let Some(adapter) = dashboard.dispatch_adapter() {
+            let any_takes_a_prompt = PROFILES.iter().any(|(profile, _)| {
+                let candidate = AdapterId::from(*profile);
+                candidate != AdapterId::Fixture
+                    && crate::adapter::builtin_available(&candidate)
+                    && !candidate.prompt_arguments("probe").is_empty()
+            });
+            if any_takes_a_prompt {
+                assert!(
+                    !adapter.prompt_arguments("probe").is_empty(),
+                    "{adapter:?} cannot be handed the task"
+                );
+            }
+        }
+        // And whichever it is, the board says so rather than choosing behind the reader's back.
+        let frame = render_to_string(&mut dashboard, 130, 32);
+        if let Some(adapter) = dashboard.dispatch_adapter() {
+            assert!(frame.contains(adapter.label()), "{frame:?}");
+        } else {
+            assert!(frame.contains("no agent installed"), "{frame:?}");
+        }
+    }
+
+    #[test]
     fn a_card_can_be_moved_across_columns_and_the_cursor_goes_with_it() {
         // A real board directory, because moving a card writes the task file.
         let root = std::env::temp_dir().join(format!("dock-move-{}", std::process::id()));
@@ -5041,9 +5125,10 @@ mod tests {
         assert_eq!(task.task_id, 12);
         assert_eq!(task.title, "Dashboard real agent dispatch");
         assert_eq!(task.pane_id, "a");
-        // The agent is decided here, from the last launch, so the dispatch cannot disagree with
-        // what the launch form shows.
-        assert_eq!(task.adapter, AdapterId::from(PROFILES[0].0));
+        // Never the fixture, whatever sits first in the profile list: it is a test stub, and a
+        // dashboard whose launch form had never been opened used to dispatch every task to it.
+        assert_ne!(task.adapter, AdapterId::Fixture);
+        assert_eq!(Some(task.adapter.clone()), dashboard.dispatch_adapter());
         assert!(dashboard.picker.is_none());
     }
 

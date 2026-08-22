@@ -36,6 +36,9 @@ use crate::{
 /// One memoised classification: the output mark it was computed from, and what it produced.
 type ClassifiedAgent = ((u64, u64, u64), Option<AgentKind>, AgentState);
 
+/// How much output a run had produced, and when that last grew.
+type OutputMark = ((u64, u64), Instant);
+
 pub struct RuntimeRegistry {
     runs: Mutex<HashMap<String, RuntimeSlot>>,
     receipts: PathBuf,
@@ -54,6 +57,9 @@ pub struct RuntimeRegistry {
     /// Agent state per run, keyed by the exact output the screen was built from. Classification is
     /// a pure function of that screen, so nothing but new bytes can change its answer.
     agent_states: Mutex<HashMap<String, ClassifiedAgent>>,
+    /// When each run's output last grew. Not memoisable the way classification is: the answer it
+    /// feeds changes with the passage of time rather than with new bytes, so it is read afresh.
+    output_marks: Mutex<HashMap<String, OutputMark>>,
     #[cfg(test)]
     /// Auto-launched pane shells put a live run in every pane, which is exactly what the
     /// dispatch-authority tests below assert cannot happen. Those tests suppress the shell so
@@ -316,6 +322,7 @@ impl RuntimeRegistry {
             pane_sizes: Mutex::new(HashMap::new()),
             process_table: Mutex::new(None),
             agent_states: Mutex::new(HashMap::new()),
+            output_marks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             suppress_pane_shells: Mutex::new(false),
             #[cfg(test)]
@@ -1885,6 +1892,48 @@ impl RuntimeRegistry {
         }
     }
 
+    /// Combines what the screen says with whether the pane is still writing.
+    ///
+    /// The screen is only asked one narrow question — is this agent blocked on something it needs
+    /// an answer to — because that is the one a pattern can answer reliably: a permission prompt
+    /// and a chooser both paint fixed chrome that does not move between releases. Everything else
+    /// comes from output. A pane that wrote in the last moment is working, whatever its spinner
+    /// happens to be called this month; a pane that has an agent and has fallen silent has handed
+    /// the turn back.
+    fn resolve_state(
+        &self,
+        run_id: &str,
+        agent: Option<AgentKind>,
+        from_screen: AgentState,
+        mark: (u64, u64),
+    ) -> AgentState {
+        let mut marks = self
+            .output_marks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = marks
+            .entry(run_id.to_owned())
+            .or_insert_with(|| (mark, Instant::now()));
+        if entry.0 != mark {
+            *entry = (mark, Instant::now());
+        }
+        let quiet_for = entry.1.elapsed();
+        drop(marks);
+
+        // A question outranks everything: an agent asking one has stopped, however recently it
+        // printed the question itself.
+        if from_screen == AgentState::Blocked {
+            return AgentState::Blocked;
+        }
+        if agent.is_none() {
+            return AgentState::Idle;
+        }
+        if quiet_for < WORKING_SILENCE {
+            return AgentState::Working;
+        }
+        AgentState::Done
+    }
+
     /// The process table, taken afresh only when the last snapshot has aged out.
     fn process_table(&self) -> Option<(u64, Arc<str>)> {
         let mut cached = self
@@ -1974,7 +2023,8 @@ impl RuntimeRegistry {
                     && *seen == key
                 {
                     snapshot.agent = *kind;
-                    snapshot.agent_state = *state;
+                    snapshot.agent_state =
+                        self.resolve_state(&snapshot.run_id, *kind, *state, mark);
                     return snapshot;
                 }
                 let agent = snapshot
@@ -1999,7 +2049,7 @@ impl RuntimeRegistry {
                 };
                 cached.insert(snapshot.run_id.clone(), (key, agent, state));
                 drop(cached);
-                snapshot.agent_state = state;
+                snapshot.agent_state = self.resolve_state(&snapshot.run_id, agent, state, mark);
                 snapshot.agent = agent;
                 snapshot
             })
@@ -2927,6 +2977,18 @@ const PANE_SHELL_RUN_ID_PREFIX: &str = "dock_sh_";
 /// when a person starts a program: at human speed, not at frame rate. Half a second is far below
 /// the point anyone notices a new agent appearing and roughly thirty times cheaper.
 const PROCESS_TABLE_TTL: Duration = Duration::from_millis(500);
+
+/// How recently a pane must have written for its agent to count as working.
+///
+/// This is the signal that does not need to know what any agent looks like. An agent that is
+/// thinking, running a tool, or printing an answer is writing to its terminal; one that is waiting
+/// for a person is silent. Three rounds of patterns tried to recognise "working" from the text on
+/// screen and were wrong each time, because every CLI spells it differently and respells it
+/// between releases. Bytes are bytes.
+///
+/// Generous enough to bridge the gaps between spinner frames and short pauses between tool calls,
+/// short enough that a finished answer stops looking busy while the reader is still looking at it.
+const WORKING_SILENCE: Duration = Duration::from_millis(1200);
 
 /// One snapshot of the process table, shared by every run in a single `inspect` and reused across
 /// calls for [`PROCESS_TABLE_TTL`]. Agent detection sits on the event-stream hot path, so it must

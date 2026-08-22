@@ -638,6 +638,10 @@ fn dock_environment(binding: &RunBinding) -> Vec<(String, String)> {
     if !binding.external_task_ref.trim().is_empty() {
         variables.push(("DOCK_TASK".to_owned(), binding.external_task_ref.clone()));
     }
+    // The socket, so an agent can file a result without being told where the daemon lives.
+    if let Ok(socket) = std::env::var("DOCK_SOCKET_PATH") {
+        variables.push(("DOCK_SOCKET".to_owned(), socket));
+    }
     // `dock task` is how an agent records what it is doing, and it is worth nothing if the binary
     // cannot be found. Dock's own directory goes on the front of PATH so a pane can always reach
     // the exact build that launched it — which matters most when it was started from a checkout as

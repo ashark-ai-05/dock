@@ -47,6 +47,10 @@ fn main() -> Result<(), String> {
         Some(socket) => socket,
         None => paths::prepare_default_socket_path()?,
     };
+    // Handed to every pane the daemon launches, so an agent can file a result without being told
+    // where to find the daemon that started it.
+    // SAFETY: single-threaded startup, before the server or any runtime thread exists.
+    unsafe { std::env::set_var("DOCK_SOCKET_PATH", &socket) };
     let server = server::Server::bind(&socket)?;
     let runtime = Arc::new(RuntimeRegistry::with_capacity(
         state_dir,

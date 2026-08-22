@@ -117,7 +117,14 @@ dock task list                       # what is on this board
 dock task add "fix the retry path"   # write one down
 dock task move 3 in-progress         # backlog · todo · in-progress · review · done
 dock task show 3
+
+dock handoff "added a retry with backoff" --check="cargo test:pass"
 ```
+
+`dock handoff` puts a result in front of you for review. The agent supplies a
+sentence; Dock measures the evidence itself — branch, changed files,
+insertions, deletions — so what was claimed sits beside what was observed.
+`Ctrl+B i` shows those, undecided first, with the decision each one received.
 
 The same commands work from any shell with `--board=<dir>`, so a board with no
 agent on it is entirely yours to run by hand. Tasks are Markdown with YAML

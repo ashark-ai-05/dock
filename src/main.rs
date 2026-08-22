@@ -4,7 +4,7 @@ use std::{
     collections::VecDeque,
     error::Error,
     fs,
-    io::{self, IsTerminal, Read},
+    io::{self, BufRead, BufReader, IsTerminal, Read, Write},
     os::unix::{
         fs::{FileTypeExt, PermissionsExt},
         io::{AsRawFd, RawFd},
@@ -96,6 +96,10 @@ fn run_noninteractive_legacy(args: &[String]) -> Result<bool, Box<dyn Error>> {
         .iter()
         .find_map(|argument| argument.strip_prefix("--dock-dir=").map(str::to_owned))
         .unwrap_or_else(|| ".dock/local".into());
+    if args.first().is_some_and(|first| first == "handoff") {
+        handoff_command(&args[1..])?;
+        return Ok(true);
+    }
     if args.first().is_some_and(|first| first == "task") {
         task_command(&args[1..])?;
         return Ok(true);
@@ -694,7 +698,10 @@ fn run_dashboard(
 /// guess is how a board stops being trustworthy. Telling the agent costs one line and is true.
 fn dispatch_prompt(task_id: u64, title: &str) -> String {
     format!(
-        "{title}\n\nThis is task #{task_id} on the Dock board. When you finish, run:\n    dock task move {task_id} review"
+        "{title}\n\nThis is task #{task_id} on the Dock board. When you finish:\n    \
+         dock task move {task_id} review\n    \
+         dock handoff \"what you did\" --check=\"cargo test:pass\"\n\
+         The handoff puts your result in front of the human with the evidence Dock measured itself."
     )
 }
 
@@ -709,6 +716,9 @@ mod dispatch_prompt_tests {
         // The instruction is explicit because the alternative is Dock watching the pane and
         // guessing when the agent is finished, which would move a durable record on a regex.
         assert!(prompt.contains("dock task move 7 review"), "{prompt}");
+        // And how to put the result in front of a person, which is the step that was impossible:
+        // the review queue could previously only be filled by hand-authoring a JSON packet.
+        assert!(prompt.contains("dock handoff"), "{prompt}");
         assert!(prompt.contains("#7"), "{prompt}");
     }
 }
@@ -812,6 +822,90 @@ fn dispatch_task(
             "dispatched into its existing worktree"
         }
     ));
+    Ok(())
+}
+
+/// `dock handoff` — an agent filing a result a person can review.
+///
+/// The review queue could only be filled by hand-authoring an eleven-field JSON packet and passing
+/// it to a separate binary, which meant nothing ever filled it. An agent will run one command with
+/// a sentence in it; it will not assemble a schema. Everything else is already known: the run, the
+/// task, the workspace and pane come from the environment Dock gave the pane, and the branch and
+/// base come from the worktree it is sitting in.
+///
+/// The evidence is measured here rather than taken from the agent, which is the whole point of the
+/// review queue: what it claims sits beside what was actually observed.
+fn handoff_command(args: &[String]) -> io::Result<()> {
+    let summary = args
+        .iter()
+        .find(|argument| !argument.starts_with("--"))
+        .ok_or_else(|| io::Error::other("dock handoff \"<what you did>\" [--question \"...\"]"))?;
+    let question = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--question="))
+        .map(str::to_owned);
+    let checks = args
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("--check="))
+        .map(|check| {
+            // `name:pass` / `name:fail`, so a check can be reported without another flag.
+            let (name, verdict) = check.rsplit_once(':').unwrap_or((check, "pass"));
+            dock::model::Check {
+                name: name.to_owned(),
+                passed: !verdict.eq_ignore_ascii_case("fail"),
+            }
+        })
+        .collect();
+    let variable = |name: &str| {
+        std::env::var(name).map_err(|_| {
+            io::Error::other(format!(
+                "{name} is not set: run this inside a pane Dock launched"
+            ))
+        })
+    };
+    let worktree = std::env::current_dir()?;
+    let facts = GitAdapter::new(&worktree)
+        .facts("HEAD")
+        .map_err(io::Error::other)?;
+    let packet = dock::model::HandoffPacket {
+        schema_version: 1,
+        run_id: variable("DOCK_RUN")?,
+        task_id: std::env::var("DOCK_TASK").unwrap_or_else(|_| "untracked".into()),
+        workspace_id: variable("DOCK_WORKSPACE")?,
+        pane_id: variable("DOCK_PANE")?,
+        worktree: facts.worktree.display().to_string(),
+        branch: facts.branch.clone(),
+        base_sha: facts.base_sha.clone(),
+        summary: summary.clone(),
+        question,
+        checks,
+    };
+    packet.validate().map_err(io::Error::other)?;
+    let socket = PathBuf::from(variable("DOCK_SOCKET")?);
+    let mut stream = UnixStream::connect(&socket)
+        .map_err(|error| io::Error::other(format!("could not reach the daemon: {error}")))?;
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|error| io::Error::other(format!("could not read the daemon: {error}")))?,
+    );
+    for request in [
+        serde_json::to_string(&Request::Hello(dock::protocol::HelloRequest {
+            version: dock::protocol::PROTOCOL_VERSION,
+        }))?,
+        serde_json::to_string(&Request::SubmitHandoff(
+            dock::protocol::SubmitHandoffRequest { packet },
+        ))?,
+    ] {
+        stream.write_all(request.as_bytes())?;
+        stream.write_all(b"\n")?;
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        if let Ok(Response::Error { message, .. }) = serde_json::from_str::<Response>(&line) {
+            return Err(io::Error::other(message));
+        }
+    }
+    println!("handed off for review");
     Ok(())
 }
 

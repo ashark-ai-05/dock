@@ -5845,6 +5845,12 @@ mod tests {
                 sent.send((inspected.len(), unrelated.run_id)).unwrap();
             })
         };
+        // The window this test runs in is not its own to set. `stop` gives the group 1.5s to leave
+        // on SIGTERM, then SIGKILLs it and gives it 1.5s more, so a fixture that traps TERM blocks
+        // the reap for about three seconds and no longer — SIGKILL is not trappable. Everything
+        // below has to land inside that window, which is why the receive bound is generous rather
+        // than tight: a bound shorter than the window turns work that finished in time into a
+        // failure, while nothing any bound can do rescues work that overruns the window itself.
         let (inspected, unrelated_id) = received
             .recv_timeout(crate::testing::budget(10))
             .expect("unrelated inspect/dispatch/lifecycle/layout blocked behind restart reap");
@@ -5929,10 +5935,20 @@ mod tests {
                     .unwrap();
             })
         };
+        // The window this test runs in is not its own to set. `stop` gives the group 1.5s to leave
+        // on SIGTERM, then SIGKILLs it and gives it 1.5s more, so a fixture that traps TERM blocks
+        // the reap for about three seconds and no longer — SIGKILL is not trappable. Everything
+        // below has to land inside that window, which is why the receive bound is generous rather
+        // than tight: a bound shorter than the window turns work that finished in time into a
+        // failure, while nothing any bound can do rescues work that overruns the window itself.
         let (unrelated_id, workspace_count) = received
             .recv_timeout(crate::testing::budget(10))
             .expect("unrelated registry/layout work blocked behind close reap");
-        assert!(!closing.is_finished());
+        assert!(
+            !closing.is_finished(),
+            "the close finished before the unrelated work did, so this run proves nothing about \
+             whether the reap held the registry or layout mutexes"
+        );
         assert!(!registry.layout().workspaces.is_empty());
         assert!(workspace_count >= 1);
 

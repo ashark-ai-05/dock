@@ -96,6 +96,19 @@ impl AgentState {
         }
     }
 
+    /// What the state means to the person reading the roster.
+    ///
+    /// A coloured glyph alone cannot carry this: it says something changed without saying what,
+    /// and "your turn" is the one state worth crossing the room for.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Blocked => "needs you",
+            Self::Working => "working",
+            Self::Done => "done",
+            Self::Idle => "idle",
+        }
+    }
+
     pub const fn glyph(self) -> char {
         match self {
             Self::Blocked | Self::Working => '●',

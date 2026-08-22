@@ -717,10 +717,30 @@ impl Dashboard {
         let roster = self.agent_roster();
         let roster_is_empty = roster.is_empty();
         for (state, label) in roster {
-            lines.push(Line::styled(
-                format!(" {} {}", state.glyph(), ellipsise(label, label_width)),
-                Style::default().fg(self.theme.agent(state)),
-            ));
+            // The state is spelled out beside the name. The glyph and its colour say that
+            // something is true of this agent; only the word says what, and "needs you" is the
+            // whole reason to look at this list at all.
+            let state_text = state.label();
+            let name_width = label_width.saturating_sub(state_text.chars().count() + 2);
+            let name = ellipsise(label, name_width);
+            let gap = label_width.saturating_sub(name.chars().count() + state_text.chars().count());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} {name}", state.glyph()),
+                    Style::default().fg(self.theme.agent(state)),
+                ),
+                Span::raw(" ".repeat(gap.max(1))),
+                Span::styled(
+                    state_text,
+                    Style::default().fg(self.theme.agent(state)).add_modifier(
+                        if state == AgentState::Blocked {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        },
+                    ),
+                ),
+            ]));
         }
         if roster_is_empty {
             lines.push(Line::styled(
@@ -4510,6 +4530,28 @@ mod tests {
         dashboard.set_git(git_facts(), String::new());
         let frame = render_to_string(&mut dashboard, 110, 34);
         assert!(frame.contains("nothing changed here"), "{frame:?}");
+    }
+
+    #[test]
+    fn the_roster_says_which_agent_wants_you_rather_than_only_colouring_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.agents.insert(
+            "run_1".into(),
+            (Some(AgentKind::Claude), AgentState::Blocked),
+        );
+        dashboard.agents.insert(
+            "run_2".into(),
+            (Some(AgentKind::Codex), AgentState::Working),
+        );
+        let rows = sidebar_rows(&mut dashboard, 100, 30).join("\n");
+        // A coloured glyph says something is true of this agent without saying what. The word is
+        // the part that is readable across a room, and "needs you" is why the roster exists.
+        assert!(rows.contains("needs you"), "{rows:?}");
+        assert!(rows.contains("working"), "{rows:?}");
+        // Blocked still sorts above working, so the agent wanting attention is the first read.
+        let blocked = rows.find("needs you").expect("blocked row");
+        let working = rows.find("working").expect("working row");
+        assert!(blocked < working, "blocked must sort first: {rows:?}");
     }
 
     #[test]

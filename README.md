@@ -1,194 +1,136 @@
-# Dock
+<div align="center">
 
-**A local runtime for coding agents.**
+# d·ock
 
-Dock gives coding-agent work a safe local home: owned workspaces and panes, provider-neutral agent runs, human-controlled lifecycle actions, and optional multi-repository delivery gates. Git remains the source of code truth; your task system remains the source of task truth.
+**A terminal multiplexer that understands coding agents.**
 
-## Run it
+Real PTY panes · `Ctrl+B` prefix · live agent state · local-first
 
-### 1. Start Dock
+</div>
 
-From any directory, including outside Git, launch the foreground dashboard; it reconnects to that
-directory's private daemon or starts one automatically:
+---
+
+```
+╭─ ● claude · dock ──────────────╮╭─ ○ zsh · ~/dev/dock ──────────╮
+│ › Reading src/runtime.rs       ││ ❯ cargo test                  │
+│   ▸ 3 files changed            ││    Running 244 tests          │
+│                                ││                               │
+╰────────────────────────────────╯╰───────────────────────────────╯
+ AGENTS ─────────────────────────  Ctrl+B ? help
+ ● claude   dock          2m14s
+ ● codex    api-svc      18m02s
+ ○ amp      idle
+```
+
+Every pane is a real terminal with full VT emulation, so `vim`, agent CLIs, and
+anything else using the alternate screen work correctly. Dock watches its own
+panes and tells you which agent needs you — without ever touching a process it
+did not launch.
+
+## Quick start
 
 ```bash
 cargo run --bin dock
 ```
 
-The separate `cargo run --bin dockd` command remains supported for explicit daemon operation.
-Dock speaks protocol v7; a v6 daemon must be stopped before this client can connect to it.
+That's it. Run it from any directory, Git or not. Dock connects to that
+directory's private daemon, or starts one for you.
 
-### 2. Create a workspace and owned run in the dashboard
+Every pane launches `$SHELL` the moment it exists, so you can type immediately.
+Start an agent the way you always do — `claude`, `codex`, `amp` — and Dock picks
+it up.
 
-Every Dock pane is a real terminal from the moment it exists: it auto-launches `$SHELL` (falling
-back to `/bin/sh`) immediately, so a pane is never inert, and full VT emulation (via `vt100`,
-rendered through `tui-term`) means `vim`, agent CLIs, and anything else that uses the alternate
-screen or redraws in place work correctly.
+## Keys
 
-`Ctrl+B` is Dock's command prefix, chosen to match tmux. Unprefixed keystrokes go straight to the
-focused pane; `Esc` is always forwarded to the pane and never intercepted; `Ctrl+B` pressed twice
-sends a literal `Ctrl+B` (`0x02`) to the pane instead of opening a command. Pasting is bracketed:
-the whole payload reaches the pane as one write when the pane's program asked for bracketed paste,
-so a multi-line paste does not run line by line as it arrives.
+`Ctrl+B` is the prefix (same as tmux). **Unprefixed keys go straight to the
+pane**, `Esc` is never intercepted, and `Ctrl+B` twice sends a literal `Ctrl+B`.
 
-A pane is never inert. Panes created by `Ctrl+B n`/`h`/`v` and panes restored after a daemon
-restart all get a fresh Dock-owned shell; a pane whose shell exits says so in its title and comes
-back with `Ctrl+B R`.
+| After `Ctrl+B` | |  | |
+|---|---|---|---|
+| `n` | new workspace | `z` | zoom pane |
+| `[` `]` | switch workspace | `r` | rename |
+| `h` `v` | split ⇋ / ⇵ | `R` | restart a pane whose shell exited |
+| arrows, `Tab`/`S-Tab` | focus | `x` | close pane |
+| `+` `-` | resize split | `l` | launch an agent |
+| `?` | help | `d` | leave — runs keep running |
+| `q` | quit | | |
 
-| Key (after `Ctrl+B`) | Action |
-|---|---|
-| `n` | new workspace |
-| `[` / `]` | switch workspace |
-| `h` / `v` | split horizontal / vertical |
-| arrows, `Tab` / `Shift+Tab` | focus |
-| `+` / `-` | resize the focused split |
-| `z` | zoom (toggle full-area view of the focused pane) |
-| `r` | rename |
-| `R` | restart the focused pane's shell (recovers a pane whose shell exited) |
-| `x` | close |
-| `l` | launch |
-| `d` | leave — runs keep running |
-| `?` | help |
-| `q` | quit |
-
-Press `Ctrl+B l` for the compact fixed-provider picker. Type to filter, use arrows or `j`/`k`,
-press `Enter` to review the exact pane and terminal-unbound versus optional repository-bound mode,
-then `Enter` again to launch. Safe provider/mode choices are retained for the current dashboard
-runtime. Missing fixed executables are labelled and cannot launch. Every form uses `Esc` to cancel.
-Pane commands with no valid target show an inline reason.
-
-The pane's own bound run identity is shown in its border title (the body is the live emulated
-screen and has no room for it); an unbound terminal never invents Git or task facts.
-Repository/task/worktree catalog discovery starts only when launch is opened and does not delay
-the initial dashboard.
-
-Discovered existing agent processes are display-only and say `external/read-only`. Click
-`dismiss all` in the sidebar to remove those candidates from the view — there is no keyboard
-binding for this action. Launching never adopts a discovered process.
-
-The direct noninteractive workspace commands remain available for scripts and compatibility, but
-they are not the normal user or Slice 6.1 smoke path:
-
-```bash
-cargo run --bin dock-workspace -- create daily "Daily work" editor
-cargo run --bin dock-workspace -- split daily editor agent vertical
-cargo run --bin dock-workspace -- inspect
-```
-
-You can focus, resize, rename, or close Dock-owned panes:
-
-```bash
-cargo run --bin dock-workspace -- focus daily agent
-cargo run --bin dock-workspace -- resize daily agent 650
-cargo run --bin dock-workspace -- rename-pane daily agent "Coding agent"
-```
+Pasting is bracketed — a multi-line paste arrives as one payload instead of
+executing line by line.
 
 ## Agent awareness
 
-Dock classifies each of its own runs into one of four states, from the screen content it renders,
-and sorts the sidebar blocked-first so whichever runs are costing the most attention surface at
-the top:
+Dock classifies each pane from what it renders and sorts the sidebar
+**blocked-first**, so whatever is costing you time surfaces at the top.
 
-- **blocked** — waiting on you
-- **working** — actively producing output
-- **done** — finished and idle
-- **idle** — no run bound, or nothing happening yet
+| | State | Meaning |
+|---|---|---|
+| ● | **blocked** | waiting on you |
+| ● | **working** | actively producing output |
+| ◍ | **done** | finished |
+| ○ | **idle** | nothing happening |
 
-This is heuristic, not a protocol the agent speaks to Dock. Detection of processes Dock did not
-launch is display-only: they appear labelled `external/read-only` and are never adopted,
-controlled, or classified into these four states.
+This is a heuristic, not a protocol the agent speaks. Agents running *outside*
+Dock appear as `external/read-only` and are never adopted or controlled.
 
-### 3. Use direct runtime commands when scripting
+## Scripting
 
-Use `fixture` to prove the runtime before using a real provider:
+Dock's runtime is scriptable without the dashboard. Prove it with the `fixture`
+adapter first:
 
 ```bash
 cargo run --bin dock-dispatch -- \
   --repo="$(pwd)" --task=TRY-1 --run-id=dock_try_1 \
   --worktree="$(pwd)" --adapter=fixture -- -c 'sleep 30'
-cargo run --bin dock-inspect -- --run-id=dock_try_1
-cargo run --bin dock-agent -- --run-id=dock_try_1 --operation=stop
+cargo run --bin dock-inspect  -- --run-id=dock_try_1
+cargo run --bin dock-agent    -- --run-id=dock_try_1 --operation=stop
 ```
 
-For a real agent, replace `fixture` with one of:
+Swap `fixture` for `amp`, `claude-code`, `codex-cli`, or `github-copilot-cli`.
+Dock checks the binary exists before creating a run; agent authentication stays
+with that agent's own setup.
 
-```text
-amp | claude-code | codex-cli | github-copilot-cli
-```
+`dock-workspace` manages panes non-interactively, and `dock-programme` inspects
+multi-repository capacity and dependency gates.
 
-Dock checks that the provider binary is available before creating a run. Agent authentication stays with that agent's normal local setup.
+## Safety
 
-## Features
+- Dock **only** controls PTYs and process groups it created. There is no
+  adoption path, and stale process groups are never signalled.
+- It never stages, commits, rebases, merges, pushes, deploys, creates worktrees,
+  or mutates your task system.
+- Durable state lives in `.dock/local` at `0700`/`0600`. Layout records hold
+  topology and labels only — never terminal output, commands, credentials, PIDs,
+  or process-group IDs. Use `--state-dir=` to relocate it.
+- A daemon restart recovers layout only. Old processes are never reattached;
+  restored panes get a fresh shell.
 
-### Daily runtime
+## Status
 
-- Create, split, focus, resize, rename, close, and inspect Dock-owned panes.
-- Persist bounded layout metadata across daemon restart.
-- Restore prior panes as **restored**, never as attached former processes.
-- Run only Dock-created PTYs and process groups; stop, interrupt, focus, or restart only those runs.
-- Use provider-neutral adapters: Amp, Claude Code, Codex CLI, GitHub Copilot CLI, fixture, or an explicit generic executable.
+Shipped: VT emulation, PTY resize, shell panes, push-based streaming, agent
+state detection, zoom, bracketed paste, and `Ctrl+C` signal delivery.
 
-### Programme control
+Deferred: pane swap, alternative theme palettes, notifications, and durable
+transcript replay. Scrollback is bounded per pane (default 2000 rows,
+`dockd --scrollback-rows`) and is not restored across a daemon restart.
 
-- Run multiple repositories with global and per-repository agent capacity.
-- Reserve capacity for human review.
-- Release downstream work only through an explicit local chain:
+The [parity matrix](docs/terminal-runtime-parity.md) states the exact status of
+every capability, including known limitations.
 
-```text
-exact upstream run → valid handoff → human decision → one downstream release
-```
-
-- Inspect active, queued, and blocked local programme work with `dock-programme`.
-
-```bash
-cargo run --bin dock-programme
-```
-
-### Safety by default
-
-- Dock never automatically stages, commits, rebases, merges, pushes, deploys, creates worktrees, or mutates task systems.
-- By default Dock intentionally creates private durable runtime state and records under
-  `.dock/local` in the current repository. That directory is ignored by this repository's
-  `.gitignore`; its no-follow directories and files are restricted to modes 0700 and 0600. This
-  expected local state does not change Git history, the index, tracked worktree content, or task
-  truth. Use `--state-dir=...` when the state must live elsewhere.
-- Dock never discovers, imports, or controls arbitrary processes.
-- Durable state is private. Semantic layout metadata contains only bounded workspace/pane topology
-  and labels: never credentials, terminal output, commands, repository/worktree paths, run bindings,
-  PIDs, or process-group IDs. Separately, private dispatch receipts necessarily retain the owned
-  runtime binding—including repository/worktree identity, run and pane identity, PID, process-group
-  ID, and lifecycle/provider state—for lifecycle control and reconciliation; they do not retain raw
-  terminal output or credentials.
-- Restart recovers layout metadata only; it does not reattach or adopt processes.
-
-## What is not here yet
-
-Dock is not yet a full terminal multiplexer. Pane swap, loading alternative theme palettes, and
-notifications are deferred, and durable transcript replay across a daemon restart is out of scope.
-Bounded live scrollback is shipped: each pane retains only its configured row budget (default
-2000, `dockd --scrollback-rows`) in memory for reconnects to that same daemon, discarding the
-oldest rows as new output arrives; it is never written to layout or restored after daemon restart.
-
-**`Ctrl+C` does not currently interrupt a running pane child.** The launch guardian backgrounds
-the worker shell, and POSIX sets `SIGINT`/`SIGQUIT` to ignore for a non-interactive shell's
-background jobs — a disposition that survives `exec`. `stop` and daemon/guardian cleanup (which
-use `SIGTERM`) are unaffected. This is a known defect with a dedicated follow-up task, not a
-silent gap; see the [terminal-runtime parity matrix](docs/terminal-runtime-parity.md) for the
-exact status of every capability, including this one.
-
-## Verify a change
+## Development
 
 ```bash
 cargo fmt --check
 cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
+
 scripts/smoke-slice5-macos.sh
 scripts/smoke-slice6-macos.sh
 scripts/smoke-slice61-macos.sh
 scripts/smoke-slice62-nongit-macos.sh
 ```
 
-See the [implementation breakdown](docs/implementation-breakdown.md) for planned work and acceptance evidence.
+Dock speaks protocol v7 — stop any older daemon before connecting.
 
 ## Licence
 

@@ -27,6 +27,8 @@ pub enum PaneCommand {
     Workspace(i8),
     /// Show every workspace at once and jump to one by name.
     WorkspacePicker,
+    /// Complete a path from the focused pane's directory into that pane.
+    FilePicker,
     /// Jump straight to the workspace in this 1-based position, if it exists.
     WorkspaceJump(u8),
     Resize(i16),
@@ -92,12 +94,13 @@ impl Keymap {
     pub fn hints() -> &'static [(&'static str, &'static str)] {
         &[
             ("n", "new"),
-            ("h", "split ⇋"),
-            ("v", "split ⇵"),
+            // Paired rather than listed separately: the bar has two rows and every column spent
+            // repeating the word "split" is a column the last binding needs to stay visible.
+            ("h/v", "split ⇋⇵"),
             ("Tab", "focus next"),
-            ("S-Tab", "focus prev"),
-            ("←↑→↓", "focus"),
+            ("S-Tab ←↑→↓", "focus prev"),
             (",/. w 1-9", "workspace"),
+            ("f", "file"),
             ("[", "copy mode"),
             ("+/-", "resize"),
             ("z", "zoom"),
@@ -138,6 +141,9 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Char('.') => PaneCommand::Workspace(1),
         // `w` is tmux's window list, and a workspace is the nearest thing Dock has to a window.
         KeyCode::Char('w') => PaneCommand::WorkspacePicker,
+        // `f` for file. The picker completes a path into the pane rather than deciding what to do
+        // with it, so `vim ` first opens it and an agent prompt simply gains the path.
+        KeyCode::Char('f') => PaneCommand::FilePicker,
         // Cycling is fine for two workspaces and miserable for eight. A digit is the only way to
         // reach a distant workspace in constant time. `0` is deliberately unbound: the positions
         // are 1-based on screen, so binding it would place a tenth workspace under a key that
@@ -277,8 +283,7 @@ mod tests {
         let keys: Vec<&str> = Keymap::hints().iter().map(|(key, _)| *key).collect();
         for expected in [
             "n",
-            "h",
-            "v",
+            "h/v",
             "z",
             "r",
             "R",
@@ -288,7 +293,8 @@ mod tests {
             "?",
             "q",
             "Tab",
-            "S-Tab",
+            "S-Tab ←↑→↓",
+            "f",
             "[",
             // The three ways to reach a workspace share one entry: the footer is two rows, and
             // listing them separately pushed the last published binding off the end of it.

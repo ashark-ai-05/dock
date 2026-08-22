@@ -48,12 +48,22 @@ pane**, `Esc` is never intercepted, and `Ctrl+B` twice sends a literal `Ctrl+B`.
 | After `Ctrl+B` | |  | |
 |---|---|---|---|
 | `n` | new workspace | `z` | zoom pane |
-| `,` `.` | switch workspace | `r` | rename |
+| `,` `.` | previous / next workspace | `r` | rename |
+| `w` | pick a workspace by name | `f` | find a file, type its path |
+| `1`–`9` | jump to a workspace | | |
 | `h` `v` | split ⇋ / ⇵ | `R` | restart a pane whose shell exited |
 | arrows, `Tab`/`S-Tab` | focus | `x` | close pane |
 | `+` `-` | resize split | `l` | launch an agent |
 | `[` | copy mode | `d` | leave — runs keep running |
 | `?` | help | `q` | quit |
+
+With more than one workspace open, a tab strip names them all and numbers them
+by the digit that jumps there; tabs and picker rows are clickable.
+
+`Ctrl+B f` lists the files where the focused pane actually is — following the
+shell's `cd`, and honouring `.gitignore` inside a repository. Taking one types
+its path into the pane rather than opening it, so `vim ` first opens the file
+and reaching for it mid-sentence hands an agent the path.
 
 Pasting is bracketed — a multi-line paste arrives as one payload instead of
 executing line by line.

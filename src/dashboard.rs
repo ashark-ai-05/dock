@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -18,6 +18,7 @@ use crate::{
     copy::{CopySession, find_matches},
     detect::{AgentKind, AgentState},
     discovery::ExternalAgentCandidate,
+    files,
     keymap::{FocusDirection, KeyOutcome, Keymap, PaneCommand},
     layout::{LayoutNode, LayoutSnapshot, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout},
     picker::{Picker, PickerItem},
@@ -115,6 +116,7 @@ pub struct Dashboard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerPurpose {
     Workspace,
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -510,6 +512,7 @@ impl Dashboard {
         };
         let title = match purpose {
             PickerPurpose::Workspace => " WORKSPACES ",
+            PickerPurpose::File => " FILES ",
         };
         let width = area.width.min(58);
         let height = area.height.min(14);
@@ -977,6 +980,7 @@ impl Dashboard {
             Line::from("n new workspace   h/v split   z zoom"),
             Line::from("r rename   R restart shell   x close   l launch   q quit"),
             Line::from("w pick a workspace by name   1-9 jump to one   ,/. previous/next"),
+            Line::from("f find a file here and type its path into the pane"),
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
@@ -1088,6 +1092,7 @@ impl Dashboard {
             )),
             PaneCommand::Workspace(delta) => self.select_workspace(delta),
             PaneCommand::WorkspacePicker => self.open_workspace_picker(),
+            PaneCommand::FilePicker => self.open_file_picker(),
             PaneCommand::WorkspaceJump(position) => self.jump_to_workspace(position),
             PaneCommand::Resize(delta) => self.resize_keyboard(delta),
             PaneCommand::Zoom => self.zoom(),
@@ -1129,6 +1134,49 @@ impl Dashboard {
             })
             .collect();
         self.picker = Some((PickerPurpose::Workspace, Picker::new(items)));
+        self.error = None;
+        UiCommand::None
+    }
+
+    /// Opens the file chooser, rooted where the focused pane actually is.
+    ///
+    /// The pane's own working directory comes first, which shells report through OSC 7 as they
+    /// move, so the listing follows a `cd` rather than staying pinned to wherever the pane started.
+    /// A pane with no run, or one whose shell never reported, falls back to the repository this
+    /// dashboard was bound to.
+    fn open_file_picker(&mut self) -> UiCommand {
+        let root = self
+            .focused_run_id()
+            .and_then(|run_id| self.runs.iter().find(|run| run.run_id == run_id))
+            .and_then(|run| run.cwd.clone())
+            .filter(|cwd| !cwd.is_empty())
+            .unwrap_or_else(|| self.repository_root.clone());
+        if root.is_empty() {
+            self.error = Some("file picker unavailable: this pane has no directory".into());
+            return UiCommand::None;
+        }
+        let listed = files::list(Path::new(&root), files::LISTING_LIMIT);
+        if listed.is_empty() {
+            self.error = Some(format!("no files under {root}"));
+            return UiCommand::None;
+        }
+        // Only the directory is shown as detail: the file name is what gets matched and what the
+        // eye lands on, and a full path repeated on every row is noise the width cannot afford.
+        let items = listed
+            .into_iter()
+            .map(|path| {
+                let (directory, name) = match path.rsplit_once('/') {
+                    Some((directory, name)) => (directory.to_owned(), name.to_owned()),
+                    None => (String::new(), path.clone()),
+                };
+                PickerItem {
+                    key: path,
+                    label: name,
+                    detail: directory,
+                }
+            })
+            .collect();
+        self.picker = Some((PickerPurpose::File, Picker::new(items)));
         self.error = None;
         UiCommand::None
     }
@@ -1194,6 +1242,16 @@ impl Dashboard {
                     None => self.error = Some("that workspace is gone".into()),
                 }
                 UiCommand::None
+            }
+            // The path is typed into the pane rather than opened, because Dock cannot know which
+            // verb was wanted. Reaching for it after `vim ` opens it; reaching for it mid-sentence
+            // to an agent hands the agent a path. A trailing space is deliberate: a path is almost
+            // never the last thing typed on a line.
+            PickerPurpose::File => {
+                let mut typed = key.to_owned();
+                typed.push(' ');
+                self.error = None;
+                self.send_to_pane(typed.into_bytes())
             }
         }
     }
@@ -3436,6 +3494,55 @@ mod tests {
         dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(dashboard.workspace_index, 0);
         assert_eq!(dashboard.error.as_deref(), Some("that workspace is gone"));
+    }
+
+    #[test]
+    fn the_file_picker_lists_the_focused_panes_directory_and_types_the_choice_into_it() {
+        let tree = std::env::temp_dir().join(format!("dock-picker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tree);
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        std::fs::write(tree.join("README.md"), "x").unwrap();
+        std::fs::write(tree.join("src/main.rs"), "x").unwrap();
+
+        let mut dashboard = bound_dashboard();
+        // The pane reports where it is through OSC 7, so the listing follows the shell's `cd`
+        // rather than staying pinned to wherever the pane was launched.
+        let mut run = snapshot();
+        run.run_id = "run_1".into();
+        run.cwd = Some(tree.to_string_lossy().into_owned());
+        dashboard.runs = vec![run];
+        render_to_string(&mut dashboard, 100, 30);
+
+        assert_eq!(command(&mut dashboard, KeyCode::Char('f')), UiCommand::None);
+        let overlay = render_to_string(&mut dashboard, 100, 30);
+        assert!(overlay.contains("FILES"), "{overlay:?}");
+        assert!(overlay.contains("README.md"), "{overlay:?}");
+        assert!(overlay.contains("main.rs"), "{overlay:?}");
+
+        for character in "main".chars() {
+            dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        // Taking a row types the path into the pane instead of opening it: Dock cannot know
+        // which verb was wanted, and the path is what every verb needs.
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiCommand::PaneInput(b"src/main.rs ".to_vec())
+        );
+        assert!(dashboard.picker.is_none());
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+
+    #[test]
+    fn a_pane_with_nowhere_to_list_says_so_rather_than_opening_an_empty_picker() {
+        let mut dashboard = bound_dashboard();
+        dashboard.repository_root = String::new();
+        render_to_string(&mut dashboard, 100, 30);
+        assert_eq!(command(&mut dashboard, KeyCode::Char('f')), UiCommand::None);
+        assert!(dashboard.picker.is_none());
+        assert_eq!(
+            dashboard.error.as_deref(),
+            Some("file picker unavailable: this pane has no directory")
+        );
     }
 
     #[test]

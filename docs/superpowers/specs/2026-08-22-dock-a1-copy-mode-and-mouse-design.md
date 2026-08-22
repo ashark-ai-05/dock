@@ -63,7 +63,14 @@ In scope:
 
 Explicitly out of scope:
 
-- Any protocol change. A1 is client-side; the client already holds a full parser replica.
+- ~~Any protocol change. A1 is client-side; the client already holds a full parser replica.~~
+  **Superseded.** This premise was falsified by probe during implementation: the client's
+  replica is a *repaint mirror*, not an append-fed terminal. `state_diff` emits
+  cursor-addressed repaints, and `vt100` only pushes rows into scrollback from its scroll
+  path, so the replica's history was permanently empty and the wheel did nothing. Scrollback
+  therefore required a protocol change: **v8** forwards the raw PTY bytes a subscriber has
+  not yet seen, so the client mirrors the daemon's terminal and builds identical history.
+  Copy mode over the visible screen remains entirely client-side as originally designed.
 - Rectangular/block selection. Line and character selection only.
 - Selection history or multiple registers.
 - Mouse reporting passthrough to programs inside the pane (an agent TUI that wants its own mouse

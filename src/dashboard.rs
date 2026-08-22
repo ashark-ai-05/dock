@@ -13,6 +13,8 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::{
     adapter::{AdapterId, AdapterSelection},
+    clipboard::{self, ClipboardRoute},
+    copy::{CopySession, find_matches},
     detect::{AgentKind, AgentState},
     discovery::ExternalAgentCandidate,
     keymap::{FocusDirection, KeyOutcome, Keymap, PaneCommand},
@@ -85,6 +87,12 @@ pub struct Dashboard {
     launch_confirm_area: Option<Rect>,
     launch_mode_area: Option<Rect>,
     help_open: bool,
+    /// Copy mode's session, if active. Client-local: reading history costs the daemon nothing.
+    copy: Option<CopySession>,
+    /// True only while copy mode's `/` prompt is taking characters. Kept beside `copy` rather
+    /// than inside `CopySession` because the query outlives the prompt: `n`/`N` reuse it once
+    /// Enter has closed the editor.
+    copy_searching: bool,
     rename_form: Option<String>,
     last_launch_profile: usize,
     last_repository_mode: bool,
@@ -357,10 +365,9 @@ impl Dashboard {
                                     .fg(self.theme.accent)
                                     .add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled(
-                                format!("{action} "),
-                                Style::default().fg(self.theme.text),
-                            ),
+                            // No trailing space: the key span already opens with one, and the
+                            // doubled gap cost more columns than the two-row footer has.
+                            Span::styled(action.to_owned(), Style::default().fg(self.theme.text)),
                         ]
                     })
                     .collect::<Vec<_>>(),
@@ -716,7 +723,8 @@ impl Dashboard {
             Line::from("Ctrl+B is the only key Dock keeps; Ctrl+B Ctrl+B sends a literal one."),
             Line::styled("AFTER Ctrl+B", heading),
             Line::from("n new workspace   h/v split   z zoom"),
-            Line::from("r rename   R restart shell   x close   l launch   q quit   [/] workspace"),
+            Line::from("r rename   R restart shell   x close   l launch   q quit   ,/. workspace"),
+            Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
             Line::styled("FORMS", heading),
@@ -784,6 +792,12 @@ impl Dashboard {
         if self.launch_form.is_some() {
             return self.launch_key(key);
         }
+        // Ahead of the keymap on purpose: copy mode owns every key while it is active, so its
+        // motions (`h`, `j`, `k`, `l`) and its verbs (`v`, `y`) can never be forwarded to the
+        // PTY as ordinary input.
+        if self.copy.is_some() {
+            return self.copy_key(key);
+        }
         let encoding = self.encoding_for_focused_pane();
         match self.keymap.handle(key, encoding) {
             // Deliberately not a `Request`: pane input is fire-and-forget, and routing it
@@ -824,6 +838,7 @@ impl Dashboard {
                 self.open_launch();
                 UiCommand::LoadCatalog
             }
+            PaneCommand::CopyMode => self.enter_copy_mode(),
             // The daemon owns every run, so leaving the dashboard signals nothing and tears
             // nothing down. Detaching and quitting are therefore the same act here.
             PaneCommand::Detach | PaneCommand::Quit => UiCommand::Quit,
@@ -835,7 +850,7 @@ impl Dashboard {
         }
     }
 
-    /// Moves the visible workspace, saturating at both ends rather than wrapping: `]` on the
+    /// Moves the visible workspace, saturating at both ends rather than wrapping: `.` on the
     /// last workspace is a mis-press, and jumping silently back to the first would move the
     /// user somewhere they did not ask to go.
     ///
@@ -873,6 +888,204 @@ impl Dashboard {
         };
         self.error = None;
         UiCommand::None
+    }
+
+    /// Whether the focused pane's viewport is frozen for selection.
+    pub fn copy_mode(&self) -> bool {
+        self.copy.is_some()
+    }
+
+    /// The mode indicator. Copy mode swallows every key, so it has to announce itself: an
+    /// input mode with no on-screen trace is indistinguishable from a hung dashboard.
+    pub fn copy_status(&self) -> Option<String> {
+        let session = self.copy.as_ref()?;
+        if self.copy_searching {
+            return Some(format!(
+                "COPY /{}",
+                session.search_query().unwrap_or_default()
+            ));
+        }
+        let (row, column) = session.cursor();
+        let verb = if session.selecting() {
+            "SELECTING"
+        } else {
+            "MOVE"
+        };
+        Some(format!("COPY {verb} {row},{column}"))
+    }
+
+    /// Freezes the focused pane for keyboard selection, starting at its live cursor.
+    fn enter_copy_mode(&mut self) -> UiCommand {
+        let Some(run_id) = self.focused_run_id().map(str::to_owned) else {
+            self.error =
+                Some("copy mode unavailable: this pane has no run · Ctrl+B l launches one".into());
+            return UiCommand::None;
+        };
+        let cursor = self
+            .screens
+            .get(&run_id)
+            .map(PaneScreen::cursor)
+            .unwrap_or((0, 0));
+        self.copy = Some(CopySession::new(run_id, cursor));
+        self.copy_searching = false;
+        self.error = None;
+        UiCommand::None
+    }
+
+    /// Every key while copy mode is active, so none of them can reach the PTY.
+    ///
+    /// The session is taken out of `self` for the duration: the handlers need the pane's
+    /// screen at the same time, and leaving the session in place would borrow `self` twice.
+    fn copy_key(&mut self, key: KeyEvent) -> UiCommand {
+        let Some(mut session) = self.copy.take() else {
+            return UiCommand::None;
+        };
+        let bounds = self
+            .screens
+            .get(&session.run_id)
+            .map(PaneScreen::size)
+            .unwrap_or((0, 0));
+        // Esc leaves unconditionally, search prompt included. A modal mode that can refuse to
+        // exit is the failure P0 removed, so the escape hatch stays single-press everywhere.
+        if key.code == KeyCode::Esc {
+            self.leave_copy_mode(&session);
+            return UiCommand::None;
+        }
+        if self.copy_searching {
+            self.copy_search_key(key, &mut session, bounds);
+            self.copy = Some(session);
+            return UiCommand::None;
+        }
+        match key.code {
+            KeyCode::Char('q') => {
+                self.leave_copy_mode(&session);
+                return UiCommand::None;
+            }
+            KeyCode::Char('h') | KeyCode::Left => self.copy_move(&mut session, 0, -1, bounds),
+            KeyCode::Char('j') | KeyCode::Down => self.copy_move(&mut session, 1, 0, bounds),
+            KeyCode::Char('k') | KeyCode::Up => self.copy_move(&mut session, -1, 0, bounds),
+            KeyCode::Char('l') | KeyCode::Right => self.copy_move(&mut session, 0, 1, bounds),
+            // Top and bottom of what the replica actually holds: the client's own grid has no
+            // scrollback of its own yet, so these are the visible extremes rather than history.
+            KeyCode::Char('g') => session.set_cursor((0, 0), bounds),
+            KeyCode::Char('G') => session.set_cursor((bounds.0.saturating_sub(1), 0), bounds),
+            KeyCode::Char('v') => session.begin_selection(),
+            KeyCode::Char('y') => {
+                if self.yank(&session) {
+                    self.leave_copy_mode(&session);
+                    return UiCommand::None;
+                }
+            }
+            KeyCode::Char('/') => {
+                session.begin_search();
+                self.copy_searching = true;
+                self.error = None;
+            }
+            KeyCode::Char('n') => self.copy_jump(&mut session, true, bounds),
+            KeyCode::Char('N') => self.copy_jump(&mut session, false, bounds),
+            _ => {}
+        }
+        self.copy = Some(session);
+        UiCommand::None
+    }
+
+    /// Keys typed at the `/` prompt. Enter closes the prompt and jumps; the query survives so
+    /// `n`/`N` can keep walking the same matches.
+    fn copy_search_key(&mut self, key: KeyEvent, session: &mut CopySession, bounds: (u16, u16)) {
+        match key.code {
+            KeyCode::Char(character) => session.push_search(character),
+            KeyCode::Backspace => {
+                if session.search_query().is_some_and(str::is_empty) {
+                    session.cancel_search();
+                    self.copy_searching = false;
+                } else {
+                    session.pop_search();
+                }
+            }
+            KeyCode::Enter => {
+                self.copy_searching = false;
+                self.copy_jump(session, true, bounds);
+            }
+            _ => {}
+        }
+    }
+
+    /// Moves the copy cursor, pulling the viewport through scrollback when it walks off an
+    /// edge so the cursor never leaves the rows on screen.
+    fn copy_move(&mut self, session: &mut CopySession, rows: i32, cols: i32, bounds: (u16, u16)) {
+        let (row, _) = session.cursor();
+        let edge = if rows < 0 && row == 0 {
+            1
+        } else if rows > 0 && row + 1 >= bounds.0 {
+            -1
+        } else {
+            0
+        };
+        if edge != 0
+            && let Some(screen) = self.screens.get_mut(&session.run_id)
+        {
+            screen.scroll_by(edge);
+        }
+        session.move_cursor(rows, cols, bounds);
+    }
+
+    /// Jumps to the next or previous hit for the standing query, or says why it could not.
+    fn copy_jump(&mut self, session: &mut CopySession, forward: bool, bounds: (u16, u16)) {
+        let Some(query) = session.search_query().map(str::to_owned) else {
+            self.error = Some("no search yet · / starts one".into());
+            return;
+        };
+        let rows: Vec<String> = self
+            .screens
+            .get(&session.run_id)
+            .map(|screen| (0..bounds.0).map(|row| screen.visible_row(row)).collect())
+            .unwrap_or_default();
+        if session.jump_to_match(&find_matches(&rows, &query), forward, bounds) {
+            self.error = None;
+        } else {
+            self.error = Some(format!("no matches for {query:?}"));
+        }
+    }
+
+    /// Puts the selection on the clipboard and names the route it took. Returns whether the
+    /// yank actually happened, so a `y` with nothing selected stays in copy mode.
+    ///
+    /// The route is reported because OSC 52 is disabled by default in some terminals: a yank
+    /// that silently reached nothing looks exactly like a yank that worked.
+    fn yank(&mut self, session: &CopySession) -> bool {
+        let Some((from, to)) = session.selection() else {
+            self.error = Some("nothing selected · v starts a selection".into());
+            return false;
+        };
+        let text = self
+            .screens
+            .get(&session.run_id)
+            .map(|screen| screen.selection_text(from, to))
+            .unwrap_or_default();
+        self.error = Some(match clipboard::copy(&text) {
+            Ok(route) => {
+                let route = match route {
+                    ClipboardRoute::Osc52 => "OSC 52".to_owned(),
+                    ClipboardRoute::Command(helper) => helper.to_owned(),
+                };
+                format!(
+                    "copied {} characters to the clipboard via {route}",
+                    text.chars().count()
+                )
+            }
+            Err(reason) => format!("copy failed: {reason}"),
+        });
+        true
+    }
+
+    /// Leaves copy mode and returns the pane to the live tail, which is where the user was
+    /// before they froze it.
+    fn leave_copy_mode(&mut self, session: &CopySession) {
+        if let Some(screen) = self.screens.get_mut(&session.run_id) {
+            screen.scroll_to_live();
+        }
+        self.copy = None;
+        self.copy_searching = false;
     }
 
     /// The focused pane's own key encoding. A program that sets DECCKM changes what bytes
@@ -2500,7 +2713,7 @@ mod tests {
             !first.contains("deploy"),
             "only the selected workspace is rendered"
         );
-        assert_eq!(command(&mut dashboard, KeyCode::Char(']')), UiCommand::None);
+        assert_eq!(command(&mut dashboard, KeyCode::Char('.')), UiCommand::None);
         assert_eq!(dashboard.workspace_index, 1);
         let second = render_to_string(&mut dashboard, 100, 30);
         assert!(second.contains("Deploy"), "{second:?}");
@@ -2512,13 +2725,13 @@ mod tests {
             !second.contains("editor"),
             "the first workspace is still on screen"
         );
-        // Saturating rather than wrapping: `]` at the last workspace is a mis-press, and
+        // Saturating rather than wrapping: `.` at the last workspace is a mis-press, and
         // silently jumping to the first would move the user somewhere they did not ask for.
-        assert_eq!(command(&mut dashboard, KeyCode::Char(']')), UiCommand::None);
+        assert_eq!(command(&mut dashboard, KeyCode::Char('.')), UiCommand::None);
         assert_eq!(dashboard.workspace_index, 1);
-        assert_eq!(command(&mut dashboard, KeyCode::Char('[')), UiCommand::None);
+        assert_eq!(command(&mut dashboard, KeyCode::Char(',')), UiCommand::None);
         assert_eq!(dashboard.workspace_index, 0);
-        assert_eq!(command(&mut dashboard, KeyCode::Char('[')), UiCommand::None);
+        assert_eq!(command(&mut dashboard, KeyCode::Char(',')), UiCommand::None);
         assert_eq!(dashboard.workspace_index, 0);
         assert!(render_to_string(&mut dashboard, 100, 30).contains("editor"));
     }
@@ -2526,7 +2739,7 @@ mod tests {
     #[test]
     fn cycling_with_no_workspace_explains_itself_rather_than_panicking() {
         let mut dashboard = Dashboard::default();
-        assert_eq!(command(&mut dashboard, KeyCode::Char(']')), UiCommand::None);
+        assert_eq!(command(&mut dashboard, KeyCode::Char('.')), UiCommand::None);
         assert_eq!(dashboard.workspace_index, 0);
         assert!(
             dashboard
@@ -2544,7 +2757,7 @@ mod tests {
             dashboard.take_pending_resizes(),
             vec![("w".to_owned(), "a".to_owned(), PANE_ROWS, PANE_COLS)]
         );
-        command(&mut dashboard, KeyCode::Char(']'));
+        command(&mut dashboard, KeyCode::Char('.'));
         render_to_string(&mut dashboard, 100, 30);
         // The second workspace is a single pane, so it owns the whole 72-column body.
         assert_eq!(
@@ -2975,6 +3188,62 @@ mod tests {
         assert!(
             !dashboard.screens["run_1"].is_scrolled(),
             "the wheel must not scroll the focused pane (\"a\") when the pointer is elsewhere"
+        );
+    }
+
+    #[test]
+    fn the_prefix_then_bracket_enters_copy_mode_and_escape_leaves_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"hello world\r\n"));
+        assert!(!dashboard.copy_mode());
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert!(dashboard.copy_mode(), "Ctrl+B [ must enter copy mode");
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!dashboard.copy_mode(), "Esc always leaves copy mode");
+    }
+
+    #[test]
+    fn copy_mode_keys_never_reach_the_pane() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"hello world\r\n"));
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        for key in ['h', 'j', 'k', 'l', 'v', 'y'] {
+            let outcome = dashboard.key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            assert!(
+                !matches!(outcome, UiCommand::PaneInput(_)),
+                "{key} must not be forwarded to the PTY while in copy mode"
+            );
+        }
+    }
+
+    #[test]
+    fn yanking_a_selection_reports_which_clipboard_route_was_used() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"copy me\r\n"));
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(!dashboard.copy_mode(), "yanking leaves copy mode");
+        let notice = dashboard.error.clone().unwrap_or_default();
+        assert!(
+            notice.contains("copied") || notice.contains("clipboard"),
+            "the yank must say what happened, got {notice:?}"
+        );
+    }
+
+    #[test]
+    fn copy_mode_is_refused_on_a_pane_with_no_run() {
+        let mut dashboard = dashboard();
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert!(!dashboard.copy_mode());
+        assert!(
+            dashboard.error.is_some(),
+            "an impossible command must explain itself rather than doing nothing"
         );
     }
 }

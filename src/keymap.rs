@@ -32,6 +32,8 @@ pub enum PaneCommand {
     /// Give an exited pane a fresh shell. The keyboard recovery path out of a dead pane.
     Respawn,
     Launch,
+    /// Freeze the focused pane's viewport for keyboard selection and yanking.
+    CopyMode,
     Detach,
     Help,
     Quit,
@@ -91,7 +93,8 @@ impl Keymap {
             ("Tab", "focus next"),
             ("S-Tab", "focus prev"),
             ("←↑→↓", "focus"),
-            ("[/]", "workspace"),
+            (",/.", "workspace"),
+            ("[", "copy mode"),
             ("+/-", "resize"),
             ("z", "zoom"),
             ("r", "rename"),
@@ -124,8 +127,11 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Char('d') => PaneCommand::Detach,
         KeyCode::Char('?') => PaneCommand::Help,
         KeyCode::Char('q') => PaneCommand::Quit,
-        KeyCode::Char('[') => PaneCommand::Workspace(-1),
-        KeyCode::Char(']') => PaneCommand::Workspace(1),
+        // `[` is tmux's copy-mode key and copying is the far more frequent act, so workspace
+        // cycling moved to the unshifted `,`/`.` pair rather than keeping the bracket.
+        KeyCode::Char('[') => PaneCommand::CopyMode,
+        KeyCode::Char(',') => PaneCommand::Workspace(-1),
+        KeyCode::Char('.') => PaneCommand::Workspace(1),
         KeyCode::Char('+') => PaneCommand::Resize(50),
         KeyCode::Char('-') => PaneCommand::Resize(-50),
         KeyCode::Tab => PaneCommand::Focus(FocusDirection::Next),
@@ -225,17 +231,33 @@ mod tests {
     }
 
     #[test]
-    fn bracket_keys_after_the_prefix_cycle_workspaces() {
+    fn comma_and_period_after_the_prefix_cycle_workspaces() {
         let mut keymap = Keymap::new();
         keymap.handle(prefix(), KeyEncoding::default());
         assert_eq!(
-            keymap.handle(plain(']'), KeyEncoding::default()),
+            keymap.handle(plain('.'), KeyEncoding::default()),
             KeyOutcome::Command(PaneCommand::Workspace(1))
         );
         keymap.handle(prefix(), KeyEncoding::default());
         assert_eq!(
-            keymap.handle(plain('['), KeyEncoding::default()),
+            keymap.handle(plain(','), KeyEncoding::default()),
             KeyOutcome::Command(PaneCommand::Workspace(-1))
+        );
+    }
+
+    #[test]
+    fn the_bracket_after_the_prefix_opens_copy_mode_and_no_longer_cycles_workspaces() {
+        let mut keymap = Keymap::new();
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(plain('['), KeyEncoding::default()),
+            KeyOutcome::Command(PaneCommand::CopyMode)
+        );
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(plain(']'), KeyEncoding::default()),
+            KeyOutcome::Ignored,
+            "the closing bracket lost its binding when workspace cycling moved to ,/."
         );
     }
 
@@ -243,7 +265,7 @@ mod tests {
     fn published_hints_cover_every_documented_binding() {
         let keys: Vec<&str> = Keymap::hints().iter().map(|(key, _)| *key).collect();
         for expected in [
-            "n", "h", "v", "z", "r", "R", "x", "l", "d", "?", "q", "Tab", "S-Tab", "[/]",
+            "n", "h", "v", "z", "r", "R", "x", "l", "d", "?", "q", "Tab", "S-Tab", ",/.", "[",
         ] {
             assert!(keys.contains(&expected), "missing hint for {expected}");
         }

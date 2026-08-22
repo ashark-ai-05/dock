@@ -563,6 +563,13 @@ impl SubscriberView {
     /// so first, or the client would paint a full-screen program's window onto its primary
     /// buffer — scrolling the user's real history away and leaving the client on the wrong
     /// buffer when the program exits.
+    ///
+    /// There is deliberately no matching `\e[?1049l` for a pane on the primary screen, and
+    /// that is only safe because `Dashboard::apply_event` rebuilds the client's parser on
+    /// every `PaneAttached` (`src/dashboard.rs`), so a seed always lands in a fresh primary
+    /// buffer. Reusing an existing parser across a re-attach — to preserve its accumulated
+    /// history, say — would strand a client that was in the alternate screen when the pane
+    /// left it. Any such change must send the leave sequence from here.
     fn seeded(output: &PaneOutput, rows: u16, cols: u16) -> (Self, Vec<u8>) {
         let mut bytes = Vec::new();
         if output.screen().alternate_screen() {
@@ -1542,7 +1549,13 @@ mod tests {
                     &serde_json::to_string(&Request::PaneInput(PaneInputRequest {
                         workspace_id: "w1".into(),
                         pane_id: "p1".into(),
-                        input: PaneInputRequest::encode(b"seq 1 200\n"),
+                        // The trailing marker is quoted so the *echoed command line* reads
+                        // `DONE""MARK` while only the shell's *output* reads `DONEMARK`. A
+                        // gate that could match the echo fires before `seq` has produced
+                        // anything, and the assertions below then run against a pane holding
+                        // only a prompt — which fails with the same message the original
+                        // defect produced, so the flake reads as a regression every time.
+                        input: PaneInputRequest::encode(b"seq 1 200; echo DONE\"\"MARK\n"),
                     }))
                     .unwrap(),
                 ],
@@ -1552,7 +1565,7 @@ mod tests {
             while !registry_ref
                 .with_run_screen(&run_id, |screen| screen.text_tail(2))
                 .expect("live screen")
-                .contains("200")
+                .contains("DONEMARK")
             {
                 assert!(
                     Instant::now() + QUIET + Duration::from_millis(600) < deadline,
@@ -1957,7 +1970,10 @@ mod tests {
         match &responses[0] {
             Response::Error { code, message } => {
                 assert_eq!(*code, ErrorCode::ProtocolMismatch);
-                assert!(message.contains("8"), "{message}");
+                assert!(
+                    message.contains(&format!("daemon requires {PROTOCOL_VERSION}")),
+                    "the refusal must name the version this daemon speaks: {message}"
+                );
             }
             other => panic!("expected protocol mismatch, got {other:?}"),
         }

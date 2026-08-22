@@ -104,11 +104,21 @@ wheel / hjkl ──▶ set_scrollback(offset)  ──▶ PseudoTerminal renders 
 The client's replica keeps receiving deltas while the user is scrolled back. If new output moved
 the view, reading old output would be impossible on a busy pane.
 
-**Rule: a non-zero scrollback offset pins the view.** Deltas are still applied to the replica —
-they must be, or the screen would desync — but the offset is preserved across `feed()`. Returning
-to offset 0 (by scrolling to the bottom, or exiting copy mode) resumes following live output.
-Whether `vt100` preserves the offset across `process()` **must be verified by probe before
-implementation**; if it resets, the client re-applies the offset after each feed.
+**Resolved by probe: `vt100` pins the view itself.** Feeding one new line while the offset was
+10 left the top visible row unchanged at `line 7` — and moved the offset to **11**. The emulator
+auto-adjusts the offset so the viewport stays still as new output pushes content upward.
+
+Two consequences, both load-bearing:
+
+- The client does **not** need to re-apply the offset after each `feed()`. Set it once.
+- **The offset number is not stable; the viewport is.** Any code that treats a specific offset as
+  an invariant (`assert_eq!(screen.scrollback(), 10)` after feeding) will be wrong. The only
+  meaningful state is `scrollback() == 0` (following live output) versus `!= 0` (pinned). Tests
+  must assert on the visible rows, never on the offset value.
+
+Clamping was also confirmed: `set_scrollback(99999)` clamped to the 17 rows actually retained, and
+`set_scrollback(0)` returns to following live output. `contents_between` reads correctly across a
+scrolled view, returning `"line 8\nline 9\nline 10"` for a three-row selection.
 
 ### Clipboard
 

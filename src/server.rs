@@ -798,7 +798,7 @@ mod tests {
     }
 
     fn connect(path: &Path) -> UnixStream {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::testing::deadline(2);
         loop {
             match UnixStream::connect(path) {
                 Ok(stream) => return stream,
@@ -829,10 +829,12 @@ mod tests {
 
     /// How long a subscribed exchange is allowed to stream before the loop returns. Production
     /// passes `None` here; a test cannot, because `exchange` waits for the server side to close.
-    const TEST_STREAM_WINDOW: Duration = Duration::from_millis(400);
+    fn test_stream_window() -> Duration {
+        crate::testing::budget_millis(400)
+    }
 
     fn exchange(lines: &[&str], runtime: &RuntimeRegistry) -> Vec<Response> {
-        exchange_within(lines, runtime, TEST_STREAM_WINDOW)
+        exchange_within(lines, runtime, test_stream_window())
     }
 
     fn exchange_within(
@@ -1330,7 +1332,7 @@ mod tests {
             ],
             &runtime,
         );
-        let ticks = TEST_STREAM_WINDOW.as_millis() / STREAM_POLL_INTERVAL.as_millis();
+        let ticks = test_stream_window().as_millis() / STREAM_POLL_INTERVAL.as_millis();
         let frames = collect_events(&responses).len() as u128;
         assert!(
             frames * 2 < ticks,
@@ -1363,7 +1365,7 @@ mod tests {
     fn an_exited_shell_is_announced_even_though_its_screen_stops_changing() {
         let runtime = registry();
         create_workspace(&runtime);
-        let deadline = Instant::now() + CONVERGENCE_BACKSTOP;
+        let deadline = Instant::now() + convergence_backstop();
         let (mut client, mut server) = UnixStream::pair().expect("socket pair");
         let shared = runtime.shared();
         // Detached: a quiet stream never writes, so the handler cannot notice this client
@@ -1457,7 +1459,10 @@ mod tests {
     /// daemon's live screen, so this bound is reached only when convergence never happens —
     /// which is a genuine failure, not a slow machine. It is generous for that reason: a
     /// subscriber that has converged returns immediately regardless of how large this is.
-    const CONVERGENCE_BACKSTOP: Duration = Duration::from_millis(15_000);
+    fn convergence_backstop() -> Duration {
+        crate::testing::budget(15)
+    }
+
     /// How long a subscriber waits for a frame before re-checking whether it has converged.
     /// Only a polling interval: nothing is concluded from silence.
     const DRAIN_POLL: Duration = Duration::from_millis(100);
@@ -1660,7 +1665,7 @@ mod tests {
             .find(|run| run.pane_id == "p1")
             .expect("bound run")
             .run_id;
-        let deadline = Instant::now() + CONVERGENCE_BACKSTOP;
+        let deadline = Instant::now() + convergence_backstop();
         let ready = std::sync::atomic::AtomicBool::new(false);
         let (mut client, mut server) = UnixStream::pair().expect("socket pair");
         let shared = runtime.shared();
@@ -1725,7 +1730,7 @@ mod tests {
                 .contains("DONEMARK")
             {
                 assert!(
-                    Instant::now() + Duration::from_secs(1) < deadline,
+                    Instant::now() + crate::testing::budget(1) < deadline,
                     "the shell never produced the requested output"
                 );
                 thread::sleep(Duration::from_millis(50));
@@ -1853,7 +1858,7 @@ mod tests {
             .find(|run| run.pane_id == "p1")
             .expect("bound run")
             .run_id;
-        let deadline = Instant::now() + CONVERGENCE_BACKSTOP;
+        let deadline = Instant::now() + convergence_backstop();
         let ready = std::sync::atomic::AtomicBool::new(false);
 
         let mut clients = Vec::new();
@@ -1900,7 +1905,7 @@ mod tests {
 
             let headroom = |what: &str| {
                 assert!(
-                    Instant::now() + Duration::from_secs(1) < deadline,
+                    Instant::now() + crate::testing::budget(1) < deadline,
                     "{what} did not happen inside the stream window"
                 );
             };

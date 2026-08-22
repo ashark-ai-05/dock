@@ -8,15 +8,55 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Dock's tests drive real PTYs, real subprocesses, and real signals, so many of them wait on a
+  # wall clock. Those deadlines are liveness backstops — they exist so a regression fails with a
+  # message instead of hanging forever, not to assert how fast the runtime is. A shared CI runner
+  # is slower and far more contended than a developer machine, so the budget that is comfortable
+  # locally becomes a coin flip here. Scaling every budget buys headroom without weakening a
+  # single assertion.
+  DOCK_TEST_TIMEOUT_SCALE: "4"
+
+# A superseded push has nothing left to prove; let the newer one have the runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-
-    runs-on: ubuntu-latest
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Dock is developed on macOS and deployed on both. A red Linux job must never hide a red
+      # macOS one, so neither cancels the other.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
+
+    - name: Cache cargo registry and build output
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-
+
+    - name: Formatting
+      run: cargo fmt --all --check
+
+    - name: Clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
     - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      run: cargo build --all-targets
+
+    - name: Test
+      run: cargo test --all-targets

@@ -468,7 +468,11 @@ impl OwnedRuntime {
             .owned_process_group
             .as_ref()
             .ok_or("run has no Dock-owned process group")?;
-        checked_signal_result(killpg(group.0, signal), || probe_owned_group(group))
+        checked_signal_result(
+            killpg(group.0, signal),
+            || probe_owned_group(group),
+            || owned_group_has_live_member(group.0.as_raw()),
+        )
     }
 }
 
@@ -508,20 +512,35 @@ fn signal_owned_group(group: &OwnedProcessGroup, signal: Signal) {
 }
 
 fn signal_owned_group_checked(group: &OwnedProcessGroup, signal: Signal) -> Result<(), String> {
-    checked_signal_result(killpg(group.0, signal), || probe_owned_group(group))
+    checked_signal_result(
+        killpg(group.0, signal),
+        || probe_owned_group(group),
+        || owned_group_has_live_member(group.0.as_raw()),
+    )
 }
 
 fn checked_signal_result(
     result: Result<(), nix::errno::Errno>,
     inspect_group: impl FnOnce() -> Result<(), nix::errno::Errno>,
+    group_has_live_member: impl FnOnce() -> Result<bool, String>,
 ) -> Result<(), String> {
     match result {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
         Err(nix::errno::Errno::EPERM) => match inspect_group() {
             Err(nix::errno::Errno::ESRCH) => Ok(()),
-            Ok(()) | Err(nix::errno::Errno::EPERM) => Err(
-                "could not signal Dock-owned process group: EPERM; exact group still exists".into(),
-            ),
+            // EPERM proves only that the signal reached nobody, never that anybody is alive. A
+            // group of unreaped zombies answers exactly like a group holding an unsignalable live
+            // process, so the process table decides. A failed inspection keeps the group.
+            Ok(()) | Err(nix::errno::Errno::EPERM) => match group_has_live_member() {
+                Ok(false) => Ok(()),
+                Ok(true) => Err(
+                    "could not signal Dock-owned process group: EPERM; exact group still exists"
+                        .into(),
+                ),
+                Err(error) => Err(format!(
+                    "could not signal Dock-owned process group: EPERM; could not inspect the process table: {error}"
+                )),
+            },
             Err(error) => Err(format!(
                 "could not signal Dock-owned process group: EPERM; could not inspect exact group: {error}"
             )),
@@ -536,9 +555,41 @@ fn probe_owned_group(group: &OwnedProcessGroup) -> Result<(), nix::errno::Errno>
     kill(Pid::from_raw(-group.0.as_raw()), None)
 }
 
+/// Whether the exact owned group still holds a member that is not an unreaped zombie.
+///
+/// `killpg` and a bare existence probe both answer EPERM when they could not reach a single member
+/// of the group, and for a group Dock created that covers two opposite situations. Every member may
+/// already be dead and merely unreaped — macOS keeps a zombie in its process group until it is
+/// waited on, and answers EPERM for a group made only of them, so a group Dock has successfully
+/// retired is indistinguishable by signal from a live one. Or a member may genuinely still be
+/// running under a uid Dock cannot signal, which a `sudo` invocation inside a pane produces; calling
+/// that group retired would strand a live Dock-owned descendant.
+///
+/// The process table is the only witness that separates them. `Z` is the zombie state on both macOS
+/// and Linux. This runs only on the EPERM path, which a healthy stop never reaches.
+fn owned_group_has_live_member(process_group_id: i32) -> Result<bool, String> {
+    let output = Command::new("ps")
+        .args(["-axo", "pgid=,stat="])
+        .output()
+        .map_err(|error| format!("could not read the process table: {error}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pgid = fields.next()?.parse::<i32>().ok()?;
+            Some((pgid, fields.next()?))
+        })
+        .any(|(pgid, state)| pgid == process_group_id && !state.starts_with('Z')))
+}
+
 fn owned_group_exists(group: &OwnedProcessGroup) -> bool {
     match probe_owned_group(group) {
-        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
+        Ok(()) => true,
+        // Ambiguous on its own: see `owned_group_has_live_member`. An inspection that cannot answer
+        // leaves the group standing, because nothing has proved it gone.
+        Err(nix::errno::Errno::EPERM) => {
+            owned_group_has_live_member(group.0.as_raw()).unwrap_or(true)
+        }
         Err(nix::errno::Errno::ESRCH) => false,
         // Unknown inspection failures cannot safely prove that the exact group is gone.
         Err(_) => true,
@@ -756,7 +807,7 @@ mod tests {
     }
 
     fn wait_for_group_exit(process_group_id: i32) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = crate::testing::deadline(3);
         while process_group_exists(process_group_id) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -764,6 +815,26 @@ mod tests {
             !process_group_exists(process_group_id),
             "Dock-owned process group {process_group_id} survived lifecycle completion"
         );
+    }
+
+    /// Reaps a directly-held Dock-owned child, then asserts its process group is gone.
+    ///
+    /// The reap must come first. An unreaped zombie stays a member of its process group on Linux,
+    /// so `kill(-pgid, 0)` still succeeds for a group whose only remaining member is a zombie;
+    /// macOS drops an exiting process from the group before it is reaped and reports the group as
+    /// already gone. Checking the group while still holding an unreaped `Child` therefore passes on
+    /// macOS and fails on Linux against identical, correct runtime behaviour. Tests that drive a
+    /// `Runtime` never need this: the runtime's supervisor thread reaps the worker for them.
+    fn reap_then_wait_for_group_exit(child: &mut Child, process_group_id: i32) {
+        let deadline = crate::testing::deadline(3);
+        while child.try_wait().expect("poll a Dock-owned child").is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "Dock-owned worker {process_group_id} survived lifecycle completion"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        wait_for_group_exit(process_group_id);
     }
 
     /// Every live process sharing `process_group_id`, as `(pid, argv)`. The process table is the
@@ -825,7 +896,7 @@ mod tests {
         runtime: &OwnedRuntime,
         predicate: impl Fn(&RuntimeSnapshot) -> bool,
     ) -> RuntimeSnapshot {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = crate::testing::deadline(3);
         loop {
             let snapshot = runtime.snapshot();
             if predicate(&snapshot) || Instant::now() >= deadline {
@@ -842,7 +913,7 @@ mod tests {
     /// The fixtures below echo a descendant PID as their only output, so the emulated screen
     /// holds exactly one numeric line once the child has written it.
     fn wait_for_screen_pid(runtime: &OwnedRuntime) -> u32 {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = crate::testing::deadline(3);
         loop {
             if let Ok(pid) = screen_text(runtime).trim().parse::<u32>() {
                 return pid;
@@ -945,7 +1016,7 @@ mod tests {
             200,
             FIXTURE_SIZE,
         );
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = crate::testing::deadline(3);
         while !runtime.lifecycle_is_terminal() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -1026,7 +1097,7 @@ mod tests {
         let started = Instant::now();
         runtime.stop().expect("bounded stop owned runtime");
 
-        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(started.elapsed() < crate::testing::budget(4));
         assert!(!process_group_exists(process_group_id));
         assert!(matches!(
             runtime.snapshot().state,
@@ -1054,7 +1125,7 @@ mod tests {
         runtime.interrupt().expect("interrupt owned runtime");
         // Give the fixture the same window it always had to react to SIGINT; what this test
         // proves is that an interrupt-capable process is still running afterwards.
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = crate::testing::deadline(3);
         while !screen_text(&runtime).contains("interrupted") && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -1302,7 +1373,7 @@ mod tests {
             },
         );
         reaped_rx
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(crate::testing::budget(3))
             .expect("leader must be reaped before the test probe");
         let group = runtime
             .owned_process_group
@@ -1395,7 +1466,7 @@ mod tests {
         assert!(process_exists(descendant));
         drop(runtime);
         wait_for_group_exit(process_group_id);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::testing::deadline(2);
         while process_exists(descendant) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -1419,7 +1490,7 @@ mod tests {
             FIXTURE_SIZE,
         );
         let pid = runtime.pid.expect("launched child") as i32;
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = crate::testing::deadline(3);
         loop {
             if matches!(
                 *runtime
@@ -1499,34 +1570,101 @@ mod tests {
 
     #[test]
     fn checked_owned_group_signal_only_treats_a_definitively_absent_group_as_terminal() {
+        let live = || Ok(true);
+        let all_zombies = || Ok(false);
+        let unreadable = || Err("process table unavailable".to_string());
+
+        // A group still holding a member Dock cannot signal keeps its authority. `sudo` inside a
+        // pane produces exactly this, and calling it retired would strand a live descendant.
         let permission_denied =
-            checked_signal_result(Err(nix::errno::Errno::EPERM), || Ok(())).unwrap_err();
+            checked_signal_result(Err(nix::errno::Errno::EPERM), || Ok(()), live).unwrap_err();
         assert!(permission_denied.contains("EPERM"));
         assert!(permission_denied.contains("still exists"));
         assert_eq!(
-            checked_signal_result(Err(nix::errno::Errno::EPERM), || {
-                Err(nix::errno::Errno::EPERM)
-            })
+            checked_signal_result(
+                Err(nix::errno::Errno::EPERM),
+                || Err(nix::errno::Errno::EPERM),
+                live
+            )
             .unwrap_err(),
             "could not signal Dock-owned process group: EPERM; exact group still exists"
         );
+
+        // A group whose every member is an unreaped zombie has been retired, however loudly the
+        // signal layer says EPERM. macOS answers EPERM for precisely that group.
         assert_eq!(
-            checked_signal_result(Err(nix::errno::Errno::EPERM), || {
-                Err(nix::errno::Errno::ESRCH)
-            }),
+            checked_signal_result(Err(nix::errno::Errno::EPERM), || Ok(()), all_zombies),
             Ok(())
         );
         assert_eq!(
-            checked_signal_result(Err(nix::errno::Errno::ESRCH), || {
-                panic!("ESRCH must not require a second probe")
-            }),
+            checked_signal_result(
+                Err(nix::errno::Errno::EPERM),
+                || Err(nix::errno::Errno::EPERM),
+                all_zombies
+            ),
+            Ok(())
+        );
+
+        // An unreadable process table proves nothing, so the group stands.
+        assert!(
+            checked_signal_result(Err(nix::errno::Errno::EPERM), || Ok(()), unreadable)
+                .unwrap_err()
+                .contains("could not inspect the process table")
+        );
+
+        // A definitively absent group is settled before the process table is ever consulted.
+        assert_eq!(
+            checked_signal_result(
+                Err(nix::errno::Errno::EPERM),
+                || Err(nix::errno::Errno::ESRCH),
+                || panic!("an absent group must not be looked up")
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            checked_signal_result(
+                Err(nix::errno::Errno::ESRCH),
+                || panic!("ESRCH must not require a second probe"),
+                || panic!("ESRCH must not require the process table")
+            ),
             Ok(())
         );
         assert!(
-            checked_signal_result(Err(nix::errno::Errno::EINVAL), || Ok(()))
+            checked_signal_result(Err(nix::errno::Errno::EINVAL), || Ok(()), live)
                 .unwrap_err()
                 .contains("EINVAL")
         );
+    }
+
+    #[test]
+    fn a_group_of_unreaped_zombies_holds_no_live_member() {
+        let mut fixture = unsafe {
+            Command::new("sleep")
+                .arg("30")
+                .pre_exec(|| setsid().map(|_| ()).map_err(std::io::Error::from))
+                .spawn()
+        }
+        .expect("spawn a fixture leading its own session and group");
+        let group = fixture.id() as i32;
+        assert!(
+            owned_group_has_live_member(group).expect("read the process table"),
+            "a running fixture must count as a live member"
+        );
+
+        unsafe { nix::libc::kill(-group, nix::libc::SIGKILL) };
+        // Deliberately left unreaped: this is the state macOS keeps inside the process group and
+        // reports as EPERM, which is the whole reason the process table has to be consulted.
+        let deadline = crate::testing::deadline(3);
+        while owned_group_has_live_member(group).expect("read the process table")
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !owned_group_has_live_member(group).expect("read the process table"),
+            "an unreaped zombie must not count as a live member"
+        );
+        fixture.wait().expect("reap the fixture");
     }
 
     #[test]
@@ -1551,8 +1689,7 @@ mod tests {
             )
             .unwrap();
         drop(control);
-        wait_for_group_exit(pid as i32);
-        let _ = guardian.wait();
+        reap_then_wait_for_group_exit(&mut guardian, pid as i32);
 
         let mut unrelated = unrelated.into_inner().unwrap().unwrap();
         assert!(unrelated.try_wait().unwrap().is_none());

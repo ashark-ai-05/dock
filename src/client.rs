@@ -332,7 +332,7 @@ mod tests {
 
         let events = Client::subscribe(&socket.0).expect("subscribe");
         let first = events
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::testing::budget(5))
             .expect("attach frame");
         assert!(matches!(
             first,
@@ -344,7 +344,7 @@ mod tests {
             }
         ));
         let second = events
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::testing::budget(5))
             .expect("delta frame");
         assert!(matches!(second, Event::PaneDelta { revision: 5, .. }));
         drop(events);
@@ -416,7 +416,7 @@ mod tests {
         stream: &mut EventStream,
         stop: impl Fn(&[StreamPoll]) -> bool,
     ) -> Vec<StreamPoll> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = crate::testing::deadline(10);
         let mut seen = Vec::new();
         while Instant::now() < deadline && !stop(&seen) {
             match stream.poll() {

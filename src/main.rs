@@ -18,7 +18,10 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -403,7 +406,15 @@ impl TerminalGuard {
             restored: false,
         };
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            // Without this the host terminal delivers a paste as a burst of key events, so every
+            // newline in it runs as a command the moment it arrives. Enabled here and disabled
+            // on every restore path below, alongside mouse capture.
+            EnableBracketedPaste
+        )?;
         Ok(guard)
     }
 
@@ -412,7 +423,12 @@ impl TerminalGuard {
     }
 
     fn restore(&mut self) -> io::Result<()> {
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
         self.original.restore(self.discard_pending_input)?;
         self.restored = true;
@@ -425,7 +441,12 @@ impl Drop for TerminalGuard {
         if self.restored {
             return;
         }
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         // Crossterm's raw-mode snapshot uses its own termios representation. On macOS that
         // representation can change otherwise-unmodelled local flags while restoring. Let it
         // clear its global raw-mode bookkeeping first, then make our complete entry snapshot the
@@ -511,6 +532,7 @@ fn run_dashboard(
         };
         let command = match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => dashboard.key(key),
+            Event::Paste(text) => dashboard.paste(text),
             Event::Mouse(mouse) => dashboard.mouse(mouse),
             Event::Resize(_, _) => UiCommand::None,
             _ => UiCommand::None,
@@ -724,11 +746,15 @@ fn request_layout(client: &mut Client) -> Result<dock::layout::LayoutSnapshot, S
 
 fn refresh(client: &mut Client, dashboard: &mut Dashboard) -> Result<(), String> {
     dashboard.layout = request_layout(client)?;
-    dashboard.runs = match client.request(&Request::Inspect(InspectRequest { run_id: None }))? {
-        Response::Snapshots { snapshots } => snapshots,
-        Response::Error { message, .. } => return Err(message),
-        response => return Err(format!("unexpected runtime response: {response:?}")),
-    };
+    // Through `set_runs` rather than the field, so the agent roster sheds entries for runs that
+    // no longer exist instead of accumulating them for the session's lifetime.
+    dashboard.set_runs(
+        match client.request(&Request::Inspect(InspectRequest { run_id: None }))? {
+            Response::Snapshots { snapshots } => snapshots,
+            Response::Error { message, .. } => return Err(message),
+            response => return Err(format!("unexpected runtime response: {response:?}")),
+        },
+    );
     if dashboard.workspace_index >= dashboard.layout.workspaces.len() {
         dashboard.workspace_index = dashboard.layout.workspaces.len().saturating_sub(1);
     }

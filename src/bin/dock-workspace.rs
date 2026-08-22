@@ -49,7 +49,7 @@ fn main() -> Result<(), String> {
 }
 
 fn parse(a: &[String]) -> Result<WorkspaceRequest, String> {
-    let usage = "usage: dock-workspace [--socket=PATH] inspect | create ID NAME PANE | split WORKSPACE PANE NEW_PANE horizontal|vertical | focus WORKSPACE PANE | resize WORKSPACE PANE RATIO_MILLI | rename-workspace WORKSPACE NAME | rename-pane WORKSPACE PANE NAME | close WORKSPACE PANE";
+    let usage = "usage: dock-workspace [--socket=PATH] inspect | create ID NAME PANE | split WORKSPACE PANE NEW_PANE horizontal|vertical | focus WORKSPACE PANE | resize WORKSPACE PANE RATIO_MILLI | rename-workspace WORKSPACE NAME | rename-pane WORKSPACE PANE NAME | close WORKSPACE PANE | respawn WORKSPACE PANE";
     match a.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["inspect"] => Ok(WorkspaceRequest::Inspect),
         ["create", w, n, p] => Ok(WorkspaceRequest::Create {
@@ -87,6 +87,10 @@ fn parse(a: &[String]) -> Result<WorkspaceRequest, String> {
             name: (*n).into(),
         }),
         ["close", w, p] => Ok(WorkspaceRequest::Close {
+            workspace_id: (*w).into(),
+            pane_id: (*p).into(),
+        }),
+        ["respawn", w, p] => Ok(WorkspaceRequest::Respawn {
             workspace_id: (*w).into(),
             pane_id: (*p).into(),
         }),

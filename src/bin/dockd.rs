@@ -57,6 +57,9 @@ fn main() -> Result<(), String> {
             human_review_reserved,
         },
     )?);
+    // A pane restored from durable layout comes back with no run at all. `dock` auto-starts
+    // `dockd`, so without this every pane is inert after a reboot.
+    runtime.revive_restored_panes();
     eprintln!("dockd listening on {}", socket.display());
     server.serve(runtime)
 }

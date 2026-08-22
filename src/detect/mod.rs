@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_agent_running_inside_one_process_group_only() {
+    fn finds_the_agent_running_beneath_one_process_group_leader_only() {
         // pid ppid pgid comm
         let table = "\
   501   1  501 zsh

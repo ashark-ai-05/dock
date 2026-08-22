@@ -21,7 +21,7 @@ use crate::{
         BindingKind, DashboardProfile, DispatchRequest, Event, LaunchIntoPaneRequest,
         PROTOCOL_VERSION, Request, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
     },
-    terminal::{KeyEncoding, PaneScreen},
+    terminal::{KeyEncoding, PaneScreen, encode_paste},
     theme::Theme,
 };
 
@@ -194,6 +194,22 @@ impl Dashboard {
     pub fn detach_screens(&mut self) {
         self.screens.clear();
         self.revisions.clear();
+        // The agent roster is replicated state exactly like the screens are, and it is pushed
+        // only when a run's identity or state *changes*. Left behind, every entry from before
+        // the drop would keep painting a sidebar row for a run that may no longer exist.
+        self.agents.clear();
+    }
+
+    /// Replaces the run list and drops any agent roster entry whose run is gone.
+    ///
+    /// `agents` is fed by pushed `AgentStateChanged` events, which are sent on change and never
+    /// on disappearance: nothing else would ever remove an entry, so a session accumulated a
+    /// dead row for every pane shell it ever retired. The authoritative run list is the only
+    /// thing that knows a run has stopped existing, so pruning happens exactly where it lands.
+    pub fn set_runs(&mut self, runs: Vec<RuntimeSnapshot>) {
+        self.agents
+            .retain(|run_id, _| runs.iter().any(|run| &run.run_id == run_id));
+        self.runs = runs;
     }
 
     /// True once when a pushed event invalidated the run list or layout. The render loop uses
@@ -501,17 +517,30 @@ impl Dashboard {
                     .and_then(|id| self.agents.get(id).copied())
                     .unwrap_or((None, AgentState::Idle));
                 let label = agent.map_or_else(|| pane.name.clone(), |kind| kind.label().to_owned());
-                let title = format!(
-                    " {} {} · {} ",
-                    state.glyph(),
-                    label,
-                    self.pane_location(pane)
-                );
+                // A pane whose process is gone keeps painting its last frame forever. Without
+                // this the only difference between a live shell and a dead one is that typing
+                // stops working, so the title has to carry the news and the recovery key.
+                let exited = pane.runtime == PaneRuntime::Exited;
+                let title = if exited {
+                    format!(" ✗ {label} · exited · Ctrl+B R restarts ")
+                } else {
+                    format!(
+                        " {} {} · {} ",
+                        state.glyph(),
+                        label,
+                        self.pane_location(pane)
+                    )
+                };
+                let title_colour = if exited {
+                    self.theme.blocked
+                } else {
+                    self.theme.agent(state)
+                };
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(Theme::border_type())
                     .title(title)
-                    .title_style(Style::default().fg(self.theme.agent(state)))
+                    .title_style(Style::default().fg(title_colour))
                     .border_style(Style::default().fg(if focused {
                         self.theme.border_focused
                     } else {
@@ -540,7 +569,7 @@ impl Dashboard {
                         )];
                         if run_id.is_none() {
                             placeholder.push(Line::styled(
-                                "Ctrl+B l launches an agent here",
+                                "Ctrl+B R starts a shell · Ctrl+B l launches an agent here",
                                 Style::default().fg(self.theme.muted),
                             ));
                         }
@@ -673,7 +702,7 @@ impl Dashboard {
             Line::from("Ctrl+B is the only key Dock keeps; Ctrl+B Ctrl+B sends a literal one."),
             Line::styled("AFTER Ctrl+B", heading),
             Line::from("n new workspace   h/v split   z zoom"),
-            Line::from("r rename   x close   l launch   q quit   [/] workspace"),
+            Line::from("r rename   R restart shell   x close   l launch   q quit   [/] workspace"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
             Line::styled("FORMS", heading),
@@ -747,10 +776,7 @@ impl Dashboard {
             // through the request arm would put two daemon round trips in front of the echo.
             // Dropped outright when the pane has no run: there is no PTY to receive it, and
             // sending anyway earns one daemon error per character straight into the footer.
-            KeyOutcome::Passthrough(bytes) if self.focused_run_id().is_some() => {
-                UiCommand::PaneInput(bytes)
-            }
-            KeyOutcome::Passthrough(_) => UiCommand::None,
+            KeyOutcome::Passthrough(bytes) => self.send_to_pane(bytes),
             KeyOutcome::Command(command) => self.run_command(command),
             KeyOutcome::PendingPrefix | KeyOutcome::Ignored => UiCommand::None,
         }
@@ -779,6 +805,7 @@ impl Dashboard {
             PaneCommand::Zoom => self.zoom(),
             PaneCommand::Rename => self.rename(),
             PaneCommand::Close => self.close(),
+            PaneCommand::Respawn => self.respawn(),
             PaneCommand::Launch => {
                 self.open_launch();
                 UiCommand::LoadCatalog
@@ -846,12 +873,66 @@ impl Dashboard {
     }
 
     fn focused_run_id(&self) -> Option<&str> {
+        self.focused_pane()?.run_id.as_deref()
+    }
+
+    fn focused_pane(&self) -> Option<&PaneLayout> {
         let workspace = self.workspace()?;
-        workspace
-            .panes
-            .get(&workspace.focused_pane_id)?
-            .run_id
-            .as_deref()
+        workspace.panes.get(&workspace.focused_pane_id)
+    }
+
+    /// Routes bytes to the focused pane, or explains why they went nowhere.
+    ///
+    /// Input aimed at a pane with no live process used to be discarded in silence, which is
+    /// indistinguishable from a frozen dashboard: the pane keeps painting the dead shell's last
+    /// frame and typing simply stops having any effect. Every rejection now names the key that
+    /// gets the pane working again.
+    fn send_to_pane(&mut self, bytes: Vec<u8>) -> UiCommand {
+        match self.focused_pane() {
+            Some(pane) if pane.runtime == PaneRuntime::Exited => {
+                self.error = Some("pane exited · Ctrl+B R restarts a shell here".into());
+                UiCommand::None
+            }
+            // A pane that never had a run is not a pane that stopped working, and the daemon
+            // would answer every character with an error that flickers through the footer. The
+            // pane body already carries the two keys that give it a process.
+            Some(pane) if pane.run_id.is_none() => UiCommand::None,
+            Some(_) => UiCommand::PaneInput(bytes),
+            None => UiCommand::None,
+        }
+    }
+
+    /// A pasted payload, wrapped for the focused pane's own bracketed-paste mode.
+    ///
+    /// Without this the host terminal delivers a paste as individual key events and each line
+    /// executes as it lands, which is precisely the paste-injection hazard `encode_paste` was
+    /// written to close — reached by a route that never called it.
+    pub fn paste(&mut self, text: String) -> UiCommand {
+        if text.is_empty() {
+            return UiCommand::None;
+        }
+        // Whether to bracket is the receiving application's decision, not this client's: an
+        // application that never enabled the mode would read the wrapper as literal input.
+        let bracketed = self
+            .focused_run_id()
+            .and_then(|run_id| self.screens.get(run_id))
+            .is_some_and(PaneScreen::bracketed_paste);
+        self.send_to_pane(encode_paste(&text, bracketed))
+    }
+
+    /// Asks the daemon for a fresh Dock-owned shell in the focused pane.
+    fn respawn(&mut self) -> UiCommand {
+        let Some(workspace) = self.workspace() else {
+            self.error = Some("restart unavailable: create a workspace first".into());
+            return UiCommand::None;
+        };
+        let workspace_id = workspace.workspace_id.clone();
+        let pane_id = workspace.focused_pane_id.clone();
+        self.error = None;
+        UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Respawn {
+            workspace_id,
+            pane_id,
+        })))
     }
 
     fn open_launch(&mut self) {
@@ -1708,6 +1789,97 @@ mod tests {
             cwd: None,
             diagnostic: None,
         }
+    }
+
+    #[test]
+    fn a_paste_reaches_the_pane_as_one_bracketed_payload_with_a_single_trailing_terminator() {
+        let mut dashboard = bound_dashboard();
+        // The pane's program turns bracketed paste on; the client reads the mode off its own
+        // replica of that pane rather than assuming it.
+        dashboard.apply_event(attach_event("run_1", b"\x1b[?2004h"));
+        let payload = "first\nsecond\x1b[201~rm -rf /\nthird";
+        let UiCommand::PaneInput(bytes) = dashboard.paste(payload.into()) else {
+            panic!("a paste into a live pane must become pane input");
+        };
+        assert!(bytes.starts_with(b"\x1b[200~"), "{bytes:?}");
+        assert!(bytes.ends_with(b"\x1b[201~"), "{bytes:?}");
+        let terminators = bytes
+            .windows(6)
+            .filter(|window| *window == b"\x1b[201~")
+            .count();
+        assert_eq!(terminators, 1, "smuggled terminator survived: {bytes:?}");
+        // One input carrying every line, so nothing executes as it lands.
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("first") && text.contains("third"), "{text:?}");
+    }
+
+    #[test]
+    fn a_paste_into_a_pane_that_never_enabled_the_mode_is_not_wrapped() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"plain"));
+        assert_eq!(
+            dashboard.paste("hi".into()),
+            UiCommand::PaneInput(b"hi".to_vec())
+        );
+    }
+
+    #[test]
+    fn an_exited_pane_is_visibly_exited_and_recoverable_from_the_keyboard() {
+        let mut dashboard = bound_dashboard();
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("a")
+            .unwrap()
+            .runtime = PaneRuntime::Exited;
+        let text = render_to_string(&mut dashboard, 110, 28);
+        assert!(text.contains("exited"), "{text:?}");
+        assert!(text.contains("Ctrl+B R restarts"), "{text:?}");
+        // Typing must not vanish into a pane with no process behind it.
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(
+            dashboard
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Ctrl+B R")),
+            "{:?}",
+            dashboard.error
+        );
+        assert_eq!(dashboard.paste("still dropped".into()), UiCommand::None);
+        assert!(matches!(
+            command(&mut dashboard, KeyCode::Char('R')),
+            UiCommand::Request(request)
+                if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Respawn { workspace_id, pane_id })
+                    if workspace_id == "w" && pane_id == "a")
+        ));
+    }
+
+    #[test]
+    fn the_agent_roster_drops_entries_whose_run_is_gone() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_1".into(),
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Blocked,
+        });
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "dock_sh_w_a".into(),
+            agent: None,
+            state: AgentState::Idle,
+        });
+        assert_eq!(dashboard.agents.len(), 2);
+        let mut live = snapshot();
+        live.run_id = "run_1".into();
+        dashboard.set_runs(vec![live]);
+        // The retired shell is gone from the roster; nothing else removed it before.
+        assert_eq!(dashboard.agents.len(), 1);
+        assert!(dashboard.agents.contains_key("run_1"));
+        // A re-established event stream re-attaches every live run from scratch, so the roster
+        // must be dropped with the screens rather than painting rows for runs that never return.
+        dashboard.detach_screens();
+        assert!(dashboard.agents.is_empty());
     }
 
     #[test]

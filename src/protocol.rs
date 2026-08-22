@@ -253,6 +253,12 @@ pub enum WorkspaceRequest {
         workspace_id: String,
         pane_id: String,
     },
+    /// Gives a pane whose shell has exited a fresh Dock-owned shell. The keyboard recovery path
+    /// out of an exited pane, so a pane that dies is never a pane the user cannot use again.
+    Respawn {
+        workspace_id: String,
+        pane_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

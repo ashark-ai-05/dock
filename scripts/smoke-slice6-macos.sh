@@ -68,7 +68,13 @@ rm -f "$socket"
 start
 output=$("$workspace" --socket="$socket" inspect)
 echo "$output" | grep -q '"workspace_id": "daily"'
-echo "$output" | grep -q '"runtime": "restored"'
+# The pane name set before the restart proves this is a restore, not a fresh create.
+echo "$output" | grep -q '"name": "editor"'
+# A restored pane is handed a brand-new Dock-owned shell at daemon start-up, so it comes back
+# usable rather than inert. Nothing is reattached: the durable file carries no run identity at
+# all, which the next line asserts directly.
+echo "$output" | grep -q '"run_id": "dock_sh_daily_pane_one"'
+echo "$output" | grep -q '"runtime": "running"'
 ! grep -Eq 'run_id|runtime|scrollback|transcript|process_group|command|/Users/' "$state/layout.json"
 head_after=$(git -C "$repo" rev-parse HEAD)
 status_after=$(git -C "$repo" status --porcelain --untracked-files=all)

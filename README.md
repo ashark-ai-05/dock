@@ -27,7 +27,13 @@ screen or redraws in place work correctly.
 
 `Ctrl+B` is Dock's command prefix, chosen to match tmux. Unprefixed keystrokes go straight to the
 focused pane; `Esc` is always forwarded to the pane and never intercepted; `Ctrl+B` pressed twice
-sends a literal `Ctrl+B` (`0x02`) to the pane instead of opening a command.
+sends a literal `Ctrl+B` (`0x02`) to the pane instead of opening a command. Pasting is bracketed:
+the whole payload reaches the pane as one write when the pane's program asked for bracketed paste,
+so a multi-line paste does not run line by line as it arrives.
+
+A pane is never inert. Panes created by `Ctrl+B n`/`h`/`v` and panes restored after a daemon
+restart all get a fresh Dock-owned shell; a pane whose shell exits says so in its title and comes
+back with `Ctrl+B R`.
 
 | Key (after `Ctrl+B`) | Action |
 |---|---|
@@ -38,6 +44,7 @@ sends a literal `Ctrl+B` (`0x02`) to the pane instead of opening a command.
 | `+` / `-` | resize the focused split |
 | `z` | zoom (toggle full-area view of the focused pane) |
 | `r` | rename |
+| `R` | restart the focused pane's shell (recovers a pane whose shell exited) |
 | `x` | close |
 | `l` | launch |
 | `d` | leave — runs keep running |

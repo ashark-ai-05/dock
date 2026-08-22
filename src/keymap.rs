@@ -29,6 +29,8 @@ pub enum PaneCommand {
     Zoom,
     Rename,
     Close,
+    /// Give an exited pane a fresh shell. The keyboard recovery path out of a dead pane.
+    Respawn,
     Launch,
     Detach,
     Help,
@@ -83,7 +85,7 @@ impl Keymap {
     /// pending, which is the discoverability property Zellij is consistently praised for.
     pub fn hints() -> &'static [(&'static str, &'static str)] {
         &[
-            ("n", "workspace"),
+            ("n", "new"),
             ("h", "split ⇋"),
             ("v", "split ⇵"),
             ("Tab", "focus next"),
@@ -94,6 +96,7 @@ impl Keymap {
             ("z", "zoom"),
             ("r", "rename"),
             ("x", "close"),
+            ("R", "restart"),
             ("l", "launch"),
             ("d", "leave · runs keep running"),
             ("?", "help"),
@@ -114,6 +117,9 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Char('z') => PaneCommand::Zoom,
         KeyCode::Char('r') => PaneCommand::Rename,
         KeyCode::Char('x') => PaneCommand::Close,
+        // Uppercase so it cannot be reached by the same finger slip that hits `r` for rename:
+        // respawning is a state change, and `r` is already taken.
+        KeyCode::Char('R') => PaneCommand::Respawn,
         KeyCode::Char('l') => PaneCommand::Launch,
         KeyCode::Char('d') => PaneCommand::Detach,
         KeyCode::Char('?') => PaneCommand::Help,
@@ -237,7 +243,7 @@ mod tests {
     fn published_hints_cover_every_documented_binding() {
         let keys: Vec<&str> = Keymap::hints().iter().map(|(key, _)| *key).collect();
         for expected in [
-            "n", "h", "v", "z", "r", "x", "l", "d", "?", "q", "Tab", "S-Tab", "[/]",
+            "n", "h", "v", "z", "r", "R", "x", "l", "d", "?", "q", "Tab", "S-Tab", "[/]",
         ] {
             assert!(keys.contains(&expected), "missing hint for {expected}");
         }

@@ -77,6 +77,13 @@ impl VtTerminal {
         self.parser.screen().alternate_screen()
     }
 
+    /// Whether the program in this pane asked for bracketed paste (DECSET 2004). A paste must
+    /// only be wrapped when the receiving application enabled the mode; wrapping unconditionally
+    /// would type the delimiters into a program that reads them as literal input.
+    pub fn bracketed_paste(&self) -> bool {
+        self.parser.screen().bracketed_paste()
+    }
+
     /// Full screen state including cursor, sufficient to reconstruct this terminal exactly.
     pub fn state_bytes(&self) -> Vec<u8> {
         self.parser.screen().state_formatted()

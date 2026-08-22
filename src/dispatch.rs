@@ -457,6 +457,39 @@ impl RuntimeRegistry {
         );
     }
 
+    /// Gives every pane restored from durable layout a working shell, so a pane that survives a
+    /// daemon restart is a pane the user can type into.
+    ///
+    /// This is not adoption and cannot become adoption. The durable layout deliberately records
+    /// no PIDs, PGIDs, or screen content, so there is no old process to reattach to and none is
+    /// consulted: each restored pane gets a brand-new Dock-created PTY in a brand-new
+    /// Dock-created process group, exactly as `Create` and `Split` do. Adoption would mean
+    /// binding a pane to a process Dock did not spawn; nothing here ever names such a process.
+    ///
+    /// Called once at daemon start-up rather than from the constructor, because constructing a
+    /// registry is not by itself a statement that panes should start running.
+    pub fn revive_restored_panes(&self) {
+        let targets: Vec<(String, String)> = self
+            .layout
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot()
+            .workspaces
+            .into_iter()
+            .flat_map(|workspace| {
+                let workspace_id = workspace.workspace_id;
+                workspace
+                    .panes
+                    .into_values()
+                    .filter(|pane| pane.run_id.is_none())
+                    .map(move |pane| (workspace_id.clone(), pane.pane_id))
+            })
+            .collect();
+        for (workspace_id, pane_id) in targets {
+            self.launch_pane_shell(&workspace_id, &pane_id);
+        }
+    }
+
     /// Retires the placeholder shell a committed dispatch has just displaced from a pane. Called
     /// only after that dispatch is irrevocable, so a refused or rolled-back launch always leaves
     /// the pane's working shell running and bound.
@@ -704,6 +737,49 @@ impl RuntimeRegistry {
         &self,
         request: WorkspaceRequest,
     ) -> Result<Option<WorkspaceLayout>, (ErrorCode, String)> {
+        if let WorkspaceRequest::Respawn {
+            workspace_id,
+            pane_id,
+        } = &request
+        {
+            let existing = {
+                let layout = self.layout.lock().unwrap_or_else(|p| p.into_inner());
+                if !layout.pane_exists(workspace_id, pane_id) {
+                    return Err((
+                        ErrorCode::InvalidLayout,
+                        "respawn target pane does not exist".into(),
+                    ));
+                }
+                layout.pane_run(workspace_id, pane_id)
+            };
+            // Respawn is a recovery path, never a way to displace something that is alive: a
+            // running agent must not be killable by a stray keystroke.
+            let alive = existing.as_deref().is_some_and(|run_id| {
+                self.runs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(run_id)
+                    .and_then(RuntimeSlot::active)
+                    .is_some_and(|entry| {
+                        matches!(
+                            entry.runtime.snapshot().state,
+                            crate::protocol::ProcessState::Running
+                        )
+                    })
+            });
+            if alive {
+                return Err((
+                    ErrorCode::UnsupportedOperation,
+                    "pane already has a running process; close it before respawning".into(),
+                ));
+            }
+            self.launch_pane_shell(workspace_id, pane_id);
+            return Ok(self
+                .layout()
+                .workspaces
+                .into_iter()
+                .find(|workspace| &workspace.workspace_id == workspace_id));
+        }
         if let WorkspaceRequest::Close {
             workspace_id,
             pane_id,
@@ -860,6 +936,9 @@ impl RuntimeRegistry {
                 .map(Some),
             WorkspaceRequest::Close { .. } => {
                 unreachable!("close requests are handled by the ownership-safe path above")
+            }
+            WorkspaceRequest::Respawn { .. } => {
+                unreachable!("respawn requests are handled by the ownership-safe path above")
             }
         };
         drop(layout);
@@ -1835,10 +1914,15 @@ impl RuntimeRegistry {
         Ok(runs
             .into_iter()
             .map(|(runtime, mut snapshot)| {
+                // The pane's process-group leader pid. Dock's pane children call `setsid` before
+                // `exec`, so the group id and the leader's pid are the same number by
+                // construction, and it is a pid Dock's own spawn produced. Detection walks
+                // *down* from there by parentage, because a job-control shell puts every command
+                // the user starts into a new process group of its own.
                 let agent = snapshot
                     .process_group_id
                     .zip(table.as_deref())
-                    .and_then(|(pgid, table)| agent_in_process_table(table, pgid));
+                    .and_then(|(leader_pid, table)| agent_in_process_table(table, leader_pid));
                 snapshot.agent_state = match agent {
                     Some(kind) => {
                         runtime.with_screen(|screen| classify_screen(kind, &screen.text_tail(40)))
@@ -2867,6 +2951,110 @@ mod tests {
             .expect("split pane");
         let layout = registry.layout();
         assert!(layout.workspaces[0].panes["p2"].run_id.is_some());
+    }
+
+    /// `dock` auto-starts `dockd`, so a reboot restarts the daemon under every dashboard. A
+    /// restored pane comes back with no run at all, and without this every pane on the screen
+    /// would be a pane the user cannot type into.
+    #[test]
+    fn a_pane_restored_after_a_daemon_restart_is_given_a_fresh_shell_and_becomes_usable() {
+        let state = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "dock-restored-panes-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let original = {
+            let first = RuntimeRegistry::new(&state, 2000).unwrap();
+            first
+                .workspace(WorkspaceRequest::Create {
+                    workspace_id: "w1".into(),
+                    name: "Daily".into(),
+                    pane_id: "p1".into(),
+                })
+                .expect("create workspace");
+            let original = first.layout().workspaces[0].panes["p1"]
+                .run_id
+                .clone()
+                .expect("a new pane auto-launches a shell");
+            first
+                .lifecycle(&original, LifecycleOperation::Stop)
+                .expect("stop the first shell");
+            original
+        };
+
+        let restored = TestRegistry {
+            registry: RuntimeRegistry::new(&state, 2000).unwrap(),
+            state: state.clone(),
+        };
+        // The durable layout deliberately records no PID, PGID, or screen content, so the pane
+        // returns with no run: there is nothing to reattach to and nothing is reattached.
+        assert!(restored.layout().workspaces[0].panes["p1"].run_id.is_none());
+        assert!(restored.pane_input("w1", "p1", b"x").is_err());
+
+        restored.revive_restored_panes();
+        let revived = restored.layout().workspaces[0].panes["p1"]
+            .run_id
+            .clone()
+            .expect("a restored pane is given a fresh Dock-owned shell");
+        assert_eq!(
+            revived, original,
+            "the shell identity belongs to the pane, not to one launch"
+        );
+        assert!(restored.pane_input("w1", "p1", b"echo revived\n").is_ok());
+    }
+
+    /// Typing `exit` leaves a pane with a dead shell. Recovery is a keyboard command, so the
+    /// request behind it must work on a dead pane and refuse a live one.
+    #[test]
+    fn respawning_revives_a_dead_pane_and_never_displaces_a_live_one() {
+        let registry = registry();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Daily".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+        let original = registry.layout().workspaces[0].panes["p1"]
+            .run_id
+            .clone()
+            .expect("a new pane auto-launches a shell");
+        let error = registry
+            .workspace(WorkspaceRequest::Respawn {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+            })
+            .expect_err("a running pane must never be respawned out from under the user");
+        assert_eq!(error.0, ErrorCode::UnsupportedOperation);
+
+        registry
+            .lifecycle(&original, LifecycleOperation::Stop)
+            .expect("stop the shell");
+        let workspace = registry
+            .workspace(WorkspaceRequest::Respawn {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("respawn a dead pane")
+            .expect("respawn returns the workspace");
+        assert_eq!(
+            workspace.panes["p1"].run_id.as_deref(),
+            Some(original.as_str())
+        );
+        assert!(registry.pane_input("w1", "p1", b"echo alive\n").is_ok());
+
+        let missing = registry
+            .workspace(WorkspaceRequest::Respawn {
+                workspace_id: "w1".into(),
+                pane_id: "nope".into(),
+            })
+            .expect_err("respawning a pane that does not exist must be refused");
+        assert_eq!(missing.0, ErrorCode::InvalidLayout);
     }
 
     #[test]

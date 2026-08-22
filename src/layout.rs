@@ -216,6 +216,11 @@ impl LayoutRegistry {
             workspaces: self.workspaces.values().cloned().collect(),
         }
     }
+    pub fn pane_exists(&self, workspace_id: &str, pane_id: &str) -> bool {
+        self.workspaces
+            .get(workspace_id)
+            .is_some_and(|workspace| workspace.panes.contains_key(pane_id))
+    }
     pub fn pane_run(&self, workspace_id: &str, pane_id: &str) -> Option<String> {
         self.workspaces
             .get(workspace_id)?

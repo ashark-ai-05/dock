@@ -333,6 +333,26 @@ mod tests {
         assert_eq!(term.scroll_offset(), 0, "cannot scroll past live output");
     }
 
+    // CONTROLLER RULING C6: the full-row-aligned test below cannot tell a reading-order run
+    // from a coordinate-wise rectangle, because at columns 0 and `width - 1` the two agree.
+    // Mouse drag selection makes mid-row endpoints the normal case, so pin the difference.
+    #[test]
+    fn a_mid_row_selection_is_a_reading_order_run_not_a_rectangle() {
+        let mut term = filled(5, 40, 20);
+        term.scroll_by(10);
+        // Rows 0..=2 hold "line 7", "line 8", "line 9". A coordinate-wise rectangle would
+        // return columns 3..5 of each row ("e 7" / "e 8" / "e 9"); a reading-order run
+        // returns the tail of row 0, all of row 1, and the head of row 2 — which is what a
+        // user dragging from mid-line to mid-line means.
+        let selected = term.selection_text((0, 5), (2, 3));
+        assert_eq!(selected, "7\nline 8\nlin", "{selected:?}");
+        assert_eq!(
+            selected,
+            term.selection_text((2, 3), (0, 5)),
+            "order-independent"
+        );
+    }
+
     #[test]
     fn selection_text_is_order_independent_and_spans_rows() {
         let mut term = filled(5, 40, 20);

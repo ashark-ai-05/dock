@@ -4,6 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
+    buffer::{Buffer, Cell},
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
@@ -26,6 +27,11 @@ use crate::{
     terminal::{KeyEncoding, PaneScreen, encode_paste},
     theme::Theme,
 };
+
+/// Copy mode's bindings, published in the footer for as long as the mode is active. It is
+/// the only way in without reading the help, and the only reminder of the way out.
+const COPY_HINTS: &str =
+    "hjkl move \u{b7} v select \u{b7} y yank \u{b7} / search \u{b7} n/N next/prev \u{b7} Esc exit";
 
 const MIN_PANE_WIDTH: u16 = 8;
 const MIN_PANE_HEIGHT: u16 = 3;
@@ -77,8 +83,15 @@ pub struct Dashboard {
     /// untouched, so zooming costs no request.
     zoomed: Option<String>,
     pane_areas: HashMap<String, Rect>,
+    /// The body of each pane, inside its border. Kept alongside `pane_areas` because the
+    /// pointer-to-grid conversion for drag selection has to skip the border cells, and only
+    /// the render pass knows where the border ended up.
+    pane_inner_areas: HashMap<String, Rect>,
     dividers: Vec<Divider>,
     dragging: Option<DragTarget>,
+    /// A left button held down inside a pane body, and the cell it went down on. Distinct
+    /// from `dragging`, which is the divider gesture; a press lands on one or the other.
+    pane_drag: Option<PaneDrag>,
     sequence: u64,
     dismiss_external_area: Option<Rect>,
     launch_area: Option<Rect>,
@@ -132,6 +145,16 @@ struct Divider {
 struct DragTarget {
     pane_id: String,
     axis: SplitAxis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneDrag {
+    run_id: String,
+    /// Grid cell the press landed on, which becomes the selection anchor.
+    origin: (u16, u16),
+    /// The pane body at press time, so the pointer can be mapped to cells for the rest of
+    /// the gesture even if a later frame moves the pane.
+    inner: Rect,
 }
 
 impl Dashboard {
@@ -263,6 +286,7 @@ impl Dashboard {
 
     pub fn render(&mut self, frame: &mut Frame) {
         self.pane_areas.clear();
+        self.pane_inner_areas.clear();
         self.dividers.clear();
         self.dismiss_external_area = None;
         self.launch_area = None;
@@ -350,6 +374,27 @@ impl Dashboard {
     /// The single footer line. While the prefix is pending it becomes a which-key bar, which
     /// is the only place the binding table is ever published without the user asking for help.
     fn footer_line(&self) -> Line<'static> {
+        // Copy mode outranks the standing hints and carries any notice alongside itself
+        // rather than being replaced by one: a modal mode that goes invisible the moment
+        // something goes wrong is the failure P0 deleted the last input mode over.
+        if let Some(status) = self.copy_status() {
+            let mut spans = vec![
+                Span::styled(
+                    status,
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" \u{b7} "),
+            ];
+            spans.push(match self.error.as_deref() {
+                Some(error) => {
+                    Span::styled(error.to_owned(), Style::default().fg(self.theme.blocked))
+                }
+                None => Span::styled(COPY_HINTS, Style::default().fg(self.theme.muted)),
+            });
+            return Line::from(spans);
+        }
         if let Some(error) = self.error.as_deref() {
             return Line::styled(error.to_owned(), Style::default().fg(self.theme.blocked));
         }
@@ -557,6 +602,26 @@ impl Dashboard {
                 } else {
                     self.theme.agent(state)
                 };
+                // Copy mode swallows every key for this pane, so the pane itself has to say
+                // so. Cloned rather than borrowed because the render below needs `self`
+                // mutably for the resize bookkeeping.
+                let copy_session = run_id
+                    .as_deref()
+                    .and_then(|id| self.copy.as_ref().filter(|session| session.run_id == id))
+                    .cloned();
+                // `title` already opens with a space, so the prefix needs none of its own.
+                let title = match &copy_session {
+                    Some(_) => Line::from(vec![
+                        Span::styled(
+                            " COPY",
+                            Style::default()
+                                .fg(self.theme.accent)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(title),
+                    ]),
+                    None => Line::from(title),
+                };
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(Theme::border_type())
@@ -570,18 +635,24 @@ impl Dashboard {
                 let inner = block.inner(area);
                 self.queue_resize(&workspace.workspace_id, pane_id, run_id.as_deref(), inner);
                 frame.render_widget(block, area);
+                self.pane_inner_areas.insert(pane_id.clone(), inner);
                 match run_id.as_deref().and_then(|id| self.screens.get(id)) {
                     Some(screen) => {
                         // The cursor belongs to whichever pane is taking keystrokes; drawing
-                        // one in every pane would make focus unreadable.
+                        // one in every pane would make focus unreadable. In copy mode the
+                        // PTY's own cursor is hidden too: the copy cursor is the one that
+                        // moves, and two blocks would make it ambiguous which is which.
                         let mut cursor = Cursor::default();
-                        if !focused {
+                        if !focused || copy_session.is_some() {
                             cursor.hide();
                         }
                         frame.render_widget(
                             PseudoTerminal::new(screen.screen()).cursor(cursor),
                             inner,
                         );
+                        if let Some(session) = &copy_session {
+                            self.render_copy_overlay(frame, inner, session);
+                        }
                     }
                     None => {
                         let mut placeholder = vec![Line::styled(
@@ -618,6 +689,38 @@ impl Dashboard {
                 self.render_node(frame, a, workspace, first);
                 self.render_node(frame, b, workspace, second);
             }
+        }
+    }
+
+    /// Paints the selection run and the copy cursor over the emulated screen.
+    ///
+    /// Only backgrounds are touched: `PseudoTerminal` stays the single thing that draws the
+    /// text, so a highlight can never disagree with what the pane actually shows.
+    fn render_copy_overlay(&self, frame: &mut Frame, inner: Rect, session: &CopySession) {
+        let buffer = frame.buffer_mut();
+        if let Some((from, to)) = session.selection() {
+            let (start, end) = if from <= to { (from, to) } else { (to, from) };
+            for row in start.0..=end.0 {
+                // Reading order, not a rectangle: whole rows in the middle and only the
+                // anchored halves of the first and last. This is the same run
+                // `VtTerminal::selection_text` extracts, so the highlight previews the yank
+                // rather than offering a second opinion about it.
+                let first = if row == start.0 { start.1 } else { 0 };
+                let last = if row == end.0 {
+                    end.1
+                } else {
+                    inner.width.saturating_sub(1)
+                };
+                for column in first..=last {
+                    if let Some(cell) = cell_at(buffer, inner, row, column) {
+                        cell.set_bg(self.theme.selection);
+                    }
+                }
+            }
+        }
+        let (row, column) = session.cursor();
+        if let Some(cell) = cell_at(buffer, inner, row, column) {
+            cell.set_bg(self.theme.accent).set_fg(self.theme.surface);
         }
     }
 
@@ -911,7 +1014,14 @@ impl Dashboard {
         } else {
             "MOVE"
         };
-        Some(format!("COPY {verb} {row},{column}"))
+        // CONTROLLER ADDENDUM: grid coordinates stay 0-based everywhere inside; only this
+        // presentation boundary counts from one, because that is how every editor and pager
+        // the user knows reports a line and column.
+        Some(format!(
+            "COPY {verb} {},{}",
+            row.saturating_add(1),
+            column.saturating_add(1)
+        ))
     }
 
     /// Freezes the focused pane for keyboard selection, starting at its live cursor.
@@ -1084,7 +1194,12 @@ impl Dashboard {
                     .map(|screen| screen.visible_row(row).trim_end().to_owned())
                     .unwrap_or_default();
                 let count = text.chars().count();
-                (text, format!("line {row} ({count} characters)"))
+                // 1-based for the same reason `copy_status` is, and it has to agree with it:
+                // seeing the same line called 0 in one place and 1 in another reads as a bug.
+                (
+                    text,
+                    format!("line {} ({count} characters)", row.saturating_add(1)),
+                )
             }
         };
         self.error = Some(match clipboard::copy(&text) {
@@ -1097,6 +1212,35 @@ impl Dashboard {
             }
             Err(reason) => format!("copy failed: {reason}"),
         });
+    }
+
+    /// Extends a pointer selection, entering copy mode on the first drag of the gesture.
+    ///
+    /// The anchor is re-applied on every event rather than only on the first: it is always
+    /// the cell the button went down on, whatever the cursor was doing beforehand, and
+    /// re-applying it is cheaper than tracking whether this drag has already anchored.
+    fn drag_selection(&mut self, drag: &PaneDrag, column: u16, row: u16) {
+        let Some(bounds) = self.screens.get(&drag.run_id).map(PaneScreen::size) else {
+            return;
+        };
+        if let Some(existing) = self.copy.clone()
+            && existing.run_id != drag.run_id
+        {
+            // Dragging in a different pane hands copy mode over; the pane being left goes
+            // back to following live output rather than staying silently frozen.
+            self.leave_copy_mode(&existing);
+        }
+        if self.copy.is_none() {
+            self.copy = Some(CopySession::new(drag.run_id.clone(), drag.origin));
+            self.copy_searching = false;
+            self.error = None;
+        }
+        let Some(session) = self.copy.as_mut() else {
+            return;
+        };
+        session.set_cursor(drag.origin, bounds);
+        session.begin_selection();
+        session.set_cursor(clamp_cell(drag.inner, column, row), bounds);
     }
 
     /// Leaves copy mode and returns the pane to the live tail, which is where the user was
@@ -1609,6 +1753,9 @@ impl Dashboard {
         }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // A fresh press ends any previous gesture, whatever swallowed its release.
+                // Without this a stale arming would hijack the next divider drag.
+                self.pane_drag = None;
                 if self
                     .dismiss_external_area
                     .is_some_and(|area| contains(area, event.column, event.row))
@@ -1645,6 +1792,22 @@ impl Dashboard {
                 else {
                     return UiCommand::None;
                 };
+                // A press inside a pane body only *arms* a selection; copy mode is entered
+                // on the first drag. Entering it here would mean every click that focuses a
+                // pane also puts the keyboard into a mode that swallows it.
+                let armed = self
+                    .workspace()
+                    .and_then(|workspace| workspace.panes.get(&pane_id))
+                    .and_then(|pane| pane.run_id.clone())
+                    .zip(self.pane_inner_areas.get(&pane_id).copied())
+                    .and_then(|(run_id, inner)| {
+                        grid_cell(inner, event.column, event.row).map(|origin| PaneDrag {
+                            run_id,
+                            origin,
+                            inner,
+                        })
+                    });
+                self.pane_drag = armed;
                 self.layout.workspaces[self.workspace_index].focused_pane_id = pane_id.clone();
                 UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Focus {
                     workspace_id,
@@ -1652,6 +1815,12 @@ impl Dashboard {
                 })))
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                // A press landed either on a divider or in a pane body, never both, so this
+                // reads the pane gesture first and leaves the divider path below untouched.
+                if let Some(drag) = self.pane_drag.clone() {
+                    self.drag_selection(&drag, event.column, event.row);
+                    return UiCommand::None;
+                }
                 let Some(target) = self.dragging.as_ref() else {
                     return UiCommand::None;
                 };
@@ -1680,6 +1849,9 @@ impl Dashboard {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.dragging = None;
+                // The selection stands, and nothing is copied. Yank is always an explicit
+                // `y`, so a stray drag can never overwrite what the user copied earlier.
+                self.pane_drag = None;
                 UiCommand::None
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -1855,6 +2027,31 @@ fn first_leaf(node: &LayoutNode) -> &str {
 fn clickable_row(area: Rect, index: usize) -> Option<Rect> {
     let row = area.y.checked_add(u16::try_from(index).ok()?)?;
     (row < area.bottom()).then(|| Rect::new(area.x, row, area.width, 1))
+}
+
+/// The cell of a pane's grid under the pointer, or `None` if the pointer is on the border
+/// or outside the pane entirely.
+fn grid_cell(inner: Rect, column: u16, row: u16) -> Option<(u16, u16)> {
+    contains(inner, column, row).then(|| (row - inner.y, column - inner.x))
+}
+
+/// The same conversion for a pointer that has been dragged past the pane's edge, clamped to
+/// the nearest cell so the selection keeps growing instead of freezing at the boundary.
+fn clamp_cell(inner: Rect, column: u16, row: u16) -> (u16, u16) {
+    let last_row = inner.bottom().saturating_sub(1).max(inner.y);
+    let last_column = inner.right().saturating_sub(1).max(inner.x);
+    (
+        row.clamp(inner.y, last_row) - inner.y,
+        column.clamp(inner.x, last_column) - inner.x,
+    )
+}
+
+/// A cell of the frame buffer addressed in a pane's grid coordinates.
+fn cell_at(buffer: &mut Buffer, inner: Rect, row: u16, column: u16) -> Option<&mut Cell> {
+    if row >= inner.height || column >= inner.width {
+        return None;
+    }
+    buffer.cell_mut((inner.x + column, inner.y + row))
 }
 
 fn contains(area: Rect, x: u16, y: u16) -> bool {
@@ -3283,7 +3480,7 @@ mod tests {
         // 25 characters is the URL with the row's trailing blanks trimmed off, which is the
         // proof that the line — not the whole padded grid row — went to the clipboard.
         assert!(
-            notice.contains("copied line 0 (25 characters)"),
+            notice.contains("copied line 1 (25 characters)"),
             "a bare yank must copy the cursor's line and say so, got {notice:?}"
         );
     }
@@ -3304,7 +3501,7 @@ mod tests {
         );
         assert_eq!(
             dashboard.copy_status().as_deref(),
-            Some("COPY MOVE 0,14"),
+            Some("COPY MOVE 1,15"),
             "the prompt is gone and the cursor is where it was"
         );
         dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -3331,7 +3528,7 @@ mod tests {
         dashboard.key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
         assert_eq!(
             dashboard.copy_status().as_deref(),
-            Some(format!("COPY MOVE {},0", PANE_ROWS - 1).as_str())
+            Some(format!("COPY MOVE {},1", PANE_ROWS).as_str())
         );
     }
 
@@ -3375,6 +3572,89 @@ mod tests {
         assert!(
             notice.contains("copied") || notice.contains("clipboard"),
             "the yank must say what happened, got {notice:?}"
+        );
+    }
+
+    // CONTROLLER RULING C2 again: the brief's version of both tests below used
+    // `dashboard()`, whose pane "a" has `run_id: None`. Copy mode is refused on an unbound
+    // pane, so neither test could have exercised anything. `bound_dashboard()` binds pane
+    // "a" to "run_1", which is also the run the attach event seeds.
+    #[test]
+    fn copy_mode_is_visibly_signalled_in_the_pane_and_footer() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"visible text\r\n"));
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        let rendered = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            rendered.contains("COPY"),
+            "the pane must say it is in copy mode"
+        );
+        // The brief asked for `contains('y')`, which every ordinary word in the UI already
+        // satisfies; only a distinctive slice of the copy footer proves it actually changed.
+        assert!(
+            rendered.contains("y yank"),
+            "the footer must publish the yank binding, got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("keys go to the focused pane"),
+            "the live-pane hint is wrong while every key is being swallowed"
+        );
+    }
+
+    #[test]
+    fn dragging_across_a_pane_selects_without_writing_to_the_clipboard() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"drag over me\r\n"));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 2,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            !dashboard.copy_mode(),
+            "a bare click focuses a pane; it must not trap the keyboard in a mode"
+        );
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 8,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            dashboard.copy_mode(),
+            "a drag inside a pane enters copy mode"
+        );
+        assert_eq!(
+            dashboard
+                .copy
+                .as_ref()
+                .and_then(CopySession::selection)
+                .expect("the drag anchored a selection"),
+            ((0, 1), (0, 7)),
+            "the anchor is the press cell and the cursor follows the pointer"
+        );
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: area.x + 8,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            dashboard.copy_mode(),
+            "releasing finalises the selection but stays in copy mode"
+        );
+        assert!(
+            dashboard.error.is_none(),
+            "releasing a drag must not write to the clipboard"
+        );
+        let rendered = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            rendered.contains("COPY"),
+            "a pointer selection puts the pane in the same visible mode a keyboard one does"
         );
     }
 

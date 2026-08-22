@@ -12,6 +12,9 @@ pub struct Theme {
     pub border: Color,
     pub border_focused: Color,
     pub text: Color,
+    /// Background for the copy-mode selection run. A background token rather than a
+    /// foreground one, so highlighted text keeps whatever colour the program gave it.
+    pub selection: Color,
     pub blocked: Color,
     pub working: Color,
     pub done: Color,
@@ -29,6 +32,7 @@ impl Theme {
             border: Color::Rgb(58, 56, 54),
             border_focused: Color::Rgb(232, 168, 88),
             text: Color::Rgb(226, 222, 214),
+            selection: Color::Rgb(58, 84, 102),
             blocked: Color::Rgb(226, 106, 94),
             working: Color::Rgb(226, 184, 96),
             done: Color::Rgb(122, 176, 214),
@@ -74,6 +78,28 @@ mod tests {
             assert!(
                 !colours[index + 1..].contains(colour),
                 "state colours must be distinguishable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_selection_background_is_distinct_from_every_other_token() {
+        let theme = Theme::warm();
+        for other in [
+            theme.accent,
+            theme.surface,
+            theme.muted,
+            theme.border,
+            theme.border_focused,
+            theme.text,
+            theme.blocked,
+            theme.working,
+            theme.done,
+            theme.idle,
+        ] {
+            assert_ne!(
+                theme.selection, other,
+                "a highlight that matches another token is not a highlight"
             );
         }
     }

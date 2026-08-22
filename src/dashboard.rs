@@ -28,6 +28,13 @@ use crate::{
 const MIN_PANE_WIDTH: u16 = 8;
 const MIN_PANE_HEIGHT: u16 = 3;
 
+/// Scrollback capacity for this client's own `VtTerminal` replica of each pane, seeded on
+/// `PaneAttached`. Mirrors `dockd`'s own `--scrollback-rows` default (see `src/bin/dockd.rs`),
+/// but the attach frame carries no capacity field, so a daemon started with a non-default
+/// `--scrollback-rows` desyncs silently from this constant: the client can never retain more
+/// history than this, even if the daemon retains more (or less).
+const DEFAULT_CLIENT_SCROLLBACK_ROWS: usize = 2000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Request(Box<Request>),
@@ -152,14 +159,11 @@ impl Dashboard {
                 cols,
                 screen,
             } => {
-                // Zero scrollback here would make this client's replica unable to retain any
-                // history at all: `vt100` only starts pushing scrolled-off rows into its
-                // scrollback deque when the grid is constructed with a nonzero capacity, and
-                // that capacity is fixed for the terminal's lifetime. Without it, the wheel
-                // (`Dashboard::mouse`'s `ScrollUp`/`ScrollDown` arm) would have nothing to
-                // scroll into no matter how much output the pane produced. 2000 matches
-                // `dockd`'s own `--scrollback-rows` default.
-                let mut terminal = PaneScreen::new(rows, cols, 2000);
+                // A zero capacity here would leave `vt100` unable to retain any scrolled-off
+                // rows at all (that capacity is fixed for the terminal's lifetime), so the wheel
+                // (`Dashboard::mouse`'s `ScrollUp`/`ScrollDown` arm) would have nothing to scroll
+                // into no matter how much output the pane produced.
+                let mut terminal = PaneScreen::new(rows, cols, DEFAULT_CLIENT_SCROLLBACK_ROWS);
                 if let Ok(bytes) = STANDARD.decode(&screen) {
                     terminal.feed(&bytes);
                 }
@@ -2920,6 +2924,57 @@ mod tests {
         assert!(
             !dashboard.screens["run_1"].is_scrolled(),
             "scrolling back to the bottom resumes following live output"
+        );
+    }
+
+    // FINDING 2 (review of Task 4): pane "a" in `bound_dashboard()` is both focused and under
+    // the pointer in the test above, so a handler that wrongly read `focused_pane_id` instead
+    // of hit-testing `pane_areas` would pass it identically. Here pane "b" is bound to a second
+    // run and the wheel lands on "b" while "a" stays focused, so only a pointer-pane
+    // implementation scrolls the right screen.
+    #[test]
+    fn the_wheel_scrolls_the_pane_under_the_pointer_not_the_focused_pane() {
+        let mut dashboard = bound_dashboard();
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("b")
+            .unwrap()
+            .run_id = Some("run_2".into());
+        assert_eq!(dashboard.layout.workspaces[0].focused_pane_id, "a");
+
+        dashboard.apply_event(attach_event("run_1", b""));
+        dashboard.apply_event(attach_event("run_2", b""));
+        for run_id in ["run_1", "run_2"] {
+            if let Some(screen) = dashboard.screens.get_mut(run_id) {
+                for index in 1..=60 {
+                    screen.feed(
+                        format!(
+                            "line {index}
+"
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+        }
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("b").expect("pane b is rendered");
+        let (column, row) = (area.x + 2, area.y + 2);
+
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(
+            dashboard.screens["run_2"].is_scrolled(),
+            "the wheel must scroll the pane under the pointer (\"b\")"
+        );
+        assert!(
+            !dashboard.screens["run_1"].is_scrolled(),
+            "the wheel must not scroll the focused pane (\"a\") when the pointer is elsewhere"
         );
     }
 }

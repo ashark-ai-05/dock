@@ -395,6 +395,12 @@ impl Dashboard {
         let heading = Style::default()
             .fg(self.theme.text)
             .add_modifier(Modifier::BOLD);
+        // Rendered without wrapping, so one pushed line is exactly one rendered row and
+        // `clickable_row` can address a row by its index in `lines`. Every line carrying
+        // variable-length text is ellipsised to the width the right border leaves, because a
+        // line that wrapped would slide every row beneath it out from under the rectangles
+        // this records for the pointer.
+        let inner_width = usize::from(area.width).saturating_sub(1);
         let mut lines = vec![Line::styled("WORKSPACES", heading)];
         for (index, workspace) in self.layout.workspaces.iter().enumerate() {
             lines.push(Line::styled(
@@ -405,7 +411,7 @@ impl Dashboard {
                     } else {
                         " "
                     },
-                    workspace.name
+                    ellipsise(&workspace.name, inner_width.saturating_sub(2))
                 ),
                 Style::default().fg(if index == self.workspace_index {
                     self.theme.accent
@@ -416,16 +422,17 @@ impl Dashboard {
         }
         lines.push(Line::from(""));
         lines.push(Line::styled("AGENTS", heading));
-        // An undetected agent falls back to its run id, which is long enough to wrap onto a
-        // second sidebar line and destroy the one-line-per-agent reading the roster exists for.
-        let label_width = usize::from(area.width).saturating_sub(4);
-        for (state, label) in self.agent_roster() {
+        // Sized so the leading glyph and its two spaces still fit inside the border.
+        let label_width = inner_width.saturating_sub(3);
+        let roster = self.agent_roster();
+        let roster_is_empty = roster.is_empty();
+        for (state, label) in roster {
             lines.push(Line::styled(
                 format!(" {} {}", state.glyph(), ellipsise(label, label_width)),
                 Style::default().fg(self.theme.agent(state)),
             ));
         }
-        if self.agents.is_empty() {
+        if roster_is_empty {
             lines.push(Line::styled(
                 " none running",
                 Style::default().fg(self.theme.muted),
@@ -441,11 +448,11 @@ impl Dashboard {
         }
         for candidate in &self.external {
             lines.push(Line::styled(
-                candidate.provider.as_str(),
+                ellipsise(candidate.provider.as_str(), inner_width),
                 Style::default().fg(self.theme.text),
             ));
             lines.push(Line::styled(
-                candidate.status(),
+                ellipsise(candidate.status(), inner_width),
                 Style::default().fg(self.theme.working),
             ));
         }
@@ -454,8 +461,7 @@ impl Dashboard {
                 " click to dismiss all",
                 Style::default().fg(self.theme.accent),
             ));
-            let row = area.y + u16::try_from(lines.len()).unwrap_or(u16::MAX) - 1;
-            self.dismiss_external_area = Some(Rect::new(area.x, row, area.width, 1));
+            self.dismiss_external_area = clickable_row(area, lines.len() - 1);
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
@@ -464,10 +470,9 @@ impl Dashboard {
                 .fg(self.theme.accent)
                 .add_modifier(Modifier::BOLD),
         ));
-        let row = area.y + u16::try_from(lines.len()).unwrap_or(u16::MAX) - 1;
-        self.launch_area = Some(Rect::new(area.x, row, area.width, 1));
+        self.launch_area = clickable_row(area, lines.len() - 1);
         frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::RIGHT)
                     .border_style(Style::default().fg(self.theme.border)),
@@ -478,17 +483,15 @@ impl Dashboard {
 
     /// Live agents ordered by how much they are costing the user: blocked first, then by
     /// label so the list does not reshuffle between frames for equally urgent agents.
+    ///
+    /// Only a run whose agent was actually detected is an agent. `self.agents` also carries
+    /// every pane's ambient shell, which reports no kind at all; listing those turned the
+    /// roster into a list of run ids for processes that are not agents.
     fn agent_roster(&self) -> Vec<(AgentState, &str)> {
         let mut roster: Vec<(AgentState, &str)> = self
             .agents
-            .iter()
-            .map(|(run_id, (kind, state))| {
-                let label = match kind {
-                    Some(kind) => kind.label(),
-                    None => run_id.as_str(),
-                };
-                (*state, label)
-            })
+            .values()
+            .filter_map(|(kind, state)| Some((*state, kind.as_ref()?.label())))
             .collect();
         roster.sort_by(|left, right| {
             left.0
@@ -1582,6 +1585,15 @@ fn first_leaf(node: &LayoutNode) -> &str {
         LayoutNode::Split { first, .. } => first_leaf(first),
     }
 }
+/// The one-row rectangle for the sidebar line at `index`, or `None` when that line falls past
+/// the bottom of the sidebar. A rectangle recorded off-screen would claim pointer coordinates
+/// belonging to whatever is drawn there instead, so a row that was never rendered is not
+/// clickable.
+fn clickable_row(area: Rect, index: usize) -> Option<Rect> {
+    let row = area.y.checked_add(u16::try_from(index).ok()?)?;
+    (row < area.bottom()).then(|| Rect::new(area.x, row, area.width, 1))
+}
+
 fn contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
 }
@@ -2367,19 +2379,23 @@ mod tests {
     }
 
     #[test]
-    fn a_long_agent_label_is_shortened_rather_than_wrapped_onto_a_second_line() {
+    fn a_long_sidebar_label_is_shortened_rather_than_wrapped_onto_a_second_line() {
         let mut dashboard = dashboard();
-        dashboard.apply_event(Event::AgentStateChanged {
-            run_id: "dock_sh_workspace_1_pane_2".into(),
-            agent: None,
-            state: AgentState::Working,
-        });
-        let rendered = render_to_string(&mut dashboard, 100, 30);
+        // Workspace names are the one piece of user-supplied text in the sidebar, so they are
+        // what can outrun the 27 columns the right border leaves.
+        dashboard.layout.workspaces[0].name = "release train for the whole fleet".into();
+        let rows = sidebar_rows(&mut dashboard, 100, 30);
         assert!(
-            rendered.contains("dock_sh_workspace_1_pan…"),
-            "{rendered:?}"
+            rows.iter()
+                .any(|row| row.contains("release train for the wh…")),
+            "{rows:#?}"
         );
-        assert!(!rendered.contains("dock_sh_workspace_1_pane_2"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("release train for the whole fleet")),
+            "{rows:#?}"
+        );
     }
 
     #[test]
@@ -2681,5 +2697,157 @@ mod tests {
         assert!(dashboard.take_refresh());
         assert!(!dashboard.take_refresh(), "refresh must not latch on");
         assert!(dashboard.take_pending_resizes().is_empty());
+    }
+
+    /// Renders the sidebar and returns, for each row of `area`, the text actually painted there.
+    fn sidebar_rows(dashboard: &mut Dashboard, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width.min(28))
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Every clickable sidebar rectangle must sit on the row that actually carries its label.
+    /// Recording rows from the logical line count while the paragraph wrapped meant a single
+    /// long line pushed every rectangle below it off its own label, so the pointer hit the
+    /// wrong control or nothing at all.
+    #[test]
+    fn sidebar_click_targets_land_on_the_rows_their_labels_are_rendered_on() {
+        let mut dashboard = dashboard();
+        // Longer than the 27 columns the sidebar's right border leaves, which is exactly what
+        // used to wrap onto extra rows the recorded rectangles knew nothing about.
+        dashboard.layout.workspaces[0].name = "a very long workspace name that overflows".into();
+        dashboard.external.push(ExternalAgentCandidate {
+            provider: "Codex CLI".into(),
+            repository_match: false,
+        });
+        let rows = sidebar_rows(&mut dashboard, 100, 30);
+        let dismiss = dashboard.dismiss_external_area.expect("dismiss row");
+        let launch = dashboard.launch_area.expect("launch row");
+        assert!(
+            rows[usize::from(dismiss.y)].contains("click to dismiss all"),
+            "dismiss rectangle at row {} but rows were {rows:#?}",
+            dismiss.y
+        );
+        assert!(
+            rows[usize::from(launch.y)].contains("LAUNCH AGENT"),
+            "launch rectangle at row {} but rows were {rows:#?}",
+            launch.y
+        );
+        // No sidebar row may carry a wrapped remainder of the workspace name: an over-long
+        // label is truncated in place rather than stealing the row below it.
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("long work")).count(),
+            1,
+            "{rows:#?}"
+        );
+        // And the rectangles still drive the real actions when clicked where they are drawn.
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: dismiss.x + 1,
+                row: dismiss.y,
+                modifiers: KeyModifiers::NONE
+            }),
+            UiCommand::None
+        );
+        assert!(dashboard.external.is_empty());
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: launch.x + 1,
+                row: launch.y,
+                modifiers: KeyModifiers::NONE
+            }),
+            UiCommand::LoadCatalog
+        );
+        assert!(dashboard.launch_form.is_some());
+    }
+
+    /// A sidebar with more entries than rows cannot record a rectangle for a control it never
+    /// drew: those coordinates belong to whatever the terminal shows there instead.
+    #[test]
+    fn a_sidebar_control_pushed_past_the_last_row_records_no_click_target() {
+        let mut dashboard = dashboard();
+        for index in 0..40 {
+            dashboard.apply_event(Event::AgentStateChanged {
+                run_id: format!("run_{index}"),
+                agent: Some(AgentKind::Claude),
+                state: AgentState::Idle,
+            });
+        }
+        let rows = sidebar_rows(&mut dashboard, 100, 30);
+        assert!(
+            !rows.iter().any(|row| row.contains("LAUNCH AGENT")),
+            "{rows:#?}"
+        );
+        assert_eq!(dashboard.launch_area, None);
+        // A click where the unrendered row would have been must not open the launch form.
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 29,
+                modifiers: KeyModifiers::NONE
+            }),
+            UiCommand::None
+        );
+        assert!(dashboard.launch_form.is_none());
+    }
+
+    /// The roster lists agents. A pane's ambient shell is a run, not an agent, and used to be
+    /// listed under its raw run id.
+    #[test]
+    fn the_agent_roster_lists_only_runs_whose_agent_was_detected() {
+        let mut dashboard = dashboard();
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "dock_sh_workspace_1_pane_2".into(),
+            agent: None,
+            state: AgentState::Idle,
+        });
+        let rows = sidebar_rows(&mut dashboard, 100, 30);
+        assert!(
+            !rows.iter().any(|row| row.contains("dock_sh_")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("none running")),
+            "{rows:#?}"
+        );
+
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_1".into(),
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Blocked,
+        });
+        assert_eq!(dashboard.agents.len(), 2);
+        assert_eq!(
+            dashboard.agent_roster(),
+            vec![(AgentState::Blocked, AgentKind::Claude.label())]
+        );
+        let rows = sidebar_rows(&mut dashboard, 100, 30);
+        assert!(
+            !rows.iter().any(|row| row.contains("none running")),
+            "{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("dock_sh_")),
+            "{rows:#?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains(AgentKind::Claude.label()))
+                .count(),
+            1,
+            "{rows:#?}"
+        );
     }
 }

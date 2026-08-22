@@ -143,7 +143,7 @@ no-op is impossible.
 | copy mode | release drag | finalise the selection and stay in copy mode |
 | live pane | `Ctrl+B [` | enter copy mode at the cursor |
 | copy mode | `h j k l`, arrows | move cursor |
-| copy mode | `g` / `G` | top of scrollback / bottom |
+| copy mode | `g` / `G` | top / bottom of the visible viewport |
 | copy mode | `v` | start selection at cursor |
 | copy mode | `y` | yank selection, exit copy mode |
 | copy mode | `/` | search; `n` / `N` cycle matches |

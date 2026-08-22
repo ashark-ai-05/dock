@@ -48,15 +48,45 @@ pane**, `Esc` is never intercepted, and `Ctrl+B` twice sends a literal `Ctrl+B`.
 | After `Ctrl+B` | |  | |
 |---|---|---|---|
 | `n` | new workspace | `z` | zoom pane |
-| `[` `]` | switch workspace | `r` | rename |
+| `,` `.` | switch workspace | `r` | rename |
 | `h` `v` | split ⇋ / ⇵ | `R` | restart a pane whose shell exited |
 | arrows, `Tab`/`S-Tab` | focus | `x` | close pane |
 | `+` `-` | resize split | `l` | launch an agent |
-| `?` | help | `d` | leave — runs keep running |
-| `q` | quit | | |
+| `[` | copy mode | `d` | leave — runs keep running |
+| `?` | help | `q` | quit |
 
 Pasting is bracketed — a multi-line paste arrives as one payload instead of
 executing line by line.
+
+## Copy and scrollback
+
+`Ctrl+B [` freezes the focused pane into copy mode, signalled by `COPY` in
+the pane's border and a footer that switches to copy-mode bindings. `hjkl`
+or the arrow keys move the cursor, `g`/`G` jump to the top/bottom of the
+**visible screen**, `v` starts a selection, and `y` yanks it — a bare `y`
+with no selection yanks the cursor's line instead, trimmed of trailing
+whitespace. `/` opens a search prompt, `n`/`N` cycle matches. `Esc` unwinds
+one level at a time (the search prompt first, then the mode itself); `q`
+always leaves immediately.
+
+Dragging with the mouse inside a pane enters copy mode and extends a
+selection the same way; a plain click still just focuses the pane. Releasing
+a drag finalises the selection but never copies anything by itself — yanking
+is always an explicit `y`.
+
+A yank tries OSC 52 first (works over SSH, since it asks the *host* terminal
+to set its clipboard) and falls back to `pbcopy`/`wl-copy`/`xclip` if that
+fails. The notice after a yank names which route was used, because OSC 52 is
+disabled by default in some terminals and a silent no-op would look
+identical to a working copy.
+
+**The mouse wheel does not scroll history yet.** Dock's client only ever
+receives cursor-addressed screen repaints from the daemon, never the raw
+output stream, so its own scrollback buffer never accumulates rows to scroll
+into — the wheel is currently a no-op. Copy mode, `g`/`G`, and `/` search
+therefore all operate on the visible screen only, not on a pane's full
+history. This is a known gap, tracked as a follow-up at the protocol layer;
+see the [parity matrix](docs/terminal-runtime-parity.md) for details.
 
 ## Agent awareness
 
@@ -108,11 +138,14 @@ multi-repository capacity and dependency gates.
 ## Status
 
 Shipped: VT emulation, PTY resize, shell panes, push-based streaming, agent
-state detection, zoom, bracketed paste, and `Ctrl+C` signal delivery.
+state detection, zoom, bracketed paste, `Ctrl+C` signal delivery, and copy
+mode (keyboard and mouse-drag selection, search, OSC 52 clipboard).
 
 Deferred: pane swap, alternative theme palettes, notifications, and durable
 transcript replay. Scrollback is bounded per pane (default 2000 rows,
-`dockd --scrollback-rows`) and is not restored across a daemon restart.
+`dockd --scrollback-rows`) and is not restored across a daemon restart. The
+mouse wheel does not scroll a pane's history yet (see "Copy and scrollback"
+above), so copy mode's own reach is limited to the visible screen.
 
 The [parity matrix](docs/terminal-runtime-parity.md) states the exact status of
 every capability, including known limitations.

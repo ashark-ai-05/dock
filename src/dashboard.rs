@@ -22,7 +22,7 @@ use crate::{
     git::GitFacts,
     keymap::{FocusDirection, KeyOutcome, Keymap, PaneCommand},
     layout::{LayoutNode, LayoutSnapshot, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout},
-    model::{HandoffRecord, ReviewRoute},
+    model::{HandoffRecord, ReviewDecision, ReviewRoute},
     picker::{Picker, PickerItem},
     protocol::{
         BindingKind, DashboardProfile, DecideRequest, DispatchRequest, Event,
@@ -204,7 +204,10 @@ pub struct TaskDispatch {
 /// The pending handoffs and where the reviewer is inside them.
 #[derive(Debug, Clone, Default)]
 pub struct ReviewOverlay {
-    pub items: Vec<HandoffRecord>,
+    /// Every handoff and the decision it has already had, if any. Answered ones are kept rather
+    /// than filtered away: "what did that agent actually produce" is asked long after the queue
+    /// is drained, and a queue that forgets is no record at all.
+    pub items: Vec<(HandoffRecord, Option<ReviewDecision>)>,
     pub selected: usize,
     /// The route chosen and the note being typed for it. A decision without a note is refused by
     /// `ReviewDecision::new`, so the note is collected before anything is sent rather than after
@@ -1924,12 +1927,17 @@ impl Dashboard {
     }
 
     /// Receives the pending handoffs and opens the review overlay over them.
-    pub fn set_review_inbox(&mut self, items: Vec<HandoffRecord>) {
+    pub fn set_review_inbox(&mut self, items: Vec<(HandoffRecord, Option<ReviewDecision>)>) {
         if items.is_empty() {
             self.review = None;
-            self.error = Some("review inbox is empty: no agent is waiting on a decision".into());
+            self.error = Some("nothing has been handed back yet".into());
             return;
         }
+        // Undecided first: those are the ones asking something of the reader. Everything else is
+        // history, and history that pushed the open questions down the list would be worse than
+        // no history at all.
+        let mut items = items;
+        items.sort_by_key(|(_, decision)| decision.is_some());
         self.review = Some(ReviewOverlay {
             items,
             selected: 0,
@@ -1959,7 +1967,7 @@ impl Dashboard {
                     }
                     let route = *route;
                     let note = note.clone();
-                    let run_id = review.items[review.selected].packet.run_id.clone();
+                    let run_id = review.items[review.selected].0.packet.run_id.clone();
                     // The overlay closes on send. Whether the decision stuck is the daemon's to
                     // say, and it is re-read from the inbox rather than assumed here.
                     self.review = None;
@@ -2015,8 +2023,17 @@ impl Dashboard {
         let muted = Style::default().fg(self.theme.muted);
 
         let mut lines = Vec::new();
-        for (index, record) in review.items.iter().enumerate() {
+        for (index, (record, decision)) in review.items.iter().enumerate() {
             let selected = index == review.selected;
+            // An answered handoff wears its answer on the row, so the list reads as a history
+            // rather than as a queue that has mysteriously stopped asking for anything.
+            let verdict = match decision {
+                Some(decision) => match decision.route {
+                    ReviewRoute::AcceptScope => "  accepted",
+                    ReviewRoute::RequestChange => "  changes requested",
+                },
+                None => "  awaiting you",
+            };
             lines.push(Line::from(vec![
                 Span::styled(
                     if selected { "> " } else { "  " },
@@ -2027,6 +2044,14 @@ impl Dashboard {
                     if selected { heading } else { muted },
                 ),
                 Span::styled(record.packet.run_id.clone(), muted),
+                Span::styled(
+                    verdict,
+                    Style::default().fg(if decision.is_some() {
+                        self.theme.done
+                    } else {
+                        self.theme.blocked
+                    }),
+                ),
             ]));
             if !selected {
                 continue;
@@ -4831,7 +4856,7 @@ mod tests {
     #[test]
     fn an_open_review_shows_the_agents_claim_beside_the_evidence_for_it() {
         let mut dashboard = bound_dashboard();
-        dashboard.set_review_inbox(vec![handoff("dock_01J9", "DOCK-7")]);
+        dashboard.set_review_inbox(vec![(handoff("dock_01J9", "DOCK-7"), None)]);
         let frame = render_to_string(&mut dashboard, 100, 30);
         assert!(frame.contains("REVIEW"), "{frame:?}");
         assert!(frame.contains("DOCK-7"), "{frame:?}");
@@ -4848,7 +4873,7 @@ mod tests {
     #[test]
     fn a_decision_carries_the_route_and_the_note_that_justifies_it() {
         let mut dashboard = bound_dashboard();
-        dashboard.set_review_inbox(vec![handoff("dock_01J9", "DOCK-7")]);
+        dashboard.set_review_inbox(vec![(handoff("dock_01J9", "DOCK-7"), None)]);
         dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         for character in "scope ok".chars() {
             dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
@@ -4872,7 +4897,7 @@ mod tests {
     #[test]
     fn a_decision_without_a_note_is_refused_before_the_daemon_ever_sees_it() {
         let mut dashboard = bound_dashboard();
-        dashboard.set_review_inbox(vec![handoff("dock_01J9", "DOCK-7")]);
+        dashboard.set_review_inbox(vec![(handoff("dock_01J9", "DOCK-7"), None)]);
         dashboard.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         // ReviewDecision::new refuses an empty note, so the note is collected here rather than
         // sending something the daemon will only bounce back.
@@ -4890,7 +4915,7 @@ mod tests {
     #[test]
     fn escape_abandons_the_note_before_it_abandons_the_queue() {
         let mut dashboard = bound_dashboard();
-        dashboard.set_review_inbox(vec![handoff("dock_01J9", "DOCK-7")]);
+        dashboard.set_review_inbox(vec![(handoff("dock_01J9", "DOCK-7"), None)]);
         dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         dashboard.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -4917,7 +4942,7 @@ mod tests {
         assert!(dashboard.review.is_none());
         assert_eq!(
             dashboard.error.as_deref(),
-            Some("review inbox is empty: no agent is waiting on a decision")
+            Some("nothing has been handed back yet")
         );
     }
 

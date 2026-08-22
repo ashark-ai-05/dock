@@ -104,7 +104,9 @@ impl AgentState {
         match self {
             Self::Blocked => "needs you",
             Self::Working => "working",
-            Self::Done => "done",
+            // Its turn is over and yours has started, but it is not stuck: it will wait as long
+            // as it takes. Distinct from "needs you", which means it cannot continue at all.
+            Self::Done => "your turn",
             Self::Idle => "idle",
         }
     }
@@ -143,7 +145,7 @@ mod tests {
         assert_eq!(
             classify_screen(AgentKind::Claude, &screen.visible_text()),
             AgentState::Blocked,
-            "the screen the agent painted says plainly that it is waiting"
+            "a chooser is the agent stuck, not the agent finished"
         );
     }
 

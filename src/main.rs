@@ -34,8 +34,8 @@ use dock::{
     paths,
     protocol::{
         DashboardProfile, DispatchRequest, InspectRequest, LaunchIntoPaneRequest, PaneInputRequest,
-        PaneResizeRequest, ProcessState, Request, Response, ReviewInboxRequest,
-        TerminalLaunchRequest, WorkspaceRequest,
+        PaneResizeRequest, ProcessState, Request, Response, TerminalLaunchRequest,
+        WorkspaceRequest,
     },
     storage::LocalStore,
 };
@@ -83,6 +83,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &mut client,
         &socket,
         runtime_directory.to_string_lossy().into_owned(),
+        &state_dir,
     )?;
     // A daemon started by Dock is intentionally left running for reconnect. This explicit policy
     // is observable through --headless-bootstrap; startup failures kill and reap it via Drop.
@@ -463,6 +464,7 @@ fn run_dashboard(
     client: &mut Client,
     socket: &Path,
     runtime_directory: String,
+    state_dir: &Path,
 ) -> Result<(), String> {
     let mut guard = TerminalGuard::enter().map_err(|e| e.to_string())?;
     let mut terminal =
@@ -595,19 +597,25 @@ fn run_dashboard(
                 client.send(&request)?;
             }
             UiCommand::LoadReviewInbox => {
-                // Painted before the round trip like every other command, so the keypress is
-                // visibly acknowledged even when the daemon is slow to answer.
-                terminal
-                    .draw(|frame| dashboard.render(frame))
-                    .map_err(|e| e.to_string())?;
-                match client.request(&Request::ReviewInbox(ReviewInboxRequest {}))? {
-                    Response::ReviewInbox { items } => dashboard.set_review_inbox(items),
-                    Response::Error { message, .. } => dashboard.error = Some(message),
-                    other => {
-                        dashboard.error =
-                            Some(format!("unexpected review inbox response: {other:?}"))
+                // Read from the daemon's own store rather than asked for over the socket. The
+                // pending queue has a request, but the answered ones do not, and adding a second
+                // one would be another protocol version for records this client can already
+                // reach: it computed this directory itself and handed it to the daemon at startup.
+                let store = LocalStore::new(state_dir);
+                match store.list_handoff_records() {
+                    Ok(records) => {
+                        let with_decisions = records
+                            .into_iter()
+                            .map(|record| {
+                                let decision = store.load_decision(&record.packet.run_id).ok();
+                                (record, decision)
+                            })
+                            .collect();
+                        dashboard.set_review_inbox(with_decisions);
                     }
+                    Err(message) => dashboard.error = Some(message),
                 }
+                continue;
             }
             UiCommand::LoadGit => {
                 // The focused pane's own worktree, so a pane dispatched onto a task shows that
@@ -678,6 +686,33 @@ fn run_dashboard(
 /// worktree top-level inside the repository before it will bind a run to it. So the client
 /// proposes a worktree and the daemon still refuses anything that is not one — Dock did not gain
 /// the power to dispatch into an arbitrary directory by gaining the power to make a worktree.
+/// What a dispatched agent is told: the task, and how to record that it finished.
+///
+/// The instruction is part of the prompt rather than something Dock works out afterwards. Dock
+/// could watch the pane and move the task when the agent looks done, but "looks done" is a regex
+/// over a screen, and the board is the durable record of what happened — moving a real task on a
+/// guess is how a board stops being trustworthy. Telling the agent costs one line and is true.
+fn dispatch_prompt(task_id: u64, title: &str) -> String {
+    format!(
+        "{title}\n\nThis is task #{task_id} on the Dock board. When you finish, run:\n    dock task move {task_id} review"
+    )
+}
+
+#[cfg(test)]
+mod dispatch_prompt_tests {
+    use super::dispatch_prompt;
+
+    #[test]
+    fn a_dispatched_agent_is_told_the_task_and_how_to_close_it() {
+        let prompt = dispatch_prompt(7, "fix the retry path");
+        assert!(prompt.starts_with("fix the retry path"), "{prompt}");
+        // The instruction is explicit because the alternative is Dock watching the pane and
+        // guessing when the agent is finished, which would move a durable record on a regex.
+        assert!(prompt.contains("dock task move 7 review"), "{prompt}");
+        assert!(prompt.contains("#7"), "{prompt}");
+    }
+}
+
 fn dispatch_task(
     client: &mut Client,
     dashboard: &mut Dashboard,
@@ -720,7 +755,7 @@ fn dispatch_task(
             run_id: run_id.to_owned(),
             profile,
             runtime_directory: dashboard.runtime_directory.clone(),
-            arguments: adapter.prompt_arguments(title),
+            arguments: adapter.prompt_arguments(&dispatch_prompt(*task_id, title)),
         });
         if let Response::Error { message, .. } = client.request(&request)? {
             return Err(message);
@@ -757,7 +792,7 @@ fn dispatch_task(
                 // repository-bound dispatch built a branch and a worktree and then opened the
                 // agent into silence, while the unbound path — the casual one — handed it
                 // everything. That was backwards.
-                arguments: adapter.prompt_arguments(title),
+                arguments: adapter.prompt_arguments(&dispatch_prompt(*task_id, title)),
             },
         },
     });

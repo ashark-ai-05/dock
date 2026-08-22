@@ -84,10 +84,13 @@ fn awaiting_input_set(agent: AgentKind) -> Option<&'static RegexSet> {
 /// the most expensive mistake available here. An explicit question outranks both: it is the one
 /// state where the agent has genuinely stopped.
 ///
-/// Waiting at an empty prompt is reported as `Blocked` rather than `Idle`. Both mean the same
-/// thing to the person reading the roster — it is your turn — and `Blocked` is what sorts to the
-/// top and colours for attention. Unknown output stays `Idle`, since a wrong call to attention is
-/// worse than a missed one the next tick will catch.
+/// Waiting at an empty prompt is `Done`, not `Blocked`. The two look alike — in both the agent has
+/// stopped and it is your turn — but they are not worth the same to the person reading the roster.
+/// `Blocked` means the agent asked something and cannot continue without an answer: a permission
+/// prompt, a chooser. `Done` means it finished its turn and will wait indefinitely. Reporting the
+/// second as the first was tried, and it makes every finished agent shout for attention until
+/// nothing in the roster means anything. Unknown output stays `Idle`, since a wrong call to
+/// attention is worse than a missed one the next tick will catch.
 pub fn classify_screen(agent: AgentKind, tail: &str) -> AgentState {
     static BLOCKED: OnceLock<RegexSet> = OnceLock::new();
     static WORKING: OnceLock<RegexSet> = OnceLock::new();
@@ -99,7 +102,7 @@ pub fn classify_screen(agent: AgentKind, tail: &str) -> AgentState {
         return AgentState::Working;
     }
     if awaiting_input_set(agent).is_some_and(|waiting| waiting.is_match(tail)) {
-        return AgentState::Blocked;
+        return AgentState::Done;
     }
     if set(DONE_PATTERNS, &DONE).is_match(tail) {
         return AgentState::Done;
@@ -129,12 +132,13 @@ mod awaiting_input_tests {
     );
 
     #[test]
-    fn claude_waiting_at_its_prompt_is_reported_as_wanting_the_user() {
-        // The reported bug: an agent that had answered and was waiting showed as Idle, so the
-        // roster gave no sign that it was the user's turn.
+    fn claude_that_has_finished_its_turn_is_done_rather_than_blocking() {
+        // It is your turn, but the agent is not stuck: it answered and will wait indefinitely.
+        // Reporting this as Blocked was tried and made every finished agent shout for attention,
+        // which leaves nothing in the roster meaning anything.
         assert_eq!(
             classify_screen(AgentKind::Claude, CLAUDE_AWAITING),
-            AgentState::Blocked
+            AgentState::Done
         );
     }
 
@@ -175,6 +179,23 @@ mod awaiting_input_tests {
     }
 
     #[test]
+    fn a_chooser_outranks_a_finished_turn_because_only_one_of_them_is_stuck() {
+        // Both screens carry Claude's input chrome. The chooser is the one that cannot continue
+        // without an answer, and it is the only one worth calling a person over.
+        let chooser = format!("{CLAUDE_AWAITING}\nEnter to select · Esc to cancel\n");
+        assert_eq!(
+            classify_screen(AgentKind::Claude, &chooser),
+            AgentState::Blocked
+        );
+        assert_eq!(
+            classify_screen(AgentKind::Claude, CLAUDE_AWAITING),
+            AgentState::Done
+        );
+        // And attention order keeps the stuck one above the finished one.
+        assert!(AgentState::Blocked.attention_rank() < AgentState::Done.attention_rank());
+    }
+
+    #[test]
     fn a_numbered_list_in_ordinary_prose_is_not_mistaken_for_a_chooser() {
         // The reason this keys on dialog chrome rather than on the options: agents print numbered
         // lists constantly, and every one of them would otherwise call the user over.
@@ -197,14 +218,14 @@ mod awaiting_input_tests {
     }
 
     #[test]
-    fn codex_waiting_at_its_empty_prompt_is_reported_as_wanting_the_user() {
+    fn codex_that_has_finished_its_turn_is_done_rather_than_blocking() {
         // Captured from a real Codex session: the placeholder is painted only while the input box
         // is empty.
         let idle = concat!(
             "› Ask Codex to do anything\n",
             "  gpt-5.6-sol default · ~/Development/dock\n",
         );
-        assert_eq!(classify_screen(AgentKind::Codex, idle), AgentState::Blocked);
+        assert_eq!(classify_screen(AgentKind::Codex, idle), AgentState::Done);
         // …and Claude must not answer for Codex's chrome either.
         assert_eq!(classify_screen(AgentKind::Amp, idle), AgentState::Idle);
     }

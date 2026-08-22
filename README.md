@@ -133,7 +133,20 @@ right place and you type the task yourself.
 
 The sidebar names the task each agent is on, and so does the pane's title, so
 three agents of the same kind are told apart by their work rather than by
-guessing. In a repository it gets a worktree of its
+guessing. An agent you start yourself by typing `claude` into a pane is **not**
+linked to any task — Dock cannot know what it is for. Dispatching from the
+board is what creates the link.
+
+A dispatched agent is also told how to close the loop: its prompt ends with
+`dock task move <id> review`, so the board follows the work. Dock never moves a
+task because an agent *looks* finished — "looks finished" is a regex over a
+screen, and the board is the durable record of what happened.
+
+Agent states are distinct on purpose: **needs you** means the agent asked
+something and cannot continue (a permission prompt, a chooser); **your turn**
+means it finished and will wait indefinitely. Reporting the second as the first
+makes every idle agent shout for attention until nothing in the roster means
+anything. In a repository it gets a worktree of its
 own on a `dock/task-<id>` branch, and dispatching the same task again lands in
 the worktree the first dispatch made. Outside one there is nothing to isolate
 from, so the agent launches where you are with the task as its opening prompt.

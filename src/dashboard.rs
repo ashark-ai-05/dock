@@ -152,7 +152,14 @@ impl Dashboard {
                 cols,
                 screen,
             } => {
-                let mut terminal = PaneScreen::new(rows, cols, 0);
+                // Zero scrollback here would make this client's replica unable to retain any
+                // history at all: `vt100` only starts pushing scrolled-off rows into its
+                // scrollback deque when the grid is constructed with a nonzero capacity, and
+                // that capacity is fixed for the terminal's lifetime. Without it, the wheel
+                // (`Dashboard::mouse`'s `ScrollUp`/`ScrollDown` arm) would have nothing to
+                // scroll into no matter how much output the pane produced. 2000 matches
+                // `dockd`'s own `--scrollback-rows` default.
+                let mut terminal = PaneScreen::new(rows, cols, 2000);
                 if let Ok(bytes) = STANDARD.decode(&screen) {
                     terminal.feed(&bytes);
                 }
@@ -1435,6 +1442,24 @@ impl Dashboard {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.dragging = None;
+                UiCommand::None
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                // Three rows per notch matches what terminals send for a single wheel click.
+                let delta = if event.kind == MouseEventKind::ScrollUp {
+                    3
+                } else {
+                    -3
+                };
+                let run_id = self
+                    .pane_areas
+                    .iter()
+                    .find(|(_, area)| contains(**area, event.column, event.row))
+                    .and_then(|(pane_id, _)| self.workspace()?.panes.get(pane_id))
+                    .and_then(|pane| pane.run_id.clone());
+                if let Some(screen) = run_id.and_then(|id| self.screens.get_mut(&id)) {
+                    screen.scroll_by(delta);
+                }
                 UiCommand::None
             }
             _ => UiCommand::None,
@@ -2848,6 +2873,53 @@ mod tests {
                 .count(),
             1,
             "{rows:#?}"
+        );
+    }
+
+    // CONTROLLER RULING C2: the brief's test used `dashboard()`, whose pane "a" has
+    // `run_id: None`. Attaching a screen for "run_1" would leave the focused pane unbound and
+    // the wheel event would land on empty space rather than exercising the scroll behaviour.
+    // `bound_dashboard()` binds pane "a" to "run_1" so the pointer is actually over a screen.
+    #[test]
+    fn the_wheel_scrolls_the_pane_under_the_pointer_and_returning_to_live_resumes_following() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        if let Some(screen) = dashboard.screens.get_mut("run_1") {
+            for index in 1..=60 {
+                screen.feed(format!("line {index}\r\n").as_bytes());
+            }
+        }
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        let (column, row) = (area.x + 2, area.y + 2);
+
+        let scrolled = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            scrolled,
+            UiCommand::None,
+            "scrolling costs no daemon request"
+        );
+        assert!(
+            dashboard.screens["run_1"].is_scrolled(),
+            "the wheel must move the viewport into history"
+        );
+
+        for _ in 0..40 {
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert!(
+            !dashboard.screens["run_1"].is_scrolled(),
+            "scrolling back to the bottom resumes following live output"
         );
     }
 }

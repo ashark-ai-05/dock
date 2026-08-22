@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod board;
 pub mod client;
 pub mod clipboard;
 pub mod copy;

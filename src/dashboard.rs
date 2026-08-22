@@ -14,6 +14,7 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::{
     adapter::{AdapterId, AdapterSelection},
+    board::BoardTask,
     clipboard::{self, ClipboardRoute},
     copy::{CopySession, find_matches},
     detect::{AgentKind, AgentState},
@@ -51,6 +52,11 @@ pub enum UiCommand {
     /// Asks the daemon for the pending handoffs. Distinct from `Request` because its response is
     /// the point: everything else only needs to know whether the daemon objected.
     LoadReviewInbox,
+    /// Asks for the task board, which lives in the repository rather than the daemon.
+    LoadBoard,
+    /// Gives a task somewhere isolated to be worked on and launches an agent there. Carries the
+    /// task rather than a worktree: the worktree may not exist yet, and making it is the point.
+    DispatchTask(TaskDispatch),
     Refresh,
     Quit,
     None,
@@ -113,11 +119,27 @@ pub struct Dashboard {
     /// The review overlay, if open. Holds the handoffs an agent submitted and is waiting on a
     /// human for, which is the one queue in Dock that a person rather than a process drains.
     review: Option<ReviewOverlay>,
+    /// The board as last read from the repository, kept so a taken row can be resolved back to the
+    /// task it named.
+    board_tasks: Vec<BoardTask>,
     picker_row_areas: Vec<Rect>,
     /// Where each workspace's tab landed, so the strip is clickable like every other chrome.
     tab_areas: Vec<(String, Rect)>,
     last_launch_profile: usize,
     last_repository_mode: bool,
+}
+
+/// Everything needed to give a task a worktree and put an agent on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDispatch {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub run_id: String,
+    pub task_id: u64,
+    pub title: String,
+    /// The agent to put on it, which is whichever one was launched last. Carried rather than
+    /// re-derived so the dispatch cannot silently disagree with what the launch form shows.
+    pub adapter: AdapterId,
 }
 
 /// The pending handoffs and where the reviewer is inside them.
@@ -136,6 +158,7 @@ pub struct ReviewOverlay {
 pub enum PickerPurpose {
     Workspace,
     File,
+    Task,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -535,6 +558,7 @@ impl Dashboard {
         let title = match purpose {
             PickerPurpose::Workspace => " WORKSPACES ",
             PickerPurpose::File => " FILES ",
+            PickerPurpose::Task => " BOARD ",
         };
         let width = area.width.min(58);
         let height = area.height.min(14);
@@ -1005,6 +1029,7 @@ impl Dashboard {
             Line::from("f find a file here and type its path into the pane"),
             Line::from("a resume the agent that last ran here, continuing its own session"),
             Line::from("i review handoffs agents are waiting on: a accept · c request changes"),
+            Line::from("k task board — dispatching one gives it a worktree and an agent"),
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
@@ -1125,6 +1150,10 @@ impl Dashboard {
                 self.error = None;
                 UiCommand::LoadReviewInbox
             }
+            PaneCommand::Board => {
+                self.error = None;
+                UiCommand::LoadBoard
+            }
             PaneCommand::WorkspaceJump(position) => self.jump_to_workspace(position),
             PaneCommand::Resize(delta) => self.resize_keyboard(delta),
             PaneCommand::Zoom => self.zoom(),
@@ -1168,6 +1197,27 @@ impl Dashboard {
         self.picker = Some((PickerPurpose::Workspace, Picker::new(items)));
         self.error = None;
         UiCommand::None
+    }
+
+    /// Receives the board and opens the task chooser over it.
+    pub fn set_board_tasks(&mut self, tasks: Vec<BoardTask>) {
+        if tasks.is_empty() {
+            self.picker = None;
+            self.error =
+                Some("no task board found: expected kanban/tasks in this repository".into());
+            return;
+        }
+        let items = tasks
+            .iter()
+            .map(|task| PickerItem {
+                key: task.id.to_string(),
+                label: task.title.clone(),
+                detail: format!("#{}  {}", task.id, task.status),
+            })
+            .collect();
+        self.board_tasks = tasks;
+        self.picker = Some((PickerPurpose::Task, Picker::new(items)));
+        self.error = None;
     }
 
     /// Receives the pending handoffs and opens the review overlay over them.
@@ -1537,6 +1587,44 @@ impl Dashboard {
                     None => self.error = Some("that workspace is gone".into()),
                 }
                 UiCommand::None
+            }
+            // Taking a task is the one picker row that changes something outside Dock, so it
+            // carries the whole context the dispatch needs rather than leaving the caller to
+            // rebuild it from a stale view of the layout.
+            PickerPurpose::Task => {
+                let Some(workspace) = self.workspace() else {
+                    self.error = Some("cannot dispatch: create a workspace first".into());
+                    return UiCommand::None;
+                };
+                let workspace_id = workspace.workspace_id.clone();
+                let pane_id = workspace.focused_pane_id.clone();
+                let Some(task) = self
+                    .board_tasks
+                    .iter()
+                    .find(|task| task.id.to_string() == key)
+                else {
+                    self.error = Some("that task is no longer on the board".into());
+                    return UiCommand::None;
+                };
+                let (task_id, title) = (task.id, task.title.clone());
+                let profile = PROFILES[self.last_launch_profile.min(PROFILES.len() - 1)].0;
+                let adapter = AdapterId::from(profile);
+                if !crate::adapter::builtin_available(&adapter) {
+                    self.error = Some(format!(
+                        "cannot dispatch: {} is not installed",
+                        adapter.label()
+                    ));
+                    return UiCommand::None;
+                }
+                self.error = None;
+                UiCommand::DispatchTask(TaskDispatch {
+                    workspace_id,
+                    pane_id,
+                    run_id: self.next_unique_id("dock_task"),
+                    task_id,
+                    title,
+                    adapter,
+                })
             }
             // The path is typed into the pane rather than opened, because Dock cannot know which
             // verb was wanted. Reaching for it after `vim ` opens it; reaching for it mid-sentence
@@ -4054,6 +4142,96 @@ mod tests {
         assert_eq!(
             dashboard.error.as_deref(),
             Some("review inbox is empty: no agent is waiting on a decision")
+        );
+    }
+
+    fn board_task(id: u64, title: &str, status: &str) -> BoardTask {
+        BoardTask {
+            id,
+            title: title.into(),
+            status: status.into(),
+            priority: "high".into(),
+            file: std::path::PathBuf::from(format!("kanban/tasks/{id}.md")),
+        }
+    }
+
+    #[test]
+    fn the_board_key_asks_for_the_board_rather_than_reading_it_from_the_key_handler() {
+        let mut dashboard = bound_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        assert_eq!(
+            command(&mut dashboard, KeyCode::Char('k')),
+            UiCommand::LoadBoard
+        );
+    }
+
+    #[test]
+    fn the_board_is_filterable_and_shows_each_tasks_number_and_status() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(vec![
+            board_task(11, "Repository-optional runtime", "review"),
+            board_task(12, "Dashboard real agent dispatch", "in-progress"),
+        ]);
+        let frame = render_to_string(&mut dashboard, 100, 30);
+        assert!(frame.contains("BOARD"), "{frame:?}");
+        assert!(frame.contains("#11"), "{frame:?}");
+        assert!(frame.contains("in-progress"), "{frame:?}");
+
+        for character in "Reposi".chars() {
+            dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        let listing = render_to_string(&mut dashboard, 100, 30);
+        let listing = listing.split("BOARD ─").nth(1).expect("overlay on screen");
+        assert!(!listing.contains("#12"), "{listing:?}");
+    }
+
+    #[test]
+    fn taking_a_task_asks_for_a_worktree_and_an_agent_rather_than_switching_anything_locally() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(vec![board_task(
+            12,
+            "Dashboard real agent dispatch",
+            "review",
+        )]);
+        render_to_string(&mut dashboard, 100, 30);
+        let taken = dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let UiCommand::DispatchTask(task) = taken else {
+            panic!("taking a task must dispatch it, got {taken:?}");
+        };
+        assert_eq!(task.task_id, 12);
+        assert_eq!(task.title, "Dashboard real agent dispatch");
+        assert_eq!(task.pane_id, "a");
+        // The agent is decided here, from the last launch, so the dispatch cannot disagree with
+        // what the launch form shows.
+        assert_eq!(task.adapter, AdapterId::from(PROFILES[0].0));
+        assert!(dashboard.picker.is_none());
+    }
+
+    #[test]
+    fn a_task_that_left_the_board_while_it_was_open_reports_rather_than_dispatching() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(vec![board_task(12, "Going away", "review")]);
+        render_to_string(&mut dashboard, 100, 30);
+        // The board is files on disk that anything may rewrite between reading and choosing.
+        dashboard.board_tasks.clear();
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert_eq!(
+            dashboard.error.as_deref(),
+            Some("that task is no longer on the board")
+        );
+    }
+
+    #[test]
+    fn a_repository_with_no_board_says_where_it_looked() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(Vec::new());
+        assert!(dashboard.picker.is_none());
+        assert_eq!(
+            dashboard.error.as_deref(),
+            Some("no task board found: expected kanban/tasks in this repository")
         );
     }
 

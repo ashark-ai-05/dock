@@ -51,6 +51,7 @@ pane**, `Esc` is never intercepted, and `Ctrl+B` twice sends a literal `Ctrl+B`.
 | `,` `.` | previous / next workspace | `r` | rename |
 | `w` | pick a workspace by name | `f` | find a file, type its path |
 | `a` | resume the agent here | `i` | review agent handoffs |
+| `k` | task board — dispatch one | | |
 | `1`–`9` | jump to a workspace | | |
 | `h` `v` | split ⇋ / ⇵ | `R` | restart a pane whose shell exited |
 | arrows, `Tab`/`S-Tab` | focus | `x` | close pane |
@@ -74,6 +75,12 @@ pane's process died, after the daemon restarted, and after a reboot. Two panes
 running the same agent in the same directory share a "most recent", so resuming
 one can land on the other's session. An agent whose resume flag Dock has not
 verified reports that it cannot be resumed rather than silently starting fresh.
+
+`Ctrl+B k` opens the task board, read straight from `kanban/tasks/*.md` — no
+`kanban-md` binary needed to see it. Choosing a task gives it a worktree of its
+own beside your repository, on a `dock/task-<id>` branch, and launches your
+last-used agent there. Dispatching the same task again lands in the worktree the
+first dispatch made. See **Safety** for exactly what that touches.
 
 `Ctrl+B i` opens the review queue: the handoffs agents submitted with
 `dock-handoff --submit` and are waiting on a person for. Each shows what the
@@ -157,8 +164,19 @@ multi-repository capacity and dependency gates.
 
 - Dock **only** controls PTYs and process groups it created. There is no
   adoption path, and stale process groups are never signalled.
-- It never stages, commits, rebases, merges, pushes, deploys, creates worktrees,
-  or mutates your task system.
+- Dock touches your repository in exactly **one** way: `Ctrl+B k` dispatching a
+  task runs `git worktree add`, creating a branch (`dock/task-<id>`) when that
+  branch does not already exist. It goes beside your repository, never inside
+  it. A path that is already occupied is refused rather than reused, and
+  dispatching the same task twice lands in the worktree the first one made.
+- Beyond that it **never** stages, commits, rebases, merges, pushes, deploys,
+  rewrites history, deletes branches, or removes worktrees — including the ones
+  it created. Cleaning up is yours, because Dock cannot know what is still
+  wanted.
+- It never completes or closes a task. A review decision is recorded and
+  carries `external_task_completed: false` and `git_mutated: false`; accepting
+  scope is a note, not a merge. Claiming a task through `kanban-md` moves it to
+  in-progress and is the only status Dock will ever set.
 - Durable state lives in `.dock/local` at `0700`/`0600`. Layout records hold
   topology and labels only — never terminal output, commands, credentials, PIDs,
   or process-group IDs. Use `--state-dir=` to relocate it.

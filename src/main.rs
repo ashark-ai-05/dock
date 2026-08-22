@@ -26,15 +26,16 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use dock::{
+    adapter::AdapterSelection,
     client::Client,
     client::{EventStream, StreamPoll},
-    dashboard::{Dashboard, UiCommand},
+    dashboard::{Dashboard, TaskDispatch, UiCommand},
     discovery::{AgentDiscovery, ProcessNameDiscovery},
     git::GitAdapter,
     paths,
     protocol::{
-        InspectRequest, PaneInputRequest, PaneResizeRequest, ProcessState, Request, Response,
-        ReviewInboxRequest, WorkspaceRequest,
+        DispatchRequest, InspectRequest, LaunchIntoPaneRequest, PaneInputRequest,
+        PaneResizeRequest, ProcessState, Request, Response, ReviewInboxRequest, WorkspaceRequest,
     },
     storage::LocalStore,
 };
@@ -608,6 +609,19 @@ fn run_dashboard(
                     }
                 }
             }
+            UiCommand::LoadBoard => {
+                let root = PathBuf::from(dashboard.repository_root.clone());
+                dashboard.set_board_tasks(dock::board::load(&root));
+            }
+            UiCommand::DispatchTask(task) => {
+                terminal
+                    .draw(|frame| dashboard.render(frame))
+                    .map_err(|e| e.to_string())?;
+                match dispatch_task(client, &mut dashboard, &task) {
+                    Ok(()) => refresh(client, &mut dashboard)?,
+                    Err(message) => dashboard.error = Some(message),
+                }
+            }
             UiCommand::Refresh => refresh(client, &mut dashboard)?,
             UiCommand::LoadCatalog => {
                 if !catalog_loading {
@@ -625,6 +639,78 @@ fn run_dashboard(
     terminal.show_cursor().map_err(|e| e.to_string())?;
     drop(terminal);
     guard.restore().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Gives a task somewhere isolated to be worked on, then launches an agent there.
+///
+/// The worktree is created by this client rather than by the daemon, which keeps the daemon's
+/// authority exactly where it already was: it validates that a supplied worktree really is a Git
+/// worktree top-level inside the repository before it will bind a run to it. So the client
+/// proposes a worktree and the daemon still refuses anything that is not one — Dock did not gain
+/// the power to dispatch into an arbitrary directory by gaining the power to make a worktree.
+fn dispatch_task(
+    client: &mut Client,
+    dashboard: &mut Dashboard,
+    task: &TaskDispatch,
+) -> Result<(), String> {
+    let TaskDispatch {
+        workspace_id,
+        pane_id,
+        run_id,
+        task_id,
+        title,
+        adapter,
+    } = task;
+    let repository_root = PathBuf::from(dashboard.repository_root.clone());
+    if repository_root.as_os_str().is_empty() {
+        return Err("cannot dispatch a task: this dashboard is not bound to a repository".into());
+    }
+    let branch = format!("dock/task-{task_id}");
+    // Beside the repository rather than inside it, so the worktree is never a candidate for the
+    // repository's own status, ignore rules, or a recursive walk.
+    let path = repository_root
+        .parent()
+        .ok_or("repository root has no parent to place a worktree beside")?
+        .join(format!(
+            "{}-task-{task_id}",
+            repository_root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "repo".into())
+        ));
+    let worktree = dock::git::ensure_worktree(&repository_root, &branch, &path, "HEAD")?;
+    let request = Request::LaunchIntoPane(LaunchIntoPaneRequest {
+        workspace_id: workspace_id.to_owned(),
+        pane_id: pane_id.to_owned(),
+        dispatch: DispatchRequest {
+            repository_root: repository_root.display().to_string(),
+            external_task_ref: task_id.to_string(),
+            run_id: run_id.to_owned(),
+            worktree: worktree.path.display().to_string(),
+            adapter: AdapterSelection {
+                id: adapter.clone(),
+                executable: None,
+                arguments: Vec::new(),
+            },
+        },
+    });
+    match client.request(&request)? {
+        Response::Error { message, .. } => return Err(message),
+        _ => {
+            dashboard.error = None;
+        }
+    }
+    // The footer carries one status line, which the codebase already uses for outcomes as well as
+    // failures — a yank reports the same way.
+    dashboard.error = Some(format!(
+        "task {task_id} {} on {branch}: {title}",
+        if worktree.created {
+            "dispatched into a new worktree"
+        } else {
+            "dispatched into its existing worktree"
+        }
+    ));
     Ok(())
 }
 

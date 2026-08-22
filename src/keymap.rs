@@ -33,6 +33,8 @@ pub enum PaneCommand {
     ResumeAgent,
     /// Show the handoffs agents are waiting on a human decision for.
     Review,
+    /// Show the task board and dispatch an agent onto one of its tasks.
+    Board,
     /// Jump straight to the workspace in this 1-based position, if it exists.
     WorkspaceJump(u8),
     Resize(i16),
@@ -108,6 +110,7 @@ impl Keymap {
             ("f", "file"),
             ("a", "resume"),
             ("i", "review"),
+            ("k", "board"),
             ("[", "copy mode"),
             ("+/-", "resize"),
             ("z", "zoom"),
@@ -157,6 +160,8 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Char('a') => PaneCommand::ResumeAgent,
         // `i` for inbox. The one queue in Dock a person rather than a process drains.
         KeyCode::Char('i') => PaneCommand::Review,
+        // `k` for kanban.
+        KeyCode::Char('k') => PaneCommand::Board,
         // Cycling is fine for two workspaces and miserable for eight. A digit is the only way to
         // reach a distant workspace in constant time. `0` is deliberately unbound: the positions
         // are 1-based on screen, so binding it would place a tenth workspace under a key that
@@ -309,6 +314,7 @@ mod tests {
             "f",
             "a",
             "i",
+            "k",
             "[",
             // The three ways to reach a workspace share one entry: the footer is two rows, and
             // listing them separately pushed the last published binding off the end of it.

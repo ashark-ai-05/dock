@@ -1,7 +1,125 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+
+/// Where a task's worktree lives and which branch it is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: String,
+    /// False when the worktree was already there and this call only found it. Dispatching twice to
+    /// the same task is an ordinary thing to do, and the second time must not look like the first.
+    pub created: bool,
+}
+
+/// Every worktree the repository knows about, as `(path, branch)`.
+///
+/// A detached worktree reports an empty branch rather than being omitted, because it still occupies
+/// its path and a new worktree cannot be created there.
+pub fn worktrees(repository_root: &Path) -> Result<Vec<(PathBuf, String)>, String> {
+    let listing = run(repository_root, ["worktree", "list", "--porcelain"])?;
+    let mut found = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut branch = String::new();
+    for line in listing.lines() {
+        if let Some(value) = line.strip_prefix("worktree ") {
+            if let Some(previous) = path.take() {
+                found.push((previous, std::mem::take(&mut branch)));
+            }
+            path = Some(PathBuf::from(value));
+        } else if let Some(value) = line.strip_prefix("branch ") {
+            branch = value.trim_start_matches("refs/heads/").to_owned();
+        }
+    }
+    if let Some(last) = path {
+        found.push((last, branch));
+    }
+    Ok(found)
+}
+
+/// Makes sure `branch` has a worktree, creating one at `path` if it does not already have one.
+///
+/// This is the one place Dock mutates a repository, and it is deliberately the least it can do to
+/// give an agent somewhere isolated to work: it adds a worktree, and a branch when that branch does
+/// not exist yet. It never stages, commits, rebases, merges, pushes, or removes anything, and it
+/// never touches a path that is already occupied — an existing directory that is not this branch's
+/// worktree is refused rather than reused, because whatever is in it belongs to someone else.
+///
+/// Idempotent on purpose. Dispatching the same task twice is ordinary, and the second dispatch
+/// should land in the worktree the first one made rather than fail or make a second one.
+pub fn ensure_worktree(
+    repository_root: &Path,
+    branch: &str,
+    path: &Path,
+    base: &str,
+) -> Result<Worktree, String> {
+    if branch.trim().is_empty() {
+        return Err("a worktree needs a branch name".into());
+    }
+    // Already checked out somewhere: use it, whatever path was suggested.
+    if let Some((existing, _)) = worktrees(repository_root)?
+        .into_iter()
+        .find(|(_, checked_out)| checked_out == branch)
+    {
+        return Ok(Worktree {
+            path: existing,
+            branch: branch.to_owned(),
+            created: false,
+        });
+    }
+    if path.exists() {
+        return Err(format!(
+            "{} already exists and is not a worktree of {branch}",
+            path.display()
+        ));
+    }
+    // `worktree add -b` creates the branch; without `-b` it checks out one that already exists.
+    // Asking git which case applies is cheaper than parsing the failure of the wrong one.
+    let branch_exists = run(
+        repository_root,
+        [
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_ok();
+    let path_text = path.to_string_lossy().into_owned();
+    if branch_exists {
+        run(repository_root, ["worktree", "add", &path_text, branch])?;
+    } else {
+        run(
+            repository_root,
+            ["worktree", "add", "-b", branch, &path_text, base],
+        )?;
+    }
+    let path = std::fs::canonicalize(path)
+        .map_err(|error| format!("could not canonicalize the new worktree: {error}"))?;
+    Ok(Worktree {
+        path,
+        branch: branch.to_owned(),
+        created: true,
+    })
+}
+
+fn run<const N: usize>(repository_root: &Path, arguments: [&str; N]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("could not run git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitFacts {
@@ -156,5 +274,135 @@ mod tests {
     #[test]
     fn empty_numstat_means_clean_comparison() {
         assert_eq!(parse_numstat(""), (0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::*;
+    use std::{
+        fs,
+        sync::atomic::{AtomicU32, Ordering},
+    };
+
+    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
+    struct Repo(PathBuf);
+
+    impl Repo {
+        /// Rooted outside the workspace: a fixture repository nested inside Dock's own would be
+        /// governed by it, and `worktree add` would resolve against the wrong top-level.
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "dock-worktree-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            let repo = Self(fs::canonicalize(&root).unwrap());
+            repo.git(["init", "-q", "-b", "main"]);
+            repo.git(["config", "user.email", "dock@example.invalid"]);
+            repo.git(["config", "user.name", "Dock Fixture"]);
+            fs::write(repo.0.join("tracked"), "fixture\n").unwrap();
+            repo.git(["add", "tracked"]);
+            repo.git(["commit", "-qm", "fixture"]);
+            repo
+        }
+
+        fn git<const N: usize>(&self, arguments: [&str; N]) -> String {
+            run(&self.0, arguments).expect("git fixture command")
+        }
+
+        fn at(&self, name: &str) -> PathBuf {
+            self.0.parent().unwrap().join(format!(
+                "{}-{name}",
+                self.0.file_name().unwrap().to_string_lossy()
+            ))
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            for (path, _) in worktrees(&self.0).unwrap_or_default() {
+                if path != self.0 {
+                    let _ = fs::remove_dir_all(path);
+                }
+            }
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_new_task_gets_a_worktree_and_a_branch() {
+        let repo = Repo::new();
+        let path = repo.at("task-7");
+        let worktree = ensure_worktree(&repo.0, "dock/task-7", &path, "HEAD").expect("create");
+        assert!(worktree.created);
+        assert_eq!(worktree.branch, "dock/task-7");
+        assert!(
+            worktree.path.join("tracked").exists(),
+            "the worktree is checked out"
+        );
+        assert!(
+            worktrees(&repo.0)
+                .unwrap()
+                .iter()
+                .any(|(_, branch)| branch == "dock/task-7")
+        );
+    }
+
+    #[test]
+    fn dispatching_the_same_task_twice_lands_in_the_first_worktree() {
+        let repo = Repo::new();
+        let first = ensure_worktree(&repo.0, "dock/task-7", &repo.at("task-7"), "HEAD").unwrap();
+        // A different path is suggested the second time; the branch already has a worktree, so
+        // that one is used and nothing new is made.
+        let second =
+            ensure_worktree(&repo.0, "dock/task-7", &repo.at("task-7-again"), "HEAD").unwrap();
+        assert!(
+            !second.created,
+            "the second dispatch must not create anything"
+        );
+        assert_eq!(first.path, second.path);
+        assert!(!repo.at("task-7-again").exists());
+    }
+
+    #[test]
+    fn an_existing_branch_is_checked_out_rather_than_recreated() {
+        let repo = Repo::new();
+        repo.git(["branch", "dock/existing"]);
+        let worktree =
+            ensure_worktree(&repo.0, "dock/existing", &repo.at("existing"), "HEAD").unwrap();
+        assert!(worktree.created);
+        assert_eq!(worktree.branch, "dock/existing");
+    }
+
+    #[test]
+    fn an_occupied_path_is_refused_rather_than_written_into() {
+        let repo = Repo::new();
+        let path = repo.at("occupied");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("someone-elses-work"), "keep me").unwrap();
+        let refused = ensure_worktree(&repo.0, "dock/task-9", &path, "HEAD");
+        assert!(refused.is_err(), "{refused:?}");
+        // Whatever was there is still there: refusing is the whole point.
+        assert!(path.join("someone-elses-work").exists());
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn a_worktree_needs_a_branch_name() {
+        let repo = Repo::new();
+        assert!(ensure_worktree(&repo.0, "   ", &repo.at("x"), "HEAD").is_err());
+    }
+
+    #[test]
+    fn the_listing_reports_the_main_worktree_and_its_branch() {
+        let repo = Repo::new();
+        let listed = worktrees(&repo.0).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, repo.0);
+        assert_eq!(listed[0].1, "main");
     }
 }

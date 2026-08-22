@@ -11,6 +11,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use regex::Regex;
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     adapter::AdapterSelection,
-    detect::{AgentState, agent_in_process_table, classify_screen},
+    detect::{AgentKind, AgentState, agent_in_process_table, classify_screen},
     git::GitAdapter,
     layout::{LayoutRegistry, LayoutSnapshot, PaneRuntime, WorkspaceLayout},
     model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
@@ -32,6 +33,9 @@ use crate::{
     terminal::{PaneOutput, PaneScreen},
 };
 
+/// One memoised classification: the output mark it was computed from, and what it produced.
+type ClassifiedAgent = ((u64, u64, u64), Option<AgentKind>, AgentState);
+
 pub struct RuntimeRegistry {
     runs: Mutex<HashMap<String, RuntimeSlot>>,
     receipts: PathBuf,
@@ -44,6 +48,12 @@ pub struct RuntimeRegistry {
     /// measured pane starts at the size the client is drawing rather than the fallback. This is
     /// a leaf lock: it is never taken while `runs` or `layout` is held.
     pane_sizes: Mutex<HashMap<String, PtySize>>,
+    /// The last process-table snapshot, when it was taken, and which snapshot it is. The
+    /// generation is what lets a memoised classification know the table underneath it changed.
+    process_table: Mutex<Option<(Instant, u64, Arc<str>)>>,
+    /// Agent state per run, keyed by the exact output the screen was built from. Classification is
+    /// a pure function of that screen, so nothing but new bytes can change its answer.
+    agent_states: Mutex<HashMap<String, ClassifiedAgent>>,
     #[cfg(test)]
     /// Auto-launched pane shells put a live run in every pane, which is exactly what the
     /// dispatch-authority tests below assert cannot happen. Those tests suppress the shell so
@@ -304,6 +314,8 @@ impl RuntimeRegistry {
             capacity,
             layout: Mutex::new(layout),
             pane_sizes: Mutex::new(HashMap::new()),
+            process_table: Mutex::new(None),
+            agent_states: Mutex::new(HashMap::new()),
             #[cfg(test)]
             suppress_pane_shells: Mutex::new(false),
             #[cfg(test)]
@@ -1873,6 +1885,27 @@ impl RuntimeRegistry {
         }
     }
 
+    /// The process table, taken afresh only when the last snapshot has aged out.
+    fn process_table(&self) -> Option<(u64, Arc<str>)> {
+        let mut cached = self
+            .process_table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((taken, generation, table)) = cached.as_ref()
+            && taken.elapsed() < PROCESS_TABLE_TTL
+        {
+            return Some((*generation, Arc::clone(table)));
+        }
+        // Shared rather than cloned: it is around 79KB on an ordinary machine, and every event
+        // stream reads it on every poll.
+        let table: Arc<str> = Arc::from(read_process_table()?);
+        let generation = cached
+            .as_ref()
+            .map_or(0, |(_, generation, _)| generation + 1);
+        *cached = Some((Instant::now(), generation, Arc::clone(&table)));
+        Some((generation, table))
+    }
+
     pub fn inspect(
         &self,
         run_id: Option<&str>,
@@ -1914,8 +1947,11 @@ impl RuntimeRegistry {
         let table = runs
             .iter()
             .any(|(_, snapshot)| snapshot.process_group_id.is_some())
-            .then(process_table)
+            .then(|| self.process_table())
             .flatten();
+        let generation = table
+            .as_ref()
+            .map_or(u64::MAX, |(generation, _)| *generation);
         Ok(runs
             .into_iter()
             .map(|(runtime, mut snapshot)| {
@@ -1924,20 +1960,46 @@ impl RuntimeRegistry {
                 // construction, and it is a pid Dock's own spawn produced. Detection walks
                 // *down* from there by parentage, because a job-control shell puts every command
                 // the user starts into a new process group of its own.
+                // Both inputs to the answer, so a pane that has written nothing since the last
+                // poll and is looking at the same process-table snapshot costs one hash lookup —
+                // no table parsing and no screen scan. That is most panes, most of the time, and
+                // parsing a 79KB table per pane per poll was the cost that made this hot.
+                let mark = runtime.with_output(|output| (output.log().epoch(), output.log().end()));
+                let key = (generation, mark.0, mark.1);
+                let mut cached = self
+                    .agent_states
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some((seen, kind, state)) = cached.get(&snapshot.run_id)
+                    && *seen == key
+                {
+                    snapshot.agent = *kind;
+                    snapshot.agent_state = *state;
+                    return snapshot;
+                }
                 let agent = snapshot
                     .process_group_id
-                    .zip(table.as_deref())
+                    .zip(table.as_ref().map(|(_, table)| table.as_ref()))
                     .and_then(|(leader_pid, table)| agent_in_process_table(table, leader_pid));
-                snapshot.agent_state = match agent {
-                    // The whole screen, not a tail. An agent's chooser leaves the cursor on the
-                    // highlighted option and prints its instructions underneath, so a
-                    // cursor-anchored tail cannot contain the very chrome that says the agent is
-                    // waiting — every pattern matched against one was unreachable.
+                // Classification reads the whole screen through several pattern sets, and this
+                // runs for every pane on every poll of the event stream. It is a pure function of
+                // the screen, and the screen is a pure function of the bytes written to it, so the
+                // output log's (epoch, end) pair says exactly when the answer can have changed.
+                // A pane that has written nothing since the last poll — which is most panes, most
+                // of the time — costs a hash lookup instead of a full scan.
+                // The whole screen, not a tail. An agent's chooser leaves the cursor on the
+                // highlighted option and prints its instructions underneath, so a cursor-anchored
+                // tail cannot contain the very chrome that says the agent is waiting — every
+                // pattern matched against one was unreachable.
+                let state = match agent {
                     Some(kind) => {
                         runtime.with_screen(|screen| classify_screen(kind, &screen.visible_text()))
                     }
                     None => AgentState::Idle,
                 };
+                cached.insert(snapshot.run_id.clone(), (key, agent, state));
+                drop(cached);
+                snapshot.agent_state = state;
                 snapshot.agent = agent;
                 snapshot
             })
@@ -2856,9 +2918,20 @@ fn pane_shell_run_id(workspace_id: &str, pane_id: &str) -> String {
 
 const PANE_SHELL_RUN_ID_PREFIX: &str = "dock_sh_";
 
-/// One snapshot of the process table, shared by every run in a single `inspect`. Agent detection
-/// sits on the event-stream hot path, so it must not cost one subprocess per run.
-fn process_table() -> Option<String> {
+/// How long a process-table snapshot is reused before another is taken.
+///
+/// The event stream polls every 16ms, and it used to take a fresh snapshot each time. On a machine
+/// with 839 processes that call costs about 39ms — more than the interval itself — so the daemon
+/// burned upwards of two cores continuously, per subscribed dashboard, and could not keep pace
+/// with its own loop. What it was asking is which agent runs under a pane, and that answer changes
+/// when a person starts a program: at human speed, not at frame rate. Half a second is far below
+/// the point anyone notices a new agent appearing and roughly thirty times cheaper.
+const PROCESS_TABLE_TTL: Duration = Duration::from_millis(500);
+
+/// One snapshot of the process table, shared by every run in a single `inspect` and reused across
+/// calls for [`PROCESS_TABLE_TTL`]. Agent detection sits on the event-stream hot path, so it must
+/// cost neither a subprocess per run nor a subprocess per frame.
+fn read_process_table() -> Option<String> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,ppid=,pgid=,comm="])
         .output()

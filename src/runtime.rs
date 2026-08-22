@@ -131,7 +131,14 @@ impl OwnedRuntime {
             scrollback_rows,
             PANE_OUTPUT_LOG_BYTES,
         )));
-        match launch_child(&command, &binding.worktree, Arc::clone(&output), size) {
+        let dock_variables = dock_environment(&binding);
+        match launch_child(
+            &command,
+            &binding.worktree,
+            Arc::clone(&output),
+            size,
+            &dock_variables,
+        ) {
             Ok((child, pid, guardian_control, pty_input_sender, pty_control)) => {
                 let lifecycle = Arc::new(Mutex::new(LifecycleState::Running));
                 let reaper_lifecycle = Arc::clone(&lifecycle);
@@ -607,13 +614,41 @@ fn wait_for_owned_group_exit(group: &OwnedProcessGroup, timeout: Duration) -> bo
     !owned_group_exists(group)
 }
 
+/// What Dock tells a pane's child about itself.
+///
+/// The child's environment is cleared and rebuilt from an allowlist, so nothing reaches it by
+/// accident. These are Dock's own, set deliberately: an agent that knows which board it belongs to
+/// and which task it was dispatched onto can record its own progress with `dock task`, instead of
+/// the person who launched it having to relay both facts by hand.
+fn dock_environment(binding: &RunBinding) -> Vec<(String, String)> {
+    let mut variables = vec![
+        ("DOCK_WORKSPACE".to_owned(), binding.workspace_id.clone()),
+        ("DOCK_PANE".to_owned(), binding.pane_id.clone()),
+        ("DOCK_RUN".to_owned(), binding.run_id.clone()),
+    ];
+    // A repository-bound run shares its repository's board; an unbound one gets the workspace's,
+    // which is the same rule the dashboard's own board key follows.
+    let board = match binding.binding_kind {
+        BindingKind::Repository => Some(binding.repository_root.join("kanban").join("tasks")),
+        BindingKind::Terminal => crate::board::workspace_tasks_dir(&binding.workspace_id),
+    };
+    if let Some(board) = board {
+        variables.push(("DOCK_BOARD".to_owned(), board.display().to_string()));
+    }
+    if !binding.external_task_ref.trim().is_empty() {
+        variables.push(("DOCK_TASK".to_owned(), binding.external_task_ref.clone()));
+    }
+    variables
+}
+
 fn launch_child(
     command: &[String],
     worktree: &Path,
     output: Arc<Mutex<PaneOutput>>,
     size: PtySize,
+    dock_variables: &[(String, String)],
 ) -> Result<ChildLaunch, String> {
-    launch_child_with_before_spawn(command, worktree, output, size, || {})
+    launch_child_with_before_spawn(command, worktree, output, size, dock_variables, || {})
 }
 
 fn launch_child_with_before_spawn(
@@ -621,6 +656,7 @@ fn launch_child_with_before_spawn(
     worktree: &Path,
     output: Arc<Mutex<PaneOutput>>,
     size: PtySize,
+    dock_variables: &[(String, String)],
     before_spawn: impl FnOnce(),
 ) -> Result<ChildLaunch, String> {
     let Some(program) = command.first() else {
@@ -657,6 +693,12 @@ fn launch_child_with_before_spawn(
     // inheritable, so an unrelated concurrent child cannot retain this live control endpoint.
     let mut process = Command::new("/bin/sh");
     apply_child_environment(&mut process, std::env::vars_os());
+    // Added after the allowlist filter, because these are Dock's own rather than anything
+    // inherited: the filter exists to stop the parent's environment leaking in, not to stop Dock
+    // telling its own child where it is.
+    for (key, value) in dock_variables {
+        process.env(key, value);
+    }
     process
         .arg("-c")
         .arg(
@@ -1682,6 +1724,7 @@ mod tests {
                 &std::env::current_dir().unwrap(),
                 output,
                 FIXTURE_SIZE,
+                &[],
                 || {
                     *unrelated.lock().unwrap() =
                         Some(Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap());

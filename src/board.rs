@@ -162,6 +162,57 @@ pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
     })
 }
 
+/// The statuses a task moves through, in the order work moves through them.
+pub const STATUSES: [&str; 5] = ["backlog", "todo", "in-progress", "review", "done"];
+
+/// Moves a task to a new status, rewriting only that line of its front matter.
+///
+/// Only the `status:` line is touched. Everything else in the file — the body, the tags, whatever
+/// another tool wrote there — is preserved byte for byte, because a board is shared with
+/// `kanban-md`, with editors, and with whoever commits to it, and a tool that reformats other
+/// people's files on the way past is a tool nobody keeps.
+pub fn set_status(directory: &Path, id: u64, status: &str) -> Result<BoardTask, String> {
+    let status = status.trim();
+    if !STATUSES.contains(&status) {
+        return Err(format!(
+            "unknown status {status:?}; expected one of {}",
+            STATUSES.join(", ")
+        ));
+    }
+    let task = load(directory)
+        .into_iter()
+        .find(|task| task.id == id)
+        .ok_or_else(|| format!("no task {id} on this board"))?;
+    let text = fs::read_to_string(&task.file)
+        .map_err(|error| format!("could not read the task: {error}"))?;
+    let mut rewritten = String::with_capacity(text.len());
+    let mut in_front_matter = false;
+    let mut replaced = false;
+    for (index, line) in text.lines().enumerate() {
+        if line.trim() == "---" {
+            // The opening fence turns it on; the closing fence turns it off, so a `status:` in
+            // the body below cannot be mistaken for the field.
+            in_front_matter = index == 0 || !in_front_matter;
+        }
+        if in_front_matter && !replaced && line.starts_with("status:") {
+            rewritten.push_str(&format!("status: {status}"));
+            replaced = true;
+        } else {
+            rewritten.push_str(line);
+        }
+        rewritten.push('\n');
+    }
+    if !replaced {
+        return Err(format!("task {id} has no status field to move"));
+    }
+    fs::write(&task.file, rewritten)
+        .map_err(|error| format!("could not write the task: {error}"))?;
+    Ok(BoardTask {
+        status: status.to_owned(),
+        ..task
+    })
+}
+
 /// Every task in `directory`, ordered by status then id.
 ///
 /// Best-effort by design: a file that cannot be read or has no `id` is skipped rather than failing
@@ -430,6 +481,61 @@ mod tests {
             "{awkward:?}"
         );
         assert!(!awkward.to_string_lossy().contains(".."), "{awkward:?}");
+    }
+
+    #[test]
+    fn moving_a_task_rewrites_its_status_and_nothing_else() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        board.task("001-a.md", &task_file(1, "Wire the parser", "backlog"));
+        let before = fs::read_to_string(dir.join("001-a.md")).unwrap();
+
+        let moved = set_status(&dir, 1, "in-progress").expect("move");
+        assert_eq!(moved.status, "in-progress");
+        assert_eq!(load(&dir)[0].status, "in-progress");
+
+        // A board is shared with kanban-md, with editors, and with whoever commits to it. Only
+        // the one line may change; a tool that reformats other people's files is not one anybody
+        // keeps pointed at their repository.
+        let after = fs::read_to_string(dir.join("001-a.md")).unwrap();
+        let changed: Vec<(&str, &str)> = before
+            .lines()
+            .zip(after.lines())
+            .filter(|(a, b)| a != b)
+            .collect();
+        assert_eq!(changed, vec![("status: backlog", "status: in-progress")]);
+        assert_eq!(before.lines().count(), after.lines().count());
+    }
+
+    #[test]
+    fn an_unknown_status_is_refused_and_names_the_ones_that_exist() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        board.task("001-a.md", &task_file(1, "Wire it", "backlog"));
+        let refused = set_status(&dir, 1, "nearly-done").expect_err("refused");
+        assert!(refused.contains("in-progress"), "{refused}");
+        assert_eq!(load(&dir)[0].status, "backlog", "the task must not move");
+    }
+
+    #[test]
+    fn moving_a_task_that_is_not_there_says_so() {
+        let board = Board::new();
+        assert!(set_status(&board.0.join("kanban/tasks"), 99, "done").is_err());
+    }
+
+    #[test]
+    fn a_status_word_in_the_body_is_not_mistaken_for_the_field() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        fs::write(
+            dir.join("001-a.md"),
+            "---\nid: 1\ntitle: 'Doc'\nstatus: backlog\n---\n\nstatus: this is prose\n",
+        )
+        .unwrap();
+        set_status(&dir, 1, "done").expect("move");
+        let after = fs::read_to_string(dir.join("001-a.md")).unwrap();
+        assert!(after.contains("status: done"), "{after}");
+        assert!(after.contains("status: this is prose"), "{after}");
     }
 
     #[test]

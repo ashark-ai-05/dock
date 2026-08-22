@@ -95,6 +95,10 @@ fn run_noninteractive_legacy(args: &[String]) -> Result<bool, Box<dyn Error>> {
         .iter()
         .find_map(|argument| argument.strip_prefix("--dock-dir=").map(str::to_owned))
         .unwrap_or_else(|| ".dock/local".into());
+    if args.first().is_some_and(|first| first == "task") {
+        task_command(&args[1..])?;
+        return Ok(true);
+    }
     if let Some(run_id) = args.iter().find_map(|a| a.strip_prefix("--load-handoff=")) {
         let packet = LocalStore::new(dock_dir)
             .load_handoff(run_id)
@@ -687,6 +691,18 @@ fn dispatch_task(
         title,
         adapter,
     } = task;
+    // Putting an agent on a task is a claim on it, so the board says so before the agent starts.
+    // Only on Dock's own board: a repository's belongs to kanban-md and to whoever commits to it,
+    // and moving a task there is that tool's business, not this one's.
+    if let Some(board) = dock::board::tasks_dir(
+        &dashboard.repository_root,
+        dashboard.workspace_id().unwrap_or_default(),
+    ) && dock::board::is_personal(&board)
+    {
+        // Best effort: a board that will not move a task is not a reason to refuse the work. The
+        // dispatch is what the user asked for; the status is bookkeeping around it.
+        let _ = dock::board::set_status(&board, *task_id, "in-progress");
+    }
     let repository_root = PathBuf::from(dashboard.repository_root.clone());
     // Without a repository there is no worktree to isolate the work in, and nothing to isolate it
     // from. The agent is launched where the dashboard already is, with the task as its opening
@@ -757,6 +773,82 @@ fn dispatch_task(
             "dispatched into its existing worktree"
         }
     ));
+    Ok(())
+}
+
+/// `dock task` — the board, from a shell or from an agent.
+///
+/// An agent Dock launches is handed `DOCK_BOARD` (and `DOCK_TASK` when it was dispatched onto
+/// one), so it can record what it is doing without being told where anything lives. The same
+/// command run by a person does the same thing, which is the point: there is one board and one way
+/// to move a task across it, whether a human or an agent is doing the moving.
+fn task_command(args: &[String]) -> io::Result<()> {
+    let board = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--board="))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("DOCK_BOARD").map(PathBuf::from))
+        .ok_or_else(|| {
+            io::Error::other(
+                "no board: pass --board=<dir>, or run this inside a pane Dock launched, where \
+                 DOCK_BOARD is already set",
+            )
+        })?;
+    let positional: Vec<&String> = args
+        .iter()
+        .filter(|argument| !argument.starts_with("--"))
+        .collect();
+    let verb = positional
+        .first()
+        .map(|verb| verb.as_str())
+        .unwrap_or("list");
+    match verb {
+        "list" => {
+            let tasks = dock::board::load(&board);
+            if tasks.is_empty() {
+                println!("no tasks in {}", board.display());
+            }
+            for task in tasks {
+                println!("{}\t{}\t{}", task.id, task.status, task.title);
+            }
+        }
+        "add" => {
+            let title = positional
+                .get(1)
+                .ok_or_else(|| io::Error::other("dock task add \"<title>\""))?;
+            let task = dock::board::create(&board, title).map_err(io::Error::other)?;
+            println!("{}\t{}\t{}", task.id, task.status, task.title);
+        }
+        "move" => {
+            let id: u64 = positional
+                .get(1)
+                .ok_or_else(|| io::Error::other("dock task move <id> <status>"))?
+                .parse()
+                .map_err(|_| io::Error::other("the task id must be a number"))?;
+            let status = positional
+                .get(2)
+                .ok_or_else(|| io::Error::other("dock task move <id> <status>"))?;
+            let task = dock::board::set_status(&board, id, status).map_err(io::Error::other)?;
+            println!("{}\t{}\t{}", task.id, task.status, task.title);
+        }
+        "show" => {
+            let id: u64 = positional
+                .get(1)
+                .ok_or_else(|| io::Error::other("dock task show <id>"))?
+                .parse()
+                .map_err(|_| io::Error::other("the task id must be a number"))?;
+            let task = dock::board::load(&board)
+                .into_iter()
+                .find(|task| task.id == id)
+                .ok_or_else(|| io::Error::other(format!("no task {id} on this board")))?;
+            println!("{}", fs::read_to_string(&task.file)?);
+        }
+        other => {
+            return Err(io::Error::other(format!(
+                "unknown task command {other:?}; expected list, add, move or show"
+            )));
+        }
+    }
     Ok(())
 }
 

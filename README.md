@@ -92,7 +92,26 @@ matches, `Enter` writes down what you typed. The board names its own directory
 along the bottom, so a workspace board and a repository board are never
 confused.
 
-Choosing a task puts an agent on it. In a repository it gets a worktree of its
+Agents track their own work with `dock task`. Every pane Dock launches gets
+`DOCK_BOARD` (its board), `DOCK_WORKSPACE`, `DOCK_PANE`, `DOCK_RUN`, and
+`DOCK_TASK` when it was dispatched onto one — so an agent already knows where
+to record things and needs no arguments:
+
+```bash
+dock task list                       # what is on this board
+dock task add "fix the retry path"   # write one down
+dock task move 3 in-progress         # backlog · todo · in-progress · review · done
+dock task show 3
+```
+
+The same commands work from any shell with `--board=<dir>`, so a board with no
+agent on it is entirely yours to run by hand. Tasks are Markdown with YAML
+front matter and `move` rewrites only the `status:` line, leaving everything
+else byte for byte — so `kanban-md`, your editor, and Dock all read and write
+the same files without fighting.
+
+Choosing a task puts an agent on it, and claims it: the task moves to
+`in-progress` on Dock's own boards before the agent starts. In a repository it gets a worktree of its
 own on a `dock/task-<id>` branch, and dispatching the same task again lands in
 the worktree the first dispatch made. Outside one there is nothing to isolate
 from, so the agent launches where you are with the task as its opening prompt.
@@ -197,11 +216,14 @@ multi-repository capacity and dependency gates.
   carries `external_task_completed: false` and `git_mutated: false`; accepting
   scope is a note, not a merge. Claiming a task through `kanban-md` moves it to
   in-progress and is the only status Dock will ever set.
-- Dock writes task files **only under `~/.dock/boards/`**, its own boards. A
-  repository's board belongs to `kanban-md` and to whoever commits to it, so
-  adding is refused there and says why. Reading any board is always safe: it
-  parses the Markdown front matter directly and never runs `kanban-md` to look.
-  Dock never deletes a board or a task.
+- The dashboard writes task files **only under `~/.dock/boards/`**, its own
+  boards: it adds a task there, and claims one to `in-progress` when it puts an
+  agent on it. A repository's board belongs to `kanban-md` and to whoever
+  commits to it, so the dashboard never writes there. The `dock task` command
+  writes wherever it is explicitly pointed — that is how an agent records its
+  own progress — and rewrites only the `status:` line, never reformatting the
+  rest of a file it shares with other tools. Reading any board is always safe
+  and never runs `kanban-md`. Dock never deletes a board or a task.
 - Durable state lives in `.dock/local` at `0700`/`0600`. Layout records hold
   topology and labels only — never terminal output, commands, credentials, PIDs,
   or process-group IDs. Use `--state-dir=` to relocate it.

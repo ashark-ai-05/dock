@@ -125,6 +125,13 @@ pub struct Dashboard {
     /// Dock only ever writes tasks to its own.
     board_dir: Option<std::path::PathBuf>,
     board_is_personal: bool,
+    /// Which task each run was dispatched onto, for runs this dashboard dispatched.
+    ///
+    /// A repository-bound run carries its task in the binding and the daemon reports it, so this
+    /// is only needed for unbound ones: `TerminalLaunchRequest` has no task field, so nothing
+    /// durable records the pairing. Client-local, and lost with the dashboard — which is honest,
+    /// because it is a note about what this dashboard did rather than a fact about the run.
+    dispatched_tasks: HashMap<String, u64>,
     /// The Git overlay, if open.
     git: Option<GitOverlay>,
     /// The board, if open.
@@ -812,13 +819,19 @@ impl Dashboard {
         let label_width = inner_width.saturating_sub(3);
         let roster = self.agent_roster();
         let roster_is_empty = roster.is_empty();
-        for (state, label) in roster {
+        for (state, label, task) in roster {
             // The state is spelled out beside the name. The glyph and its colour say that
             // something is true of this agent; only the word says what, and "needs you" is the
             // whole reason to look at this list at all.
             let state_text = state.label();
+            // The task rides with the name, because which agent is which is the question a roster
+            // of three identical "claude" rows cannot answer.
+            let named = match &task {
+                Some(task) => format!("{label} #{task}"),
+                None => label.to_owned(),
+            };
             let name_width = label_width.saturating_sub(state_text.chars().count() + 2);
-            let name = ellipsise(label, name_width);
+            let name = ellipsise(&named, name_width);
             let gap = label_width.saturating_sub(name.chars().count() + state_text.chars().count());
             lines.push(Line::from(vec![
                 Span::styled(
@@ -894,19 +907,41 @@ impl Dashboard {
     /// Only a run whose agent was actually detected is an agent. `self.agents` also carries
     /// every pane's ambient shell, which reports no kind at all; listing those turned the
     /// roster into a list of run ids for processes that are not agents.
-    fn agent_roster(&self) -> Vec<(AgentState, &str)> {
-        let mut roster: Vec<(AgentState, &str)> = self
+    fn agent_roster(&self) -> Vec<(AgentState, &str, Option<String>)> {
+        // Joined to the run so the roster can say which task each agent is on. Three agents all
+        // reading "claude" tell you only that three agents are running.
+        let mut roster: Vec<(AgentState, &str, Option<String>)> = self
             .agents
-            .values()
-            .filter_map(|(kind, state)| Some((*state, kind.as_ref()?.label())))
+            .iter()
+            .filter_map(|(run_id, (kind, state))| {
+                Some((*state, kind.as_ref()?.label(), self.task_of(run_id)))
+            })
             .collect();
         roster.sort_by(|left, right| {
             left.0
                 .attention_rank()
                 .cmp(&right.0.attention_rank())
                 .then_with(|| left.1.cmp(right.1))
+                .then_with(|| left.2.cmp(&right.2))
         });
         roster
+    }
+
+    /// The task a run is working on, if anything knows: the daemon's own binding first, then this
+    /// dashboard's note of what it dispatched.
+    fn task_of(&self, run_id: &str) -> Option<String> {
+        let bound = self
+            .runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .map(|run| run.external_task_ref.trim())
+            .filter(|task| !task.is_empty())
+            .map(str::to_owned);
+        bound.or_else(|| {
+            self.dispatched_tasks
+                .get(run_id)
+                .map(|task| task.to_string())
+        })
     }
 
     fn render_node(
@@ -1144,12 +1179,14 @@ impl Dashboard {
         let Some(run_id) = pane.run_id.as_deref() else {
             return "unbound".into();
         };
-        let Some(run) = self.runs.iter().find(|run| run.run_id == run_id) else {
+        let Some(_run) = self.runs.iter().find(|run| run.run_id == run_id) else {
             return format!("{run_id} · unavailable");
         };
-        match run.binding_kind {
-            BindingKind::Terminal => run_id.to_owned(),
-            BindingKind::Repository => format!("{run_id} · {}", run.external_task_ref),
+        // The task first when there is one: a run id identifies a row in a receipt, a task
+        // identifies the work, and only one of those is what a person is looking for.
+        match self.task_of(run_id) {
+            Some(task) => format!("#{task} · {run_id}"),
+            None => run_id.to_owned(),
         }
     }
 
@@ -1245,7 +1282,7 @@ impl Dashboard {
             Line::from("f find a file here and type its path into the pane"),
             Line::from("a resume the agent that last ran here, continuing its own session"),
             Line::from("i review handoffs agents are waiting on: a accept · c request changes"),
-            Line::from("k task board: ←/→ column · ↑/↓ card · </> move it · n new · Enter dispatch"),
+            Line::from("k board: ←/→ column · ↑/↓ card · </> move · n new · Enter dispatch"),
             Line::from("g what changed in this pane's worktree · j/k scroll · g/G ends"),
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
@@ -2300,10 +2337,12 @@ impl Dashboard {
                     return UiCommand::None;
                 }
                 self.error = None;
+                let run_id = self.next_unique_id("dock_task");
+                self.dispatched_tasks.insert(run_id.clone(), task_id);
                 UiCommand::DispatchTask(TaskDispatch {
                     workspace_id,
                     pane_id,
-                    run_id: self.next_unique_id("dock_task"),
+                    run_id,
                     task_id,
                     title,
                     adapter,
@@ -4021,8 +4060,10 @@ mod tests {
         dashboard.runs.push(snapshot());
         let text = render_to_string(&mut dashboard, 110, 28);
         // The body is the emulated screen now, so the run's identity has to survive in the
-        // one place still reserved for facts about the binding: the pane's own title.
-        assert!(text.contains("dock_real · TASK-61"), "{text:?}");
+        // one place still reserved for facts about the binding: the pane's own title. The task
+        // leads, because a run id identifies a row in a receipt and a task identifies the work —
+        // and only one of those is what someone glancing at a pane is looking for.
+        assert!(text.contains("#TASK-61 · dock_real"), "{text:?}");
         assert!(text.contains("agent · unbound"), "{text:?}");
         for gone in [
             "repository: /repo/real",
@@ -5184,6 +5225,63 @@ mod tests {
     }
 
     #[test]
+    fn the_roster_says_which_task_each_agent_is_on() {
+        let mut dashboard = bound_dashboard();
+        let mut first = snapshot();
+        first.run_id = "run_1".into();
+        first.external_task_ref = "7".into();
+        let mut second = snapshot();
+        second.run_id = "run_2".into();
+        second.external_task_ref = "12".into();
+        dashboard.runs = vec![first, second];
+        dashboard.agents.insert(
+            "run_1".into(),
+            (Some(AgentKind::Claude), AgentState::Blocked),
+        );
+        dashboard.agents.insert(
+            "run_2".into(),
+            (Some(AgentKind::Claude), AgentState::Working),
+        );
+
+        let rows = sidebar_rows(&mut dashboard, 100, 30).join("\n");
+        // Two agents of the same kind are otherwise indistinguishable: both rows read "claude"
+        // and neither says what it is doing.
+        assert!(rows.contains("claude #7"), "{rows:?}");
+        assert!(rows.contains("claude #12"), "{rows:?}");
+        assert!(
+            rows.find("#7").unwrap() < rows.find("#12").unwrap(),
+            "blocked first"
+        );
+    }
+
+    #[test]
+    fn an_unbound_dispatch_still_remembers_which_task_it_was_for() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(
+            vec![board_task(4, "unbound work", "backlog")],
+            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+        );
+        dashboard.board.as_mut().unwrap().writable = true;
+        let UiCommand::DispatchTask(task) =
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter dispatches the selected card");
+        };
+        // TerminalLaunchRequest carries no task field, so nothing durable records the pairing for
+        // an unbound run. The dashboard notes what it dispatched so the roster can still say.
+        let mut run = snapshot();
+        run.run_id = task.run_id.clone();
+        run.external_task_ref = String::new();
+        dashboard.runs = vec![run];
+        dashboard.agents.insert(
+            task.run_id.clone(),
+            (Some(AgentKind::Claude), AgentState::Working),
+        );
+        let rows = sidebar_rows(&mut dashboard, 100, 30).join("\n");
+        assert!(rows.contains("claude #4"), "{rows:?}");
+    }
+
+    #[test]
     fn the_roster_says_which_agent_wants_you_rather_than_only_colouring_it() {
         let mut dashboard = bound_dashboard();
         dashboard.agents.insert(
@@ -5660,7 +5758,7 @@ mod tests {
         assert_eq!(dashboard.agents.len(), 2);
         assert_eq!(
             dashboard.agent_roster(),
-            vec![(AgentState::Blocked, AgentKind::Claude.label())]
+            vec![(AgentState::Blocked, AgentKind::Claude.label(), None)]
         );
         let rows = sidebar_rows(&mut dashboard, 100, 30);
         assert!(

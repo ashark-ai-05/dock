@@ -720,7 +720,7 @@ fn dispatch_task(
             run_id: run_id.to_owned(),
             profile,
             runtime_directory: dashboard.runtime_directory.clone(),
-            arguments: vec![title.to_owned()],
+            arguments: adapter.prompt_arguments(title),
         });
         if let Response::Error { message, .. } = client.request(&request)? {
             return Err(message);
@@ -753,7 +753,11 @@ fn dispatch_task(
             adapter: AdapterSelection {
                 id: adapter.clone(),
                 executable: None,
-                arguments: Vec::new(),
+                // The task, so the agent knows what it was dispatched for. Without this a
+                // repository-bound dispatch built a branch and a worktree and then opened the
+                // agent into silence, while the unbound path — the casual one — handed it
+                // everything. That was backwards.
+                arguments: adapter.prompt_arguments(title),
             },
         },
     });

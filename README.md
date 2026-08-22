@@ -108,8 +108,9 @@ never altered, since `kanban-md` owns it.
 
 Agents track their own work with `dock task`. Every pane Dock launches gets
 `DOCK_BOARD` (its board), `DOCK_WORKSPACE`, `DOCK_PANE`, `DOCK_RUN`, and
-`DOCK_TASK` when it was dispatched onto one — so an agent already knows where
-to record things and needs no arguments:
+`DOCK_TASK` when it was dispatched onto one — and Dock's own directory leads
+`PATH`, so `dock` resolves inside a pane even when Dock was started from a
+checkout with `cargo run`. An agent needs no arguments:
 
 ```bash
 dock task list                       # what is on this board
@@ -125,7 +126,14 @@ else byte for byte — so `kanban-md`, your editor, and Dock all read and write
 the same files without fighting.
 
 Choosing a task puts an agent on it, and claims it: the task moves to
-`in-progress` on Dock's own boards before the agent starts. In a repository it gets a worktree of its
+`in-progress` on Dock's own boards before the agent starts. The task is handed
+to the agent as its opening instruction where that agent documents one —
+`claude [prompt]` and `codex [PROMPT]` do, `amp` does not, so it opens in the
+right place and you type the task yourself.
+
+The sidebar names the task each agent is on, and so does the pane's title, so
+three agents of the same kind are told apart by their work rather than by
+guessing. In a repository it gets a worktree of its
 own on a `dock/task-<id>` branch, and dispatching the same task again lands in
 the worktree the first dispatch made. Outside one there is nothing to isolate
 from, so the agent launches where you are with the task as its opening prompt.

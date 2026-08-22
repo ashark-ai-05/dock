@@ -638,6 +638,22 @@ fn dock_environment(binding: &RunBinding) -> Vec<(String, String)> {
     if !binding.external_task_ref.trim().is_empty() {
         variables.push(("DOCK_TASK".to_owned(), binding.external_task_ref.clone()));
     }
+    // `dock task` is how an agent records what it is doing, and it is worth nothing if the binary
+    // cannot be found. Dock's own directory goes on the front of PATH so a pane can always reach
+    // the exact build that launched it — which matters most when it was started from a checkout as
+    // `cargo run`, where nothing named `dock` is installed anywhere at all.
+    if let Some(directory) = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(Path::to_path_buf))
+    {
+        let inherited = std::env::var("PATH").unwrap_or_default();
+        let path = if inherited.is_empty() {
+            directory.display().to_string()
+        } else {
+            format!("{}:{inherited}", directory.display())
+        };
+        variables.push(("PATH".to_owned(), path));
+    }
     variables
 }
 
@@ -1676,6 +1692,71 @@ mod tests {
                 .unwrap_err()
                 .contains("EINVAL")
         );
+    }
+
+    #[test]
+    fn a_pane_is_told_which_board_and_task_it_belongs_to_and_can_find_dock() {
+        let binding = RunBinding {
+            binding_kind: BindingKind::Repository,
+            repository_root: PathBuf::from("/repo/real"),
+            external_task_ref: "7".into(),
+            run_id: "dock_task_1".into(),
+            worktree: PathBuf::from("/repo/real"),
+            branch: "dock/task-7".into(),
+            base_sha: String::new(),
+            workspace_id: "workspace_1".into(),
+            pane_id: "pane_2".into(),
+        };
+        let variables: std::collections::HashMap<String, String> =
+            dock_environment(&binding).into_iter().collect();
+        // An agent that knows its board and its task can record what it is doing with `dock task`
+        // without anyone relaying either fact by hand.
+        assert_eq!(
+            variables.get("DOCK_BOARD").map(String::as_str),
+            Some("/repo/real/kanban/tasks")
+        );
+        assert_eq!(variables.get("DOCK_TASK").map(String::as_str), Some("7"));
+        assert_eq!(
+            variables.get("DOCK_WORKSPACE").map(String::as_str),
+            Some("workspace_1")
+        );
+        // …and it can actually run it. Dock's own directory leads PATH, which is what makes this
+        // work from a checkout where nothing named `dock` is installed anywhere.
+        let path = variables.get("PATH").expect("PATH is set for the pane");
+        let own = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(path.starts_with(&own), "{path}");
+        assert!(
+            path.len() > own.len(),
+            "the inherited PATH must survive: {path}"
+        );
+    }
+
+    #[test]
+    fn an_unbound_pane_gets_its_workspace_board_and_no_task() {
+        let binding = RunBinding {
+            binding_kind: BindingKind::Terminal,
+            // A terminal launch records its directory here; it is not a repository, so the board
+            // must not be looked for inside it.
+            repository_root: PathBuf::from("/tmp/somewhere"),
+            external_task_ref: String::new(),
+            run_id: "dock_ui_1".into(),
+            worktree: PathBuf::from("/tmp/somewhere"),
+            branch: String::new(),
+            base_sha: String::new(),
+            workspace_id: "workspace_9".into(),
+            pane_id: "pane_1".into(),
+        };
+        let variables: std::collections::HashMap<String, String> =
+            dock_environment(&binding).into_iter().collect();
+        let board = variables.get("DOCK_BOARD").expect("a board");
+        assert!(board.ends_with("boards/workspace_9/tasks"), "{board}");
+        assert!(!board.contains("/tmp/somewhere"), "{board}");
+        assert_eq!(variables.get("DOCK_TASK"), None);
     }
 
     #[test]

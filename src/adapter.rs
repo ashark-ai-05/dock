@@ -166,6 +166,32 @@ impl AdapterId {
         }
     }
 
+    /// How this agent is handed an opening instruction, or nothing if Dock has no verified way.
+    ///
+    /// Read from each CLI's own `--help`, on the same principle as [`resume_arguments`]: a wrong
+    /// guess here does not fail loudly, it launches the agent with the task text as a filename or
+    /// a subcommand and leaves the person watching an error they did not cause. `amp` takes
+    /// `[options] [command]` with no prompt positional at all, so it gets none — dispatching to it
+    /// opens the agent in the right place and the task is typed by hand.
+    pub fn prompt_arguments(&self, prompt: &str) -> Vec<String> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Vec::new();
+        }
+        match self {
+            // `claude [options] [command] [prompt]`
+            Self::ClaudeCode => vec![prompt.to_owned()],
+            // `codex [OPTIONS] [PROMPT]`
+            Self::CodexCli => vec![prompt.to_owned()],
+            // `amp [options] [command]` — no prompt positional.
+            Self::Amp => Vec::new(),
+            // Not installed anywhere its arguments could be read.
+            Self::GithubCopilotCli => Vec::new(),
+            // The fixture runs a fixed script, and a shell handed a sentence would try to run it.
+            Self::Fixture | Self::Generic | Self::Shell => Vec::new(),
+        }
+    }
+
     /// The agent's name as a person would say it, for messages about what could not be done.
     pub const fn label(&self) -> &'static str {
         match self {
@@ -328,6 +354,35 @@ mod tests {
             AdapterId::Amp.resume_arguments(),
             Some(&["threads", "continue", "--last"][..])
         );
+    }
+
+    #[test]
+    fn only_agents_that_document_a_prompt_positional_are_handed_one() {
+        // Read from each CLI's own --help. Handing a sentence to something that does not take one
+        // launches the agent with the task as a filename and blames the user for the error.
+        assert_eq!(
+            AdapterId::ClaudeCode.prompt_arguments("fix the retry path"),
+            vec!["fix the retry path".to_owned()]
+        );
+        assert_eq!(
+            AdapterId::CodexCli.prompt_arguments("fix the retry path"),
+            vec!["fix the retry path".to_owned()]
+        );
+        // `amp [options] [command]` has no prompt positional.
+        assert!(
+            AdapterId::Amp
+                .prompt_arguments("fix the retry path")
+                .is_empty()
+        );
+        // A shell handed a sentence would try to run it; the fixture runs a fixed script.
+        for adapter in [AdapterId::Shell, AdapterId::Fixture, AdapterId::Generic] {
+            assert!(
+                adapter.prompt_arguments("anything").is_empty(),
+                "{adapter:?}"
+            );
+        }
+        // An empty task title is never passed as an argument at all.
+        assert!(AdapterId::ClaudeCode.prompt_arguments("   ").is_empty());
     }
 
     #[test]

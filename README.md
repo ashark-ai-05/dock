@@ -80,11 +80,17 @@ running the same agent in the same directory share a "most recent", so resuming
 one can land on the other's session. An agent whose resume flag Dock has not
 verified reports that it cannot be resumed rather than silently starting fresh.
 
-`Ctrl+B k` opens the task board, read straight from `kanban/tasks/*.md` — no
-`kanban-md` binary needed to see it. Choosing a task gives it a worktree of its
-own beside your repository, on a `dock/task-<id>` branch, and launches your
-last-used agent there. Dispatching the same task again lands in the worktree the
-first dispatch made. See **Safety** for exactly what that touches.
+`Ctrl+B k` opens the task board, read straight from Markdown front matter — no
+`kanban-md` binary needed to see it. In a repository that's `kanban/tasks/`;
+outside one it's your personal board at `~/.dock/board/tasks`, so there is
+always somewhere to track work. Type a title and `Ctrl+N` adds a task to the
+personal board.
+
+Choosing a task puts an agent on it. In a repository it gets a worktree of its
+own on a `dock/task-<id>` branch, and dispatching the same task again lands in
+the worktree the first dispatch made. Outside one there is nothing to isolate
+from, so the agent launches where you are with the task as its opening prompt.
+See **Safety** for exactly what that touches.
 
 `Ctrl+B g` shows what changed in the focused pane's worktree — branch, counts,
 and the diff, coloured with Dock's own palette. No `delta` or `lazygit` needed;
@@ -185,6 +191,10 @@ multi-repository capacity and dependency gates.
   carries `external_task_completed: false` and `git_mutated: false`; accepting
   scope is a note, not a merge. Claiming a task through `kanban-md` moves it to
   in-progress and is the only status Dock will ever set.
+- Dock writes task files **only to its own board**, `~/.dock/board/tasks`. A
+  repository's board belongs to `kanban-md` and to whoever commits to it, so
+  `Ctrl+N` is refused there and says why. Reading any board is always safe: it
+  parses the Markdown front matter directly and never runs `kanban-md` to look.
 - Durable state lives in `.dock/local` at `0700`/`0600`. Layout records hold
   topology and labels only — never terminal output, commands, credentials, PIDs,
   or process-group IDs. Use `--state-dir=` to relocate it.

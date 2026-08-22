@@ -27,13 +27,105 @@ pub struct BoardTask {
 /// unfamiliar column is still visible rather than silently missing.
 const STATUS_ORDER: [&str; 5] = ["in-progress", "review", "backlog", "todo", "done"];
 
-/// Every task under `<repository_root>/kanban/tasks`, ordered by status then id.
+/// Where the board a dashboard should show actually lives.
+///
+/// A repository's own board comes first: tasks belonging to a project belong beside it, and that is
+/// where `kanban-md` already looks. But work exists that no repository owns — the user's own, and
+/// whatever their agents are doing for them — and a dashboard opened outside a repository had
+/// nothing to show at all. So it falls back to a personal board under the home directory, which
+/// survives moving between projects and belongs to no project in particular.
+///
+/// Returns `None` only when neither a repository nor a home directory can be determined, which
+/// leaves nowhere a board could sensibly live.
+pub fn tasks_dir(repository_root: &str) -> Option<PathBuf> {
+    let repository = repository_root.trim();
+    if !repository.is_empty() {
+        return Some(Path::new(repository).join("kanban").join("tasks"));
+    }
+    personal_tasks_dir()
+}
+
+/// The personal board: `~/.dock/board/tasks`.
+pub fn personal_tasks_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(
+        PathBuf::from(home)
+            .join(".dock")
+            .join("board")
+            .join("tasks"),
+    )
+}
+
+/// Whether this directory is the personal board rather than a repository's.
+///
+/// Dock writes tasks only to its own board. A repository's board is owned by `kanban-md` and by
+/// whoever else commits to it, and creating files in someone else's board is not Dock's to do.
+pub fn is_personal(directory: &Path) -> bool {
+    personal_tasks_dir().is_some_and(|personal| personal == directory)
+}
+
+/// Writes a new task onto a board and returns it.
+///
+/// Only ever called for Dock's own personal board. A repository's board belongs to `kanban-md` and
+/// to whoever else commits to it, and creating files in someone else's board is not Dock's to do.
+///
+/// The id is one past the highest already present, so it stays stable against a board that other
+/// tools also write to: reusing a free gap would collide with a task that was archived rather than
+/// deleted.
+pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("a task needs a title".into());
+    }
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("could not create the board directory: {error}"))?;
+    let id = load(directory)
+        .iter()
+        .map(|task| task.id)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let slug: String = title
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("-");
+    let file = directory.join(format!("{id:03}-{slug}.md"));
+    // Single quotes around the title, matching the front matter these files already use, with any
+    // quote of its own removed rather than escaped: a title is not worth a YAML quoting dialect.
+    let safe_title = title.replace('\'', "");
+    let body = format!(
+        "---\nid: {id}\ntitle: '{safe_title}'\nstatus: backlog\npriority: medium\nclass: standard\n---\n\n# Outcome\n\n{safe_title}\n"
+    );
+    fs::write(&file, body).map_err(|error| format!("could not write the task: {error}"))?;
+    Ok(BoardTask {
+        id,
+        title: safe_title,
+        status: "backlog".into(),
+        priority: "medium".into(),
+        file,
+    })
+}
+
+/// Every task in `directory`, ordered by status then id.
 ///
 /// Best-effort by design: a file that cannot be read or has no `id` is skipped rather than failing
 /// the board, because one malformed task should not hide the other eleven.
-pub fn load(repository_root: &Path) -> Vec<BoardTask> {
-    let directory = repository_root.join("kanban").join("tasks");
-    let Ok(entries) = fs::read_dir(&directory) else {
+pub fn load(directory: &Path) -> Vec<BoardTask> {
+    let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
     };
     let mut tasks: Vec<BoardTask> = entries
@@ -159,7 +251,7 @@ mod tests {
             "001-a.md",
             &task_file(1, "Slice 6.2: real-agent launch", "review"),
         );
-        let tasks = load(&board.0);
+        let tasks = load(&board.0.join("kanban/tasks"));
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, 1);
         assert_eq!(tasks[0].title, "Slice 6.2: real-agent launch");
@@ -173,7 +265,7 @@ mod tests {
         // every line would read them as keys and could overwrite a real field.
         let board = Board::new();
         board.task("001-a.md", &task_file(7, "Has tags", "backlog"));
-        let tasks = load(&board.0);
+        let tasks = load(&board.0.join("kanban/tasks"));
         assert_eq!(tasks[0].id, 7);
         assert_eq!(tasks[0].status, "backlog");
     }
@@ -185,7 +277,10 @@ mod tests {
             .task("003-c.md", &task_file(3, "Done thing", "done"))
             .task("001-a.md", &task_file(1, "Backlog thing", "backlog"))
             .task("002-b.md", &task_file(2, "Running thing", "in-progress"));
-        let statuses: Vec<String> = load(&board.0).into_iter().map(|task| task.status).collect();
+        let statuses: Vec<String> = load(&board.0.join("kanban/tasks"))
+            .into_iter()
+            .map(|task| task.status)
+            .collect();
         assert_eq!(statuses, ["in-progress", "backlog", "done"]);
     }
 
@@ -195,7 +290,7 @@ mod tests {
         board
             .task("001-a.md", &task_file(1, "Odd", "blocked"))
             .task("002-b.md", &task_file(2, "Known", "review"));
-        let statuses: Vec<String> = load(&board.0)
+        let statuses: Vec<String> = load(&board.0.join("kanban/tasks"))
             .iter()
             .map(|task| task.status.clone())
             .collect();
@@ -209,9 +304,74 @@ mod tests {
             .task("001-a.md", "no front matter at all\n")
             .task("002-b.md", "---\ntitle: 'No id'\nstatus: review\n---\n")
             .task("003-c.md", &task_file(3, "Fine", "review"));
-        let tasks = load(&board.0);
+        let tasks = load(&board.0.join("kanban/tasks"));
         assert_eq!(tasks.len(), 1, "{tasks:?}");
         assert_eq!(tasks[0].id, 3);
+    }
+
+    #[test]
+    fn a_created_task_reads_back_as_a_task() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        let made = create(&dir, "Track the weather agent").expect("create");
+        assert_eq!(made.id, 1);
+        assert_eq!(made.status, "backlog");
+        // The point of writing front matter rather than a private format: the file this produces
+        // is the same shape kanban-md and every other reader already understands.
+        let listed = load(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Track the weather agent");
+        assert_eq!(listed[0].id, 1);
+    }
+
+    #[test]
+    fn ids_continue_past_the_highest_present_rather_than_filling_gaps() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        board.task("007-existing.md", &task_file(7, "Existing", "done"));
+        // Reusing a gap would collide with a task that was archived rather than deleted, which is
+        // a thing boards do.
+        assert_eq!(create(&dir, "Next").expect("create").id, 8);
+    }
+
+    #[test]
+    fn a_title_without_a_usable_slug_still_produces_a_readable_task() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        let made = create(&dir, "!!! ???").expect("create");
+        assert_eq!(load(&dir).len(), 1);
+        assert_eq!(made.title, "!!! ???");
+    }
+
+    #[test]
+    fn a_quote_in_a_title_cannot_break_the_front_matter_it_is_written_into() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        create(&dir, "don't break the parser").expect("create");
+        // Read back through the same parser every other reader uses: if the quoting were wrong the
+        // task would come back truncated or not at all.
+        let listed = load(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "dont break the parser");
+    }
+
+    #[test]
+    fn an_empty_title_is_refused_rather_than_written() {
+        let board = Board::new();
+        assert!(create(&board.0.join("kanban/tasks"), "   ").is_err());
+    }
+
+    #[test]
+    fn a_board_outside_a_repository_is_the_personal_one() {
+        // Without a repository the board still has to live somewhere, and it is the same place
+        // regardless of which directory the dashboard was opened in.
+        let personal = personal_tasks_dir().expect("HOME is set in the test environment");
+        assert_eq!(tasks_dir("").as_deref(), Some(personal.as_path()));
+        assert!(is_personal(&personal));
+        // A repository's board is its own, and is never treated as Dock's to write to.
+        let repository = tasks_dir("/repo/real").expect("a repository board");
+        assert_eq!(repository, Path::new("/repo/real/kanban/tasks"));
+        assert!(!is_personal(&repository));
     }
 
     #[test]
@@ -222,7 +382,7 @@ mod tests {
     #[test]
     fn this_repositorys_own_board_parses() {
         // The format is not hypothetical: Dock's own tasks are the fixture.
-        let tasks = load(Path::new(env!("CARGO_MANIFEST_DIR")));
+        let tasks = load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("kanban/tasks"));
         assert!(!tasks.is_empty(), "Dock's own kanban/tasks must parse");
         assert!(tasks.iter().all(|task| task.id > 0));
         assert!(tasks.iter().all(|task| !task.title.is_empty()));

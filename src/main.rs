@@ -34,8 +34,9 @@ use dock::{
     git::GitAdapter,
     paths,
     protocol::{
-        DispatchRequest, InspectRequest, LaunchIntoPaneRequest, PaneInputRequest,
-        PaneResizeRequest, ProcessState, Request, Response, ReviewInboxRequest, WorkspaceRequest,
+        DashboardProfile, DispatchRequest, InspectRequest, LaunchIntoPaneRequest, PaneInputRequest,
+        PaneResizeRequest, ProcessState, Request, Response, ReviewInboxRequest,
+        TerminalLaunchRequest, WorkspaceRequest,
     },
     storage::LocalStore,
 };
@@ -630,10 +631,15 @@ fn run_dashboard(
                     Err(message) => dashboard.error = Some(message),
                 }
             }
-            UiCommand::LoadBoard => {
-                let root = PathBuf::from(dashboard.repository_root.clone());
-                dashboard.set_board_tasks(dock::board::load(&root));
-            }
+            UiCommand::LoadBoard => match dock::board::tasks_dir(&dashboard.repository_root) {
+                Some(directory) => {
+                    let tasks = dock::board::load(&directory);
+                    dashboard.set_board_tasks(tasks, directory);
+                }
+                None => {
+                    dashboard.error = Some("no board: not in a repository and HOME is unset".into())
+                }
+            },
             UiCommand::DispatchTask(task) => {
                 terminal
                     .draw(|frame| dashboard.render(frame))
@@ -684,8 +690,29 @@ fn dispatch_task(
         adapter,
     } = task;
     let repository_root = PathBuf::from(dashboard.repository_root.clone());
+    // Without a repository there is no worktree to isolate the work in, and nothing to isolate it
+    // from. The agent is launched where the dashboard already is, with the task as its opening
+    // prompt — both `claude [prompt]` and `codex [PROMPT]` take one, read from their own --help.
     if repository_root.as_os_str().is_empty() {
-        return Err("cannot dispatch a task: this dashboard is not bound to a repository".into());
+        let profile = DashboardProfile::try_from(adapter.clone()).map_err(|()| {
+            format!(
+                "cannot dispatch: {} has no terminal profile",
+                adapter.label()
+            )
+        })?;
+        let request = Request::TerminalLaunch(TerminalLaunchRequest {
+            workspace_id: workspace_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            run_id: run_id.to_owned(),
+            profile,
+            runtime_directory: dashboard.runtime_directory.clone(),
+            arguments: vec![title.to_owned()],
+        });
+        if let Response::Error { message, .. } = client.request(&request)? {
+            return Err(message);
+        }
+        dashboard.error = Some(format!("task {task_id} dispatched here, unbound: {title}"));
+        return Ok(());
     }
     let branch = format!("dock/task-{task_id}");
     // Beside the repository rather than inside it, so the worktree is never a candidate for the

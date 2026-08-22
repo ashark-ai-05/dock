@@ -122,9 +122,12 @@ pub struct Dashboard {
     /// The review overlay, if open. Holds the handoffs an agent submitted and is waiting on a
     /// human for, which is the one queue in Dock that a person rather than a process drains.
     review: Option<ReviewOverlay>,
-    /// The board as last read from the repository, kept so a taken row can be resolved back to the
-    /// task it named.
+    /// The board as last read, kept so a taken row can be resolved back to the task it named.
     board_tasks: Vec<BoardTask>,
+    /// Where that board was read from, and whether it is Dock's own rather than a repository's.
+    /// Dock only ever writes tasks to its own.
+    board_dir: Option<std::path::PathBuf>,
+    board_is_personal: bool,
     /// The Git overlay, if open.
     git: Option<GitOverlay>,
     picker_row_areas: Vec<Rect>,
@@ -1191,7 +1194,7 @@ impl Dashboard {
             Line::from("f find a file here and type its path into the pane"),
             Line::from("a resume the agent that last ran here, continuing its own session"),
             Line::from("i review handoffs agents are waiting on: a accept · c request changes"),
-            Line::from("k task board — dispatching one gives it a worktree and an agent"),
+            Line::from("k task board — Ctrl+N adds one · taking one puts an agent on it"),
             Line::from("g what changed in this pane's worktree · j/k scroll · g/G ends"),
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
@@ -1495,14 +1498,59 @@ impl Dashboard {
         );
     }
 
+    /// Adds a task to Dock's own board from whatever was typed into the chooser.
+    fn create_task(&mut self, title: &str) -> UiCommand {
+        let Some(directory) = self.board_dir.clone() else {
+            self.error = Some("no board is open".into());
+            return UiCommand::None;
+        };
+        if !self.board_is_personal {
+            self.error = Some(
+                "this is the repository's board — add tasks with kanban-md so its history stays \
+                 the repository's"
+                    .into(),
+            );
+            return UiCommand::None;
+        }
+        if title.trim().is_empty() {
+            self.error = Some("type a title first, then Ctrl+N adds it".into());
+            return UiCommand::None;
+        }
+        match crate::board::create(&directory, title) {
+            Ok(task) => {
+                self.error = Some(format!("added task {}: {}", task.id, task.title));
+                // Re-read rather than pushing the new task onto the open list: the board is files
+                // on disk, and anything else may have written to it since it was opened.
+                UiCommand::LoadBoard
+            }
+            Err(message) => {
+                self.error = Some(message);
+                UiCommand::None
+            }
+        }
+    }
+
     /// Receives the board and opens the task chooser over it.
-    pub fn set_board_tasks(&mut self, tasks: Vec<BoardTask>) {
+    ///
+    /// The directory is kept because an empty board is not an error — it is a board with nothing
+    /// on it yet — and the only useful thing to say about one is where it is and how to add to it.
+    pub fn set_board_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
+        self.board_is_personal = crate::board::is_personal(&directory);
         if tasks.is_empty() {
             self.picker = None;
-            self.error =
-                Some("no task board found: expected kanban/tasks in this repository".into());
+            self.error = Some(format!(
+                "no tasks yet in {}{}",
+                directory.display(),
+                if self.board_is_personal {
+                    " — type a title and press Ctrl+N to add one"
+                } else {
+                    ""
+                }
+            ));
+            self.board_dir = Some(directory);
             return;
         }
+        self.board_dir = Some(directory);
         let items = tasks
             .iter()
             .map(|task| PickerItem {
@@ -1845,6 +1893,17 @@ impl Dashboard {
                 if let Some((purpose, key)) = taken {
                     return self.take_picked(purpose, &key);
                 }
+            }
+            // Ctrl+N turns what has been typed into a task. It is the one key the query does not
+            // swallow, and only on Dock's own board: a repository's board belongs to kanban-md and
+            // to whoever else commits to it.
+            KeyCode::Char('n' | 'N')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && *purpose == PickerPurpose::Task =>
+            {
+                let title = picker.query().to_owned();
+                self.picker = None;
+                return self.create_task(&title);
             }
             // Every printable character is query text. Only the chording modifiers are excluded —
             // SHIFT must not be, because crossterm reports it on every capital letter and a
@@ -4515,10 +4574,13 @@ mod tests {
     #[test]
     fn the_board_is_filterable_and_shows_each_tasks_number_and_status() {
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(vec![
-            board_task(11, "Repository-optional runtime", "review"),
-            board_task(12, "Dashboard real agent dispatch", "in-progress"),
-        ]);
+        dashboard.set_board_tasks(
+            vec![
+                board_task(11, "Repository-optional runtime", "review"),
+                board_task(12, "Dashboard real agent dispatch", "in-progress"),
+            ],
+            "/repo/real/kanban/tasks".into(),
+        );
         let frame = render_to_string(&mut dashboard, 100, 30);
         assert!(frame.contains("BOARD"), "{frame:?}");
         assert!(frame.contains("#11"), "{frame:?}");
@@ -4535,11 +4597,10 @@ mod tests {
     #[test]
     fn taking_a_task_asks_for_a_worktree_and_an_agent_rather_than_switching_anything_locally() {
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(vec![board_task(
-            12,
-            "Dashboard real agent dispatch",
-            "review",
-        )]);
+        dashboard.set_board_tasks(
+            vec![board_task(12, "Dashboard real agent dispatch", "review")],
+            "/repo/real/kanban/tasks".into(),
+        );
         render_to_string(&mut dashboard, 100, 30);
         let taken = dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let UiCommand::DispatchTask(task) = taken else {
@@ -4557,7 +4618,10 @@ mod tests {
     #[test]
     fn a_task_that_left_the_board_while_it_was_open_reports_rather_than_dispatching() {
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(vec![board_task(12, "Going away", "review")]);
+        dashboard.set_board_tasks(
+            vec![board_task(12, "Going away", "review")],
+            "/repo/real/kanban/tasks".into(),
+        );
         render_to_string(&mut dashboard, 100, 30);
         // The board is files on disk that anything may rewrite between reading and choosing.
         dashboard.board_tasks.clear();
@@ -4572,13 +4636,33 @@ mod tests {
     }
 
     #[test]
-    fn a_repository_with_no_board_says_where_it_looked() {
+    fn an_empty_board_says_where_it_looked_rather_than_calling_it_an_error() {
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(Vec::new());
+        dashboard.set_board_tasks(Vec::new(), "/repo/real/kanban/tasks".into());
         assert!(dashboard.picker.is_none());
+        // A board with nothing on it is not a missing board. Naming the directory is the only
+        // useful thing to say, because it is the thing the user would otherwise have to guess.
         assert_eq!(
             dashboard.error.as_deref(),
-            Some("no task board found: expected kanban/tasks in this repository")
+            Some("no tasks yet in /repo/real/kanban/tasks")
+        );
+        // The invitation to add one appears only on Dock's own board: a repository's belongs to
+        // kanban-md and to whoever commits to it.
+        assert!(!dashboard.board_is_personal);
+    }
+
+    #[test]
+    fn dock_refuses_to_write_a_task_into_a_repositorys_own_board() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(Vec::new(), "/repo/real/kanban/tasks".into());
+        assert_eq!(dashboard.create_task("something"), UiCommand::None);
+        assert!(
+            dashboard
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("kanban-md")),
+            "{:?}",
+            dashboard.error
         );
     }
 

@@ -18,6 +18,15 @@ const BLOCKED_PATTERNS: &[&str] = &[
     r"(?i)waiting for (your )?(input|approval)",
     r"(?i)allow this (tool|command)",
     r"(?mi)^\s*[1-9]\.\s+(yes|no)\b",
+    // A chooser is the state that matters most and the one the yes/no rule cannot see: its
+    // options are content ("Melbourne, AU", "Sydney, AU"), not the words yes and no. These match
+    // the dialog's own chrome instead, which is fixed text an agent does not write by accident.
+    // Matching the numbered options themselves was the alternative and would fire on any prose
+    // list an agent happened to print, which is the false call to attention this file exists to
+    // avoid.
+    r"(?i)enter to select",
+    r"(?i)(↑/↓|up/down) to navigate",
+    r"(?i)esc to cancel",
 ];
 
 const WORKING_PATTERNS: &[&str] = &[
@@ -137,6 +146,45 @@ mod awaiting_input_tests {
             classify_screen(AgentKind::Claude, CLAUDE_WORKING),
             AgentState::Working
         );
+    }
+
+    #[test]
+    fn a_chooser_whose_options_are_not_yes_or_no_still_reports_as_blocking() {
+        // Captured from a real pane: Claude replaced its input box with a selection dialog, so
+        // none of the input-box chrome was on screen and the yes/no rule could not see options
+        // that are place names. It read as idle while the agent sat waiting.
+        let chooser = concat!(
+            "Which location should I get the weather for?\n",
+            "\n",
+            "❯ 1. Melbourne, AU\n",
+            "     Local timezone in this session is AEST, so Melbourne is a likely fit.\n",
+            "  2. Sydney, AU\n",
+            "  3. San Francisco, US\n",
+            "\n",
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n",
+        );
+        assert_eq!(
+            classify_screen(AgentKind::Claude, chooser),
+            AgentState::Blocked
+        );
+        // The chooser chrome is not Claude's alone, so every agent gets the benefit.
+        assert_eq!(
+            classify_screen(AgentKind::Amp, chooser),
+            AgentState::Blocked
+        );
+    }
+
+    #[test]
+    fn a_numbered_list_in_ordinary_prose_is_not_mistaken_for_a_chooser() {
+        // The reason this keys on dialog chrome rather than on the options: agents print numbered
+        // lists constantly, and every one of them would otherwise call the user over.
+        let prose = concat!(
+            "Here is the plan:\n",
+            "1. Read the config\n",
+            "2. Patch the parser\n",
+            "3. Run the tests\n",
+        );
+        assert_eq!(classify_screen(AgentKind::Claude, prose), AgentState::Idle);
     }
 
     #[test]

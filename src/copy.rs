@@ -5,6 +5,7 @@ pub struct CopySession {
     pub run_id: String,
     cursor: (u16, u16),
     anchor: Option<(u16, u16)>,
+    search: Option<String>,
 }
 
 impl CopySession {
@@ -13,6 +14,7 @@ impl CopySession {
             run_id,
             cursor,
             anchor: None,
+            search: None,
         }
     }
 
@@ -56,6 +58,85 @@ impl CopySession {
             u16::try_from(col.clamp(0, last_col)).unwrap_or(0),
         );
     }
+
+    pub fn search_query(&self) -> Option<&str> {
+        self.search.as_deref()
+    }
+
+    pub fn begin_search(&mut self) {
+        self.search = Some(String::new());
+    }
+
+    pub fn push_search(&mut self, character: char) {
+        if let Some(query) = self.search.as_mut() {
+            query.push(character);
+        }
+    }
+
+    pub fn pop_search(&mut self) {
+        if let Some(query) = self.search.as_mut() {
+            query.pop();
+        }
+    }
+
+    pub fn cancel_search(&mut self) {
+        self.search = None;
+    }
+
+    /// Moves the cursor to the next or previous match, wrapping at both ends. Returns false
+    /// when there is nothing to jump to, so the caller can report "no matches" rather than
+    /// silently doing nothing.
+    pub fn jump_to_match(
+        &mut self,
+        matches: &[(u16, u16)],
+        forward: bool,
+        bounds: (u16, u16),
+    ) -> bool {
+        if matches.is_empty() {
+            return false;
+        }
+        let cursor = self.cursor;
+        let target = if forward {
+            matches
+                .iter()
+                .find(|candidate| **candidate > cursor)
+                .or_else(|| matches.first())
+        } else {
+            matches
+                .iter()
+                .rev()
+                .find(|candidate| **candidate < cursor)
+                .or_else(|| matches.last())
+        };
+        if let Some(target) = target.copied() {
+            self.set_cursor(target, bounds);
+            return true;
+        }
+        false
+    }
+}
+
+/// Every occurrence of `query` across the visible rows, in reading order. Case-sensitive,
+/// matching what a user typing an exact string expects.
+pub fn find_matches(rows: &[String], query: &str) -> Vec<(u16, u16)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let Ok(row_index) = u16::try_from(index) else {
+            break;
+        };
+        let mut from = 0;
+        while let Some(found) = row[from..].find(query) {
+            let column = from + found;
+            if let Ok(column) = u16::try_from(column) {
+                matches.push((row_index, column));
+            }
+            from = column + query.len();
+        }
+    }
+    matches
 }
 
 #[cfg(test)]
@@ -104,5 +185,89 @@ mod tests {
         assert_eq!(session.selection(), Some(((1, 1), (7, 20))));
         session.set_cursor((9_999, 9_999), BOUNDS);
         assert_eq!(session.selection(), Some(((1, 1), (23, 79))));
+    }
+
+    fn rows() -> Vec<String> {
+        vec![
+            "alpha beta".to_string(),
+            "gamma".to_string(),
+            "beta again beta".to_string(),
+        ]
+    }
+
+    #[test]
+    fn find_matches_returns_every_hit_in_reading_order() {
+        assert_eq!(find_matches(&rows(), "beta"), vec![(0, 6), (2, 0), (2, 11)]);
+        assert_eq!(find_matches(&rows(), "nothing"), Vec::new());
+        assert_eq!(
+            find_matches(&rows(), ""),
+            Vec::new(),
+            "an empty query matches nothing"
+        );
+    }
+
+    #[test]
+    fn jumping_cycles_forward_and_backward_and_wraps() {
+        let matches = find_matches(&rows(), "beta");
+        let mut session = CopySession::new("run".into(), (0, 0));
+        assert!(session.jump_to_match(&matches, true, BOUNDS));
+        assert_eq!(session.cursor(), (0, 6));
+        session.jump_to_match(&matches, true, BOUNDS);
+        assert_eq!(session.cursor(), (2, 0));
+        session.jump_to_match(&matches, true, BOUNDS);
+        assert_eq!(session.cursor(), (2, 11));
+        session.jump_to_match(&matches, true, BOUNDS);
+        assert_eq!(session.cursor(), (0, 6), "wraps to the first hit");
+        session.jump_to_match(&matches, false, BOUNDS);
+        assert_eq!(session.cursor(), (2, 11), "wraps backward to the last hit");
+    }
+
+    #[test]
+    fn jumping_with_no_matches_reports_failure_and_leaves_the_cursor_alone() {
+        let mut session = CopySession::new("run".into(), (4, 4));
+        assert!(!session.jump_to_match(&[], true, BOUNDS));
+        assert_eq!(session.cursor(), (4, 4));
+    }
+
+    #[test]
+    fn a_search_query_is_edited_and_cancelled() {
+        let mut session = CopySession::new("run".into(), (0, 0));
+        assert_eq!(session.search_query(), None);
+        session.begin_search();
+        assert_eq!(session.search_query(), Some(""));
+        session.push_search('a');
+        session.push_search('b');
+        assert_eq!(session.search_query(), Some("ab"));
+        session.pop_search();
+        assert_eq!(session.search_query(), Some("a"));
+        session.cancel_search();
+        assert_eq!(session.search_query(), None);
+    }
+
+    #[test]
+    fn clamping_survives_degenerate_bounds_and_extreme_deltas() {
+        // A pane rendered with no inner area gives a zero-sized grid; the cursor must still
+        // land somewhere valid rather than panicking or underflowing.
+        for bounds in [(0, 0), (1, 1), (0, 80), (24, 0)] {
+            let mut session = CopySession::new("run".into(), (0, 0));
+            session.move_cursor(i32::MAX, i32::MAX, bounds);
+            let (row, col) = session.cursor();
+            assert!(
+                row < bounds.0.max(1) && col < bounds.1.max(1),
+                "{bounds:?} -> {row},{col}"
+            );
+            session.move_cursor(i32::MIN, i32::MIN, bounds);
+            assert_eq!(session.cursor(), (0, 0), "{bounds:?} clamps to the origin");
+        }
+    }
+
+    #[test]
+    fn selection_endpoints_stay_in_creation_order_and_are_never_sorted() {
+        let mut session = CopySession::new("run".into(), (5, 5));
+        session.begin_selection();
+        session.set_cursor((1, 1), BOUNDS);
+        // Ordering is VtTerminal::selection_text's job and it is order-independent. Sorting
+        // here would be redundant today and wrong if that downstream ever changed.
+        assert_eq!(session.selection(), Some(((5, 5), (1, 1))));
     }
 }

@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod client;
+pub mod copy;
 pub mod dashboard;
 pub mod detect;
 pub mod discovery;

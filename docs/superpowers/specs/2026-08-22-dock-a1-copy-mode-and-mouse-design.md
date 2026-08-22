@@ -140,12 +140,20 @@ no-op is impossible.
 | copy mode | `v` | start selection at cursor |
 | copy mode | `y` | yank selection, exit copy mode |
 | copy mode | `/` | search; `n` / `N` cycle matches |
+| copy mode search | `Esc` | cancel the prompt, stay in copy mode |
 | copy mode | `Esc`, `q` | exit without yanking |
 
 Releasing a drag finalises the selection but does **not** write to the clipboard. Yanking is
 always an explicit `y`, so a stray drag can never overwrite what the user copied earlier —
 the same reason tmux separates selection from yank. The selection stays adjustable by motion
 keys after release.
+
+`Esc` moves strictly outward, one level per press: from the search prompt it cancels the
+prompt, and from copy mode it leaves the mode. "Never trap the user" means a bounded, small
+number of presses always reaches the live pane — not that a single press must escape every
+level at once. Dock already applies this to forms, where `Esc` cancels a rename rather than
+quitting the dashboard; the search prompt is the same shape of nested state and must behave
+the same way.
 
 Copy mode is modal and must **say so**: the pane title shows `COPY` and the footer shows the
 copy-mode bindings, for the same reason P0 deleted the old invisible input mode.

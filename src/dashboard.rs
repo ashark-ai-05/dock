@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -945,9 +945,10 @@ impl Dashboard {
             .get(&session.run_id)
             .map(PaneScreen::size)
             .unwrap_or((0, 0));
-        // Esc leaves unconditionally, search prompt included. A modal mode that can refuse to
-        // exit is the failure P0 removed, so the escape hatch stays single-press everywhere.
-        if key.code == KeyCode::Esc {
+        // Esc unwinds one level at a time: the prompt first, then the mode. The invariant is
+        // that a small bounded number of presses always reaches the live pane, not that one
+        // press escapes every level — which is exactly what a rename form already does.
+        if key.code == KeyCode::Esc && !self.copy_searching {
             self.leave_copy_mode(&session);
             return UiCommand::None;
         }
@@ -957,6 +958,10 @@ impl Dashboard {
             return UiCommand::None;
         }
         match key.code {
+            // A composed letter is somebody reaching past copy mode, not a motion: without
+            // this `Ctrl+H` moves left and `Ctrl+Y` yanks. Shift stays allowed because
+            // crossterm reports uppercase `G` and `N` with it set.
+            KeyCode::Char(_) if composed(key) => {}
             KeyCode::Char('q') => {
                 self.leave_copy_mode(&session);
                 return UiCommand::None;
@@ -971,10 +976,9 @@ impl Dashboard {
             KeyCode::Char('G') => session.set_cursor((bounds.0.saturating_sub(1), 0), bounds),
             KeyCode::Char('v') => session.begin_selection(),
             KeyCode::Char('y') => {
-                if self.yank(&session) {
-                    self.leave_copy_mode(&session);
-                    return UiCommand::None;
-                }
+                self.yank(&session);
+                self.leave_copy_mode(&session);
+                return UiCommand::None;
             }
             KeyCode::Char('/') => {
                 session.begin_search();
@@ -993,7 +997,13 @@ impl Dashboard {
     /// `n`/`N` can keep walking the same matches.
     fn copy_search_key(&mut self, key: KeyEvent, session: &mut CopySession, bounds: (u16, u16)) {
         match key.code {
+            // Same rule as the mode's own bindings: `Ctrl+C` must not type a `c` into the query.
+            KeyCode::Char(_) if composed(key) => {}
             KeyCode::Char(character) => session.push_search(character),
+            KeyCode::Esc => {
+                session.cancel_search();
+                self.copy_searching = false;
+            }
             KeyCode::Backspace => {
                 if session.search_query().is_some_and(str::is_empty) {
                     session.cancel_search();
@@ -1047,35 +1057,46 @@ impl Dashboard {
         }
     }
 
-    /// Puts the selection on the clipboard and names the route it took. Returns whether the
-    /// yank actually happened, so a `y` with nothing selected stays in copy mode.
+    /// Puts the selection on the clipboard and names the route it took.
+    ///
+    /// A bare `y` with no anchor yanks the cursor's line rather than refusing: the dominant
+    /// reason to press `y` in a terminal is "give me that line" — a URL, a path, a stack
+    /// frame — and demanding `v$y` for it is friction on the most common copy there is. The
+    /// line yank names itself in the notice so a user who meant something else sees it at once.
     ///
     /// The route is reported because OSC 52 is disabled by default in some terminals: a yank
     /// that silently reached nothing looks exactly like a yank that worked.
-    fn yank(&mut self, session: &CopySession) -> bool {
-        let Some((from, to)) = session.selection() else {
-            self.error = Some("nothing selected · v starts a selection".into());
-            return false;
+    fn yank(&mut self, session: &CopySession) {
+        let screen = self.screens.get(&session.run_id);
+        let (text, subject) = match session.selection() {
+            Some((from, to)) => {
+                let text = screen
+                    .map(|screen| screen.selection_text(from, to))
+                    .unwrap_or_default();
+                let count = text.chars().count();
+                (text, format!("{count} characters"))
+            }
+            None => {
+                let row = session.cursor().0;
+                // Trailing blanks are grid padding, not content: nobody wants 60 spaces
+                // pasted after the path they just copied.
+                let text = screen
+                    .map(|screen| screen.visible_row(row).trim_end().to_owned())
+                    .unwrap_or_default();
+                let count = text.chars().count();
+                (text, format!("line {row} ({count} characters)"))
+            }
         };
-        let text = self
-            .screens
-            .get(&session.run_id)
-            .map(|screen| screen.selection_text(from, to))
-            .unwrap_or_default();
         self.error = Some(match clipboard::copy(&text) {
             Ok(route) => {
                 let route = match route {
-                    ClipboardRoute::Osc52 => "OSC 52".to_owned(),
-                    ClipboardRoute::Command(helper) => helper.to_owned(),
+                    ClipboardRoute::Osc52 => "OSC 52",
+                    ClipboardRoute::Command(helper) => helper,
                 };
-                format!(
-                    "copied {} characters to the clipboard via {route}",
-                    text.chars().count()
-                )
+                format!("copied {subject} to the clipboard via {route}")
             }
             Err(reason) => format!("copy failed: {reason}"),
         });
-        true
     }
 
     /// Leaves copy mode and returns the pane to the live tail, which is where the user was
@@ -1880,6 +1901,14 @@ fn runtime_label(runtime: PaneRuntime) -> &'static str {
     }
 }
 
+/// Whether a key carries a composing modifier, i.e. it is somebody reaching past the current
+/// mode rather than pressing one of its letters. Shift is excluded on purpose: crossterm
+/// reports an uppercase `G` or `N` with Shift set, and those are real copy-mode bindings.
+fn composed(key: KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1888,7 +1917,7 @@ mod tests {
         adapter::{AdapterCapabilities, ProcessCapabilities},
         protocol::{ProcessState, ProviderState},
     };
-    use crossterm::event::{KeyEventKind, KeyModifiers};
+    use crossterm::event::KeyEventKind;
     use ratatui::{Terminal, backend::TestBackend};
     use std::collections::BTreeMap;
 
@@ -2614,6 +2643,9 @@ mod tests {
             "runs keep running",
             "focus prev",
             "workspace",
+            // The newest hint, and therefore the one nearest the point where the bar stops
+            // fitting the two-row footer.
+            "copy mode",
             "quit",
         ] {
             assert!(pending.contains(hint), "missing which-key hint {hint}");
@@ -3209,13 +3241,124 @@ mod tests {
         dashboard.apply_event(attach_event("run_1", b"hello world\r\n"));
         dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
         dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
-        for key in ['h', 'j', 'k', 'l', 'v', 'y'] {
-            let outcome = dashboard.key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        // Ctrl+C, Ctrl+D and Enter are the three that would actually do something to the
+        // shell — interrupt it, close its stdin, run whatever is on the line. `y` is last
+        // because yanking deliberately leaves the mode, and every key before it must find
+        // copy mode still in charge for the loop to be proving containment at all.
+        for key in [
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        ] {
+            assert!(
+                dashboard.copy_mode(),
+                "copy mode must still be active to be the thing swallowing {key:?}"
+            );
+            let outcome = dashboard.key(key);
             assert!(
                 !matches!(outcome, UiCommand::PaneInput(_)),
-                "{key} must not be forwarded to the PTY while in copy mode"
+                "{key:?} must not be forwarded to the PTY while in copy mode"
             );
         }
+        assert!(!dashboard.copy_mode(), "the trailing y yanked and left");
+    }
+
+    #[test]
+    fn a_bare_yank_copies_the_cursors_line_and_names_it() {
+        let mut dashboard = bound_dashboard();
+        // No trailing newline, so the live cursor — and therefore copy mode's — sits on the
+        // row that actually holds the text.
+        dashboard.apply_event(attach_event("run_1", b"https://example.test/path"));
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(!dashboard.copy_mode(), "yanking leaves copy mode");
+        let notice = dashboard.error.clone().unwrap_or_default();
+        // 25 characters is the URL with the row's trailing blanks trimmed off, which is the
+        // proof that the line — not the whole padded grid row — went to the clipboard.
+        assert!(
+            notice.contains("copied line 0 (25 characters)"),
+            "a bare yank must copy the cursor's line and say so, got {notice:?}"
+        );
+    }
+
+    #[test]
+    fn escape_cancels_the_search_prompt_first_and_copy_mode_second() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"needle in here"));
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(dashboard.copy_status().as_deref(), Some("COPY /n"));
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            dashboard.copy_mode(),
+            "the first Esc cancels the prompt, not the mode"
+        );
+        assert_eq!(
+            dashboard.copy_status().as_deref(),
+            Some("COPY MOVE 0,14"),
+            "the prompt is gone and the cursor is where it was"
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!dashboard.copy_mode(), "the second Esc leaves copy mode");
+    }
+
+    #[test]
+    fn control_modified_letters_are_not_copy_mode_bindings() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"hello world"));
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        let before = dashboard.copy_status();
+        for key in ['h', 'j', 'v', 'g'] {
+            dashboard.key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL));
+        }
+        assert_eq!(
+            dashboard.copy_status(),
+            before,
+            "Ctrl+letter is somebody reaching past copy mode, not a motion or a verb"
+        );
+        // Shift is the exception: crossterm reports uppercase G with it set, so requiring a
+        // literally empty modifier set would take `G` and `N` away.
+        dashboard.key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(
+            dashboard.copy_status().as_deref(),
+            Some(format!("COPY MOVE {},0", PANE_ROWS - 1).as_str())
+        );
+    }
+
+    #[test]
+    fn copy_mode_publishes_a_status_line_for_the_footer_to_render() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"hello world"));
+        assert_eq!(
+            dashboard.copy_status(),
+            None,
+            "there is no indicator when the mode is off"
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        let status = dashboard.copy_status().unwrap_or_default();
+        assert!(
+            status.contains("COPY"),
+            "a modal mode must have something to show, got {status:?}"
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(
+            dashboard
+                .copy_status()
+                .unwrap_or_default()
+                .contains("SELECT"),
+            "starting a selection must be visible too"
+        );
     }
 
     #[test]

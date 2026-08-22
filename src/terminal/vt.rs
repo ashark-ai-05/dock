@@ -96,6 +96,19 @@ impl VtTerminal {
     /// ending in `\r\n` leaves the cursor on the next, still-blank row (anchoring on the
     /// cursor returns a blank tail). So walk up from the cursor past any trailing blank
     /// rows to the last row with real content, then take `rows` lines ending there.
+    /// Everything currently on the screen, top to bottom.
+    ///
+    /// [`text_tail`](Self::text_tail) ends at the cursor, which is right for a shell — the cursor
+    /// is always after the last thing printed — and wrong for a full-screen program, where the
+    /// cursor sits wherever that program put it. A selection dialog leaves the cursor on the
+    /// highlighted option, so its instructions ("enter to select", "esc to cancel") are *below*
+    /// the cursor and a tail can never contain them. Anything classifying a TUI agent has to read
+    /// the whole screen or it is reading a haystack the needle cannot be in.
+    pub fn visible_text(&self) -> String {
+        let (rows, width) = self.size();
+        self.parser.screen().contents_between(0, 0, rows, width)
+    }
+
     pub fn text_tail(&self, rows: u16) -> String {
         let (_, width) = self.size();
         let (cursor_row, _) = self.cursor();
@@ -234,6 +247,27 @@ mod tests {
         let tail = term.text_tail(3);
         assert!(tail.contains("line39"));
         assert!(!tail.contains("line36"));
+    }
+
+    #[test]
+    fn the_whole_screen_includes_what_sits_below_the_cursor() {
+        let mut term = VtTerminal::new(24, 80, 100);
+        // A full-screen program paints a dialog and leaves the cursor on the highlighted row,
+        // with its instructions underneath — the exact shape of an agent's chooser.
+        term.feed(b"Which location?\r\n");
+        term.feed(b"  1. Sydney\r\n  2. Melbourne\r\n");
+        term.feed(b"Enter to select \xc2\xb7 Esc to cancel\r\n");
+        // Put the cursor back on the highlighted option, as such a program would.
+        term.feed(b"\x1b[2;1H");
+
+        let tail = term.text_tail(40);
+        assert!(
+            !tail.contains("Enter to select"),
+            "a cursor-anchored tail cannot see below the cursor: {tail:?}"
+        );
+        let whole = term.visible_text();
+        assert!(whole.contains("Which location?"), "{whole:?}");
+        assert!(whole.contains("Enter to select"), "{whole:?}");
     }
 
     #[test]

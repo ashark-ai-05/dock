@@ -18,7 +18,6 @@ use crate::{
     clipboard::{self, ClipboardRoute},
     copy::{CopySession, find_matches},
     detect::{AgentKind, AgentState},
-    discovery::ExternalAgentCandidate,
     files,
     git::GitFacts,
     keymap::{FocusDirection, KeyOutcome, Keymap, PaneCommand},
@@ -69,7 +68,6 @@ pub enum UiCommand {
 pub struct Dashboard {
     pub layout: LayoutSnapshot,
     pub runs: Vec<RuntimeSnapshot>,
-    pub external: Vec<ExternalAgentCandidate>,
     pub repository_root: String,
     pub runtime_directory: String,
     pub repository_launches: Vec<RepositoryLaunchOption>,
@@ -102,7 +100,6 @@ pub struct Dashboard {
     /// from `dragging`, which is the divider gesture; a press lands on one or the other.
     pane_drag: Option<PaneDrag>,
     sequence: u64,
-    dismiss_external_area: Option<Rect>,
     launch_area: Option<Rect>,
     launch_form: Option<LaunchForm>,
     launch_profile_areas: Vec<Rect>,
@@ -138,6 +135,8 @@ pub struct Dashboard {
     rename_workspace_area: Option<Rect>,
     /// Split and close controls on the focused pane's own border.
     pane_control_areas: Vec<(PaneControl, Rect)>,
+    /// The sidebar's clickable menu of what this dashboard can do.
+    quick_action_areas: Vec<(PaneCommand, Rect)>,
     last_launch_profile: usize,
     last_repository_mode: bool,
 }
@@ -213,6 +212,15 @@ struct LaunchForm {
     confirming: bool,
     query: String,
 }
+
+/// The sidebar menu: the things worth doing from a dashboard with nothing running yet, each with
+/// the key that also does it. Deliberately short — a menu of everything is a menu of nothing.
+const QUICK_ACTIONS: [(&str, &str, PaneCommand); 4] = [
+    ("Ctrl+B k", "task board", PaneCommand::Board),
+    ("Ctrl+B f", "find a file", PaneCommand::FilePicker),
+    ("Ctrl+B g", "what changed", PaneCommand::Git),
+    ("Ctrl+B ?", "every key", PaneCommand::Help),
+];
 
 const PROFILES: &[(DashboardProfile, &str)] = &[
     (DashboardProfile::Fixture, "Fixture"),
@@ -379,7 +387,6 @@ impl Dashboard {
         self.pane_areas.clear();
         self.pane_inner_areas.clear();
         self.dividers.clear();
-        self.dismiss_external_area = None;
         self.launch_area = None;
         self.launch_profile_areas.clear();
         self.launch_confirm_area = None;
@@ -795,30 +802,31 @@ impl Dashboard {
             ));
         }
         lines.push(Line::from(""));
-        lines.push(Line::styled("EXISTING AGENTS", heading));
-        if self.external.is_empty() {
-            lines.push(Line::styled(
-                " none discovered",
-                Style::default().fg(self.theme.muted),
-            ));
+        // What this pane of the sidebar used to hold was a list of agents running elsewhere on the
+        // machine, which Dock has no way to control and which included the user's own editor
+        // session. Its replacement answers the question a quiet dashboard actually raises: what
+        // can I do from here. Each row is clickable, so the list is a menu rather than a poster.
+        lines.push(Line::styled("START HERE", heading));
+        self.quick_action_areas.clear();
+        for (key, action, command) in QUICK_ACTIONS {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {key} "),
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    ellipsise(action, inner_width.saturating_sub(key.chars().count() + 2)),
+                    Style::default().fg(self.theme.text),
+                ),
+            ]));
+            if let Some(row) = clickable_row(area, lines.len() - 1) {
+                self.quick_action_areas.push((command, row));
+            }
         }
-        for candidate in &self.external {
-            lines.push(Line::styled(
-                ellipsise(candidate.provider.as_str(), inner_width),
-                Style::default().fg(self.theme.text),
-            ));
-            lines.push(Line::styled(
-                ellipsise(candidate.status(), inner_width),
-                Style::default().fg(self.theme.working),
-            ));
-        }
-        if !self.external.is_empty() {
-            lines.push(Line::styled(
-                " click to dismiss all",
-                Style::default().fg(self.theme.accent),
-            ));
-            self.dismiss_external_area = clickable_row(area, lines.len() - 1);
-        }
+        // Launch keeps its own emphatic row: it is the one action that starts work rather than
+        // showing something, and it was the only discoverable action here before.
         lines.push(Line::from(""));
         lines.push(Line::styled(
             "Ctrl+B l LAUNCH AGENT",
@@ -2882,12 +2890,13 @@ impl Dashboard {
                         PaneControl::Close => PaneCommand::Close,
                     });
                 }
-                if self
-                    .dismiss_external_area
-                    .is_some_and(|area| contains(area, event.column, event.row))
+                if let Some(command) = self
+                    .quick_action_areas
+                    .iter()
+                    .find(|(_, area)| contains(*area, event.column, event.row))
+                    .map(|(command, _)| *command)
                 {
-                    self.external.clear();
-                    return UiCommand::None;
+                    return self.run_command(command);
                 }
                 if self
                     .launch_area
@@ -3696,21 +3705,15 @@ mod tests {
     }
 
     #[test]
-    fn external_dismiss_and_owned_launch_have_keyboard_and_mouse_actions() {
+    fn the_sidebar_menu_and_launch_row_both_work_by_key_and_by_click() {
         let mut dashboard = dashboard();
         dashboard.repository_root = "/repo".into();
         dashboard.runtime_directory = "/tmp".into();
-        dashboard.external.push(ExternalAgentCandidate {
-            provider: "Codex CLI".into(),
-            repository_match: false,
-        });
-        // `d` is a pane keystroke now, so it must never clear the list.
+        // `d` is a pane keystroke, and must stay one.
         assert!(!matches!(
             dashboard.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
             UiCommand::Request(_)
         ));
-        assert_eq!(dashboard.external.len(), 1);
-        dashboard.external.clear();
         assert_eq!(
             command(&mut dashboard, KeyCode::Char('l')),
             UiCommand::LoadCatalog
@@ -3724,23 +3727,25 @@ mod tests {
             if matches!(request.as_ref(), Request::TerminalLaunch(request) if request.profile == DashboardProfile::Fixture && request.runtime_directory == "/tmp" && request.workspace_id == "w" && request.pane_id == "a"))
         );
 
-        dashboard.external.push(ExternalAgentCandidate {
-            provider: "Claude Code".into(),
-            repository_match: false,
-        });
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
         terminal.draw(|frame| dashboard.render(frame)).unwrap();
-        let dismiss = dashboard.dismiss_external_area.unwrap();
+        // Every menu row runs the same command its key does, so the menu is a way in rather than
+        // a second vocabulary to learn.
+        let board = dashboard
+            .quick_action_areas
+            .iter()
+            .find(|(command, _)| *command == PaneCommand::Board)
+            .map(|(_, area)| *area)
+            .expect("the board row is on the menu");
         assert_eq!(
             dashboard.mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: dismiss.x + 1,
-                row: dismiss.y,
+                column: board.x + 1,
+                row: board.y,
                 modifiers: KeyModifiers::NONE
             }),
-            UiCommand::None
+            UiCommand::LoadBoard
         );
-        assert!(dashboard.external.is_empty());
         terminal.draw(|frame| dashboard.render(frame)).unwrap();
         let launch = dashboard.launch_area.unwrap();
         assert_eq!(
@@ -3752,12 +3757,6 @@ mod tests {
             }),
             UiCommand::LoadCatalog
         );
-        assert!(dashboard.launch_form.is_some());
-        assert_eq!(
-            dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            UiCommand::None
-        );
-        assert!(dashboard.launch_form.is_none());
     }
 
     #[test]
@@ -5156,18 +5155,22 @@ mod tests {
         // Longer than the 27 columns the sidebar's right border leaves, which is exactly what
         // used to wrap onto extra rows the recorded rectangles knew nothing about.
         dashboard.layout.workspaces[0].name = "a very long workspace name that overflows".into();
-        dashboard.external.push(ExternalAgentCandidate {
-            provider: "Codex CLI".into(),
-            repository_match: false,
-        });
         let rows = sidebar_rows(&mut dashboard, 100, 30);
-        let dismiss = dashboard.dismiss_external_area.expect("dismiss row");
         let launch = dashboard.launch_area.expect("launch row");
-        assert!(
-            rows[usize::from(dismiss.y)].contains("click to dismiss all"),
-            "dismiss rectangle at row {} but rows were {rows:#?}",
-            dismiss.y
-        );
+        // Every menu rectangle has to sit on the row carrying its own label, which is the exact
+        // thing a wrapped line above it used to break.
+        for (command, area) in &dashboard.quick_action_areas {
+            let label = QUICK_ACTIONS
+                .iter()
+                .find(|(_, _, candidate)| candidate == command)
+                .map(|(_, label, _)| *label)
+                .expect("every recorded row comes from the menu");
+            assert!(
+                rows[usize::from(area.y)].contains(label),
+                "{command:?} rectangle at row {} but rows were {rows:#?}",
+                area.y
+            );
+        }
         assert!(
             rows[usize::from(launch.y)].contains("LAUNCH AGENT"),
             "launch rectangle at row {} but rows were {rows:#?}",
@@ -5181,16 +5184,6 @@ mod tests {
             "{rows:#?}"
         );
         // And the rectangles still drive the real actions when clicked where they are drawn.
-        assert_eq!(
-            dashboard.mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: dismiss.x + 1,
-                row: dismiss.y,
-                modifiers: KeyModifiers::NONE
-            }),
-            UiCommand::None
-        );
-        assert!(dashboard.external.is_empty());
         assert_eq!(
             dashboard.mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),

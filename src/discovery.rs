@@ -16,6 +16,15 @@ pub trait AgentDiscovery {
     fn discover(&self, repository: &Path) -> Vec<ExternalAgentCandidate>;
 }
 
+/// Not wired into the dashboard.
+///
+/// It was, and what it produced was a list of agent processes from the whole machine, scanned once
+/// at startup and never refreshed — so it included agents running in Dock's own panes, in unrelated
+/// terminals, and the user's own editor session, all under a heading promising "existing agents".
+/// None of it was actionable either, because Dock has no adoption path by design. It is kept
+/// because the intent is sound: knowing an agent is running outside Dock is worth showing, once it
+/// is scoped to something meaningful (the `repository` argument below is still ignored) and
+/// refreshed rather than frozen at launch.
 pub struct ProcessNameDiscovery;
 
 impl AgentDiscovery for ProcessNameDiscovery {

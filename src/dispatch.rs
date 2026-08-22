@@ -1929,8 +1929,12 @@ impl RuntimeRegistry {
                     .zip(table.as_deref())
                     .and_then(|(leader_pid, table)| agent_in_process_table(table, leader_pid));
                 snapshot.agent_state = match agent {
+                    // The whole screen, not a tail. An agent's chooser leaves the cursor on the
+                    // highlighted option and prints its instructions underneath, so a
+                    // cursor-anchored tail cannot contain the very chrome that says the agent is
+                    // waiting — every pattern matched against one was unreachable.
                     Some(kind) => {
-                        runtime.with_screen(|screen| classify_screen(kind, &screen.text_tail(40)))
+                        runtime.with_screen(|screen| classify_screen(kind, &screen.visible_text()))
                     }
                     None => AgentState::Idle,
                 };

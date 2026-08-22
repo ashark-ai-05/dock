@@ -120,6 +120,33 @@ impl AgentState {
 
 #[cfg(test)]
 mod tests {
+    use crate::terminal::VtTerminal;
+
+    /// The bug this guards: every chooser pattern was matched against a cursor-anchored tail, and
+    /// a chooser leaves the cursor on the highlighted option with its instructions underneath. The
+    /// patterns were correct and unreachable, so the roster said "idle" while the agent waited.
+    #[test]
+    fn a_chooser_is_recognised_through_the_screen_the_agent_actually_painted() {
+        let mut screen = VtTerminal::new(24, 100, 100);
+        screen.feed(b"\xe2\x9c\xb3 Cogitated for 4s\r\n\r\n");
+        screen.feed(b"What location would you like the weather for?\r\n\r\n");
+        screen.feed(b"  1. Sydney, AU\r\n  2. Melbourne, AU\r\n  3. Brisbane, AU\r\n\r\n");
+        screen.feed("Enter to select · ↑/↓ to navigate · Esc to cancel\r\n".as_bytes());
+        // Where such a program leaves the cursor: on the highlighted option, not at the end.
+        screen.feed(b"\x1b[5;3H");
+
+        assert_eq!(
+            classify_screen(AgentKind::Claude, &screen.text_tail(40)),
+            AgentState::Idle,
+            "the tail cannot see the chooser, which is the whole defect"
+        );
+        assert_eq!(
+            classify_screen(AgentKind::Claude, &screen.visible_text()),
+            AgentState::Blocked,
+            "the screen the agent painted says plainly that it is waiting"
+        );
+    }
+
     use super::*;
 
     #[test]

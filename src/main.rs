@@ -30,7 +30,6 @@ use dock::{
     client::Client,
     client::{EventStream, StreamPoll},
     dashboard::{Dashboard, TaskDispatch, UiCommand},
-    discovery::{AgentDiscovery, ProcessNameDiscovery},
     git::GitAdapter,
     paths,
     protocol::{
@@ -80,11 +79,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
-    let external = ProcessNameDiscovery.discover(&runtime_directory);
     run_dashboard(
         &mut client,
         &socket,
-        external,
         runtime_directory.to_string_lossy().into_owned(),
     )?;
     // A daemon started by Dock is intentionally left running for reconnect. This explicit policy
@@ -461,14 +458,12 @@ impl Drop for TerminalGuard {
 fn run_dashboard(
     client: &mut Client,
     socket: &Path,
-    external: Vec<dock::discovery::ExternalAgentCandidate>,
     runtime_directory: String,
 ) -> Result<(), String> {
     let mut guard = TerminalGuard::enter().map_err(|e| e.to_string())?;
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).map_err(|e| e.to_string())?;
     let mut dashboard = Dashboard::default();
-    dashboard.external = external;
     dashboard.runtime_directory = runtime_directory.clone();
     let (catalog_tx, catalog_rx) = mpsc::channel();
     let mut catalog_loading = false;

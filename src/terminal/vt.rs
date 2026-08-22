@@ -147,6 +147,48 @@ impl VtTerminal {
     pub(crate) fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
     }
+
+    /// Moves the viewport through retained scrollback. Positive goes back into history.
+    ///
+    /// `vt100` clamps to the rows actually retained and, while the offset is non-zero, adjusts it
+    /// as new output arrives so the visible rows stay put. That is why callers must treat the
+    /// offset as opaque: only "zero versus non-zero" is meaningful.
+    pub fn scroll_by(&mut self, delta: i32) {
+        let current = i64::try_from(self.parser.screen().scrollback()).unwrap_or(i64::MAX);
+        let target = (current + i64::from(delta)).max(0);
+        let target = usize::try_from(target).unwrap_or(usize::MAX);
+        self.parser.screen_mut().set_scrollback(target);
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
+    pub fn scroll_to_live(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    pub fn is_scrolled(&self) -> bool {
+        self.scroll_offset() != 0
+    }
+
+    pub fn visible_row(&self, row: u16) -> String {
+        let (_, cols) = self.size();
+        self.parser.screen().contents_between(row, 0, row, cols)
+    }
+
+    /// Text between two points of the visible grid, in reading order regardless of which
+    /// point was anchored first.
+    pub fn selection_text(&self, from: (u16, u16), to: (u16, u16)) -> String {
+        let (start, end) = if (from.0, from.1) <= (to.0, to.1) {
+            (from, to)
+        } else {
+            (to, from)
+        };
+        self.parser
+            .screen()
+            .contents_between(start.0, start.1, end.0, end.1)
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +286,61 @@ mod tests {
         let delta = sync.delta_from(&live);
         sync.apply(&delta);
         assert!(sync.delta_from(&live).is_empty());
+    }
+
+    fn filled(rows: u16, cols: u16, lines: usize) -> VtTerminal {
+        let mut term = VtTerminal::new(rows, cols, 100);
+        for index in 1..=lines {
+            term.feed(format!("line {index}\r\n").as_bytes());
+        }
+        term
+    }
+
+    #[test]
+    fn scrolling_back_shows_older_rows_and_returning_to_live_restores_the_tail() {
+        let mut term = filled(5, 40, 20);
+        assert!(!term.is_scrolled());
+        term.scroll_by(10);
+        assert!(term.is_scrolled());
+        assert_eq!(term.visible_row(0).trim(), "line 7");
+        term.scroll_to_live();
+        assert!(!term.is_scrolled());
+        assert_eq!(term.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn the_viewport_is_pinned_while_scrolled_even_as_new_output_arrives() {
+        let mut term = filled(5, 40, 20);
+        term.scroll_by(10);
+        let before = term.visible_row(0);
+        term.feed(b"NEW OUTPUT\r\n");
+        // vt100 auto-adjusts the offset to hold the view still, so assert on the ROW, never on
+        // the offset number, which legitimately changes.
+        assert_eq!(term.visible_row(0), before);
+        assert!(term.is_scrolled());
+    }
+
+    #[test]
+    fn scrolling_is_clamped_at_both_ends() {
+        let mut term = filled(5, 40, 20);
+        term.scroll_by(9_999);
+        let top = term.visible_row(0);
+        term.scroll_by(9_999);
+        assert_eq!(term.visible_row(0), top, "already at the oldest row");
+        term.scroll_by(-9_999);
+        assert_eq!(term.scroll_offset(), 0);
+        term.scroll_by(-9_999);
+        assert_eq!(term.scroll_offset(), 0, "cannot scroll past live output");
+    }
+
+    #[test]
+    fn selection_text_is_order_independent_and_spans_rows() {
+        let mut term = filled(5, 40, 20);
+        term.scroll_by(10);
+        let forward = term.selection_text((0, 0), (2, 39));
+        let reversed = term.selection_text((2, 39), (0, 0));
+        assert_eq!(forward, reversed);
+        assert!(forward.contains("line 7"));
+        assert!(forward.contains("line 9"));
     }
 }

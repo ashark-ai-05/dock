@@ -552,3 +552,165 @@ mod tests {
         assert!(tasks.iter().all(|task| !task.title.is_empty()));
     }
 }
+
+/// Where the cursor is on a board laid out as columns of cards.
+///
+/// Kept apart from the drawing so the awkward parts — an empty column, a column that empties when
+/// its last card moves out of it, the edges — are decided by something that can be tested without
+/// a terminal.
+#[derive(Debug, Clone, Default)]
+pub struct BoardView {
+    tasks: Vec<BoardTask>,
+    column: usize,
+    row: usize,
+}
+
+impl BoardView {
+    /// Opens on the leftmost column that has anything in it, so a board whose backlog is empty
+    /// does not open staring at nothing.
+    pub fn new(tasks: Vec<BoardTask>) -> Self {
+        let column = STATUSES
+            .iter()
+            .position(|status| tasks.iter().any(|task| task.status == *status))
+            .unwrap_or(0);
+        Self {
+            tasks,
+            column,
+            row: 0,
+        }
+    }
+
+    pub fn tasks(&self) -> &[BoardTask] {
+        &self.tasks
+    }
+
+    pub fn column(&self) -> usize {
+        self.column
+    }
+
+    pub fn row(&self) -> usize {
+        self.row
+    }
+
+    /// The cards in one column, in board order.
+    pub fn cards(&self, status: &str) -> Vec<&BoardTask> {
+        self.tasks
+            .iter()
+            .filter(|task| task.status == status)
+            .collect()
+    }
+
+    pub fn selected(&self) -> Option<&BoardTask> {
+        self.cards(STATUSES[self.column]).into_iter().nth(self.row)
+    }
+
+    /// Moves across columns, saturating rather than wrapping, and keeps the cursor on a card that
+    /// exists — a taller column to the left leaves the row index past the end of a shorter one.
+    pub fn move_column(&mut self, delta: isize) {
+        self.column = self
+            .column
+            .saturating_add_signed(delta)
+            .min(STATUSES.len() - 1);
+        self.clamp_row();
+    }
+
+    pub fn move_row(&mut self, delta: isize) {
+        self.row = self.row.saturating_add_signed(delta);
+        self.clamp_row();
+    }
+
+    fn clamp_row(&mut self) {
+        let last = self.cards(STATUSES[self.column]).len().saturating_sub(1);
+        self.row = self.row.min(last);
+    }
+
+    /// Follows a task to wherever it has just been moved, so the card the user was holding stays
+    /// under the cursor instead of the cursor staying over a column position.
+    pub fn follow(&mut self, id: u64) {
+        if let Some(task) = self.tasks.iter().find(|task| task.id == id)
+            && let Some(column) = STATUSES.iter().position(|status| *status == task.status)
+        {
+            self.column = column;
+            self.row = self
+                .cards(STATUSES[column])
+                .iter()
+                .position(|card| card.id == id)
+                .unwrap_or(0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn task(id: u64, status: &str) -> BoardTask {
+        BoardTask {
+            id,
+            title: format!("task {id}"),
+            status: status.into(),
+            priority: "medium".into(),
+            file: PathBuf::from(format!("{id}.md")),
+        }
+    }
+
+    #[test]
+    fn a_board_opens_on_the_first_column_holding_anything() {
+        // Backlog and todo are empty; staring at an empty column would make a board with work on
+        // it look like a board with none.
+        let view = BoardView::new(vec![task(1, "in-progress"), task(2, "done")]);
+        assert_eq!(STATUSES[view.column()], "in-progress");
+        assert_eq!(view.selected().map(|task| task.id), Some(1));
+    }
+
+    #[test]
+    fn moving_across_columns_saturates_and_keeps_the_cursor_on_a_card() {
+        let mut view = BoardView::new(vec![
+            task(1, "backlog"),
+            task(2, "backlog"),
+            task(3, "backlog"),
+            task(4, "review"),
+        ]);
+        view.move_row(2);
+        assert_eq!(view.selected().map(|task| task.id), Some(3));
+        // Review holds one card, so a row index of 2 has to come back to something that exists.
+        view.move_column(3);
+        assert_eq!(STATUSES[view.column()], "review");
+        assert_eq!(view.selected().map(|task| task.id), Some(4));
+        // And the ends hold rather than wrapping round.
+        view.move_column(9);
+        assert_eq!(STATUSES[view.column()], "done");
+        view.move_column(-9);
+        assert_eq!(STATUSES[view.column()], "backlog");
+    }
+
+    #[test]
+    fn an_empty_column_selects_nothing_instead_of_panicking() {
+        let mut view = BoardView::new(vec![task(1, "backlog")]);
+        view.move_column(1);
+        assert!(view.selected().is_none());
+        view.move_row(5);
+        assert!(view.selected().is_none());
+    }
+
+    #[test]
+    fn the_cursor_follows_a_card_that_moved_rather_than_staying_put() {
+        let mut view = BoardView::new(vec![task(1, "backlog"), task(2, "backlog")]);
+        view.move_row(1);
+        assert_eq!(view.selected().map(|task| task.id), Some(2));
+        // The card is moved on: the cursor should still be on it, in its new column.
+        view.tasks[1].status = "in-progress".into();
+        view.follow(2);
+        assert_eq!(STATUSES[view.column()], "in-progress");
+        assert_eq!(view.selected().map(|task| task.id), Some(2));
+    }
+
+    #[test]
+    fn an_empty_board_is_navigable_without_selecting_anything() {
+        let mut view = BoardView::new(Vec::new());
+        assert!(view.selected().is_none());
+        view.move_column(2);
+        view.move_row(2);
+        assert!(view.selected().is_none());
+    }
+}

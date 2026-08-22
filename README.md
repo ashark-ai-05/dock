@@ -86,11 +86,25 @@ repository it's that repository's `kanban/tasks/`, shared by every workspace
 open on it; otherwise it's the workspace's own board under
 `~/.dock/boards/<workspace>/tasks`, created the first time you add something.
 
-An empty board opens like any other and invites the first task: type a title
-and press `Enter` (or `Ctrl+N`). Typing filters what's there; if nothing
-matches, `Enter` writes down what you typed. The board names its own directory
-along the bottom, so a workspace board and a repository board are never
-confused.
+It's drawn as a board — a column per status, cards inside them:
+
+```
+╭ BOARD ──────────────────────────────────────────────────────────────────╮
+│BACKLOG · 2            TODO · 0        IN-PROGRESS · 1     REVIEW · 1     │
+│─────────────────────  ──────────────  ──────────────────  ───────────────│
+│› #3 write the docs      —               #1 wire the parse   #2 add tests │
+│  #5 fix the retry pa…                                                    │
+│                                                                          │
+│←/→ column · ↑/↓ card · </> move it · n new · Enter dispatch · Esc close   │
+│~/.dock/boards/workspace_1/tasks                                          │
+╰──────────────────────────────────────────────────────────────────────────╯
+```
+
+`←`/`→` picks a column, `↑`/`↓` a card, `<`/`>` moves the card itself between
+columns, `n` starts a new task, and `Enter` puts an agent on the selected one.
+The board names its own directory along the bottom, so a workspace board and a
+repository board are never confused — and a repository's board is shown but
+never altered, since `kanban-md` owns it.
 
 Agents track their own work with `dock task`. Every pane Dock launches gets
 `DOCK_BOARD` (its board), `DOCK_WORKSPACE`, `DOCK_PANE`, `DOCK_RUN`, and

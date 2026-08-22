@@ -14,7 +14,7 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::{
     adapter::{AdapterId, AdapterSelection},
-    board::BoardTask,
+    board::{BoardTask, BoardView, STATUSES},
     clipboard::{self, ClipboardRoute},
     copy::{CopySession, find_matches},
     detect::{AgentKind, AgentState},
@@ -127,6 +127,8 @@ pub struct Dashboard {
     board_is_personal: bool,
     /// The Git overlay, if open.
     git: Option<GitOverlay>,
+    /// The board, if open.
+    board: Option<BoardOverlay>,
     picker_row_areas: Vec<Rect>,
     /// Where each workspace's tab landed, so the strip is clickable like every other chrome.
     tab_areas: Vec<(String, Rect)>,
@@ -157,6 +159,18 @@ pub enum PaneControl {
 pub enum RenameTarget {
     Pane,
     Workspace,
+}
+
+/// The board, laid out as columns of cards.
+#[derive(Debug, Clone)]
+pub struct BoardOverlay {
+    pub view: BoardView,
+    pub directory: std::path::PathBuf,
+    /// Whether Dock may write here. A repository's board is read on the same screen but never
+    /// altered, so the controls that would change it are not offered.
+    pub writable: bool,
+    /// A title being typed. While this is `Some`, every printable key belongs to it.
+    pub composing: Option<String>,
 }
 
 /// What Git says about a worktree, and how far into the diff the reader is.
@@ -483,6 +497,9 @@ impl Dashboard {
         }
         if self.git.is_some() {
             self.render_git(frame, area);
+        }
+        if self.board.is_some() {
+            self.render_board(frame, area);
         }
         // The which-key bar publishes every binding, and there are now more bindings than two rows
         // can hold. Rather than shaving words off the table until the last entry fits — which
@@ -1228,7 +1245,7 @@ impl Dashboard {
             Line::from("f find a file here and type its path into the pane"),
             Line::from("a resume the agent that last ran here, continuing its own session"),
             Line::from("i review handoffs agents are waiting on: a accept · c request changes"),
-            Line::from("k task board — Ctrl+N adds one · taking one puts an agent on it"),
+            Line::from("k task board: ←/→ column · ↑/↓ card · </> move it · n new · Enter dispatch"),
             Line::from("g what changed in this pane's worktree · j/k scroll · g/G ends"),
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
@@ -1314,6 +1331,9 @@ impl Dashboard {
         }
         if self.review.is_some() {
             return self.review_key(key);
+        }
+        if self.board.is_some() {
+            return self.board_key(key);
         }
         if self.git.is_some() {
             return self.git_key(key);
@@ -1450,6 +1470,190 @@ impl Dashboard {
     ///
     /// `delta` is not used here even when it is installed: it emits ANSI, and the overlay would
     /// have to un-escape that text only to style it again.
+    /// The board: one column per status, cards inside them.
+    ///
+    /// Drawn as columns rather than a filtered list because the shape is the information — where
+    /// the work has piled up, what is in flight, what is waiting on a person — and a list of the
+    /// same tasks sorted by status shows none of it at a glance.
+    fn render_board(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(board) = self.board.as_ref() else {
+            return;
+        };
+        // Sized to the tallest column rather than filling the screen: a board with four cards on
+        // it should look like a board with four cards on it, not like one that has lost the rest.
+        let tallest = STATUSES
+            .iter()
+            .map(|status| board.view.cards(status).len())
+            .max()
+            .unwrap_or(0);
+        let chrome = 7;
+        let width = area.width.min(120);
+        // Two rows are left for the dashboard's own footer, which is painted after every overlay
+        // and would otherwise write over the bottom of this one.
+        let height = (tallest as u16 + chrome)
+            .max(10)
+            .min(area.height.saturating_sub(3));
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height.saturating_sub(2) - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(Theme::border_type())
+                .border_style(Style::default().fg(self.theme.border_focused))
+                .style(Style::default().bg(self.theme.surface))
+                .title(" BOARD "),
+            popup,
+        );
+        let inner = Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        );
+        if inner.width < 20 || inner.height < 6 {
+            return;
+        }
+
+        // Columns share the width evenly. Five is few enough that an even split stays readable at
+        // any terminal width Dock already refuses to draw below.
+        let columns = STATUSES.len() as u16;
+        let column_width = inner.width / columns;
+        let card_rows = inner.height.saturating_sub(4);
+
+        for (index, status) in STATUSES.iter().enumerate() {
+            let x = inner.x + column_width * index as u16;
+            let cards = board.view.cards(status);
+            let active = index == board.view.column();
+            // A rule under each heading gives the columns edges without spending a column of
+            // width on borders, which at five columns would cost a fifth of the card text.
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "─".repeat(usize::from(column_width.saturating_sub(2))),
+                    Style::default().fg(if active {
+                        self.theme.accent
+                    } else {
+                        self.theme.border
+                    }),
+                )),
+                Rect::new(x, inner.y + 1, column_width.saturating_sub(1), 1),
+            );
+            let heading = Style::default()
+                .fg(if active {
+                    self.theme.accent
+                } else {
+                    self.theme.muted
+                })
+                .add_modifier(if active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                });
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    ellipsise(
+                        &format!("{} · {}", status.to_uppercase(), cards.len()),
+                        usize::from(column_width.saturating_sub(1)),
+                    ),
+                    heading,
+                )),
+                Rect::new(x, inner.y, column_width.saturating_sub(1), 1),
+            );
+
+            // A column taller than the space scrolls to keep the cursor visible, rather than
+            // hiding the selected card behind the bottom edge.
+            let first = if active {
+                board
+                    .view
+                    .row()
+                    .saturating_sub(usize::from(card_rows).saturating_sub(1))
+            } else {
+                0
+            };
+            for (row, task) in cards
+                .iter()
+                .skip(first)
+                .take(usize::from(card_rows))
+                .enumerate()
+            {
+                let y = inner.y + 2 + row as u16;
+                if y >= inner.bottom() {
+                    break;
+                }
+                let selected = active && first + row == board.view.row();
+                let style = if selected {
+                    Style::default()
+                        .bg(self.theme.accent)
+                        .fg(self.theme.surface)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(self.theme.text)
+                };
+                let label = format!(
+                    "{} #{} {}",
+                    if selected { "›" } else { " " },
+                    task.id,
+                    task.title
+                );
+                frame.render_widget(
+                    Paragraph::new(Line::styled(
+                        ellipsise(&label, usize::from(column_width.saturating_sub(1))),
+                        style,
+                    )),
+                    Rect::new(x, y, column_width.saturating_sub(1), 1),
+                );
+            }
+            if cards.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(Line::styled("  —", Style::default().fg(self.theme.border))),
+                    Rect::new(x, inner.y + 2, column_width.saturating_sub(1), 1),
+                );
+            }
+        }
+
+        // The footer carries the board's identity and its controls, which is where a person looks
+        // when they do not already know what a key does.
+        let footer = inner.bottom().saturating_sub(2);
+        let hint = match board.composing.as_ref() {
+            Some(title) => Line::from(vec![
+                Span::styled(
+                    "new task: ",
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{title}█"), Style::default().fg(self.theme.text)),
+                Span::styled(
+                    "   Enter adds it · Esc cancels",
+                    Style::default().fg(self.theme.muted),
+                ),
+            ]),
+            None if board.writable => Line::styled(
+                "←/→ column · ↑/↓ card · </> move it · n new · Enter put an agent on it · Esc close",
+                Style::default().fg(self.theme.muted),
+            ),
+            None => Line::styled(
+                "←/→ column · ↑/↓ card · Enter put an agent on it · Esc close · kanban-md owns this board",
+                Style::default().fg(self.theme.muted),
+            ),
+        };
+        frame.render_widget(hint, Rect::new(inner.x, footer, inner.width, 1));
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                ellipsise(
+                    &board.directory.display().to_string(),
+                    usize::from(inner.width),
+                ),
+                Style::default().fg(self.theme.border),
+            )),
+            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+        );
+    }
+
     fn render_git(&self, frame: &mut Frame, area: Rect) {
         let Some(git) = self.git.as_ref() else {
             return;
@@ -1564,28 +1768,122 @@ impl Dashboard {
         }
     }
 
-    /// Receives the board and opens the task chooser over it.
-    ///
-    /// The directory is kept because an empty board is not an error — it is a board with nothing
-    /// on it yet — and the only useful thing to say about one is where it is and how to add to it.
+    /// Receives the board and opens it as columns of cards.
     pub fn set_board_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
-        // An empty board opens like any other. The previous behaviour refused to open and printed
-        // "type a title and press Ctrl+N" into the footer — an instruction with nowhere to follow
-        // it, since the thing you would type into is the overlay that did not open. A board with
-        // no tasks is the normal first state of every board, not an error.
-        self.board_is_personal = crate::board::is_personal(&directory);
-        self.board_dir = Some(directory);
-        let items = tasks
-            .iter()
-            .map(|task| PickerItem {
-                key: task.id.to_string(),
-                label: task.title.clone(),
-                detail: format!("#{}  {}", task.id, task.status),
-            })
-            .collect();
-        self.board_tasks = tasks;
-        self.picker = Some((PickerPurpose::Task, Picker::new(items)));
+        let writable = crate::board::is_personal(&directory);
+        self.board_is_personal = writable;
+        self.board_tasks = tasks.clone();
+        self.board_dir = Some(directory.clone());
+        self.board = Some(BoardOverlay {
+            view: BoardView::new(tasks),
+            directory,
+            writable,
+            composing: None,
+        });
         self.error = None;
+    }
+
+    fn board_key(&mut self, key: KeyEvent) -> UiCommand {
+        let Some(board) = self.board.as_mut() else {
+            return UiCommand::None;
+        };
+        // A title being typed owns every printable key, so the single-letter controls below are
+        // live only when one is not. Esc unwinds a level at a time, as copy mode does: abandoning
+        // a half-typed title should not also close the board behind it.
+        if let Some(title) = board.composing.as_mut() {
+            match key.code {
+                KeyCode::Esc => board.composing = None,
+                KeyCode::Backspace => {
+                    title.pop();
+                }
+                KeyCode::Enter => {
+                    let title = title.clone();
+                    board.composing = None;
+                    return self.create_task(&title);
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    title.push(character)
+                }
+                _ => {}
+            }
+            return UiCommand::None;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.board = None,
+            KeyCode::Left | KeyCode::Char('h') => board.view.move_column(-1),
+            KeyCode::Right | KeyCode::Char('l') => board.view.move_column(1),
+            KeyCode::Up | KeyCode::Char('k') => board.view.move_row(-1),
+            KeyCode::Down | KeyCode::Char('j') => board.view.move_row(1),
+            KeyCode::Char('n') if board.writable => board.composing = Some(String::new()),
+            KeyCode::Char('n') => {
+                self.error =
+                    Some("this board is the repository's — add tasks with kanban-md".into())
+            }
+            // `<` and `>` move the card itself, which is the one thing a board is for that a list
+            // cannot do at all.
+            KeyCode::Char('<' | ',') => return self.shift_task(-1),
+            KeyCode::Char('>' | '.') => return self.shift_task(1),
+            KeyCode::Enter => return self.dispatch_selected_task(),
+            _ => {}
+        }
+        UiCommand::None
+    }
+
+    /// Moves the selected card one column, and follows it there.
+    fn shift_task(&mut self, delta: isize) -> UiCommand {
+        let Some(board) = self.board.as_mut() else {
+            return UiCommand::None;
+        };
+        if !board.writable {
+            self.error = Some("this board is the repository's — move tasks with kanban-md".into());
+            return UiCommand::None;
+        }
+        let Some(task) = board.view.selected() else {
+            return UiCommand::None;
+        };
+        let (id, status) = (task.id, task.status.clone());
+        let Some(current) = STATUSES.iter().position(|known| *known == status) else {
+            self.error = Some(format!("task {id} is in an unknown column: {status}"));
+            return UiCommand::None;
+        };
+        let next = current.saturating_add_signed(delta).min(STATUSES.len() - 1);
+        if next == current {
+            return UiCommand::None;
+        }
+        let directory = board.directory.clone();
+        match crate::board::set_status(&directory, id, STATUSES[next]) {
+            Ok(_) => {
+                // Re-read rather than editing the copy in hand: the board is files on disk and
+                // anything else may have written to it since it was opened.
+                let tasks = crate::board::load(&directory);
+                self.board_tasks = tasks.clone();
+                if let Some(board) = self.board.as_mut() {
+                    board.view = BoardView::new(tasks);
+                    board.view.follow(id);
+                }
+                self.error = None;
+            }
+            Err(message) => self.error = Some(message),
+        }
+        UiCommand::None
+    }
+
+    /// Puts an agent on the selected card.
+    fn dispatch_selected_task(&mut self) -> UiCommand {
+        let Some(board) = self.board.as_ref() else {
+            return UiCommand::None;
+        };
+        let Some(task) = board.view.selected() else {
+            self.error = Some("no task selected".into());
+            return UiCommand::None;
+        };
+        let key = task.id.to_string();
+        self.board = None;
+        self.take_picked(PickerPurpose::Task, &key)
     }
 
     /// Receives the pending handoffs and opens the review overlay over them.
@@ -4603,26 +4901,63 @@ mod tests {
     }
 
     #[test]
-    fn the_board_is_filterable_and_shows_each_tasks_number_and_status() {
+    fn a_card_can_be_moved_across_columns_and_the_cursor_goes_with_it() {
+        // A real board directory, because moving a card writes the task file.
+        let root = std::env::temp_dir().join(format!("dock-move-{}", std::process::id()));
+        let dir = root.join("tasks");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::board::create(&dir, "wire the parser").expect("seed a task");
+
+        let mut dashboard = bound_dashboard();
+        // Point the board at this directory and make it writable the way a workspace board is.
+        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.board.as_mut().unwrap().writable = true;
+        assert_eq!(
+            STATUSES[dashboard.board.as_ref().unwrap().view.column()],
+            "backlog"
+        );
+
+        // `>` is the one thing a board does that a list cannot do at all.
+        dashboard.key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
+        assert_eq!(crate::board::load(&dir)[0].status, "todo", "the file moved");
+        let board = dashboard.board.as_ref().unwrap();
+        assert_eq!(
+            STATUSES[board.view.column()],
+            "todo",
+            "the cursor follows the card rather than staying over a column position"
+        );
+        assert_eq!(board.view.selected().map(|task| task.id), Some(1));
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
+        assert_eq!(crate::board::load(&dir)[0].status, "backlog");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_board_is_drawn_as_columns_of_cards_with_their_counts() {
         let mut dashboard = bound_dashboard();
         dashboard.set_board_tasks(
             vec![
                 board_task(11, "Repository-optional runtime", "review"),
                 board_task(12, "Dashboard real agent dispatch", "in-progress"),
+                board_task(13, "Write the docs", "backlog"),
             ],
-            "/repo/real/kanban/tasks".into(),
+            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
         );
-        let frame = render_to_string(&mut dashboard, 100, 30);
-        assert!(frame.contains("BOARD"), "{frame:?}");
-        assert!(frame.contains("#11"), "{frame:?}");
-        assert!(frame.contains("in-progress"), "{frame:?}");
-
-        for character in "Reposi".chars() {
-            dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        let frame = render_to_string(&mut dashboard, 130, 32);
+        // The shape is the information: where work has piled up, what is in flight, what waits on
+        // a person. A list sorted by status shows none of that at a glance.
+        for column in ["BACKLOG", "TODO", "IN-PROGRESS", "REVIEW", "DONE"] {
+            assert!(frame.contains(column), "missing column {column}: {frame:?}");
         }
-        let listing = render_to_string(&mut dashboard, 100, 30);
-        let listing = listing.split("BOARD ─").nth(1).expect("overlay on screen");
-        assert!(!listing.contains("#12"), "{listing:?}");
+        assert!(frame.contains("#11"), "{frame:?}");
+        assert!(frame.contains("#12"), "{frame:?}");
+        // It opens on the leftmost column holding anything, which here is backlog.
+        assert_eq!(
+            STATUSES[dashboard.board.as_ref().unwrap().view.column()],
+            "backlog"
+        );
     }
 
     #[test]
@@ -4667,36 +5002,57 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_board_opens_and_offers_to_write_the_first_task_down() {
+    fn an_empty_board_opens_and_can_take_its_first_task() {
         let mut dashboard = bound_dashboard();
-        let personal = crate::board::tasks_dir("", "workspace_1").expect("a workspace board");
-        dashboard.set_board_tasks(Vec::new(), personal);
-        // The old behaviour refused to open and printed "type a title and press Ctrl+N" into the
-        // footer — an instruction with nowhere to follow it, because the thing you would type
-        // into was the overlay that did not open.
-        assert!(dashboard.picker.is_some(), "an empty board still opens");
-        assert_eq!(dashboard.error, None, "an empty board is not an error");
+        dashboard.set_board_tasks(
+            Vec::new(),
+            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+        );
+        // An empty board is the normal first state of every board, not an error.
+        assert!(dashboard.board.is_some(), "an empty board still opens");
+        assert_eq!(dashboard.error, None);
+        let frame = render_to_string(&mut dashboard, 130, 32);
+        assert!(
+            frame.contains("n new"),
+            "the way in is on screen: {frame:?}"
+        );
 
-        let frame = render_to_string(&mut dashboard, 110, 30);
-        assert!(frame.contains("nothing here yet"), "{frame:?}");
-        assert!(frame.contains("press Enter"), "{frame:?}");
-
+        dashboard.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         for character in "buy milk".chars() {
             dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
-        let offering = render_to_string(&mut dashboard, 110, 30);
-        assert!(offering.contains("buy milk"), "{offering:?}");
+        assert_eq!(
+            dashboard.board.as_ref().unwrap().composing.as_deref(),
+            Some("buy milk"),
+            "n starts a title rather than being swallowed as navigation"
+        );
+        let composing = render_to_string(&mut dashboard, 130, 32);
+        assert!(composing.contains("buy milk"), "{composing:?}");
     }
 
     #[test]
-    fn a_repository_board_says_who_owns_it_instead_of_offering_to_write() {
+    fn a_repository_board_is_readable_but_offers_no_way_to_change_it() {
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(Vec::new(), "/repo/real/kanban/tasks".into());
-        assert!(dashboard.picker.is_some());
-        let frame = render_to_string(&mut dashboard, 110, 30);
-        // Dock does not write into a repository's board, so the empty state says why rather than
-        // inviting something that would be refused.
+        dashboard.set_board_tasks(
+            vec![board_task(1, "Owned elsewhere", "backlog")],
+            "/repo/real/kanban/tasks".into(),
+        );
+        assert!(dashboard.board.is_some());
+        assert!(!dashboard.board.as_ref().unwrap().writable);
+        let frame = render_to_string(&mut dashboard, 130, 32);
         assert!(frame.contains("kanban-md owns this board"), "{frame:?}");
+
+        // The controls that would write are refused rather than silently doing nothing.
+        dashboard.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(dashboard.board.as_ref().unwrap().composing.is_none());
+        assert!(
+            dashboard
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("kanban-md")),
+            "{:?}",
+            dashboard.error
+        );
     }
 
     #[test]

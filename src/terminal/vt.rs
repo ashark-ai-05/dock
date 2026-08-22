@@ -178,16 +178,26 @@ impl VtTerminal {
     }
 
     /// Text between two points of the visible grid, in reading order regardless of which
-    /// point was anchored first.
+    /// point was anchored first. Both endpoints are INCLUSIVE, columns as well as rows.
+    ///
+    /// `vt100::contents_between` is row-inclusive but column-EXCLUSIVE, so the end column is
+    /// advanced by one here. That is not a taste call: `Dashboard::render_copy_overlay`
+    /// highlights `first..=last`, and a highlight that promises a character this method then
+    /// declines to return is a silent, permanent off-by-one on every copy — the last
+    /// character of every dragged path or URL, and the whole of a single-cell selection.
     pub fn selection_text(&self, from: (u16, u16), to: (u16, u16)) -> String {
         let (start, end) = if (from.0, from.1) <= (to.0, to.1) {
             (from, to)
         } else {
             (to, from)
         };
-        self.parser
-            .screen()
-            .contents_between(start.0, start.1, end.0, end.1)
+        let (_, cols) = self.size();
+        self.parser.screen().contents_between(
+            start.0,
+            start.1,
+            end.0,
+            end.1.saturating_add(1).min(cols),
+        )
     }
 }
 
@@ -344,8 +354,16 @@ mod tests {
         // return columns 3..5 of each row ("e 7" / "e 8" / "e 9"); a reading-order run
         // returns the tail of row 0, all of row 1, and the head of row 2 — which is what a
         // user dragging from mid-line to mid-line means.
+        //
+        // WHOLE-BRANCH REVIEW C1: the end COLUMN is inclusive, so row 2 contributes "line"
+        // — four characters, columns 0..=3 — not "lin". This expectation previously ended at
+        // "lin" and thereby pinned `vt100::contents_between`'s column-exclusive convention as
+        // if it were Dock's, which is exactly why the defect survived nine reviews. Dock's
+        // convention is inclusive because `Dashboard::render_copy_overlay` highlights
+        // `first..=last`: every cell the user sees highlighted must be a character the yank
+        // actually returns, or the clipboard quietly disagrees with the screen.
         let selected = term.selection_text((0, 5), (2, 3));
-        assert_eq!(selected, "7\nline 8\nlin", "{selected:?}");
+        assert_eq!(selected, "7\nline 8\nline", "{selected:?}");
         assert_eq!(
             selected,
             term.selection_text((2, 3), (0, 5)),

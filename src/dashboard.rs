@@ -700,6 +700,14 @@ impl Dashboard {
                 // anchored halves of the first and last. This is the same run
                 // `VtTerminal::selection_text` extracts, so the highlight previews the yank
                 // rather than offering a second opinion about it.
+                //
+                // True only because the two conventions were deliberately aligned by
+                // whole-branch review C1: `last` is INCLUSIVE here, and `selection_text` now
+                // advances its end column by one to match, since the `vt100` call underneath
+                // it is column-exclusive. Until then the claim above was false and the
+                // clipboard was silently one character short of the highlight on every
+                // selection. `a_mid_row_selection_yanks_exactly_as_many_characters_as_it_highlights`
+                // guards the agreement so the two halves cannot drift apart again.
                 let first = if row == start.0 { start.1 } else { 0 };
                 let last = if row == end.0 {
                     end.1
@@ -3789,6 +3797,73 @@ mod tests {
             cells_with_background(&after, area, selection).is_empty(),
             "leaving copy mode must take the highlight with it"
         );
+    }
+
+    /// WHOLE-BRANCH REVIEW C1. The overlay and `VtTerminal::selection_text` are two
+    /// independent answers to "which cells are selected": the overlay walks `first..=last`
+    /// itself, the yank asks `vt100::contents_between`. Each half was internally consistent
+    /// and the two disagreed by exactly one cell on *every* selection, because
+    /// `contents_between` is column-exclusive while the highlight is inclusive. Every
+    /// dragged path or URL lost its last character, and a single-cell selection copied
+    /// nothing while the footer still said "copied 0 characters ... via OSC 52". Nine
+    /// reviews missed it because no test ever compared the two counts against each other.
+    /// This is that comparison, and it is why the end column is now inclusive on both sides.
+    #[test]
+    fn a_mid_row_selection_yanks_exactly_as_many_characters_as_it_highlights() {
+        const ROW: &str = "ABCDEFGHIJKLMNOP";
+        for extra in 0..5u16 {
+            let mut dashboard = bound_dashboard();
+            dashboard.apply_event(attach_event("run_1", format!("{ROW}\r\n").as_bytes()));
+            let selection = dashboard.theme.selection;
+            let accent = dashboard.theme.accent;
+
+            dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+            dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+            dashboard.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+            dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+            for _ in 0..extra {
+                dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+            }
+
+            let terminal = render_terminal(&mut dashboard, 100, 30);
+            let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+            // The overlay paints the run with `theme.selection` and then repaints the
+            // cursor's own cell with `theme.accent`, so the highlighted run the user sees is
+            // the selection cells plus that one.
+            let cursor = &terminal.backend().buffer()[(area.x + 1 + extra, area.y + 1)];
+            assert_eq!(cursor.bg, accent, "the copy cursor sits inside the run");
+            let highlighted = cells_with_background(&terminal, area, selection).len() + 1;
+            assert_eq!(
+                highlighted,
+                usize::from(extra) + 1,
+                "{extra} rightward moves must highlight {} cells",
+                extra + 1
+            );
+
+            // Read before the yank: `y` leaves copy mode, taking the session with it.
+            let (from, to) = dashboard
+                .copy
+                .as_ref()
+                .and_then(CopySession::selection)
+                .expect("the selection is anchored");
+            dashboard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+            let notice = dashboard.error.clone().expect("a yank reports itself");
+            assert!(
+                notice.starts_with(&format!("copied {highlighted} characters")),
+                "{highlighted} highlighted cells must be reported as {highlighted} \
+                 characters, got {notice:?}"
+            );
+            let yanked = dashboard
+                .screens
+                .get("run_1")
+                .expect("the pane has a screen")
+                .selection_text(from, to);
+            assert_eq!(
+                yanked,
+                ROW[..highlighted],
+                "the clipboard must hold exactly the highlighted cells"
+            );
+        }
     }
 
     #[test]

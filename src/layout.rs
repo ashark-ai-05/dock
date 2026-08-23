@@ -590,6 +590,18 @@ impl LayoutRegistry {
         };
         validate_durable_workspaces(&value.workspaces)?;
         let bytes = serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?;
+        // Every durable mutation routes through here, including the ones that change nothing:
+        // `focus` re-focusing the pane that is already focused, and `resize` re-sending the ratio
+        // a split already has. A divider drag emits a resize per mouse movement, so those were
+        // costing a full write plus two F_FULLFSYNC flushes — 10.7ms each on APFS — per frame of
+        // a drag, which is what made dragging a divider feel like it was fighting back.
+        //
+        // Comparing against the file rather than against a remembered copy is what makes this
+        // safe to skip: if the bytes on disk already are the bytes this would write, the write is
+        // a no-op by definition, and no cache can go stale because there is no cache.
+        if already_persisted(&self.path, &bytes) {
+            return Ok(());
+        }
         let tmp = self
             .path
             .with_extension(format!("json.tmp-{}", std::process::id()));
@@ -615,6 +627,44 @@ impl LayoutRegistry {
         }
         result.map_err(|e| format!("could not persist layout metadata: {e}"))
     }
+}
+
+/// Whether `path` already holds exactly `bytes`, under the same guards the loader applies.
+///
+/// This is the skip condition for a layout write that would not change the file. It answers only
+/// "is a write pointless here", so every uncertainty answers `false` and the caller does the full
+/// write: an unreadable file, a short read, a symlink, someone else's file, or permissions that
+/// still need repairing all fall through to the write rather than being skipped.
+///
+/// The guards are the loader's, for the loader's reasons, and are checked against the open handle
+/// rather than the path so that nothing can be swapped underneath between the check and the read.
+/// `O_NOFOLLOW` refuses a symlink outright, which is what stops a planted link from turning a
+/// read of Dock's own state directory into a read of a file elsewhere; the uid check refuses a
+/// file another user left behind. A file whose mode is not already `0o600` is never skipped, so
+/// the write still runs and still restores owner-only permissions.
+fn already_persisted(path: &Path, bytes: &[u8]) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(mut file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    // SAFETY: geteuid(2) has no preconditions and does not access memory.
+    let effective_uid = unsafe { nix::libc::geteuid() };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.len() != bytes.len() as u64
+    {
+        return false;
+    }
+    let mut existing = Vec::with_capacity(bytes.len());
+    file.read_to_end(&mut existing).is_ok() && existing == bytes
 }
 
 fn quarantine_invalid_layout(path: &Path) -> Result<(), String> {
@@ -1007,6 +1057,110 @@ mod tests {
         fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
         p
     }
+    /// The mtime of the layout file, as the observable record of whether it was rewritten.
+    fn written_at(dir: &Path) -> SystemTime {
+        fs::metadata(dir.join("layout.json"))
+            .unwrap()
+            .modified()
+            .unwrap()
+    }
+
+    /// A rewrite is observable, so give the clock room to distinguish one from no rewrite at all.
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    #[test]
+    fn a_mutation_that_changes_nothing_does_not_rewrite_the_layout_file() {
+        // Focusing the pane that is already focused, and resizing a split to the ratio it already
+        // has, both reached `persist` and both cost a full write plus two F_FULLFSYNC flushes —
+        // 10.7ms each on APFS. A divider drag emits one resize per mouse movement, so this was
+        // paid per frame of a drag, and the dashboard re-focuses on every pane switch.
+        let dir = directory("idempotent-persist");
+        let mut layout = LayoutRegistry::load(&dir).unwrap();
+        layout
+            .create_workspace("work_1".into(), "daily".into(), "pane_1".into())
+            .unwrap();
+        layout
+            .split("work_1", "pane_1", "pane_2".into(), SplitAxis::Vertical)
+            .unwrap();
+        // Apply each mutation once, so the file already holds the state the loop below re-asserts.
+        layout.resize("work_1", "pane_2", 700).unwrap();
+        layout.focus("work_1", "pane_1").unwrap();
+        layout
+            .rename("work_1", Some("pane_1"), "pane_1".into())
+            .unwrap();
+        settle();
+        let untouched = written_at(&dir);
+
+        for _ in 0..5 {
+            layout.focus("work_1", "pane_1").unwrap();
+            layout.resize("work_1", "pane_2", 700).unwrap();
+            layout
+                .rename("work_1", Some("pane_1"), "pane_1".into())
+                .unwrap();
+        }
+
+        settle();
+        assert_eq!(
+            written_at(&dir),
+            untouched,
+            "a no-op mutation must not rewrite layout.json"
+        );
+        // Skipping the write must not have skipped the state change: the registry still answers
+        // as though every one of those calls happened, because every one of them did.
+        assert_eq!(layout.snapshot().workspaces[0].focused_pane_id, "pane_1");
+    }
+
+    #[test]
+    fn a_mutation_that_changes_something_still_rewrites_the_layout_file() {
+        // The other half of the guard, and the one that matters: skipping identical writes is only
+        // safe if a real change is never mistaken for one of them.
+        let dir = directory("real-change-persists");
+        let mut layout = LayoutRegistry::load(&dir).unwrap();
+        layout
+            .create_workspace("work_1".into(), "daily".into(), "pane_1".into())
+            .unwrap();
+        layout
+            .split("work_1", "pane_1", "pane_2".into(), SplitAxis::Vertical)
+            .unwrap();
+        settle();
+        let before = written_at(&dir);
+
+        layout.resize("work_1", "pane_2", 300).unwrap();
+
+        settle();
+        assert_ne!(written_at(&dir), before, "a real change must be written");
+        // And it must be the new state that survives a restart, not the old one.
+        let reloaded = LayoutRegistry::load(&dir).unwrap();
+        assert_eq!(
+            reloaded.snapshot().workspaces[0].root,
+            layout.snapshot().workspaces[0].root
+        );
+    }
+
+    #[test]
+    fn layout_permissions_are_repaired_even_when_the_content_is_unchanged() {
+        // The skip compares content, but owner-only permissions are part of what persisting
+        // guarantees. A layout file left group- or world-readable must not be able to stay that
+        // way just because nobody happened to change a pane afterwards.
+        let dir = directory("permission-repair");
+        let mut layout = LayoutRegistry::load(&dir).unwrap();
+        layout
+            .create_workspace("work_1".into(), "daily".into(), "pane_1".into())
+            .unwrap();
+        let path = dir.join("layout.json");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        layout.focus("work_1", "pane_1").unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a widened layout file must be rewritten owner-only rather than skipped"
+        );
+    }
+
     #[test]
     fn dynamic_split_focus_resize_rename_and_close_are_deterministic() {
         let dir = directory("operations");

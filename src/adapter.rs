@@ -251,11 +251,21 @@ impl AdapterCapabilities {
 }
 
 fn find_executable(name: &str) -> Option<PathBuf> {
+    locate_executable(name).and_then(|path| fs::canonicalize(path).ok())
+}
+
+/// Where `name` would be run from, without resolving what it finally points at.
+///
+/// Split out from [`find_executable`] because most callers only ever ask whether an agent is
+/// installed. Answering that with [`find_executable`] meant a `canonicalize` — a full resolution
+/// of every component of the path, plus every symlink along it, and package managers hand out
+/// binaries that are symlinks into a versioned store — to produce a `PathBuf` that was then
+/// thrown away. Launching an agent still canonicalizes, because launching cares which file it
+/// actually got; asking whether one exists does not.
+fn locate_executable(name: &str) -> Option<PathBuf> {
     let candidate = Path::new(name);
     if candidate.components().count() > 1 {
-        return executable(candidate)
-            .then(|| fs::canonicalize(candidate).ok())
-            .flatten();
+        return executable(candidate).then(|| candidate.to_path_buf());
     }
     env::var_os("PATH")?
         .as_os_str()
@@ -264,7 +274,6 @@ fn find_executable(name: &str) -> Option<PathBuf> {
         .filter(|part| !part.is_empty())
         .map(|part| Path::new(part).join(name))
         .find(|path| executable(path))
-        .and_then(|path| fs::canonicalize(path).ok())
 }
 
 fn executable(path: &Path) -> bool {
@@ -272,9 +281,17 @@ fn executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// Whether this adapter's fixed executable is installed.
+///
+/// Deliberately uncached, and asked of the filesystem every time. The launch popup redraws this
+/// for every profile on every frame, so a cache is tempting — but the thing it would cache is
+/// "you have not installed that agent", and the moment it goes stale is the moment the user
+/// installs one and comes back to a list still telling them it is unavailable. The lookup was
+/// made cheap instead: no `canonicalize`, and a `stat` per `PATH` entry that stops at the first
+/// hit. See [`locate_executable`].
 pub fn builtin_available(id: &AdapterId) -> bool {
     id.default_executable()
-        .is_some_and(|name| find_executable(name).is_some())
+        .is_some_and(|name| locate_executable(name).is_some())
 }
 
 #[cfg(test)]

@@ -146,15 +146,28 @@ impl GitAdapter {
     }
 
     pub fn facts(&self, base: &str) -> Result<GitFacts, String> {
-        let worktree = PathBuf::from(self.git(["rev-parse", "--show-toplevel"])?);
+        // One `rev-parse` for three answers rather than three of them. Each `git` here is a fork,
+        // an exec, and a repository discovery walk — around 13ms apiece on a warm cache — and
+        // `rev-parse` was already being asked three separate times for facts it will happily
+        // print together, in argument order, one per line.
+        let revisions = self.git(["rev-parse", "--show-toplevel", "HEAD", base])?;
+        let mut revisions = revisions.lines();
+        let mut next = |what: &str| {
+            revisions
+                .next()
+                .filter(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("git rev-parse did not report {what}"))
+        };
+        let worktree = PathBuf::from(next("the worktree root")?);
         let worktree = std::fs::canonicalize(&worktree)
             .map_err(|error| format!("could not canonicalize live Git worktree: {error}"))?;
-        let head_sha = self.git(["rev-parse", "HEAD"])?;
+        let head_sha = next("HEAD")?;
+        let base_sha = next("the base revision")?;
         let branch = self
             .git(["branch", "--show-current"])?
             .if_empty("DETACHED")
             .to_owned();
-        let base_sha = self.git(["rev-parse", base])?;
         let status = self.git(["status", "--porcelain=v1", "--untracked-files=normal"])?;
         if status.lines().any(|line| line.starts_with("?? ")) {
             return Err(
@@ -405,6 +418,32 @@ mod worktree_tests {
     fn a_worktree_needs_a_branch_name() {
         let repo = Repo::new();
         assert!(ensure_worktree(&repo.0, "   ", &repo.at("x"), "HEAD").is_err());
+    }
+
+    #[test]
+    fn facts_still_report_the_worktree_head_and_base_after_one_combined_rev_parse() {
+        // `facts` used to ask `rev-parse` three separate times — once for the worktree root, once
+        // for HEAD, once for the base — at roughly 13ms per fork and exec. They are now one call
+        // whose answers arrive in argument order, one per line, so this pins that order: reading
+        // them back in the wrong order would silently swap a path into a SHA field.
+        let repo = Repo::new();
+        let facts = GitAdapter::new(&repo.0).facts("HEAD").expect("facts");
+        assert_eq!(facts.worktree, repo.0);
+        assert_eq!(facts.branch, "main");
+        assert_eq!(facts.head_sha, facts.base_sha, "base HEAD resolves to HEAD");
+        assert_eq!(facts.head_sha.len(), 40, "{}", facts.head_sha);
+        assert!(facts.head_sha.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn facts_name_the_revision_that_could_not_be_resolved() {
+        // A base that does not exist made the combined `rev-parse` fail rather than the single
+        // one that used to ask for it, so the failure has to stay attributable.
+        let repo = Repo::new();
+        let refused = GitAdapter::new(&repo.0)
+            .facts("no-such-base")
+            .expect_err("an unknown base must be refused");
+        assert!(refused.contains("git"), "{refused}");
     }
 
     #[test]

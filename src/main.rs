@@ -980,12 +980,216 @@ fn agent_state_command(args: &[String]) -> io::Result<()> {
         ))?,
     ] {
         if stream.write_all(request.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
+            hook_debug("the daemon closed the connection mid-report");
             return Ok(());
         }
         let mut line = String::new();
         let _ = reader.read_line(&mut line);
+        // The daemon's refusals were being read and dropped, so a report the daemon rejected
+        // outright — a run it does not own, a protocol it does not speak — looked from here
+        // exactly like one it accepted.
+        if let Ok(Response::Error { code, message }) = serde_json::from_str::<Response>(&line) {
+            hook_debug(&format!(
+                "the daemon refused the report: {code:?}: {message}"
+            ));
+            return Ok(());
+        }
     }
     Ok(())
+}
+
+/// Which of Dock's hook entries are absent from a settings document.
+///
+/// Pure, so the comparison can be tested without a settings file on disk. It looks for exactly what
+/// `--install` writes and by the same rule `--install` skips on: an event is wired when Dock's own
+/// entry is one of the values in that event's list. Anything else in the list belongs to somebody
+/// else and is not our business either way.
+fn missing_hook_events(settings: &serde_json::Value, expected: &serde_json::Value) -> Vec<String> {
+    let installed = settings.get("hooks").and_then(|hooks| hooks.as_object());
+    let mut missing = Vec::new();
+    for (event, entry) in expected["hooks"].as_object().expect("hook events") {
+        let ours = &entry.as_array().expect("hook entries")[0];
+        let present = installed
+            .and_then(|hooks| hooks.get(event))
+            .and_then(|slot| slot.as_array())
+            .is_some_and(|list| list.contains(ours));
+        if !present {
+            missing.push(event.clone());
+        }
+    }
+    missing.sort();
+    missing
+}
+
+/// Where a bare `dock` resolves on this `PATH`, if anywhere.
+///
+/// Pure over its inputs because the answer is worth testing and a real `PATH` is not reproducible.
+/// The hooks invoke `dock` by bare name, so a Dock that works when you type its full path and does
+/// nothing when a hook runs it is a `PATH` problem wearing a protocol problem's clothes.
+fn resolve_on_path(path: Option<&str>, name: &str) -> Option<PathBuf> {
+    path?
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| PathBuf::from(entry).join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// `dock hooks --check` — walks the road a hook report takes and says where it stops.
+///
+/// Every failure along that road is silent by design (see [`hook_debug`]), which is survivable
+/// right up until you are looking at a pane whose state is wrong and have no way to ask why. This
+/// asks on your behalf, in order, and reports the first thing that is not true.
+///
+/// The daemon leg deliberately sends `Inspect` rather than a state report: `report_agent_state`
+/// refuses a run the daemon does not own, and `Inspect` refuses the same run for the same reason,
+/// so it answers the identical question without leaving a sticky state behind on a pane whose owner
+/// only asked a question.
+fn hooks_check(expected: &serde_json::Value) -> io::Result<()> {
+    let mut failures = 0usize;
+    let mut report = |ok: bool, detail: String| {
+        if !ok {
+            failures += 1;
+        }
+        println!("{} {detail}", if ok { "ok  " } else { "FAIL" });
+    };
+
+    let settings_path = PathBuf::from(".claude").join("settings.json");
+    match fs::read_to_string(&settings_path) {
+        Ok(text) if !text.trim().is_empty() => match serde_json::from_str(&text) {
+            Ok(settings) => {
+                let missing = missing_hook_events(&settings, expected);
+                report(
+                    missing.is_empty(),
+                    if missing.is_empty() {
+                        format!("all {} hooks wired in {}", 6, settings_path.display())
+                    } else {
+                        format!(
+                            "{} is missing Dock's entry for: {} — run `dock hooks --install`",
+                            settings_path.display(),
+                            missing.join(", ")
+                        )
+                    },
+                );
+            }
+            Err(error) => report(
+                false,
+                format!("{} is not valid JSON: {error}", settings_path.display()),
+            ),
+        },
+        _ => report(
+            false,
+            format!(
+                "no hooks found at {} — run `dock hooks --install`",
+                settings_path.display()
+            ),
+        ),
+    }
+
+    let path = std::env::var("PATH").ok();
+    match resolve_on_path(path.as_deref(), "dock") {
+        Some(found) => report(true, format!("hooks can run `dock`: {}", found.display())),
+        None => report(
+            false,
+            "`dock` is not on PATH, so every hook runs a command that does not exist".into(),
+        ),
+    }
+
+    let (run_id, socket) = match (std::env::var("DOCK_RUN"), std::env::var("DOCK_SOCKET")) {
+        (Ok(run_id), Ok(socket)) => {
+            report(true, format!("inside Dock pane run {run_id}"));
+            (run_id, socket)
+        }
+        _ => {
+            report(
+                false,
+                "DOCK_RUN and DOCK_SOCKET are not both set: run this inside a Dock pane, because \
+                 the rest of the checks are about that pane's own connection"
+                    .into(),
+            );
+            return finish_check(failures);
+        }
+    };
+
+    let mut stream = match UnixStream::connect(&socket) {
+        Ok(stream) => {
+            report(true, format!("daemon answers at {socket}"));
+            stream
+        }
+        Err(error) => {
+            report(false, format!("no daemon at {socket}: {error}"));
+            return finish_check(failures);
+        }
+    };
+    let mut reader = BufReader::new(stream.try_clone()?);
+    for request in [
+        serde_json::to_string(&Request::Hello(dock::protocol::HelloRequest {
+            version: dock::protocol::PROTOCOL_VERSION,
+        }))?,
+        serde_json::to_string(&Request::Inspect(dock::protocol::InspectRequest {
+            run_id: Some(run_id.clone()),
+        }))?,
+    ] {
+        stream.write_all(request.as_bytes())?;
+        stream.write_all(b"\n")?;
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        match serde_json::from_str::<Response>(&line) {
+            Ok(Response::Hello { version }) => report(
+                version == dock::protocol::PROTOCOL_VERSION,
+                format!(
+                    "daemon speaks protocol {version} (this dock speaks {})",
+                    dock::protocol::PROTOCOL_VERSION
+                ),
+            ),
+            Ok(Response::Snapshot { .. }) => report(
+                true,
+                format!("daemon owns run {run_id}, so it will accept its reports"),
+            ),
+            Ok(Response::Error { code, message }) => {
+                report(false, format!("daemon refused: {code:?}: {message}"))
+            }
+            Ok(other) => report(
+                false,
+                format!("unexpected answer from the daemon: {other:?}"),
+            ),
+            Err(error) => report(
+                false,
+                format!("could not read the daemon's answer: {error}"),
+            ),
+        }
+    }
+    finish_check(failures)
+}
+
+/// The verdict, and an exit status that a script can branch on.
+fn finish_check(failures: usize) -> io::Result<()> {
+    if failures == 0 {
+        println!("\nhooks are wired: this pane's state is reported, not guessed.");
+        return Ok(());
+    }
+    // Printed and exited rather than returned as an error: `main` renders one with `{:?}`, and a
+    // diagnostic whose entire purpose is a legible answer should not sign off in Debug format. The
+    // status is the part a script branches on, in the manner of `cargo fmt --check`.
+    eprintln!(
+        "\n{failures} check(s) failed. Until they pass, this pane's state is inferred from its \
+         screen rather than reported — which is what makes it flicker between working and your \
+         turn while nothing is happening."
+    );
+    std::process::exit(1);
+}
+
+/// Why a hook report went nowhere, said out loud only when asked.
+///
+/// A hook runs inside the agent's own terminal, so anything written here lands in the middle of the
+/// transcript somebody is reading. Silence is the right default — and it was also the bug: a report
+/// that never arrives looked exactly like one that did, so a pane whose hooks were never wired sat
+/// on guessed-from-the-screen state forever with nothing to say so. `DOCK_HOOK_DEBUG` buys the
+/// explanation back for one run, and `dock hooks --check` walks the same road end to end without
+/// having to wait for a real turn boundary to fire.
+fn hook_debug(reason: &str) {
+    if std::env::var_os("DOCK_HOOK_DEBUG").is_some() {
+        eprintln!("dock agent-state: {reason}");
+    }
 }
 
 /// The turn boundaries Dock needs, in the vocabulary Claude Code and Codex both use.
@@ -1016,6 +1220,9 @@ fn hook_events() -> serde_json::Value {
 fn hooks_command(args: &[String]) -> io::Result<()> {
     let hooks = hook_events();
     let pretty = serde_json::to_string_pretty(&hooks)?;
+    if args.iter().any(|argument| argument == "--check") {
+        return hooks_check(&hooks);
+    }
     if !args.iter().any(|argument| argument == "--install") {
         println!("{pretty}");
         eprintln!("\nClaude Code: .claude/settings.json — or `dock hooks --install` to merge it.");

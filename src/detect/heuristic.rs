@@ -45,6 +45,28 @@ const DONE_PATTERNS: &[&str] = &[
     r"(?mi)^\s*(task|work)\s+(is\s+)?(complete|completed|finished)\b",
 ];
 
+/// The chrome Claude Code paints when, and only when, it is between turns.
+///
+/// Two rules rather than one because this is the single piece of evidence that a Claude pane has
+/// handed the turn back, and one regex over one string is a single point of failure: the roster
+/// flipped to "working" every time the footer hint rotated or a frame was sampled part-way through
+/// a repaint. Both tolerate whitespace where the footer has spaces, because a narrow pane wraps
+/// that line and [`visible_text`](crate::terminal::VtTerminal::visible_text) joins rows with a
+/// newline — `\s` matches it, and the leading indent of the row it wrapped onto, so the phrase
+/// survives being split at any of its spaces.
+///
+/// Safe to widen only in this direction. `classify_screen` tests working before awaiting, so a
+/// mid-turn Claude — which paints this same footer — is caught by "esc to interrupt" first. A
+/// pattern that is also painted *while working* would not be, and would report a streaming agent
+/// as finished.
+const CLAUDE_AWAITING_PATTERNS: &[&str] = &[
+    r"(?i)shift\s*\+\s*tab\s+to\s+cycle",
+    r"(?i)\?\s+for\s+shortcuts",
+];
+
+/// Gemini CLI's empty input box, which Qwen Code inherited when it forked from it.
+const GEMINI_AWAITING_PATTERNS: &[&str] = &[r"(?i)type\s+your\s+message\s+or\s+@path"];
+
 fn set(patterns: &[&str], cell: &'static OnceLock<RegexSet>) -> &'static RegexSet {
     cell.get_or_init(|| RegexSet::new(patterns).expect("embedded patterns must compile"))
 }
@@ -57,6 +79,11 @@ fn set(patterns: &[&str], cell: &'static OnceLock<RegexSet>) -> &'static RegexSe
 /// attention it does not want, which is the failure this roster exists to avoid. An agent with no
 /// verified pattern gets none rather than inheriting another's, which would be a guess wearing the
 /// costume of a fact.
+///
+/// Going without one is no longer fatal to an agent's roster entry: the caller reads a pane that
+/// has genuinely fallen silent as finished whether or not it recognised any chrome, so a missing
+/// pattern now costs a slower answer rather than a permanently wrong one. It used to cost the
+/// latter, which is why every agent below Codex read as working forever.
 ///
 /// These are the starting point, not the last word: a manifest under
 /// `~/.config/dock/agent-detection/<agent>.json` replaces any of the three, so an agent that
@@ -73,8 +100,14 @@ pub(crate) fn built_in(
         BLOCKED_PATTERNS,
         WORKING_PATTERNS,
         match agent {
-            AgentKind::Claude => &[r"(?i)\(shift\+tab to cycle\)"],
+            AgentKind::Claude => CLAUDE_AWAITING_PATTERNS,
             AgentKind::Codex => &[r"(?i)ask codex to do anything"],
+            // Gemini CLI paints its placeholder only while the input box is empty and no turn is
+            // running, which is exactly the question being asked here.
+            AgentKind::Gemini => GEMINI_AWAITING_PATTERNS,
+            // Qwen Code is a fork of Gemini CLI and inherited its input box unchanged. This is the
+            // one place borrowing another agent's chrome is a fact rather than a guess.
+            AgentKind::Qwen => GEMINI_AWAITING_PATTERNS,
             _ => &[],
         },
     )
@@ -218,6 +251,64 @@ mod awaiting_input_tests {
             classify_screen(AgentKind::Claude, &asking),
             AgentState::Blocked
         );
+    }
+
+    #[test]
+    fn claudes_footer_is_still_recognised_when_a_narrow_pane_wraps_it() {
+        // A pane too narrow for the footer wraps it, and `visible_text` joins rows with a newline,
+        // so the phrase arrives split. Anchoring on the exact bracketed string missed every one of
+        // these, and each miss was a frame the roster spent saying "working" about a pane that was
+        // waiting for its user.
+        for wrapped in [
+            "  ⏵⏵ auto mode on (shift+tab\n  to cycle)\n",
+            "  ⏵⏵ auto mode on (shift+\n  tab to cycle)\n",
+            "  ⏵⏵ plan mode on (shift+tab to\n  cycle)\n",
+        ] {
+            assert_eq!(
+                classify_screen(AgentKind::Claude, wrapped),
+                AgentState::Done,
+                "a wrapped footer is the same footer: {wrapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_between_turns_is_recognised_by_more_than_one_piece_of_its_chrome() {
+        // The hint under the input box, which Claude paints while it is waiting for a person. One
+        // rule over one string was a single point of failure: when it missed, nothing else in the
+        // file could say the agent had stopped.
+        assert_eq!(
+            classify_screen(AgentKind::Claude, "  ? for shortcuts\n"),
+            AgentState::Done
+        );
+    }
+
+    #[test]
+    fn a_working_claude_is_not_talked_into_finishing_by_the_wider_patterns() {
+        // The reason widening is safe: working is tested first, and a mid-turn Claude paints the
+        // interrupt hint alongside the very footer the rules above match.
+        let working = format!("{CLAUDE_WORKING}  ? for shortcuts\n");
+        assert_eq!(
+            classify_screen(AgentKind::Claude, &working),
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn gemini_and_the_fork_that_borrowed_its_input_box_both_report_a_finished_turn() {
+        // Qwen Code forked Gemini CLI and kept the input box, so this is the one case where two
+        // agents sharing chrome is an observation rather than a guess.
+        let idle = concat!(
+            "╭──────────────────────────────────────────╮\n",
+            "│ > Type your message or @path/to/file     │\n",
+            "╰──────────────────────────────────────────╯\n",
+            "  ~/Development/dock (main*)   gemini-3-pro (98% context left)\n",
+        );
+        for agent in [AgentKind::Gemini, AgentKind::Qwen] {
+            assert_eq!(classify_screen(agent, idle), AgentState::Done, "{agent:?}");
+        }
+        // And it stays theirs: an agent whose chrome nobody has captured gets no answer from it.
+        assert_eq!(classify_screen(AgentKind::Amp, idle), AgentState::Idle);
     }
 
     #[test]

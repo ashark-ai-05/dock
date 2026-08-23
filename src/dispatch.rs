@@ -36,8 +36,168 @@ use crate::{
 /// One memoised classification: the output mark it was computed from, and what it produced.
 type ClassifiedAgent = ((u64, u64, u64), Option<AgentKind>, AgentState);
 
-/// How much output a run had produced, and when that last grew.
-type OutputMark = ((u64, u64), Instant);
+/// Everything one run's state inference remembers between polls.
+///
+/// Deliberately free of the registry and of the clock: every method is handed the `now` it should
+/// reason from. Reaching this judgement through a `RuntimeRegistry` needs a real agent process in
+/// the process table, which a unit test cannot conjure — an earlier attempt at testing it drove a
+/// pane shell instead, where detection finds no agent and the decision is never reached, so the
+/// test passed against the very logic it was written to catch. Keeping the reasoning here means a
+/// test can replay six seconds of a real polling rhythm in no time at all and read every answer.
+#[derive(Debug, Clone, Copy)]
+struct StateTracker {
+    /// How far the run's output log had got, and when that last moved.
+    mark: (u64, u64),
+    changed_at: Instant,
+    /// When the burst of output that `changed_at` belongs to began.
+    growing_since: Instant,
+    /// What the roster is currently showing, once anything has been positively established.
+    /// `None` until then: a run nobody has been able to say anything about yet.
+    resolved: Option<AgentState>,
+    /// A different answer waiting out [`STATE_DWELL`], and when it first appeared.
+    pending: Option<(AgentState, Instant)>,
+}
+
+impl StateTracker {
+    fn new(mark: (u64, u64), now: Instant) -> Self {
+        Self {
+            mark,
+            changed_at: now,
+            growing_since: now,
+            resolved: None,
+            pending: None,
+        }
+    }
+
+    /// Folds one poll's view of the output log into the record.
+    fn observe(&mut self, mark: (u64, u64), now: Instant) {
+        if self.mark != mark {
+            // A burst that begins after a gap is a new burst; one that continues an existing burst
+            // leaves its start where it was, so the burst's age keeps growing. The gap is short on
+            // purpose: measured against [`WORKING_SILENCE`] instead, a footer clock ticking once a
+            // second never registered a gap at all, so one burst ran from the moment the pane
+            // opened and "sustained" came to mean "has written at least twice, ever".
+            if now.saturating_duration_since(self.changed_at) >= BURST_GAP {
+                self.growing_since = now;
+            }
+            self.mark = mark;
+            self.changed_at = now;
+        }
+    }
+
+    /// How long the pane has been silent.
+    fn quiet_for(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.changed_at)
+    }
+
+    /// How long output had been arriving without a break, as of the last byte seen.
+    fn growing_for(&self) -> Duration {
+        self.changed_at
+            .saturating_duration_since(self.growing_since)
+    }
+
+    /// What the roster shows for this run right now.
+    ///
+    /// A run whose state has never been established reads as working: the only way to reach that
+    /// is to be looking at a pane that has just started, and a pane that has just started is
+    /// starting up.
+    fn shown(&self) -> AgentState {
+        self.resolved.unwrap_or(AgentState::Working)
+    }
+
+    /// Commits a state without waiting, and forgets any transition part-way through its dwell.
+    ///
+    /// For the two answers that are not inferences: what the agent reported about itself, and the
+    /// absence of an agent altogether. Delaying either would be holding a guess over a fact.
+    fn commit(&mut self, state: AgentState) -> AgentState {
+        self.resolved = Some(state);
+        self.pending = None;
+        state
+    }
+
+    /// Commits a candidate only once it has held for [`STATE_DWELL`].
+    ///
+    /// The first answer for a run commits immediately: hysteresis exists to resist *changes*, and
+    /// at the start there is nothing yet to change from.
+    fn settle(&mut self, candidate: AgentState, now: Instant) -> AgentState {
+        if self.resolved.is_none() || candidate == AgentState::Blocked {
+            // Blocked is the one state that costs the user throughput while it waits. Making an
+            // agent that is stuck sit out a dwell before it can say so is the one delay this
+            // roster cannot afford.
+            return self.commit(candidate);
+        }
+        if Some(candidate) == self.resolved {
+            self.pending = None;
+            return candidate;
+        }
+        match self.pending {
+            // A candidate that changes while pending is not a candidate that held, so its clock
+            // starts over.
+            Some((waiting, since)) if waiting == candidate => {
+                if now.saturating_duration_since(since) >= STATE_DWELL {
+                    return self.commit(candidate);
+                }
+            }
+            _ => self.pending = Some((candidate, now)),
+        }
+        self.shown()
+    }
+
+    /// What to show for this run, given what its screen says and what the agent said about itself.
+    fn decide(
+        &mut self,
+        now: Instant,
+        agent: Option<AgentKind>,
+        from_screen: AgentState,
+        reported: Option<AgentState>,
+    ) -> AgentState {
+        // What the agent said about itself beats anything read off its screen. A hook fires on the
+        // agent's own turn boundaries, so it knows; everything below is inference from bytes. It
+        // is committed rather than merely returned so that if the hook later stops reporting —
+        // an agent restarted without it, a wrapper that dropped away — inference resumes from
+        // where the agent actually was rather than from whatever it had guessed beforehand.
+        if let Some(reported) = reported {
+            return self.commit(reported);
+        }
+        // A question outranks everything: an agent asking one has stopped, however recently it
+        // printed the question itself.
+        if from_screen == AgentState::Blocked {
+            return self.commit(AgentState::Blocked);
+        }
+        if agent.is_none() {
+            return self.commit(AgentState::Idle);
+        }
+        // Every arm below has to be a positive claim, because `classify_screen` returning `Idle`
+        // means "no rule matched", which is "no idea" and not "not working". Letting a shrug fall
+        // through to a state was the whole defect: an idle pane that failed to match its own
+        // chrome for one frame was reported as working on that frame.
+        let candidate = if from_screen == AgentState::Done {
+            // The agent is painting its own input chrome, which is it saying it is between turns.
+            Some(AgentState::Done)
+        } else if output_looks_like_work(self.quiet_for(now), self.growing_for()) {
+            // Output has been streaming rather than twitching, which is generation.
+            Some(AgentState::Working)
+        } else if self.quiet_for(now) >= WORKING_SILENCE {
+            // Nothing has been written for long enough that nothing is being written.
+            Some(AgentState::Done)
+        } else {
+            // The ambiguous middle: something wrote recently, but not for long enough to be work,
+            // and no chrome matched. Hold — including any transition already part-way through its
+            // dwell, since a frame that says nothing is not a frame that argues against it.
+            None
+        };
+        // Deliberately absent: an arm reading `from_screen == Working` as Working.
+        // `WORKING_PATTERNS` is matched against the whole visible screen and the terminal title,
+        // both of which keep whatever the last turn left there — a "Running…" line scrolled up but
+        // still on screen would pin a finished agent to working forever. Screen text is trusted to
+        // say an agent has *stopped* (that chrome is only painted when it has) and never to say it
+        // is going.
+        match candidate {
+            Some(candidate) => self.settle(candidate, now),
+            None => self.shown(),
+        }
+    }
+}
 
 pub struct RuntimeRegistry {
     runs: Mutex<HashMap<String, RuntimeSlot>>,
@@ -63,7 +223,7 @@ pub struct RuntimeRegistry {
     reported_states: Mutex<HashMap<String, AgentState>>,
     /// When each run's output last grew. Not memoisable the way classification is: the answer it
     /// feeds changes with the passage of time rather than with new bytes, so it is read afresh.
-    output_marks: Mutex<HashMap<String, OutputMark>>,
+    output_marks: Mutex<HashMap<String, StateTracker>>,
     #[cfg(test)]
     /// Auto-launched pane shells put a live run in every pane, which is exactly what the
     /// dispatch-authority tests below assert cannot happen. Those tests suppress the shell so
@@ -1979,42 +2139,24 @@ impl RuntimeRegistry {
         from_screen: AgentState,
         mark: (u64, u64),
     ) -> AgentState {
-        let mut marks = self
-            .output_marks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = marks
-            .entry(run_id.to_owned())
-            .or_insert_with(|| (mark, Instant::now()));
-        if entry.0 != mark {
-            *entry = (mark, Instant::now());
-        }
-        let quiet_for = entry.1.elapsed();
-        drop(marks);
-
-        // What the agent said about itself beats anything read off its screen. A hook fires on the
-        // agent's own turn boundaries, so it knows; everything below is inference from bytes.
-        if let Some(reported) = self
+        // Read before the output marks are locked: this is a leaf lock and taking the two in one
+        // order everywhere is what keeps it one.
+        let reported = self
             .reported_states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(run_id)
-            .copied()
-        {
-            return reported;
-        }
-        // A question outranks everything: an agent asking one has stopped, however recently it
-        // printed the question itself.
-        if from_screen == AgentState::Blocked {
-            return AgentState::Blocked;
-        }
-        if agent.is_none() {
-            return AgentState::Idle;
-        }
-        if quiet_for < WORKING_SILENCE {
-            return AgentState::Working;
-        }
-        AgentState::Done
+            .copied();
+        let mut marks = self
+            .output_marks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        let tracker = marks
+            .entry(run_id.to_owned())
+            .or_insert_with(|| StateTracker::new(mark, now));
+        tracker.observe(mark, now);
+        tracker.decide(now, agent, from_screen, reported)
     }
 
     /// Records what an agent says it is doing.
@@ -2045,6 +2187,63 @@ impl RuntimeRegistry {
         Ok(())
     }
 
+    /// Forgets everything remembered about runs that have ended.
+    ///
+    /// None of the three maps is keyed to anything but a run id, and run ids come back: a pane
+    /// shell wears the same identity every time its pane opens one. A hook report is sticky on
+    /// purpose — it holds until the agent says otherwise — so one left behind by a dead run would
+    /// be inherited by the next run wearing its name and outrank everything that run's own screen
+    /// said, for as long as it lived. The rest is a slow leak of one entry per run the daemon has
+    /// ever hosted.
+    ///
+    /// Runs leave through a dozen paths — a stop, a rollback, a pane closing, a shell reclaimed —
+    /// and sweeping here rather than at each of them keeps the cleanup out of code whose whole job
+    /// is undoing things carefully. It costs three lengths compared and does nothing else at all
+    /// until a run has actually departed.
+    fn forget_departed_runs(&self, live_runs: usize) {
+        // Each length in a statement of its own: taking two of these locks at once, in an order
+        // no other caller uses, is how a leaf lock stops being one.
+        let marks = self
+            .output_marks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        let classified = self
+            .agent_states
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        let reported = self
+            .reported_states
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        if marks.max(classified).max(reported) <= live_runs {
+            return;
+        }
+        let live: Vec<String> = self
+            .runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        // Every slot, not only the active ones: a run part-way through a transition is still a run
+        // whose agent has not gone anywhere.
+        self.output_marks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|run_id, _| live.contains(run_id));
+        self.agent_states
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|run_id, _| live.contains(run_id));
+        self.reported_states
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|run_id, _| live.contains(run_id));
+    }
+
     /// The process table, taken afresh only when the last snapshot has aged out.
     fn process_table(&self) -> Option<(u64, Arc<ProcessTree>)> {
         let mut cached = self
@@ -2073,13 +2272,17 @@ impl RuntimeRegistry {
     /// six fields, none of them those. Those fields are also fixed for a run's whole life, so
     /// rebuilding them at frame rate is work whose answer cannot have changed.
     pub fn pulse(&self) -> Vec<RunPulse> {
-        let runtimes: Vec<Arc<OwnedRuntime>> = {
+        let (runtimes, live_runs): (Vec<Arc<OwnedRuntime>>, usize) = {
             let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
-            runs.values()
-                .filter_map(RuntimeSlot::active)
-                .map(|run| Arc::clone(&run.runtime))
-                .collect()
+            (
+                runs.values()
+                    .filter_map(RuntimeSlot::active)
+                    .map(|run| Arc::clone(&run.runtime))
+                    .collect(),
+                runs.len(),
+            )
         };
+        self.forget_departed_runs(live_runs);
         let mut pulses: Vec<(Arc<OwnedRuntime>, RunPulse)> = runtimes
             .into_iter()
             .map(|runtime| {
@@ -2120,6 +2323,8 @@ impl RuntimeRegistry {
         // Snapshots are taken outside the registry lock: agent classification reads each run's
         // emulated screen, and holding `runs` across that would serialise every dispatch behind
         // the event stream's continuous polling.
+        let live_runs = self.runs.lock().unwrap_or_else(|p| p.into_inner()).len();
+        self.forget_departed_runs(live_runs);
         let runtimes: Vec<Arc<OwnedRuntime>> = {
             let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
             match run_id {
@@ -3119,6 +3324,49 @@ const PROCESS_TABLE_TTL: Duration = Duration::from_millis(500);
 /// short enough that a finished answer stops looking busy while the reader is still looking at it.
 const WORKING_SILENCE: Duration = Duration::from_millis(1200);
 
+/// How long output must have been arriving before it counts as work rather than animation.
+///
+/// Agents redraw while idle: Claude's footer counts elapsed seconds, and a cursor blinks. Those
+/// are single short bursts seconds apart, and treating any recent byte as work made the state flip
+/// every time one landed inside the window. Real work streams — a burst that is still going a
+/// moment later is generation, and one that was over as soon as it started was a clock.
+const SUSTAINED_OUTPUT: Duration = Duration::from_millis(400);
+
+/// How long a pane must stop writing before the next byte counts as a fresh burst.
+///
+/// This is what makes "sustained" mean anything. It has to sit in the gap between two rhythms:
+/// the frames of a stream, which arrive as fast as the poll can see them (sixteen milliseconds),
+/// and the tick of an idle animation, which is about a second. Two hundred milliseconds is an
+/// order of magnitude above the first and five times below the second, so a generating agent keeps
+/// one long burst while a footer clock produces one short burst per tick and never accumulates.
+///
+/// The first version of this fix measured the gap against [`WORKING_SILENCE`] instead, and that is
+/// the bug it was written to fix: a clock ticking every second never opened a gap of 1.2 seconds,
+/// so the burst that began when the pane opened never ended, and after the first second every idle
+/// pane looked like it had been streaming for as long as it had been alive.
+const BURST_GAP: Duration = Duration::from_millis(200);
+
+/// How long a new answer must hold before the roster is allowed to show it.
+///
+/// Panes are polled every sixteen milliseconds and every input to the decision is a sample: a
+/// screen scraped mid-repaint, a burst that had not finished arriving. Without a dwell, one
+/// unlucky frame in sixty is a visible change of state, and a roster that changes its mind sixty
+/// times a second is one nobody can read. Six hundred milliseconds is long enough to outlast any
+/// single bad sample and short enough that a real handover still lands well inside the second it
+/// takes a person to look over. `Blocked` is exempt: see [`StateTracker::settle`].
+const STATE_DWELL: Duration = Duration::from_millis(600);
+
+/// Whether output arriving in a pane is generation rather than an idle redraw.
+///
+/// A free function so the judgement can be tested at the timings that actually caused trouble.
+/// Reaching it through a registry needs a real agent process in the table, which a unit test
+/// cannot conjure — an earlier attempt at this test drove a pane shell instead, where detection
+/// finds no agent and the decision below is never reached, so it passed against the very logic it
+/// was written to catch.
+fn output_looks_like_work(quiet_for: Duration, growing_for: Duration) -> bool {
+    quiet_for < WORKING_SILENCE && growing_for >= SUSTAINED_OUTPUT
+}
+
 /// One snapshot of the process table, shared by every run in a single `inspect` and reused across
 /// calls for [`PROCESS_TABLE_TTL`]. Agent detection sits on the event-stream hot path, so it must
 /// cost neither a subprocess per run nor a subprocess per frame.
@@ -3519,6 +3767,266 @@ mod tests {
                 .remove(0)
                 .agent_state,
             AgentState::Working
+        );
+    }
+
+    #[test]
+    fn a_lone_redraw_is_a_clock_and_a_continuing_stream_is_work() {
+        // Agents animate between turns: Claude's footer counts elapsed seconds. Those arrive as a
+        // short burst every second or so, and treating any recent byte as work made the roster
+        // flip between working and your-turn while nothing was happening.
+        let tick = Duration::from_millis(0);
+        assert!(
+            !output_looks_like_work(Duration::from_millis(10), tick),
+            "a burst that was over as soon as it started is a redraw"
+        );
+        // Generation keeps arriving, so the run of output has age by the time it is looked at.
+        assert!(output_looks_like_work(
+            Duration::from_millis(10),
+            Duration::from_millis(500)
+        ));
+        // And output that stopped a while ago is the turn handed back, however long it ran.
+        assert!(!output_looks_like_work(
+            Duration::from_secs(3),
+            Duration::from_secs(9)
+        ));
+    }
+
+    /// One frame of the loop the server polls panes on. The rhythm matters: the accumulator below
+    /// is fed at frame rate, and the whole defect was a threshold that only misbehaves when it is.
+    const FRAME: Duration = Duration::from_millis(16);
+
+    /// Replays a pane's polling history through a real [`StateTracker`] and returns every state it
+    /// reported, so a test can assert on the sequence rather than on one sampled instant.
+    ///
+    /// `output` says how many bytes the pane wrote on a given frame, and `screen` what
+    /// classification the screen produced on it. Time is handed in rather than slept through: a
+    /// test that waits out six seconds of a one-hertz animation is a test nobody runs.
+    fn replay(
+        frames: u64,
+        mut output: impl FnMut(u64) -> u64,
+        mut screen: impl FnMut(u64) -> AgentState,
+    ) -> Vec<AgentState> {
+        let start = Instant::now();
+        let mut tracker = StateTracker::new((1, 0), start);
+        let mut written = 0;
+        (0..frames)
+            .map(|frame| {
+                let now = start + FRAME * frame as u32;
+                written += output(frame);
+                tracker.observe((1, written), now);
+                tracker.decide(now, Some(AgentKind::Claude), screen(frame), None)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_idle_pane_redrawing_its_clock_once_a_second_never_flickers_back_to_working() {
+        // The defect, at the timings that produced it. Claude's footer counts the elapsed seconds,
+        // so an idle pane writes a short burst about once a second and never falls silent for as
+        // long as `WORKING_SILENCE` asks. Meanwhile the one rule that says "between turns" is a
+        // regex over the visible screen, and it misses whenever a frame is sampled mid-repaint or
+        // the footer wraps — so the roster flipped to "working" on those frames and back on the
+        // next, on a pane where nothing at all was happening.
+        //
+        // The earlier unit test passed throughout, because it hand-fed a `growing_for` of zero:
+        // a value the real accumulator stops producing after the first second.
+        let states = replay(
+            375, // six seconds
+            |frame| u64::from(frame % 63 == 0) * 120,
+            |frame| {
+                if frame % 17 == 3 {
+                    AgentState::Idle
+                } else {
+                    AgentState::Done
+                }
+            },
+        );
+        let flips = states.windows(2).filter(|pair| pair[0] != pair[1]).count();
+        assert_eq!(
+            (states[0], flips),
+            (AgentState::Done, 0),
+            "an idle pane must read as your-turn on every frame, not flicker: \
+             {} of {} frames read as working",
+            states
+                .iter()
+                .filter(|state| **state == AgentState::Working)
+                .count(),
+            states.len(),
+        );
+    }
+
+    #[test]
+    fn a_pane_streaming_a_reply_reads_as_working_until_it_stops() {
+        // The other half of the same judgement. Steadiness bought by never noticing work would be
+        // no better than the flicker: generation arrives on nearly every frame, and that unbroken
+        // rhythm — not the mere fact that something was written — is what separates it from a
+        // clock ticking once a second.
+        let stops_at = 250usize;
+        let states = replay(
+            375,
+            |frame| u64::from(frame < stops_at as u64) * 40,
+            // Mid-turn chrome that none of the rules recognise, so the stream is the only witness.
+            |_| AgentState::Idle,
+        );
+        assert!(
+            states[..stops_at].iter().all(|s| *s == AgentState::Working),
+            "a streaming pane must read as working throughout"
+        );
+        let handed_back = states
+            .iter()
+            .rposition(|state| *state == AgentState::Working)
+            .expect("the pane was working");
+        assert_eq!(states[states.len() - 1], AgentState::Done);
+        // And the turn comes back promptly once the stream stops: silence long enough to mean it,
+        // plus the dwell, and no longer.
+        assert!(
+            FRAME * (handed_back - stops_at) as u32
+                <= WORKING_SILENCE + STATE_DWELL + Duration::from_millis(50),
+            "the handover took {:?}",
+            FRAME * (handed_back - stops_at) as u32
+        );
+    }
+
+    #[test]
+    fn a_new_answer_has_to_hold_before_the_roster_will_show_it() {
+        // Every input to this decision is a sample: a screen scraped mid-repaint, a burst that had
+        // not finished arriving. At sixty frames a second, one unlucky sample without a dwell in
+        // front of it is a visible change of state, and a roster that changes its mind that often
+        // is one nobody can read.
+        let start = Instant::now();
+        let mut tracker = StateTracker::new((1, 0), start);
+        assert_eq!(
+            tracker.decide(start, Some(AgentKind::Claude), AgentState::Done, None),
+            AgentState::Done,
+            "the first answer for a run commits at once: there is nothing yet to change from"
+        );
+
+        // A turn begins, and the chrome on screen is not something the rules can read, so the
+        // stream is the only evidence there is.
+        let began = 1_000;
+        let (mut written, mut first_working) = (0, None);
+        for ms in (began..began + 3_000).step_by(FRAME.as_millis() as usize) {
+            written += 60;
+            let now = start + Duration::from_millis(ms);
+            tracker.observe((1, written), now);
+            let state = tracker.decide(now, Some(AgentKind::Claude), AgentState::Idle, None);
+            if state == AgentState::Working && first_working.is_none() {
+                first_working = Some(Duration::from_millis(ms - began));
+            }
+        }
+        let took = first_working.expect("a stream this steady is work by any measure");
+        assert!(
+            took >= SUSTAINED_OUTPUT + STATE_DWELL,
+            "working showed after {took:?}, before the stream had earned it"
+        );
+        assert!(
+            took < SUSTAINED_OUTPUT + STATE_DWELL + FRAME * 2,
+            "working showed after {took:?}, long after the stream had earned it"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_is_stuck_says_so_without_waiting_out_the_dwell() {
+        // The dwell exists to stop the roster twitching. An agent that cannot continue until
+        // somebody answers it is the one thing in the roster that costs the user throughput while
+        // it waits, so it is the one thing that must never be held back to look calm.
+        let start = Instant::now();
+        let mut tracker = StateTracker::new((1, 0), start);
+        let (mut written, mut now) = (0, start);
+        for _ in 0..60 {
+            written += 60;
+            now += FRAME;
+            tracker.observe((1, written), now);
+            tracker.decide(now, Some(AgentKind::Claude), AgentState::Idle, None);
+        }
+        assert_eq!(
+            tracker.decide(now, Some(AgentKind::Claude), AgentState::Idle, None),
+            AgentState::Working
+        );
+        now += FRAME;
+        assert_eq!(
+            tracker.decide(now, Some(AgentKind::Claude), AgentState::Blocked, None),
+            AgentState::Blocked,
+            "a permission prompt is not something to sit on for half a second"
+        );
+    }
+
+    #[test]
+    fn what_an_agent_reports_about_itself_lands_at_once_and_is_what_inference_resumes_from() {
+        // A hook fires on the agent's own turn boundaries, so it outranks anything read off a
+        // screen and has nothing to prove by waiting. It also replaces the record rather than
+        // sitting on top of it: if the reports later stop — the agent was restarted without its
+        // hook, a wrapper fell away — inference has to carry on from where the agent actually was,
+        // not from the stale guess it happened to be holding when the first report arrived.
+        let start = Instant::now();
+        let mut tracker = StateTracker::new((1, 0), start);
+        let reported = tracker.decide(
+            start + FRAME,
+            Some(AgentKind::Claude),
+            AgentState::Idle,
+            Some(AgentState::Done),
+        );
+        assert_eq!(reported, AgentState::Done);
+        assert_eq!(
+            tracker.decide(
+                start + FRAME * 2,
+                Some(AgentKind::Claude),
+                AgentState::Idle,
+                None
+            ),
+            AgentState::Done,
+            "with the reports gone and the screen unreadable, the last thing the agent said \
+             about itself is the best answer available"
+        );
+    }
+
+    #[test]
+    fn what_a_dead_run_said_about_itself_is_not_inherited_by_the_next_run_of_its_name() {
+        let registry = registry();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Daily".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+        let live = registry
+            .pulse()
+            .first()
+            .map(|pulse| pulse.run_id.clone())
+            .expect("the pane has a shell");
+        // A run that has since ended, and the report it left behind. Reports are sticky by
+        // design and run ids come back — a pane shell wears the same identity every time its
+        // pane opens one — so this one would outrank everything the new run's own screen said.
+        let departed = "dock_sh_w1_p1_gone".to_owned();
+        registry
+            .reported_states
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(departed.clone(), AgentState::Done);
+        registry
+            .output_marks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(departed.clone(), StateTracker::new((1, 0), Instant::now()));
+
+        registry.pulse();
+        assert!(
+            !registry
+                .reported_states
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&departed),
+            "a dead run's sticky report would win forever over the next run of its name"
+        );
+        assert!(
+            registry
+                .output_marks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&live),
+            "the sweep must not forget a run that is still going"
         );
     }
 

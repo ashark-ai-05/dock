@@ -788,7 +788,18 @@ fn dispatch_prompt(task_id: u64, title: &str) -> String {
 
 #[cfg(test)]
 mod hook_check_tests {
-    use super::{hook_events, missing_hook_events, resolve_on_path};
+    use super::{Verdict, hook_events, missing_hook_events, resolve_on_path, verdict};
+
+    #[test]
+    fn a_check_that_could_not_reach_a_pane_has_not_thereby_failed() {
+        // This command's own first bug: run from an ordinary shell, where there is no pane and so
+        // no connection to test, it reported a correctly wired install as broken and exited 1.
+        assert_eq!(verdict(0, true), Verdict::Reachable);
+        assert_eq!(verdict(0, false), Verdict::Wired);
+        // What it must not do is let the skip swallow a real failure found before it.
+        assert_eq!(verdict(1, true), Verdict::Failed);
+        assert_eq!(verdict(1, false), Verdict::Failed);
+    }
 
     #[test]
     fn a_settings_file_with_no_hooks_at_all_is_missing_every_event() {
@@ -1204,13 +1215,15 @@ fn hooks_check(expected: &serde_json::Value) -> io::Result<()> {
             (run_id, socket)
         }
         _ => {
-            report(
-                false,
-                "DOCK_RUN and DOCK_SOCKET are not both set: run this inside a Dock pane, because \
-                 the rest of the checks are about that pane's own connection"
-                    .into(),
+            // Not a failure, and calling it one was this command's own bug: run from any ordinary
+            // shell it condemned a correctly wired install, because the two checks it cannot make
+            // from out here are about a pane's connection and there is no pane. What it can check
+            // it has checked; the rest is unknown, which is a different answer from wrong.
+            println!(
+                "--   not inside a Dock pane, so the daemon connection was not checked. \
+                 Run this again in a Dock pane to finish."
             );
-            return finish_check(failures);
+            return finish_check(failures, true);
         }
     };
 
@@ -1221,7 +1234,7 @@ fn hooks_check(expected: &serde_json::Value) -> io::Result<()> {
         }
         Err(error) => {
             report(false, format!("no daemon at {socket}: {error}"));
-            return finish_check(failures);
+            return finish_check(failures, false);
         }
     };
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -1262,12 +1275,43 @@ fn hooks_check(expected: &serde_json::Value) -> io::Result<()> {
             ),
         }
     }
-    finish_check(failures)
+    finish_check(failures, false)
+}
+
+/// What a run of the checks amounts to.
+///
+/// Separated from the printing because the first version of this command got the classification
+/// wrong rather than the wording: run from an ordinary shell it counted "there is no pane to ask
+/// about" as a failure, and condemned an install that was in fact correctly wired. Not knowing is
+/// its own answer and has to be able to succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Everything asked, everything true.
+    Wired,
+    /// Everything askable from here is true; the pane-bound checks were not reachable.
+    Reachable,
+    /// Something asked was false.
+    Failed,
+}
+
+fn verdict(failures: usize, skipped: bool) -> Verdict {
+    match (failures, skipped) {
+        (0, true) => Verdict::Reachable,
+        (0, false) => Verdict::Wired,
+        _ => Verdict::Failed,
+    }
 }
 
 /// The verdict, and an exit status that a script can branch on.
-fn finish_check(failures: usize) -> io::Result<()> {
-    if failures == 0 {
+fn finish_check(failures: usize, skipped: bool) -> io::Result<()> {
+    if verdict(failures, skipped) == Verdict::Reachable {
+        println!(
+            "\nhooks are installed and Dock is reachable. Run this inside a Dock pane to check \
+             the connection they report over."
+        );
+        return Ok(());
+    }
+    if verdict(failures, skipped) == Verdict::Wired {
         println!("\nhooks are wired: this pane's state is reported, not guessed.");
         return Ok(());
     }

@@ -70,6 +70,9 @@ pub struct RunPulse {
 }
 
 pub struct OwnedRuntime {
+    #[cfg(test)]
+    /// Lengthened by tests that need a reap to stay parked while they check something else.
+    pub(crate) stop_escalation: Mutex<Option<Duration>>,
     binding: RunBinding,
     command: Vec<String>,
     adapter: AdapterId,
@@ -179,6 +182,8 @@ impl OwnedRuntime {
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
                     }) {
                     Ok(reaper) => Self {
+                        #[cfg(test)]
+                        stop_escalation: Mutex::new(None),
                         binding,
                         command,
                         adapter: adapter_id,
@@ -199,6 +204,8 @@ impl OwnedRuntime {
                         launch_error: None,
                     },
                     Err(error) => Self {
+                        #[cfg(test)]
+                        stop_escalation: Mutex::new(None),
                         binding,
                         command,
                         adapter: adapter_id,
@@ -223,6 +230,8 @@ impl OwnedRuntime {
                 }
             }
             Err(error) => Self {
+                #[cfg(test)]
+                stop_escalation: Mutex::new(None),
                 binding,
                 command,
                 adapter: adapter_id,
@@ -459,15 +468,34 @@ impl OwnedRuntime {
                 TrySendError::Disconnected(_) => "Dock-owned PTY input capability is closed".into(),
             })
     }
+    /// How long a group is given to leave on SIGTERM before SIGKILL, and again after it.
+    ///
+    /// Fixed in production. Tests can lengthen it because several of them work by parking a reap
+    /// on a fixture that ignores SIGTERM, and the escalation is what eventually unparks it: with
+    /// the production value those tests have about three seconds to do everything they check, and
+    /// on a loaded machine they lose that race and fail for a reason unrelated to what they test.
+    fn stop_escalation(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(escalation) = *self
+            .stop_escalation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return escalation;
+        }
+        Duration::from_millis(1500)
+    }
+
     pub fn stop(&self) -> Result<(), String> {
         if let Some(group) = self.owned_process_group.as_ref() {
             // The leader watcher is not group authority: descendants can keep the exact owned
             // PGID alive after the leader is terminal. Probe and retire that group independently.
             if owned_group_exists(group) {
+                let escalation = self.stop_escalation();
                 signal_owned_group_checked(group, Signal::SIGTERM)?;
-                if !wait_for_owned_group_exit(group, Duration::from_millis(1500)) {
+                if !wait_for_owned_group_exit(group, escalation) {
                     signal_owned_group_checked(group, Signal::SIGKILL)?;
-                    if !wait_for_owned_group_exit(group, Duration::from_millis(1500)) {
+                    if !wait_for_owned_group_exit(group, escalation) {
                         return Err("Dock-owned process group did not exit after SIGKILL".into());
                     }
                 }
@@ -475,7 +503,7 @@ impl OwnedRuntime {
         } else if !self.lifecycle_is_terminal() {
             return Err("run has no Dock-owned process group".into());
         }
-        self.wait_for_lifecycle_and_join(Duration::from_millis(1500))?;
+        self.wait_for_lifecycle_and_join(self.stop_escalation())?;
         Ok(())
     }
     fn wait_for_lifecycle_and_join(&self, timeout: Duration) -> Result<(), String> {

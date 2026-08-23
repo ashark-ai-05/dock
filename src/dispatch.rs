@@ -1897,6 +1897,24 @@ impl RuntimeRegistry {
         }
     }
 
+    #[cfg(test)]
+    /// Lengthens how long a run's stop waits before escalating SIGTERM to SIGKILL.
+    ///
+    /// Several tests park a reap on a fixture that ignores SIGTERM and then check that unrelated
+    /// work still gets through. The escalation is what eventually unparks it, so with the
+    /// production window those tests have about three seconds to do everything they check —
+    /// including dispatching a real process — and on a loaded machine they lose that race and fail
+    /// for a reason that has nothing to do with the property under test.
+    pub(crate) fn set_stop_escalation(&self, run_id: &str, escalation: Duration) {
+        let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(run) = runs.get(run_id).and_then(RuntimeSlot::active) {
+            *run.runtime
+                .stop_escalation
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(escalation);
+        }
+    }
+
     /// Which agent is under a run and what it is doing, memoised on everything that can change it.
     ///
     /// Shared by `inspect` and `pulse` so the two cannot drift: they answer the same question and
@@ -6169,6 +6187,10 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(ready.exists(), "TERM-ignoring fixture did not become ready");
+        // The escalation is what eventually unparks the reap below, so it is lengthened well past
+        // anything this test does. With the production window the test has about three seconds to
+        // dispatch a real process and check the result, and a loaded machine loses that race.
+        registry.set_stop_escalation(&first.run_id, Duration::from_secs(60));
 
         let restarting = {
             let registry = Arc::clone(&registry);
@@ -6263,6 +6285,9 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(ready.exists());
+        // As above: the reap must stay parked for the whole of what follows, rather than being
+        // released by an escalation this test never asked about.
+        registry.set_stop_escalation(&first.run_id, Duration::from_secs(60));
         let closing = {
             let registry = Arc::clone(&registry);
             let workspace_id = first.workspace_id.clone();

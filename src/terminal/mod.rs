@@ -7,7 +7,7 @@ use std::{
 };
 
 pub use keys::{KeyEncoding, encode_key, encode_paste};
-pub use vt::{ShellSignals, VtTerminal};
+pub use vt::{PaneSnapshot, ShellSignals, VtTerminal};
 
 /// Single swap point for the terminal engine. `rio-vt` can replace `VtTerminal` here
 /// without touching any caller once it is mature enough to depend on.

@@ -228,6 +228,18 @@ whitespace. `/` opens a search prompt, `n`/`N` cycle matches. `Esc` unwinds
 one level at a time (the search prompt first, then the mode itself); `q`
 always leaves immediately.
 
+The freeze is real: entering copy mode takes a copy of the pane's screen,
+and the pane is painted from that copy — and the selection read from it —
+until the mode ends, so a pane that is still producing output cannot scroll
+the highlighted text out from under you. The scrollback comes with the copy,
+so the wheel and `k` past the top row still walk history from inside the
+mode. Nothing is held back while you select: the pane's own emulator keeps
+consuming every byte behind the freeze, so leaving copy mode drops the copy
+and the pane is already caught up, with nothing to replay and nothing to
+resynchronise. A pane that is *resized* while frozen leaves copy mode with a
+notice, because a selection is a set of coordinates on one particular grid
+and that grid has just been replaced.
+
 Dragging with the mouse inside a pane enters copy mode and extends a
 selection the same way; a plain click still just focuses the pane. Releasing
 a drag **copies the selection**, which is what iTerm2, Ghostty, WezTerm and
@@ -273,9 +285,9 @@ resumes following live output. The daemon streams each pane's raw output to
 the client, so the client's own terminal scrolls exactly as the daemon's does
 and retains the same number of rows (`dockd --scrollback-rows`, default
 2000). In copy mode, `k`/`↑` past the top row walks into that history a row
-at a time; `g`/`G` jump to the top and bottom of the current viewport, and
-`/` search covers the rows on screen, so scrolling back first widens what it
-searches. History is per-connection: a pane accumulates it from the moment
+at a time — through the frozen copy, so live output cannot move it —
+`g`/`G` jump to the top and bottom of the current viewport, and `/` search
+covers the rows on screen, so scrolling back first widens what it searches. History is per-connection: a pane accumulates it from the moment
 this client attached, the way it does in tmux, and it is not restored across
 a daemon restart.
 

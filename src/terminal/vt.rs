@@ -181,10 +181,7 @@ impl VtTerminal {
     /// as new output arrives so the visible rows stay put. That is why callers must treat the
     /// offset as opaque: only "zero versus non-zero" is meaningful.
     pub fn scroll_by(&mut self, delta: i32) {
-        let current = i64::try_from(self.parser.screen().scrollback()).unwrap_or(i64::MAX);
-        let target = (current + i64::from(delta)).max(0);
-        let target = usize::try_from(target).unwrap_or(usize::MAX);
-        self.parser.screen_mut().set_scrollback(target);
+        scroll_screen(self.parser.screen_mut(), delta);
     }
 
     pub fn scroll_offset(&self) -> usize {
@@ -200,8 +197,18 @@ impl VtTerminal {
     }
 
     pub fn visible_row(&self, row: u16) -> String {
-        let (_, cols) = self.size();
-        self.parser.screen().contents_between(row, 0, row, cols)
+        row_text(self.parser.screen(), row)
+    }
+
+    /// The screen exactly as it stands now, detached from the parser that produced it.
+    ///
+    /// See [`PaneSnapshot`] for why copy mode holds one of these rather than stopping the
+    /// parser. Costs a full copy of the grid *and* the scrollback, so it belongs on a
+    /// deliberate gesture — entering copy mode — and never on a render path.
+    pub fn snapshot(&self) -> PaneSnapshot {
+        PaneSnapshot {
+            screen: self.parser.screen().clone(),
+        }
     }
 
     /// Text between two points of the visible grid, in reading order regardless of which
@@ -213,18 +220,95 @@ impl VtTerminal {
     /// declines to return is a silent, permanent off-by-one on every copy — the last
     /// character of every dragged path or URL, and the whole of a single-cell selection.
     pub fn selection_text(&self, from: (u16, u16), to: (u16, u16)) -> String {
-        let (start, end) = if (from.0, from.1) <= (to.0, to.1) {
-            (from, to)
-        } else {
-            (to, from)
-        };
-        let (_, cols) = self.size();
-        self.parser.screen().contents_between(
-            start.0,
-            start.1,
-            end.0,
-            end.1.saturating_add(1).min(cols),
-        )
+        text_between(self.parser.screen(), from, to)
+    }
+}
+
+/// One row of a screen, whole.
+fn row_text(screen: &vt100::Screen, row: u16) -> String {
+    let (_, cols) = screen.size();
+    screen.contents_between(row, 0, row, cols)
+}
+
+/// Text between two points of the visible grid, in reading order regardless of which point
+/// was anchored first. Both endpoints are INCLUSIVE, columns as well as rows.
+///
+/// `vt100::contents_between` is row-inclusive but column-EXCLUSIVE, so the end column is
+/// advanced by one here. That is not a taste call: `Dashboard::render_copy_overlay`
+/// highlights `first..=last`, and a highlight that promises a character this then declines to
+/// return is a silent, permanent off-by-one on every copy — the last character of every
+/// dragged path or URL, and the whole of a single-cell selection.
+///
+/// Free-standing rather than a method so the live terminal and the frozen [`PaneSnapshot`]
+/// copy mode selects from share one answer. Two implementations of an inclusive/exclusive
+/// boundary is exactly how that off-by-one got in the first time.
+fn text_between(screen: &vt100::Screen, from: (u16, u16), to: (u16, u16)) -> String {
+    let (start, end) = if (from.0, from.1) <= (to.0, to.1) {
+        (from, to)
+    } else {
+        (to, from)
+    };
+    let (_, cols) = screen.size();
+    screen.contents_between(start.0, start.1, end.0, end.1.saturating_add(1).min(cols))
+}
+
+/// Moves a screen's viewport through its retained scrollback. Positive goes back into history.
+fn scroll_screen(screen: &mut vt100::Screen, delta: i32) {
+    let current = i64::try_from(screen.scrollback()).unwrap_or(i64::MAX);
+    let target = (current + i64::from(delta)).max(0);
+    screen.set_scrollback(usize::try_from(target).unwrap_or(usize::MAX));
+}
+
+/// One pane's screen as it stood at a single instant, detached from the parser that produced it.
+///
+/// Copy mode promised a frozen pane and did not deliver one: `Dashboard::apply_event` kept
+/// feeding every pushed `PaneDelta` into the parser the pane rendered from, so on a busy pane
+/// the highlighted text scrolled out from under the selection while it was being made.
+///
+/// Holding the deltas back instead would be worse. `vt100` is a stateful machine: a chunk
+/// dropped because a buffer filled does not lose whole lines, it desynchronises
+/// escape-sequence parsing, and the user would leave copy mode into a screen that no longer
+/// describes anything the child wrote. Every overflow policy corrupts, so that question has no
+/// good answer. Cloning the screen never asks it — the live parser keeps consuming every byte
+/// for as long as the mode is open, so there is nothing to flush on exit and the live screen is
+/// already current the moment the clone is dropped.
+///
+/// Deliberately **not** `Clone`. A `vt100::Cell` is 32 bytes and the clone carries the
+/// scrollback with it, so a snapshot of a wide pane with deep history is megabytes; the render
+/// path reaches for it on every frame, and only the type system can keep a stray `.clone()`
+/// there from turning copy mode into a per-frame megabyte copy.
+#[derive(Debug)]
+pub struct PaneSnapshot {
+    screen: vt100::Screen,
+}
+
+impl PaneSnapshot {
+    pub fn size(&self) -> (u16, u16) {
+        self.screen.size()
+    }
+
+    pub fn visible_row(&self, row: u16) -> String {
+        row_text(&self.screen, row)
+    }
+
+    /// Text between two inclusive endpoints of the frozen grid. See [`text_between`].
+    pub fn selection_text(&self, from: (u16, u16), to: (u16, u16)) -> String {
+        text_between(&self.screen, from, to)
+    }
+
+    /// Scrolls the frozen viewport. The clone carries the scrollback, so copy mode can walk
+    /// back through history without the live parser — and therefore without new output —
+    /// moving anything underneath it.
+    pub fn scroll_by(&mut self, delta: i32) {
+        scroll_screen(&mut self.screen, delta);
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.screen.scrollback()
+    }
+
+    pub(crate) fn screen(&self) -> &vt100::Screen {
+        &self.screen
     }
 }
 

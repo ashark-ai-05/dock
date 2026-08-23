@@ -29,7 +29,7 @@ use crate::{
         LaunchIntoPaneRequest, PROTOCOL_VERSION, Request, RuntimeSnapshot, TerminalLaunchRequest,
         WorkspaceRequest,
     },
-    terminal::{KeyEncoding, PaneScreen, encode_paste},
+    terminal::{KeyEncoding, PaneScreen, PaneSnapshot, encode_paste},
     theme::Theme,
 };
 
@@ -116,8 +116,8 @@ pub struct Dashboard {
     launch_confirm_area: Option<Rect>,
     launch_mode_area: Option<Rect>,
     help_open: bool,
-    /// Copy mode's session, if active. Client-local: reading history costs the daemon nothing.
-    copy: Option<CopySession>,
+    /// Copy mode, if active. Client-local: reading history costs the daemon nothing.
+    copy: Option<CopyMode>,
     /// True only while copy mode's `/` prompt is taking characters. Kept beside `copy` rather
     /// than inside `CopySession` because the query outlives the prompt: `n`/`N` reuse it once
     /// Enter has closed the editor.
@@ -355,6 +355,64 @@ struct Click {
 /// separate clicks on the same word are not fused into one.
 const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(450);
 
+/// An open copy mode: the selection, and the screen it is a selection *of*.
+///
+/// The two are one object because a selection means nothing apart from the exact grid it was
+/// made against. Copy mode used to hold only the session and read the pane's live screen, so
+/// every pushed delta moved the text under coordinates that had already been chosen — the
+/// mode called itself frozen and was not. Freezing is this clone and nothing else: the live
+/// parser is never interrupted, so on exit there is no backlog to replay and the live screen
+/// is already current.
+///
+/// Not `Clone`, because [`PaneSnapshot`] is not. That is deliberate rather than incidental:
+/// the render path wants this object on every frame for every pane, and a session that could
+/// be cloned there would copy the whole grid and scrollback sixty times a second.
+struct CopyMode {
+    session: CopySession,
+    /// The pane's screen as it stood when the mode opened. Rendered from, selected from, and
+    /// scrolled through for as long as the mode lasts; dropping it is the entire exit path.
+    frozen: PaneSnapshot,
+}
+
+impl CopyMode {
+    fn new(run_id: String, cursor: (u16, u16), frozen: PaneSnapshot) -> Self {
+        Self {
+            session: CopySession::new(run_id, cursor),
+            frozen,
+        }
+    }
+
+    fn is_for(&self, run_id: &str) -> bool {
+        self.session.run_id == run_id
+    }
+
+    /// Moves the copy cursor, pulling the frozen viewport through scrollback when it walks off
+    /// an edge so the cursor never leaves the rows on screen.
+    ///
+    /// The scrollback travels with the clone, so this walks back through history that new
+    /// output can no longer move underneath it.
+    fn step(&mut self, rows: i32, cols: i32, bounds: (u16, u16)) {
+        let (row, _) = self.session.cursor();
+        let edge = if rows < 0 && row == 0 {
+            1
+        } else if rows > 0 && row + 1 >= bounds.0 {
+            -1
+        } else {
+            0
+        };
+        if edge != 0 {
+            let before = self.frozen.scroll_offset();
+            self.frozen.scroll_by(edge);
+            // Only the anchor. The cursor is what the user is deliberately moving, and it is
+            // pinned to the edge by the clamp in `move_cursor` below — which is exactly how
+            // `k` past the top row walks into history a row at a time.
+            self.session
+                .shift_anchor(scrolled(before, self.frozen.scroll_offset()), bounds);
+        }
+        self.session.move_cursor(rows, cols, bounds);
+    }
+}
+
 impl Dashboard {
     pub fn set_repository_catalog(
         &mut self,
@@ -399,7 +457,8 @@ impl Dashboard {
                     terminal.feed(&bytes);
                 }
                 self.screens.insert(run_id.clone(), terminal);
-                self.revisions.insert(run_id, revision);
+                self.revisions.insert(run_id.clone(), revision);
+                self.end_copy_mode_for(&run_id, "the pane was re-attached");
             }
             Event::PaneDelta {
                 run_id,
@@ -410,6 +469,7 @@ impl Dashboard {
                 if expected != Some(revision) {
                     self.screens.remove(&run_id);
                     self.revisions.remove(&run_id);
+                    self.end_copy_mode_for(&run_id, "the pane lost sync and is re-seeding");
                     return;
                 }
                 if let (Some(terminal), Ok(decoded)) =
@@ -449,6 +509,12 @@ impl Dashboard {
     pub fn detach_screens(&mut self) {
         self.screens.clear();
         self.revisions.clear();
+        // The frozen screen would happily outlive the replica it was cloned from — nothing in
+        // it points back at one — but a selection over a pane that is about to be rebuilt from
+        // a fresh snapshot is a selection of rows the user is no longer being shown.
+        if let Some(run_id) = self.copy.as_ref().map(|mode| mode.session.run_id.clone()) {
+            self.end_copy_mode_for(&run_id, "the connection was re-established");
+        }
         // The agent roster is replicated state exactly like the screens are, and it is pushed
         // only when a run's identity or state *changes*. Left behind, every entry from before
         // the drop would keep painting a sidebar row for a run that may no longer exist.
@@ -1132,15 +1198,15 @@ impl Dashboard {
                     self.theme.agent(state)
                 };
                 // Copy mode swallows every key for this pane, so the pane itself has to say
-                // so. Cloned rather than borrowed because the render below needs `self`
-                // mutably for the resize bookkeeping.
-                let copy_session = run_id
+                // so. A flag rather than the mode itself: the render below needs `self`
+                // mutably for the resize bookkeeping, and `CopyMode` owns a whole cloned
+                // screen, so borrowing it across that — or, worse, cloning it — is not free.
+                let copying = run_id
                     .as_deref()
-                    .and_then(|id| self.copy.as_ref().filter(|session| session.run_id == id))
-                    .cloned();
+                    .is_some_and(|id| self.copy.as_ref().is_some_and(|mode| mode.is_for(id)));
                 // `title` already opens with a space, so the prefix needs none of its own.
-                let title = match &copy_session {
-                    Some(_) => Line::from(vec![
+                let title = if copying {
+                    Line::from(vec![
                         Span::styled(
                             " COPY",
                             Style::default()
@@ -1148,8 +1214,9 @@ impl Dashboard {
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::raw(title),
-                    ]),
-                    None => Line::from(title),
+                    ])
+                } else {
+                    Line::from(title)
                 };
                 // Measured before the block takes ownership: the controls sit on the same border
                 // row as the title, so they are only drawn when they cannot land on top of it.
@@ -1231,22 +1298,33 @@ impl Dashboard {
                         x = x.saturating_add(3);
                     }
                 }
-                match run_id.as_deref().and_then(|id| self.screens.get(id)) {
+                // A frozen pane is painted from its own clone of the screen, which is what
+                // makes copy mode a freeze rather than a claim: the live parser keeps
+                // consuming every pushed delta behind it, and none of them reach the grid the
+                // selection was made against.
+                let copying = run_id
+                    .as_deref()
+                    .and_then(|id| self.copy.as_ref().filter(|mode| mode.is_for(id)));
+                let painted = match &copying {
+                    Some(mode) => Some(mode.frozen.screen()),
+                    None => run_id
+                        .as_deref()
+                        .and_then(|id| self.screens.get(id))
+                        .map(PaneScreen::screen),
+                };
+                match painted {
                     Some(screen) => {
                         // The cursor belongs to whichever pane is taking keystrokes; drawing
                         // one in every pane would make focus unreadable. In copy mode the
                         // PTY's own cursor is hidden too: the copy cursor is the one that
                         // moves, and two blocks would make it ambiguous which is which.
                         let mut cursor = Cursor::default();
-                        if !focused || copy_session.is_some() {
+                        if !focused || copying.is_some() {
                             cursor.hide();
                         }
-                        frame.render_widget(
-                            PseudoTerminal::new(screen.screen()).cursor(cursor),
-                            inner,
-                        );
-                        if let Some(session) = &copy_session {
-                            self.render_copy_overlay(frame, inner, session);
+                        frame.render_widget(PseudoTerminal::new(screen).cursor(cursor), inner);
+                        if let Some(mode) = copying {
+                            self.render_copy_overlay(frame, inner, &mode.session);
                         }
                     }
                     None => {
@@ -2622,7 +2700,7 @@ impl Dashboard {
     /// The mode indicator. Copy mode swallows every key, so it has to announce itself: an
     /// input mode with no on-screen trace is indistinguishable from a hung dashboard.
     pub fn copy_status(&self) -> Option<String> {
-        let session = self.copy.as_ref()?;
+        let session = &self.copy.as_ref()?.session;
         if self.copy_searching {
             return Some(format!(
                 "COPY /{}",
@@ -2646,18 +2724,23 @@ impl Dashboard {
     }
 
     /// Freezes the focused pane for keyboard selection, starting at its live cursor.
+    ///
+    /// The freeze is a clone of the pane's screen taken here and held for the life of the
+    /// session. The live parser is deliberately left running: see [`CopyMode`] for why
+    /// stopping it — or buffering what it would have consumed — is the worse of the two.
     fn enter_copy_mode(&mut self) -> UiCommand {
         let Some(run_id) = self.focused_run_id().map(str::to_owned) else {
             self.error =
                 Some("copy mode unavailable: this pane has no run · Ctrl+B l launches one".into());
             return UiCommand::None;
         };
-        let cursor = self
-            .screens
-            .get(&run_id)
-            .map(PaneScreen::cursor)
-            .unwrap_or((0, 0));
-        self.copy = Some(CopySession::new(run_id, cursor));
+        // A pane whose screen has not arrived yet has nothing to freeze, and a mode that
+        // swallows every key over an empty grid is a dashboard that looks hung.
+        let Some(screen) = self.screens.get(&run_id) else {
+            self.error = Some("copy mode unavailable: this pane has not painted yet".into());
+            return UiCommand::None;
+        };
+        self.copy = Some(CopyMode::new(run_id, screen.cursor(), screen.snapshot()));
         self.copy_searching = false;
         self.error = None;
         UiCommand::None
@@ -2665,27 +2748,25 @@ impl Dashboard {
 
     /// Every key while copy mode is active, so none of them can reach the PTY.
     ///
-    /// The session is taken out of `self` for the duration: the handlers need the pane's
-    /// screen at the same time, and leaving the session in place would borrow `self` twice.
+    /// The mode is taken out of `self` for the duration: the handlers need `self.error` and
+    /// the frozen screen at the same time, and leaving it in place would borrow `self` twice.
     fn copy_key(&mut self, key: KeyEvent) -> UiCommand {
-        let Some(mut session) = self.copy.take() else {
+        let Some(mut mode) = self.copy.take() else {
             return UiCommand::None;
         };
-        let bounds = self
-            .screens
-            .get(&session.run_id)
-            .map(PaneScreen::size)
-            .unwrap_or((0, 0));
+        // The frozen grid, not the live one: every coordinate in the session is a cell of the
+        // screen the mode was opened on, and a live resize must not silently re-scale them.
+        let bounds = mode.frozen.size();
         // Esc unwinds one level at a time: the prompt first, then the mode. The invariant is
         // that a small bounded number of presses always reaches the live pane, not that one
         // press escapes every level — which is exactly what a rename form already does.
         if key.code == KeyCode::Esc && !self.copy_searching {
-            self.leave_copy_mode(&session);
+            self.leave_copy_mode(&mode.session.run_id);
             return UiCommand::None;
         }
         if self.copy_searching {
-            self.copy_search_key(key, &mut session, bounds);
-            self.copy = Some(session);
+            self.copy_search_key(key, &mut mode, bounds);
+            self.copy = Some(mode);
             return UiCommand::None;
         }
         match key.code {
@@ -2694,101 +2775,83 @@ impl Dashboard {
             // crossterm reports uppercase `G` and `N` with it set.
             KeyCode::Char(_) if composed(key) => {}
             KeyCode::Char('q') => {
-                self.leave_copy_mode(&session);
+                self.leave_copy_mode(&mode.session.run_id);
                 return UiCommand::None;
             }
-            KeyCode::Char('h') | KeyCode::Left => self.copy_move(&mut session, 0, -1, bounds),
-            KeyCode::Char('j') | KeyCode::Down => self.copy_move(&mut session, 1, 0, bounds),
-            KeyCode::Char('k') | KeyCode::Up => self.copy_move(&mut session, -1, 0, bounds),
-            KeyCode::Char('l') | KeyCode::Right => self.copy_move(&mut session, 0, 1, bounds),
+            KeyCode::Char('h') | KeyCode::Left => mode.step(0, -1, bounds),
+            KeyCode::Char('j') | KeyCode::Down => mode.step(1, 0, bounds),
+            KeyCode::Char('k') | KeyCode::Up => mode.step(-1, 0, bounds),
+            KeyCode::Char('l') | KeyCode::Right => mode.step(0, 1, bounds),
             // Deliberately the top and bottom of the *viewport*, not of history: `g` in a pane
             // scrolled back must reach the row above the cursor, not jump the user thousands of
             // rows away from what they are reading. `k` past the top edge walks into history a
-            // row at a time (see `copy_move`).
-            KeyCode::Char('g') => session.set_cursor((0, 0), bounds),
-            KeyCode::Char('G') => session.set_cursor((bounds.0.saturating_sub(1), 0), bounds),
-            KeyCode::Char('v') => session.begin_selection(),
+            // row at a time (see `CopyMode::step`).
+            KeyCode::Char('g') => mode.session.set_cursor((0, 0), bounds),
+            KeyCode::Char('G') => mode
+                .session
+                .set_cursor((bounds.0.saturating_sub(1), 0), bounds),
+            KeyCode::Char('v') => mode.session.begin_selection(),
             KeyCode::Char('y') => {
-                self.yank(&session);
-                self.leave_copy_mode(&session);
+                self.yank(&mode);
+                self.leave_copy_mode(&mode.session.run_id);
                 return UiCommand::None;
             }
             KeyCode::Char('/') => {
-                session.begin_search();
+                mode.session.begin_search();
                 self.copy_searching = true;
                 self.error = None;
             }
-            KeyCode::Char('n') => self.copy_jump(&mut session, true, bounds),
-            KeyCode::Char('N') => self.copy_jump(&mut session, false, bounds),
+            KeyCode::Char('n') => self.copy_jump(&mut mode, true, bounds),
+            KeyCode::Char('N') => self.copy_jump(&mut mode, false, bounds),
             _ => {}
         }
-        self.copy = Some(session);
+        self.copy = Some(mode);
         UiCommand::None
     }
 
     /// Keys typed at the `/` prompt. Enter closes the prompt and jumps; the query survives so
     /// `n`/`N` can keep walking the same matches.
-    fn copy_search_key(&mut self, key: KeyEvent, session: &mut CopySession, bounds: (u16, u16)) {
+    fn copy_search_key(&mut self, key: KeyEvent, mode: &mut CopyMode, bounds: (u16, u16)) {
         match key.code {
             // Same rule as the mode's own bindings: `Ctrl+C` must not type a `c` into the query.
             KeyCode::Char(_) if composed(key) => {}
-            KeyCode::Char(character) => session.push_search(character),
+            KeyCode::Char(character) => mode.session.push_search(character),
             KeyCode::Esc => {
-                session.cancel_search();
+                mode.session.cancel_search();
                 self.copy_searching = false;
             }
             KeyCode::Backspace => {
-                if session.search_query().is_some_and(str::is_empty) {
-                    session.cancel_search();
+                if mode.session.search_query().is_some_and(str::is_empty) {
+                    mode.session.cancel_search();
                     self.copy_searching = false;
                 } else {
-                    session.pop_search();
+                    mode.session.pop_search();
                 }
             }
             KeyCode::Enter => {
                 self.copy_searching = false;
-                self.copy_jump(session, true, bounds);
+                self.copy_jump(mode, true, bounds);
             }
             _ => {}
         }
     }
 
-    /// Moves the copy cursor, pulling the viewport through scrollback when it walks off an
-    /// edge so the cursor never leaves the rows on screen.
-    fn copy_move(&mut self, session: &mut CopySession, rows: i32, cols: i32, bounds: (u16, u16)) {
-        let (row, _) = session.cursor();
-        let edge = if rows < 0 && row == 0 {
-            1
-        } else if rows > 0 && row + 1 >= bounds.0 {
-            -1
-        } else {
-            0
-        };
-        if edge != 0
-            && let Some(screen) = self.screens.get_mut(&session.run_id)
-        {
-            let before = screen.scroll_offset();
-            screen.scroll_by(edge);
-            // Only the anchor. The cursor is what the user is deliberately moving, and it is
-            // pinned to the edge by the clamp in `move_cursor` below — which is exactly how
-            // `k` past the top row walks into history a row at a time.
-            session.shift_anchor(scrolled(before, screen.scroll_offset()), bounds);
-        }
-        session.move_cursor(rows, cols, bounds);
-    }
-
     /// Jumps to the next or previous hit for the standing query, or says why it could not.
-    fn copy_jump(&mut self, session: &mut CopySession, forward: bool, bounds: (u16, u16)) {
-        let Some(query) = session.search_query().map(str::to_owned) else {
+    ///
+    /// Searches the frozen rows, which are the rows the user is looking at. Reading the live
+    /// screen would land the cursor on a coordinate whose text is not the text that matched.
+    fn copy_jump(&mut self, mode: &mut CopyMode, forward: bool, bounds: (u16, u16)) {
+        let Some(query) = mode.session.search_query().map(str::to_owned) else {
             self.error = Some("no search yet · / starts one".into());
             return;
         };
-        let rows: Vec<String> = self
-            .screens
-            .get(&session.run_id)
-            .map(|screen| (0..bounds.0).map(|row| screen.visible_row(row)).collect())
-            .unwrap_or_default();
-        if session.jump_to_match(&find_matches(&rows, &query), forward, bounds) {
+        let rows: Vec<String> = (0..bounds.0)
+            .map(|row| mode.frozen.visible_row(row))
+            .collect();
+        if mode
+            .session
+            .jump_to_match(&find_matches(&rows, &query), forward, bounds)
+        {
             self.error = None;
         } else {
             self.error = Some(format!("no matches for {query:?}"));
@@ -2804,23 +2867,21 @@ impl Dashboard {
     ///
     /// The route is reported because OSC 52 is disabled by default in some terminals: a yank
     /// that silently reached nothing looks exactly like a yank that worked.
-    fn yank(&mut self, session: &CopySession) {
-        let screen = self.screens.get(&session.run_id);
-        let (text, subject) = match session.selection() {
+    fn yank(&mut self, mode: &CopyMode) {
+        // The frozen screen, so the clipboard gets the characters the highlight was over
+        // rather than whatever output has since scrolled through those cells.
+        let screen = &mode.frozen;
+        let (text, subject) = match mode.session.selection() {
             Some((from, to)) => {
-                let text = screen
-                    .map(|screen| screen.selection_text(from, to))
-                    .unwrap_or_default();
+                let text = screen.selection_text(from, to);
                 let count = text.chars().count();
                 (text, format!("{count} characters"))
             }
             None => {
-                let row = session.cursor().0;
+                let row = mode.session.cursor().0;
                 // Trailing blanks are grid padding, not content: nobody wants 60 spaces
                 // pasted after the path they just copied.
-                let text = screen
-                    .map(|screen| screen.visible_row(row).trim_end().to_owned())
-                    .unwrap_or_default();
+                let text = screen.visible_row(row).trim_end().to_owned();
                 let count = text.chars().count();
                 // 1-based for the same reason `copy_status` is, and it has to agree with it:
                 // seeing the same line called 0 in one place and 1 in another reads as a bug.
@@ -2863,16 +2924,13 @@ impl Dashboard {
     /// deliberately with a run of spaces. Auto-copy is only worth having if it cannot destroy
     /// something.
     fn copy_pointer_selection(&mut self) {
-        let Some(session) = self.copy.clone() else {
-            return;
-        };
-        let Some((from, to)) = session.selection() else {
-            return;
-        };
         let Some(text) = self
-            .screens
-            .get(&session.run_id)
-            .map(|screen| screen.selection_text(from, to))
+            .copy
+            .as_ref()
+            .and_then(|mode| {
+                let (from, to) = mode.session.selection()?;
+                Some(mode.frozen.selection_text(from, to))
+            })
             .filter(|text| !text.trim().is_empty())
         else {
             return;
@@ -2941,10 +2999,17 @@ impl Dashboard {
         let Some(drag) = self.pane_drag.clone() else {
             return;
         };
-        let Some((bounds, row_text)) = self
-            .screens
-            .get(&drag.run_id)
-            .map(|screen| (screen.size(), screen.visible_row(drag.origin.0)))
+        // Read the row from the frozen screen when this pane is already frozen. A second
+        // click inside an open selection must land on the characters the user can see, and
+        // the live screen may have scrolled several times since the mode opened.
+        let frozen_here = self.copy.as_ref().filter(|mode| mode.is_for(&drag.run_id));
+        let Some((bounds, row_text)) = frozen_here
+            .map(|mode| (mode.frozen.size(), mode.frozen.visible_row(drag.origin.0)))
+            .or_else(|| {
+                self.screens
+                    .get(&drag.run_id)
+                    .map(|screen| (screen.size(), screen.visible_row(drag.origin.0)))
+            })
         else {
             return;
         };
@@ -2953,23 +3018,43 @@ impl Dashboard {
         } else {
             word_bounds(&row_text, drag.origin.1)
         };
+        // Deliberately before anything is committed: a double click on blank padding selects
+        // nothing, and must therefore not freeze a pane or take the keyboard either.
         let Some((first, last)) = selection else {
             return;
         };
-        if let Some(existing) = self.copy.clone()
-            && existing.run_id != drag.run_id
-        {
-            self.leave_copy_mode(&existing);
+        if let Some(stale) = self.stale_copy_run(&drag.run_id) {
+            self.leave_copy_mode(&stale);
         }
         let mut session = CopySession::new(drag.run_id.clone(), (drag.origin.0, first));
         session.begin_selection();
         session.set_cursor((drag.origin.0, last), bounds);
-        self.copy = Some(session);
+        match self.copy.as_mut() {
+            // Already frozen on this pane: keep the freeze rather than re-taking it, or a
+            // double click inside a scrolled-back selection would snap the view to the tail.
+            Some(mode) => mode.session = session,
+            None => {
+                let Some(frozen) = self.screens.get(&drag.run_id).map(PaneScreen::snapshot) else {
+                    return;
+                };
+                self.copy = Some(CopyMode { session, frozen });
+            }
+        }
         self.copy_searching = false;
         self.error = None;
         if let Some(armed) = self.pane_drag.as_mut() {
             armed.selected = true;
         }
+    }
+
+    /// The run of an open copy session that is *not* `run_id`, if there is one. Dragging or
+    /// clicking in a different pane hands copy mode over, and the pane being left has to be
+    /// released rather than staying silently frozen.
+    fn stale_copy_run(&self, run_id: &str) -> Option<String> {
+        self.copy
+            .as_ref()
+            .filter(|mode| !mode.is_for(run_id))
+            .map(|mode| mode.session.run_id.clone())
     }
 
     /// Scrolls a pane, dragging any selection anchored in it along with the viewport.
@@ -2980,22 +3065,23 @@ impl Dashboard {
     /// actually went — `scroll_by` clamps at both ends, so the request is not the answer — and
     /// an anchor pushed off the screen ends the selection rather than clamping to an edge it
     /// no longer means.
+    /// While the pane is frozen the wheel moves the *frozen* viewport, because that is the
+    /// screen being painted; scrolling the live one would move nothing the user can see.
     fn scroll_pane(&mut self, run_id: &str, delta: i32) {
-        let Some(screen) = self.screens.get_mut(run_id) else {
-            return;
-        };
-        let before = screen.scroll_offset();
-        screen.scroll_by(delta);
-        let moved = scrolled(before, screen.scroll_offset());
-        let bounds = screen.size();
-        if moved == 0 {
+        if let Some(mode) = self.copy.as_mut().filter(|mode| mode.is_for(run_id)) {
+            let before = mode.frozen.scroll_offset();
+            mode.frozen.scroll_by(delta);
+            let moved = scrolled(before, mode.frozen.scroll_offset());
+            if moved == 0 {
+                return;
+            }
+            let bounds = mode.frozen.size();
+            mode.session.shift_anchor(moved, bounds);
+            mode.session.shift_cursor(moved, bounds);
             return;
         }
-        if let Some(session) = self.copy.as_mut()
-            && session.run_id == run_id
-        {
-            session.shift_anchor(moved, bounds);
-            session.shift_cursor(moved, bounds);
+        if let Some(screen) = self.screens.get_mut(run_id) {
+            screen.scroll_by(delta);
         }
     }
 
@@ -3005,37 +3091,62 @@ impl Dashboard {
     /// the cell the button went down on, whatever the cursor was doing beforehand, and
     /// re-applying it is cheaper than tracking whether this drag has already anchored.
     fn drag_selection(&mut self, drag: &PaneDrag, column: u16, row: u16) {
-        let Some(bounds) = self.screens.get(&drag.run_id).map(PaneScreen::size) else {
-            return;
-        };
-        if let Some(existing) = self.copy.clone()
-            && existing.run_id != drag.run_id
-        {
+        if let Some(stale) = self.stale_copy_run(&drag.run_id) {
             // Dragging in a different pane hands copy mode over; the pane being left goes
             // back to following live output rather than staying silently frozen.
-            self.leave_copy_mode(&existing);
+            self.leave_copy_mode(&stale);
         }
         if self.copy.is_none() {
-            self.copy = Some(CopySession::new(drag.run_id.clone(), drag.origin));
+            // The first drag of a gesture is what freezes the pane, so the pointer keeps
+            // pointing at the characters it was put on however much the pane is producing.
+            let Some(frozen) = self.screens.get(&drag.run_id).map(PaneScreen::snapshot) else {
+                return;
+            };
+            self.copy = Some(CopyMode::new(drag.run_id.clone(), drag.origin, frozen));
             self.copy_searching = false;
             self.error = None;
         }
-        let Some(session) = self.copy.as_mut() else {
+        let Some(mode) = self.copy.as_mut() else {
             return;
         };
-        session.set_cursor(drag.origin, bounds);
-        session.begin_selection();
-        session.set_cursor(clamp_cell(drag.inner, column, row), bounds);
+        let bounds = mode.frozen.size();
+        mode.session.set_cursor(drag.origin, bounds);
+        mode.session.begin_selection();
+        mode.session
+            .set_cursor(clamp_cell(drag.inner, column, row), bounds);
     }
 
     /// Leaves copy mode and returns the pane to the live tail, which is where the user was
     /// before they froze it.
-    fn leave_copy_mode(&mut self, session: &CopySession) {
-        if let Some(screen) = self.screens.get_mut(&session.run_id) {
+    ///
+    /// Dropping the frozen screen is the entire exit path. The live parser was never stopped,
+    /// so there is no backlog to replay and nothing to re-seed: the pane is already current
+    /// the moment the next frame renders from it again. `scroll_to_live` is here only for the
+    /// live viewport the *user* may have scrolled back before entering the mode.
+    fn leave_copy_mode(&mut self, run_id: &str) {
+        if let Some(screen) = self.screens.get_mut(run_id) {
             screen.scroll_to_live();
         }
         self.copy = None;
         self.copy_searching = false;
+    }
+
+    /// Ends a frozen selection whose pane has been replaced, and says why it went.
+    ///
+    /// A re-attach is a re-seed: the daemon sends one when a run is first seen and again
+    /// whenever the pane's *geometry* changes, and a lost revision drops the replica outright.
+    /// Either way the grid the selection was made against is gone. Painting the old snapshot
+    /// into a differently sized rect would show the user rows that are no longer anywhere, and
+    /// keeping coordinates chosen on an 80-column grid while the pane is now 120 would yank
+    /// text nobody pointed at. Ending the mode loses the selection, which is a real cost — but
+    /// it is visible, and it happens at the moment the user resized the thing they were
+    /// selecting from, so it is not mysterious.
+    fn end_copy_mode_for(&mut self, run_id: &str, reason: &str) {
+        if !self.copy.as_ref().is_some_and(|mode| mode.is_for(run_id)) {
+            return;
+        }
+        self.leave_copy_mode(run_id);
+        self.error = Some(format!("copy mode ended: {reason}"));
     }
 
     /// The focused pane's own key encoding. A program that sets DECCKM changes what bytes
@@ -4253,6 +4364,12 @@ mod tests {
             UiCommand::None
         );
         assert!(dashboard.prefix_pending());
+    }
+
+    /// The open selection, if any. Copy mode holds the session inside a `CopyMode` that also
+    /// owns the frozen screen, so tests reach through it rather than at a bare session.
+    fn copy_selection(dashboard: &Dashboard) -> Option<((u16, u16), (u16, u16))> {
+        dashboard.copy.as_ref()?.session.selection()
     }
 
     fn command(dashboard: &mut Dashboard, code: KeyCode) -> UiCommand {
@@ -6797,6 +6914,287 @@ mod tests {
         assert!(!dashboard.copy_mode(), "Esc always leaves copy mode");
     }
 
+    /// The defect copy mode was named for. `apply_event` keeps feeding every pushed
+    /// `PaneDelta` into the parser the pane renders from, so a pane still producing output
+    /// scrolled the highlighted text out from under the selection while it was being made:
+    /// the mode called itself frozen, the doc comments said "frozen", and the pane moved.
+    ///
+    /// The fix is a clone of the screen rather than a buffer of the deltas. `vt100` is a
+    /// stateful machine, so a chunk dropped when a buffer filled would desynchronise
+    /// escape-sequence parsing rather than lose whole lines, and the user would leave copy
+    /// mode into a corrupted screen — which is why the last two assertions here check that
+    /// the live pane comes back intact and current, with nothing to flush.
+    #[test]
+    fn copy_mode_holds_the_pane_still_while_output_keeps_arriving_and_releases_it_on_exit() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"frozen text\r\n"));
+        let opened = render_terminal(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        let body = |terminal: &Terminal<TestBackend>| {
+            (area.y + 1..area.bottom() - 1)
+                .map(|row| row_text(terminal, area, row))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            body(&opened).concat().contains("frozen text"),
+            "{:?}",
+            body(&opened)
+        );
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        for _ in 0..10 {
+            dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        }
+        let frozen = body(&render_terminal(&mut dashboard, 100, 30));
+
+        // Far more than the pane's 24 rows, so nothing that was on screen at the freeze can
+        // still be on a live screen afterwards.
+        let mut written = Vec::new();
+        for line in 1..=60 {
+            written.extend_from_slice(format!("live line {line}\r\n").as_bytes());
+        }
+        dashboard.apply_event(Event::PaneDelta {
+            run_id: "run_1".into(),
+            revision: 2,
+            bytes: STANDARD.encode(&written),
+        });
+
+        let still = body(&render_terminal(&mut dashboard, 100, 30));
+        assert_eq!(
+            still, frozen,
+            "a frozen pane must paint the same rows it painted before the delta arrived"
+        );
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(
+            dashboard.last_copied.as_deref(),
+            Some("frozen text"),
+            "the yank must return the text the selection was placed on, not whatever \
+             output moved underneath it"
+        );
+
+        // The live parser never stopped, so there is nothing to flush: dropping the clone is
+        // the whole exit path and the pane is already current.
+        assert!(!dashboard.copy_mode(), "yanking leaves copy mode");
+        let live = body(&render_terminal(&mut dashboard, 100, 30)).concat();
+        for line in 40..=60 {
+            assert!(
+                live.contains(&format!("live line {line}")),
+                "the live pane must come back current and uncorrupted, missing \
+                 {line}: {live:?}"
+            );
+        }
+        assert!(
+            !live.contains("frozen text"),
+            "the frozen rows scrolled into history while the mode was open: {live:?}"
+        );
+    }
+
+    /// The clone carries the scrollback with it (`vt100::Screen` owns both its grids), which
+    /// is the whole reason a freeze can be a copy rather than a pause: history stays reachable
+    /// from inside the mode, and reaching it cannot be undone by output still arriving.
+    #[test]
+    fn scrolling_inside_a_frozen_pane_reaches_the_history_the_clone_carried_with_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        // Through a delta rather than the attach snapshot: a snapshot carries the screen only,
+        // so a replica seeded from one has no history to be cloned along with it.
+        let mut written = Vec::new();
+        for line in 1..=60 {
+            written.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        dashboard.apply_event(Event::PaneDelta {
+            run_id: "run_1".into(),
+            revision: 2,
+            bytes: STANDARD.encode(&written),
+        });
+        render_to_string(&mut dashboard, 100, 30);
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        // `g` parks the cursor on the top row, so every one of these walks a row into history.
+        for _ in 0..20 {
+            dashboard.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            dashboard
+                .copy
+                .as_ref()
+                .expect("still frozen")
+                .frozen
+                .scroll_offset(),
+            20,
+            "`k` past the top row must move the frozen viewport, which is the one on screen"
+        );
+        assert_eq!(
+            dashboard.screens["run_1"].scroll_offset(),
+            0,
+            "the live replica keeps following its own output while the mode reads history"
+        );
+
+        dashboard.apply_event(Event::PaneDelta {
+            run_id: "run_1".into(),
+            revision: 3,
+            bytes: STANDARD.encode(b"line 61\r\n"),
+        });
+        let text = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            text.contains("line 18"),
+            "twenty rows back from the tail of sixty is where the viewport should be: {text:?}"
+        );
+        assert!(
+            !text.contains("line 61"),
+            "output arriving behind a scrolled-back freeze must not move it: {text:?}"
+        );
+    }
+
+    /// A re-attach is the daemon saying the pane's *geometry* changed, so every coordinate the
+    /// session holds was chosen against a grid that no longer exists. Painting the old
+    /// snapshot into the new rect would show rows that are nowhere, and keeping the
+    /// coordinates would yank text nobody pointed at, so the mode ends and says so.
+    #[test]
+    fn a_pane_re_seeded_while_it_is_frozen_ends_copy_mode_rather_than_selecting_a_grid_that_is_gone()
+     {
+        for reseed in [
+            Event::PaneAttached {
+                run_id: "run_1".into(),
+                revision: 2,
+                rows: 12,
+                cols: 20,
+                scrollback_rows: 2000,
+                screen: String::new(),
+            },
+            // The other re-seed trigger: a revision gap means this client missed bytes, so
+            // the replica is dropped and rebuilt from a fresh snapshot.
+            Event::PaneDelta {
+                run_id: "run_1".into(),
+                revision: 9,
+                bytes: STANDARD.encode(b"unreachable"),
+            },
+        ] {
+            let mut dashboard = bound_dashboard();
+            dashboard.apply_event(attach_event("run_1", b"before the resize\r\n"));
+            render_to_string(&mut dashboard, 100, 30);
+            dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+            dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+            dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+            assert!(dashboard.copy_mode());
+
+            dashboard.apply_event(reseed);
+            assert!(
+                !dashboard.copy_mode(),
+                "a selection over a grid that has been replaced cannot be honoured"
+            );
+            let notice = dashboard.error.clone().unwrap_or_default();
+            assert!(
+                notice.starts_with("copy mode ended"),
+                "a mode that swallows every key must say when it stops, got {notice:?}"
+            );
+        }
+    }
+
+    /// `detach_screens` drops every replica so a re-established stream can re-attach them. The
+    /// frozen clone would happily outlive its replica, but a selection over rows the user is
+    /// about to stop being shown is a selection of nothing they can see.
+    #[test]
+    fn re_establishing_the_event_stream_ends_a_frozen_selection_with_the_screens_it_came_from() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"before the reconnect\r\n"));
+        render_to_string(&mut dashboard, 100, 30);
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert!(dashboard.copy_mode());
+        dashboard.detach_screens();
+        assert!(!dashboard.copy_mode(), "the pane it froze is gone");
+        assert!(
+            dashboard
+                .error
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("copy mode ended")),
+            "{:?}",
+            dashboard.error
+        );
+    }
+
+    /// The snapshot holds no reference back to the parser it was cloned from, so a run that
+    /// dies under an open selection leaves the mode entirely usable: the pane keeps painting
+    /// the rows the user froze, and the yank still reaches them. The alternative — blanking
+    /// the pane the instant the process went — would destroy the last thing it printed, which
+    /// is exactly what somebody in copy mode over a dying run is trying to keep.
+    #[test]
+    fn a_run_that_dies_while_its_pane_is_frozen_still_paints_yanks_and_exits() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"last words\r\n"));
+        render_to_string(&mut dashboard, 100, 30);
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        for _ in 0..9 {
+            dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        }
+
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("a")
+            .unwrap()
+            .runtime = PaneRuntime::Exited;
+        dashboard.set_runs(vec![]);
+        let text = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            text.contains("last words"),
+            "the frozen rows outlive the run that printed them: {text:?}"
+        );
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(dashboard.last_copied.as_deref(), Some("last words"));
+        assert!(!dashboard.copy_mode(), "and the mode still exits");
+    }
+
+    /// A pane entering the alternate screen is just more bytes into a parser copy mode is no
+    /// longer reading from, so the freeze holds through it — and, because the parser was never
+    /// interrupted, the full-screen program is fully painted the moment the mode ends. This is
+    /// the case a buffer-and-flush design handles worst: `\x1b[?1049h` is precisely the sort of
+    /// escape sequence a dropped chunk would cut in half.
+    #[test]
+    fn a_pane_entering_the_alternate_screen_while_frozen_neither_moves_it_nor_corrupts_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"ordinary output\r\n"));
+        render_to_string(&mut dashboard, 100, 30);
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        for _ in 0..14 {
+            dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        }
+
+        dashboard.apply_event(Event::PaneDelta {
+            run_id: "run_1".into(),
+            revision: 2,
+            bytes: STANDARD.encode(b"\x1b[?1049h\x1b[2J\x1b[HFULL SCREEN PROGRAM"),
+        });
+        let frozen = render_to_string(&mut dashboard, 100, 30);
+        assert!(frozen.contains("ordinary output"), "{frozen:?}");
+        assert!(
+            !frozen.contains("FULL SCREEN PROGRAM"),
+            "the alternate screen must not reach a frozen pane: {frozen:?}"
+        );
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(dashboard.last_copied.as_deref(), Some("ordinary output"));
+        let live = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            live.contains("FULL SCREEN PROGRAM"),
+            "the live parser consumed the switch as it arrived, so there is nothing to \
+             replay on exit: {live:?}"
+        );
+    }
+
     #[test]
     fn copy_mode_keys_never_reach_the_pane() {
         let mut dashboard = bound_dashboard();
@@ -7006,10 +7404,7 @@ mod tests {
         for _ in 0..3 {
             dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
         }
-        assert_eq!(
-            dashboard.copy.as_ref().and_then(CopySession::selection),
-            Some(((0, 0), (0, 3)))
-        );
+        assert_eq!(copy_selection(&dashboard), Some(((0, 0), (0, 3))));
 
         let terminal = render_terminal(&mut dashboard, 100, 30);
         // The cursor cell is the fourth of the run and is painted as the cursor rather than
@@ -7080,11 +7475,7 @@ mod tests {
             );
 
             // Read before the yank: `y` leaves copy mode, taking the session with it.
-            let (from, to) = dashboard
-                .copy
-                .as_ref()
-                .and_then(CopySession::selection)
-                .expect("the selection is anchored");
+            let (from, to) = copy_selection(&dashboard).expect("the selection is anchored");
             dashboard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
             let notice = dashboard.error.clone().expect("a yank reports itself");
             assert!(
@@ -7168,11 +7559,7 @@ mod tests {
             "a drag inside a pane enters copy mode"
         );
         assert_eq!(
-            dashboard
-                .copy
-                .as_ref()
-                .and_then(CopySession::selection)
-                .expect("the drag anchored a selection"),
+            copy_selection(&dashboard).expect("the drag anchored a selection"),
             ((0, 1), (0, 7)),
             "the anchor is the press cell and the cursor follows the pointer"
         );
@@ -7274,21 +7661,13 @@ mod tests {
         dashboard.mouse(press);
         dashboard.mouse(press);
         assert_eq!(
-            dashboard
-                .copy
-                .as_ref()
-                .and_then(CopySession::selection)
-                .expect("the double click selected a word"),
+            copy_selection(&dashboard).expect("the double click selected a word"),
             ((0, 4), (0, 17)),
             "a path with a line number is one word, not five"
         );
         dashboard.mouse(press);
         assert_eq!(
-            dashboard
-                .copy
-                .as_ref()
-                .and_then(CopySession::selection)
-                .expect("the triple click selected a line"),
+            copy_selection(&dashboard).expect("the triple click selected a line"),
             ((0, 0), (0, 21)),
             "the line stops at its last character, not at the padded width of the grid"
         );
@@ -7450,10 +7829,12 @@ mod tests {
             row: area.y + 2,
             modifiers: KeyModifiers::NONE,
         });
+        // Read through the frozen screen, because that is the one the pane is painting and
+        // the one the wheel now moves: the live parser is left following its own output.
         let selected = |dashboard: &Dashboard| {
-            let session = dashboard.copy.as_ref().expect("a session");
-            let (from, to) = session.selection().expect("an anchored selection");
-            dashboard.screens["run_1"].selection_text(from, to)
+            let mode = dashboard.copy.as_ref().expect("a session");
+            let (from, to) = mode.session.selection().expect("an anchored selection");
+            mode.frozen.selection_text(from, to)
         };
         let before = selected(&dashboard);
         assert!(!before.trim().is_empty(), "the drag selected something");
@@ -7465,7 +7846,12 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_ne!(
-            dashboard.screens["run_1"].scroll_offset(),
+            dashboard
+                .copy
+                .as_ref()
+                .expect("still frozen")
+                .frozen
+                .scroll_offset(),
             0,
             "the wheel moved the viewport"
         );

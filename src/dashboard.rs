@@ -44,6 +44,11 @@ const MIN_PANE_HEIGHT: u16 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Request(Box<Request>),
+    /// Several requests that only mean anything together, sent in order. Closing a workspace is
+    /// the one command Dock has that cannot be expressed as a single `WorkspaceRequest`: the
+    /// daemon drops a workspace when its last pane goes, so the workspace is closed by closing
+    /// every pane in it, and a half-sent batch would leave a workspace nobody asked to keep.
+    Requests(Vec<Request>),
     /// Raw bytes bound for the focused pane's PTY. Kept apart from `Request` because the render
     /// loop must send it without waiting for a reply: the echo comes back on the event stream,
     /// so blocking here would put a daemon round trip in front of every keystroke's paint.
@@ -139,9 +144,15 @@ pub struct Dashboard {
     picker_row_areas: Vec<Rect>,
     /// Where each workspace's tab landed, so the strip is clickable like every other chrome.
     tab_areas: Vec<(String, Rect)>,
-    /// The `+` at the end of the tab strip, and the rename affordance on the active tab.
+    /// The `+` at the end of the tab strip, and the rename and close affordances on the
+    /// active tab.
     new_workspace_area: Option<Rect>,
     rename_workspace_area: Option<Rect>,
+    close_workspace_area: Option<Rect>,
+    /// The workspace whose close control has been clicked once and is waiting to be clicked
+    /// again. Held as an id rather than a flag so a refresh that reorders or drops workspaces
+    /// cannot turn a primed confirmation into consent to destroy a different one.
+    close_workspace_armed: Option<String>,
     /// Split and close controls on the focused pane's own border.
     pane_control_areas: Vec<(PaneControl, Rect)>,
     /// The sidebar's clickable menu of what this dashboard can do.
@@ -156,6 +167,7 @@ pub struct Dashboard {
 pub enum PaneControl {
     SplitHorizontal,
     SplitVertical,
+    Rename,
     Close,
 }
 
@@ -419,6 +431,7 @@ impl Dashboard {
         self.tab_areas.clear();
         self.new_workspace_area = None;
         self.rename_workspace_area = None;
+        self.close_workspace_area = None;
         self.pane_control_areas.clear();
         let area = frame.area();
         // Painted first so every widget that leaves cells untouched still sits on the theme's
@@ -654,6 +667,30 @@ impl Dashboard {
                 frame.render_widget(Paragraph::new(Line::styled(" ✎ ", style)), pencil);
                 self.rename_workspace_area = Some(pencil);
                 x = x.saturating_add(3);
+            }
+            // Close rides beside rename, and asks before it acts. Closing a workspace takes
+            // every pane in it and every process still running in them, which is far too much
+            // to hang off one stray click on a three-cell target; the armed tab says so in
+            // words rather than opening a ninth modal overlay.
+            if active {
+                let armed =
+                    self.close_workspace_armed.as_deref() == Some(workspace.workspace_id.as_str());
+                let label = if armed { " × confirm? " } else { " × " };
+                let width = label.chars().count() as u16;
+                if x.saturating_add(width) <= area.right() {
+                    let close = Rect::new(x, area.y, width, 1);
+                    let style = if armed {
+                        Style::default()
+                            .bg(self.theme.blocked)
+                            .fg(self.theme.surface)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        style
+                    };
+                    frame.render_widget(Paragraph::new(Line::styled(label, style)), close);
+                    self.close_workspace_area = Some(close);
+                    x = x.saturating_add(width);
+                }
             }
             x = x.saturating_add(1);
         }
@@ -1012,15 +1049,19 @@ impl Dashboard {
                 // window's controls live. Rendered as a right-aligned title so ratatui lays them
                 // out rather than being painted over the border afterwards, which is how they
                 // first landed on top of the exited pane's recovery hint.
-                // An exited pane offers only close: splitting a dead pane is a strange thing to
-                // ask for, and its title is carrying the key that brings it back, so the controls
-                // take as little of that row as they can.
-                const LIVE_CONTROLS: [(PaneControl, &str); 3] = [
+                // An exited pane cannot be split: asking a dead pane to divide itself is a
+                // strange thing to offer, and its title is carrying the key that brings it back,
+                // so the controls take as little of that row as they can. Rename survives the
+                // exit because naming a pane is how a person keeps track of what it was for,
+                // which matters most for the one that stopped.
+                const LIVE_CONTROLS: [(PaneControl, &str); 4] = [
                     (PaneControl::SplitHorizontal, " ⇋ "),
                     (PaneControl::SplitVertical, " ⇵ "),
+                    (PaneControl::Rename, " ✎ "),
                     (PaneControl::Close, " × "),
                 ];
-                const EXITED_CONTROLS: [(PaneControl, &str); 1] = [(PaneControl::Close, " × ")];
+                const EXITED_CONTROLS: [(PaneControl, &str); 2] =
+                    [(PaneControl::Rename, " ✎ "), (PaneControl::Close, " × ")];
                 let controls: &[(PaneControl, &str)] = if exited {
                     &EXITED_CONTROLS
                 } else {
@@ -1263,14 +1304,7 @@ impl Dashboard {
     }
 
     fn render_help(&self, frame: &mut Frame, area: Rect) {
-        let width = area.width.min(68);
-        let height = area.height.min(18);
-        let popup = Rect::new(
-            area.x + (area.width - width) / 2,
-            area.y + (area.height - height) / 2,
-            width,
-            height,
-        );
+        let width = area.width.min(72);
         let heading = Style::default()
             .fg(self.theme.accent)
             .add_modifier(Modifier::BOLD);
@@ -1290,6 +1324,11 @@ impl Dashboard {
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
+            Line::styled("POINTER", heading),
+            Line::from("Tab strip: click a tab to switch   ✎ rename   × close (twice)"),
+            Line::from("+ at the end of the strip makes a workspace"),
+            Line::from("Focused pane's lower border: ⇋ ⇵ split   ✎ rename   × close"),
+            Line::from("Drag a divider to resize   drag inside a pane to select text"),
             Line::styled("FORMS AND PICKERS", heading),
             Line::from("type to filter/edit   ↑/↓ or j/k select   Enter review/confirm"),
             Line::from("Esc cancels a form rather than reaching the pane while one is open."),
@@ -1301,6 +1340,21 @@ impl Dashboard {
             }),
             Line::from("Esc or ? closes help"),
         ];
+        // Sized to what it says. This list grows every time a control is published, and a fixed
+        // height would keep the newest lines — the ones nobody knows about yet — off the bottom
+        // of the one screen whose whole job is to publish them.
+        let inner_width = usize::from(width.saturating_sub(2)).max(1);
+        let rows: usize = lines
+            .iter()
+            .map(|line| line.width().div_ceil(inner_width).max(1))
+            .sum();
+        let height = area.height.min(rows as u16 + 2);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: true })
@@ -1383,6 +1437,13 @@ impl Dashboard {
         // PTY as ordinary input.
         if self.copy.is_some() {
             return self.copy_key(key);
+        }
+        // Esc answers the armed workspace close before it reaches the pane. The confirmation is
+        // a question the dashboard put on screen, and the key that dismisses every other thing
+        // Dock asks has to dismiss this one too rather than leaving it primed.
+        if self.close_workspace_armed.is_some() && key.code == KeyCode::Esc {
+            self.disarm_workspace_close();
+            return UiCommand::None;
         }
         let encoding = self.encoding_for_focused_pane();
         match self.keymap.handle(key, encoding) {
@@ -2274,6 +2335,7 @@ impl Dashboard {
             return UiCommand::None;
         }
         self.workspace_index = index;
+        self.disarm_workspace_close();
         self.error = None;
         UiCommand::None
     }
@@ -2343,6 +2405,7 @@ impl Dashboard {
                 {
                     Some(index) => {
                         self.workspace_index = index;
+                        self.disarm_workspace_close();
                         self.error = None;
                     }
                     None => self.error = Some("that workspace is gone".into()),
@@ -2419,6 +2482,7 @@ impl Dashboard {
                 .saturating_add(usize::from(delta.unsigned_abs()))
                 .min(last)
         };
+        self.disarm_workspace_close();
         self.error = None;
         UiCommand::None
     }
@@ -3143,6 +3207,47 @@ impl Dashboard {
         })))
     }
 
+    /// Closes the visible workspace, on the second click rather than the first.
+    ///
+    /// The daemon has no "close workspace" operation and does not need one: it drops a workspace
+    /// once its last pane is gone, so this closes every pane and lets that rule do the work.
+    /// Nothing is repainted optimistically, unlike rename and split — the pane close this is
+    /// built from does not either, and inventing a local guess about which panes survived a
+    /// batch the daemon has not answered yet is exactly the disagreement `refresh` exists to
+    /// prevent.
+    fn close_workspace(&mut self) -> UiCommand {
+        let Some(workspace) = self.workspace() else {
+            self.error = Some("close unavailable: create a workspace first".into());
+            return UiCommand::None;
+        };
+        let workspace_id = workspace.workspace_id.clone();
+        if self.close_workspace_armed.as_deref() != Some(workspace_id.as_str()) {
+            self.close_workspace_armed = Some(workspace_id);
+            self.error = None;
+            return UiCommand::None;
+        }
+        let requests = workspace
+            .panes
+            .keys()
+            .map(|pane_id| {
+                Request::Workspace(WorkspaceRequest::Close {
+                    workspace_id: workspace_id.clone(),
+                    pane_id: pane_id.clone(),
+                })
+            })
+            .collect();
+        self.close_workspace_armed = None;
+        self.error = None;
+        UiCommand::Requests(requests)
+    }
+
+    /// Withdraws a pending workspace close. Arming is a question about the workspace on screen,
+    /// so anything that changes which workspace that is, or that answers with something other
+    /// than a second click on the same control, has to take the question back.
+    fn disarm_workspace_close(&mut self) {
+        self.close_workspace_armed = None;
+    }
+
     fn rename_key(&mut self, key: KeyEvent) -> UiCommand {
         match key.code {
             KeyCode::Esc => {
@@ -3304,6 +3409,16 @@ impl Dashboard {
                     return self.run_command(PaneCommand::NewWorkspace);
                 }
                 if self
+                    .close_workspace_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    return self.close_workspace();
+                }
+                // Every other press is an answer of "no" to a pending workspace close. A primed
+                // destructive control that survives the user going off to do something else is
+                // a trap: the click that arms it and the click that fires it must be adjacent.
+                self.disarm_workspace_close();
+                if self
                     .rename_workspace_area
                     .is_some_and(|area| contains(area, event.column, event.row))
                 {
@@ -3328,6 +3443,7 @@ impl Dashboard {
                     return self.run_command(match control {
                         PaneControl::SplitHorizontal => PaneCommand::Split(SplitAxis::Horizontal),
                         PaneControl::SplitVertical => PaneCommand::Split(SplitAxis::Vertical),
+                        PaneControl::Rename => PaneCommand::Rename,
                         PaneControl::Close => PaneCommand::Close,
                     });
                 }
@@ -5491,6 +5607,7 @@ mod tests {
             vec![
                 PaneControl::SplitHorizontal,
                 PaneControl::SplitVertical,
+                PaneControl::Rename,
                 PaneControl::Close
             ]
         );
@@ -5521,16 +5638,158 @@ mod tests {
             .runtime = PaneRuntime::Exited;
         let frame = render_to_string(&mut dashboard, 140, 24);
         assert!(frame.contains("Ctrl+B R restarts"), "{frame:?}");
-        // An exited pane offers close only: splitting a dead pane makes no sense, and the row it
-        // would have taken belongs to the hint that brings the pane back.
+        // An exited pane offers no split: dividing a dead pane makes no sense, and the columns
+        // it would have taken belong to the hint that brings the pane back. Rename stays,
+        // because what a stopped pane was for is exactly what a person needs recorded.
         assert_eq!(
             dashboard
                 .pane_control_areas
                 .iter()
                 .map(|(control, _)| *control)
                 .collect::<Vec<_>>(),
-            vec![PaneControl::Close]
+            vec![PaneControl::Rename, PaneControl::Close]
         );
+    }
+
+    #[test]
+    fn the_focused_pane_can_be_renamed_from_its_own_border() {
+        let mut dashboard = bound_dashboard();
+        let frame = render_to_string(&mut dashboard, 110, 30);
+        // Rename sits between the splits and close, so the destructive control keeps the far
+        // corner it has always had and no existing muscle memory now lands on a different verb.
+        assert!(frame.contains("⇋  ⇵  ✎  ×"), "{frame:?}");
+        let (_, pencil) = dashboard
+            .pane_control_areas
+            .iter()
+            .find(|(control, _)| *control == PaneControl::Rename)
+            .copied()
+            .expect("a rename control");
+        assert_eq!(click(&mut dashboard, pencil), UiCommand::None);
+        // The pane, not the workspace: the tab strip's pencil is the one that renames a
+        // workspace, and the two forms are a click apart on screen.
+        assert_eq!(
+            dashboard.rename_form.as_ref().map(|(target, _)| *target),
+            Some(RenameTarget::Pane)
+        );
+        assert!(render_to_string(&mut dashboard, 110, 30).contains("Pane name: editor"));
+    }
+
+    #[test]
+    fn closing_a_workspace_from_its_tab_asks_first_and_then_closes_every_pane() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 110, 30);
+        let close = dashboard
+            .close_workspace_area
+            .expect("the active tab carries a close affordance");
+        // One click on a three-cell target is not consent to end two panes and whatever is
+        // running in them, so the first click only asks.
+        assert_eq!(click(&mut dashboard, close), UiCommand::None);
+        let frame = render_to_string(&mut dashboard, 110, 30);
+        assert!(frame.contains("× confirm?"), "{frame:?}");
+
+        let close = dashboard.close_workspace_area.expect("the armed control");
+        let UiCommand::Requests(requests) = click(&mut dashboard, close) else {
+            panic!("the second click must close the workspace");
+        };
+        // The daemon has no close-workspace operation and needs none: it drops a workspace with
+        // its last pane, so every pane is named rather than the protocol being widened.
+        let closed: Vec<(String, String)> = requests
+            .iter()
+            .map(|request| match request {
+                Request::Workspace(WorkspaceRequest::Close {
+                    workspace_id,
+                    pane_id,
+                }) => (workspace_id.clone(), pane_id.clone()),
+                other => panic!("expected a pane close, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            closed,
+            vec![
+                ("w".to_owned(), "a".to_owned()),
+                ("w".to_owned(), "b".to_owned())
+            ]
+        );
+        assert_eq!(dashboard.close_workspace_armed, None);
+        // Nothing is removed locally: the daemon's reply and the refresh behind it decide what
+        // survived, and a client that guessed would disagree with it for one frame.
+        assert_eq!(dashboard.layout.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn an_armed_workspace_close_is_given_up_by_any_other_click() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 110, 30);
+        let close = dashboard.close_workspace_area.expect("close affordance");
+        click(&mut dashboard, close);
+        assert_eq!(dashboard.close_workspace_armed.as_deref(), Some("w"));
+
+        let pencil = dashboard.rename_workspace_area.expect("rename affordance");
+        click(&mut dashboard, pencil);
+        // The neighbouring control disarms like any other click: the two presses that destroy a
+        // workspace have to be adjacent, or a stale arming turns an ordinary click into a close.
+        assert_eq!(dashboard.close_workspace_armed, None);
+        let frame = render_to_string(&mut dashboard, 110, 30);
+        assert!(!frame.contains("confirm?"), "{frame:?}");
+    }
+
+    #[test]
+    fn an_armed_workspace_close_is_given_up_by_escape_and_by_leaving_the_workspace() {
+        let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 110, 30);
+        let close = dashboard.close_workspace_area.expect("close affordance");
+        click(&mut dashboard, close);
+        // Esc is kept from the pane only while the question is on screen; it is the key that
+        // dismisses everything else Dock asks, so it has to dismiss this too.
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert_eq!(dashboard.close_workspace_armed, None);
+
+        render_to_string(&mut dashboard, 110, 30);
+        let close = dashboard.close_workspace_area.expect("close affordance");
+        click(&mut dashboard, close);
+        command(&mut dashboard, KeyCode::Char('.'));
+        // The confirmation was asked about the workspace that was on screen, and the tab it was
+        // drawn on is no longer the active one.
+        assert_eq!(dashboard.close_workspace_armed, None);
+        assert_eq!(dashboard.workspace_index, 1);
+    }
+
+    #[test]
+    fn once_escape_has_no_armed_close_to_answer_it_goes_back_to_the_pane() {
+        let mut dashboard = bound_dashboard();
+        dashboard.runs.push(snapshot());
+        // Esc belongs to the focused pane; keeping it permanently is the failure this dashboard
+        // deleted a whole input mode over, so the confirmation borrows it and gives it straight
+        // back.
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            UiCommand::PaneInput(vec![0x1b])
+        );
+    }
+
+    #[test]
+    fn help_publishes_the_pointer_controls_and_is_sized_to_fit_all_of_them() {
+        let mut dashboard = dashboard();
+        command(&mut dashboard, KeyCode::Char('?'));
+        let text = render_to_string(&mut dashboard, 100, 40);
+        for published in [
+            "POINTER",
+            "✎ rename",
+            "× close (twice)",
+            "⇋ ⇵ split",
+            "Drag a divider to resize",
+        ] {
+            assert!(
+                text.contains(published),
+                "missing pointer control: {published}"
+            );
+        }
+        // The overlay is sized to its own content, so the newest lines — the ones nobody has
+        // read yet — are not the ones silently cut off the bottom.
+        assert!(text.contains("Esc or ? closes help"), "{text:?}");
     }
 
     #[test]

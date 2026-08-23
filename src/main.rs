@@ -595,6 +595,24 @@ fn run_dashboard(
                         .map_err(|e| e.to_string())?;
                 }
             }
+            UiCommand::Requests(requests) => {
+                // Painted before the batch for the same reason a single request is, then sent in
+                // order. The loop keeps going after a refusal rather than stopping at the first
+                // one: these are the panes of one workspace, and abandoning the rest would leave
+                // a workspace that is neither closed nor whole. `refresh` below is what the
+                // dashboard actually believes afterwards.
+                terminal
+                    .draw(|frame| dashboard.render(frame))
+                    .map_err(|e| e.to_string())?;
+                let mut failure = None;
+                for request in &requests {
+                    if let Response::Error { message, .. } = client.request(request)? {
+                        failure = Some(message);
+                    }
+                }
+                dashboard.error = failure;
+                refresh(client, &mut dashboard)?;
+            }
             UiCommand::PaneInput(bytes) => {
                 let Some(workspace) = dashboard.workspace() else {
                     continue;

@@ -2086,9 +2086,8 @@ impl RuntimeRegistry {
                 // tail cannot contain the very chrome that says the agent is waiting — every
                 // pattern matched against one was unreachable.
                 let state = match agent {
-                    Some(kind) => {
-                        runtime.with_screen(|screen| classify_screen(kind, &screen.visible_text()))
-                    }
+                    Some(kind) => runtime
+                        .with_screen(|screen| classify_screen(kind, &screen.classifiable_text())),
                     None => AgentState::Idle,
                 };
                 cached.insert(snapshot.run_id.clone(), (key, agent, state));

@@ -104,6 +104,20 @@ impl VtTerminal {
     /// highlighted option, so its instructions ("enter to select", "esc to cancel") are *below*
     /// the cursor and a tail can never contain them. Anything classifying a TUI agent has to read
     /// the whole screen or it is reading a haystack the needle cannot be in.
+    /// The screen with the terminal title in front of it, for classification.
+    ///
+    /// The title is evidence in its own right: agents set it to say what they are doing, and it
+    /// survives a screen that has scrolled the interesting part away. It leads rather than trails
+    /// so a rule can anchor on the first line when it means the title specifically, and it is
+    /// omitted entirely when unset rather than leaving a blank line that patterns would have to
+    /// tolerate.
+    pub fn classifiable_text(&self) -> String {
+        match self.title() {
+            Some(title) if !title.trim().is_empty() => format!("{title}\n{}", self.visible_text()),
+            _ => self.visible_text(),
+        }
+    }
+
     pub fn visible_text(&self) -> String {
         let (rows, width) = self.size();
         self.parser.screen().contents_between(0, 0, rows, width)
@@ -247,6 +261,26 @@ mod tests {
         let tail = term.text_tail(3);
         assert!(tail.contains("line39"));
         assert!(!tail.contains("line36"));
+    }
+
+    #[test]
+    fn the_title_leads_the_screen_so_a_rule_can_match_either() {
+        let mut term = VtTerminal::new(24, 80, 100);
+        term.feed(b"\x1b]2;claude - waiting for input\x07");
+        term.feed(b"some ordinary output\r\n");
+        let text = term.classifiable_text();
+        // The title is evidence in its own right: an agent sets it to say what it is doing, and
+        // it survives a screen that has scrolled the interesting part away.
+        assert!(text.starts_with("claude - waiting for input\n"), "{text:?}");
+        assert!(text.contains("some ordinary output"), "{text:?}");
+    }
+
+    #[test]
+    fn a_pane_with_no_title_contributes_no_blank_line_to_match_against() {
+        let mut term = VtTerminal::new(24, 80, 100);
+        term.feed(b"just output\r\n");
+        // A leading empty line would be something every rule had to tolerate for no reason.
+        assert_eq!(term.classifiable_text(), term.visible_text());
     }
 
     #[test]

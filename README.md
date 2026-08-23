@@ -167,6 +167,11 @@ state is sticky: it holds until the agent reports something else, because
 "finished" stays true until the next turn begins. Merging is per event and
 repeatable — your own hooks on those events are left alone.
 
+Dock recognises **20 agents** by binary name: claude, codex, amp, copilot,
+cursor, droid, kimi, opencode, hermes, pi, gemini, qwen, kiro, antigravity,
+vibe, omp, aider, devin, kilo and qoder. Recognition is what puts an agent in
+the roster; the rules that give it a *state* are per-agent and yours to edit.
+
 ### When the state is wrong, fix it yourself
 
 Detection rules are files, not code. Ask what is in force and why:

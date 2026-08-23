@@ -27,6 +27,9 @@ pub enum AgentKind {
     Vibe,
     Omp,
     Aider,
+    Devin,
+    Kilo,
+    Qoder,
 }
 
 impl AgentKind {
@@ -49,6 +52,12 @@ impl AgentKind {
             "vibe" => Self::Vibe,
             "omp" => Self::Omp,
             "aider" => Self::Aider,
+            // Binary names read from each tool's own install instructions. Qoder is listed both
+            // ways in the wild; an alias that matches nothing costs nothing, while a missing one
+            // means the agent is simply never seen.
+            "devin" => Self::Devin,
+            "kilo" => Self::Kilo,
+            "qoder" | "qodercli" => Self::Qoder,
             _ => return None,
         })
     }
@@ -72,6 +81,9 @@ impl AgentKind {
             Self::Vibe => "vibe",
             Self::Omp => "omp",
             Self::Aider => "aider",
+            Self::Devin => "devin",
+            Self::Kilo => "kilo",
+            Self::Qoder => "qoder",
         }
     }
 }
@@ -124,6 +136,35 @@ impl AgentState {
 #[cfg(test)]
 mod tests {
     use crate::terminal::VtTerminal;
+
+    #[test]
+    fn every_agent_herdr_lists_is_recognised_by_its_own_binary_name() {
+        // Breadth is the whole point of a multiplexer for agents: one it cannot name is one it
+        // cannot show a state for, however good the rules behind that state are.
+        for (executable, expected) in [
+            ("claude", AgentKind::Claude),
+            ("codex", AgentKind::Codex),
+            ("copilot", AgentKind::Copilot),
+            ("cursor-agent", AgentKind::Cursor),
+            ("droid", AgentKind::Droid),
+            ("kimi", AgentKind::Kimi),
+            ("opencode", AgentKind::OpenCode),
+            ("hermes", AgentKind::Hermes),
+            ("pi", AgentKind::Pi),
+            ("devin", AgentKind::Devin),
+            ("kilo", AgentKind::Kilo),
+            ("qoder", AgentKind::Qoder),
+            ("qodercli", AgentKind::Qoder),
+        ] {
+            assert_eq!(
+                AgentKind::from_executable(executable),
+                Some(expected),
+                "{executable} is not recognised"
+            );
+        }
+        // And an unrelated binary is still not an agent.
+        assert_eq!(AgentKind::from_executable("bash"), None);
+    }
 
     /// The bug this guards: every chooser pattern was matched against a cursor-anchored tail, and
     /// a chooser leaves the cursor on the highlighted option with its instructions underneath. The

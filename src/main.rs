@@ -34,9 +34,9 @@ use dock::{
     git::GitAdapter,
     paths,
     protocol::{
-        DashboardProfile, DispatchRequest, InspectRequest, LaunchIntoPaneRequest, PaneInputRequest,
-        PaneResizeRequest, ProcessState, Request, Response, TerminalLaunchRequest,
-        WorkspaceRequest,
+        DashboardProfile, DispatchRequest, InspectRequest, LaunchIntoPaneRequest, PROTOCOL_VERSION,
+        PaneInputRequest, PaneResizeRequest, ProcessState, Request, Response,
+        TerminalLaunchRequest, WorkspaceRequest,
     },
     storage::LocalStore,
 };
@@ -65,7 +65,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!(
             "{}",
             serde_json::json!({
-                "protocol": 6,
+                // Reported from the constant, not restated. It said 6 for four protocol
+                // versions, which is exactly how long nobody would have noticed.
+                "protocol": PROTOCOL_VERSION,
                 "daemon": if daemon.spawned.is_some() { "started" } else { "reconnected" },
                 "workspaces": layout.workspaces.len(),
                 "socket_mode": socket_mode(&socket)?,

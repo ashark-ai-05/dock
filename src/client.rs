@@ -76,9 +76,15 @@ impl Client {
         self.deferred_error.take()
     }
 
+    /// Writes one request as a single message.
+    ///
+    /// Serialised in full first: `to_writer` on the socket emits the value in pieces, so a client
+    /// that dies partway leaves a fragment the daemon has to make sense of. The same reasoning as
+    /// the daemon's own `write_response`, in the other direction.
     fn write_request(&mut self, request: &Request) -> Result<(), String> {
-        serde_json::to_writer(&mut self.stream, request).map_err(|e| e.to_string())?;
-        self.stream.write_all(b"\n").map_err(|e| e.to_string())
+        let mut message = serde_json::to_vec(request).map_err(|e| e.to_string())?;
+        message.push(b'\n');
+        self.stream.write_all(&message).map_err(|e| e.to_string())
     }
 
     fn read_reply(&mut self) -> Result<Response, String> {
@@ -91,7 +97,17 @@ impl Client {
         {
             return Err("daemon closed the connection".into());
         }
-        serde_json::from_str(&line).map_err(|e| format!("invalid daemon response: {e}"))
+        serde_json::from_str(&line).map_err(|error| {
+            // A response that does not end in a newline never finished being written, which
+            // happens when the daemon goes away mid-message. Saying so beats reporting a column
+            // number in JSON nobody wrote: "EOF while parsing a string at line 1 column 2" is a
+            // true statement about `{"` and a useless one about what to do next.
+            if line.ends_with('\n') {
+                format!("invalid daemon response: {error}")
+            } else {
+                "the daemon stopped mid-reply — it exited or was killed; start Dock again".into()
+            }
+        })
     }
 
     /// Opens a connection dedicated to pushed events and returns a receiver fed by a reader
@@ -108,9 +124,10 @@ impl Client {
         let Self {
             mut stream, reader, ..
         } = Self::connect(socket)?;
-        serde_json::to_writer(&mut stream, &Request::Subscribe(SubscribeRequest {}))
+        let mut message = serde_json::to_vec(&Request::Subscribe(SubscribeRequest {}))
             .map_err(|e| e.to_string())?;
-        stream.write_all(b"\n").map_err(|e| e.to_string())?;
+        message.push(b'\n');
+        stream.write_all(&message).map_err(|e| e.to_string())?;
         let (sender, receiver) = mpsc::channel();
         thread::Builder::new()
             .name("dock-event-reader".into())
@@ -206,6 +223,27 @@ impl EventStream {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reply_cut_short_blames_the_daemon_rather_than_the_json() {
+        // What a client saw when a daemon died mid-write: `to_writer` emitted the value in
+        // pieces straight at the socket, so two bytes reached the reader and serde reported a
+        // column number in a document nobody had written.
+        let cut_short = "{\"";
+        let error = serde_json::from_str::<Response>(cut_short)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("column 2"), "{error}");
+
+        // Responses are now written whole, so a fragment means one thing and says it.
+        let message = if cut_short.ends_with('\n') {
+            format!("invalid daemon response: {error}")
+        } else {
+            "the daemon stopped mid-reply — it exited or was killed; start Dock again".to_owned()
+        };
+        assert!(message.contains("daemon stopped mid-reply"), "{message}");
+        assert!(!message.contains("column"), "{message}");
+    }
+
     use super::*;
     use crate::protocol::{ErrorCode, InspectRequest, PaneInputRequest};
     use std::{

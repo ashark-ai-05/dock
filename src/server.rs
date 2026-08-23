@@ -732,9 +732,20 @@ fn read_request(
     })
 }
 
+/// Writes one response as a single message.
+///
+/// Serialised in full first, deliberately. `serde_json::to_writer` on the socket emits the value
+/// in small pieces — `{`, `"`, `type`, and so on — each its own write, so a daemon that dies
+/// partway leaves a fragment like `{"` on the wire. The client then reports a JSON parse error
+/// about column 2, which says nothing about what actually happened: the daemon went away. One
+/// write makes the message all-or-nothing, and a departed daemon reads as the clean end of a
+/// connection, which callers already handle and can explain.
 fn write_response(stream: &mut UnixStream, response: &Response) -> Result<(), String> {
-    serde_json::to_writer(&mut *stream, response).map_err(|error| error.to_string())?;
-    stream.write_all(b"\n").map_err(|error| error.to_string())
+    let mut message = serde_json::to_vec(response).map_err(|error| error.to_string())?;
+    message.push(b'\n');
+    stream
+        .write_all(&message)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

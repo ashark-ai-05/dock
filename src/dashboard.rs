@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, time::Instant};
+use std::{borrow::Cow, collections::HashMap, path::Path, time::Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -1051,32 +1051,43 @@ impl Dashboard {
         // line that wrapped would slide every row beneath it out from under the rectangles
         // this records for the pointer.
         let inner_width = usize::from(area.width).saturating_sub(1);
-        let mut lines = vec![Line::styled("WORKSPACES", heading)];
+        let mut rows = SidebarRows::new(area.height);
+        rows.push(|| Line::styled("WORKSPACES", heading));
         for (index, workspace) in self.layout.workspaces.iter().enumerate() {
-            lines.push(Line::styled(
-                format!(
-                    "{} {}",
-                    if index == self.workspace_index {
-                        "›"
+            rows.push(|| {
+                Line::styled(
+                    format!(
+                        "{} {}",
+                        if index == self.workspace_index {
+                            "›"
+                        } else {
+                            " "
+                        },
+                        ellipsise(&workspace.name, inner_width.saturating_sub(2))
+                    ),
+                    Style::default().fg(if index == self.workspace_index {
+                        self.theme.accent
                     } else {
-                        " "
-                    },
-                    ellipsise(&workspace.name, inner_width.saturating_sub(2))
-                ),
-                Style::default().fg(if index == self.workspace_index {
-                    self.theme.accent
-                } else {
-                    self.theme.muted
-                }),
-            ));
+                        self.theme.muted
+                    }),
+                )
+            });
         }
-        lines.push(Line::from(""));
-        lines.push(Line::styled("AGENTS", heading));
+        rows.push(|| Line::from(""));
+        rows.push(|| Line::styled("AGENTS", heading));
         // Sized so the leading glyph and its two spaces still fit inside the border.
         let label_width = inner_width.saturating_sub(3);
         let roster = self.agent_roster();
         let roster_is_empty = roster.is_empty();
         for (state, label, task, workspace) in roster {
+            // An agent below the sidebar's last row cannot be seen, and neither can any agent
+            // after it. Everything below is off the bottom too, so every remaining index is
+            // one `clickable_row` already answers `None` for and no rectangle can be misplaced
+            // by stopping here. Formatting the rest was formatting for nobody: a busy runtime
+            // spans workspaces, and this list used to build two lines per agent in all of them.
+            if !rows.has_room() {
+                break;
+            }
             // The state is spelled out beside the name. The glyph and its colour say that
             // something is true of this agent; only the word says what, and "needs you" is the
             // whole reason to look at this list at all.
@@ -1084,7 +1095,7 @@ impl Dashboard {
             // The task rides with the name, because which agent is which is the question a roster
             // of three identical "claude" rows cannot answer.
             let named = match &task {
-                Some(detail) => format!("{label} {detail}"),
+                Some(detail) => format!("{label} #{detail}"),
                 None => label.to_owned(),
             };
             let name_width = label_width.saturating_sub(state_text.chars().count() + 2);
@@ -1093,87 +1104,91 @@ impl Dashboard {
             // which reads as a roster answering "which workspace" and in fact never saying. A
             // second line costs a row and always says it.
             let inline = workspace
-                .as_deref()
                 .map(|workspace| format!("{named} · {workspace}"))
                 .filter(|inline| inline.chars().count() <= name_width);
-            let overflow = match (&inline, &workspace) {
-                (None, Some(workspace)) => Some(workspace.clone()),
+            let overflow = match (&inline, workspace) {
+                (None, Some(workspace)) => Some(workspace),
                 _ => None,
             };
             let named = inline.unwrap_or(named);
             let name = ellipsise(&named, name_width);
             let gap = label_width.saturating_sub(name.chars().count() + state_text.chars().count());
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {} {name}", state.glyph()),
-                    Style::default().fg(self.theme.agent(state)),
-                ),
-                Span::raw(" ".repeat(gap.max(1))),
-                Span::styled(
-                    state_text,
-                    Style::default().fg(self.theme.agent(state)).add_modifier(
-                        if state == AgentState::Blocked {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        },
+            rows.push(|| {
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {} {name}", state.glyph()),
+                        Style::default().fg(self.theme.agent(state)),
                     ),
-                ),
-            ]));
+                    Span::raw(" ".repeat(gap.max(1))),
+                    Span::styled(
+                        state_text,
+                        Style::default().fg(self.theme.agent(state)).add_modifier(
+                            if state == AgentState::Blocked {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            },
+                        ),
+                    ),
+                ])
+            });
             if let Some(workspace) = overflow {
                 // Indented under its agent and muted, so the eye reads it as belonging to the row
                 // above rather than as another agent.
-                lines.push(Line::styled(
-                    format!(
-                        "   in {}",
-                        ellipsise(&workspace, label_width.saturating_sub(4))
-                    ),
-                    Style::default().fg(self.theme.muted),
-                ));
+                rows.push(|| {
+                    Line::styled(
+                        format!(
+                            "   in {}",
+                            ellipsise(workspace, label_width.saturating_sub(4))
+                        ),
+                        Style::default().fg(self.theme.muted),
+                    )
+                });
             }
         }
         if roster_is_empty {
-            lines.push(Line::styled(
-                " none running",
-                Style::default().fg(self.theme.muted),
-            ));
+            rows.push(|| Line::styled(" none running", Style::default().fg(self.theme.muted)));
         }
-        lines.push(Line::from(""));
+        rows.push(|| Line::from(""));
         // What this pane of the sidebar used to hold was a list of agents running elsewhere on the
         // machine, which Dock has no way to control and which included the user's own editor
         // session. Its replacement answers the question a quiet dashboard actually raises: what
         // can I do from here. Each row is clickable, so the list is a menu rather than a poster.
-        lines.push(Line::styled("START HERE", heading));
+        rows.push(|| Line::styled("START HERE", heading));
         self.quick_action_areas.clear();
         for (key, action, command) in QUICK_ACTIONS {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {key} "),
-                    Style::default()
-                        .fg(self.theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    ellipsise(action, inner_width.saturating_sub(key.chars().count() + 2)),
-                    Style::default().fg(self.theme.text),
-                ),
-            ]));
-            if let Some(row) = clickable_row(area, lines.len() - 1) {
+            rows.push(|| {
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {key} "),
+                        Style::default()
+                            .fg(self.theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        ellipsise(action, inner_width.saturating_sub(key.chars().count() + 2)),
+                        Style::default().fg(self.theme.text),
+                    ),
+                ])
+            });
+            if let Some(row) = clickable_row(area, rows.last()) {
                 self.quick_action_areas.push((command, row));
             }
         }
         // Launch keeps its own emphatic row: it is the one action that starts work rather than
         // showing something, and it was the only discoverable action here before.
-        lines.push(Line::from(""));
-        lines.push(Line::styled(
-            "Ctrl+B l LAUNCH AGENT",
-            Style::default()
-                .fg(self.theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ));
-        self.launch_area = clickable_row(area, lines.len() - 1);
+        rows.push(|| Line::from(""));
+        rows.push(|| {
+            Line::styled(
+                "Ctrl+B l LAUNCH AGENT",
+                Style::default()
+                    .fg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
+        self.launch_area = clickable_row(area, rows.last());
         frame.render_widget(
-            Paragraph::new(lines).block(
+            Paragraph::new(rows.into_lines()).block(
                 Block::default()
                     .borders(Borders::RIGHT)
                     .border_style(Style::default().fg(self.theme.border)),
@@ -1188,18 +1203,29 @@ impl Dashboard {
     /// Only a run whose agent was actually detected is an agent. `self.agents` also carries
     /// every pane's ambient shell, which reports no kind at all; listing those turned the
     /// roster into a list of run ids for processes that are not agents.
-    fn agent_roster(&self) -> Vec<(AgentState, &str, Option<String>, Option<String>)> {
+    ///
+    /// The task and the workspace are borrowed rather than copied, so an entry the sidebar
+    /// turns out to have no room for costs nothing beyond the comparison that sorted it. Only
+    /// a task this dashboard dispatched itself has to be built, because that one is held as a
+    /// number rather than as text.
+    fn agent_roster(&self) -> Vec<RosterEntry<'_>> {
+        // Indexed once, not asked once per agent. Answering "which workspace" for a single run
+        // means walking every pane of every workspace, and answering "which task" means walking
+        // the run list; asking them per agent made this list cost agents × workspaces × panes
+        // on a path that runs on every frame.
+        let workspaces = self.workspaces_by_run();
+        let tasks = self.tasks_by_run();
         // Joined to the run so the roster can say which task each agent is on. Three agents all
         // reading "claude" tell you only that three agents are running.
-        let mut roster: Vec<(AgentState, &str, Option<String>, Option<String>)> = self
+        let mut roster: Vec<RosterEntry<'_>> = self
             .agents
             .iter()
             .filter_map(|(run_id, (kind, state))| {
                 // The workspace rides alongside the task for the same reason the task rides
                 // with the name: this list spans every workspace, so "needs you" is actionable
                 // only once you know where to go.
-                let task = self.task_of(run_id).map(|task| format!("#{task}"));
-                let workspace = self.workspace_of(run_id).map(str::to_owned);
+                let task = tasks.get(run_id.as_str()).cloned();
+                let workspace = workspaces.get(run_id.as_str()).copied();
                 Some((*state, kind.as_ref()?.label(), task, workspace))
             })
             .collect();
@@ -1214,24 +1240,44 @@ impl Dashboard {
         roster
     }
 
-    /// The workspace a run is in, by the name a person gave it.
+    /// The workspace each run is in, by the name a person gave it, in one pass over the layout.
     ///
     /// The roster is the one view that spans workspaces, so it was also the only place an agent
     /// could say it needs you without saying where to go and answer it.
     ///
     /// Read from the layout rather than the run list because the layout is what carries the name;
-    /// a snapshot knows only the id, and an id is what the name exists to avoid.
-    fn workspace_of(&self, run_id: &str) -> Option<&str> {
-        self.layout
-            .workspaces
+    /// a snapshot knows only the id, and an id is what the name exists to avoid. First workspace
+    /// wins, because a run bound into two panes is a bug rather than two homes.
+    fn workspaces_by_run(&self) -> HashMap<&str, &str> {
+        let mut index = HashMap::new();
+        for workspace in &self.layout.workspaces {
+            for pane in workspace.panes.values() {
+                if let Some(run_id) = pane.run_id.as_deref() {
+                    index.entry(run_id).or_insert(workspace.name.as_str());
+                }
+            }
+        }
+        index
+    }
+
+    /// The task each run is on, in one pass, giving the same answer for every run that
+    /// [`task_of`](Self::task_of) gives for one.
+    ///
+    /// The daemon's own binding wins over this dashboard's note of what it dispatched, which is
+    /// why the bindings are written second. Borrowed where the text already exists; only a
+    /// dispatched task has to be built, because it is held as a number.
+    fn tasks_by_run(&self) -> HashMap<&str, Cow<'_, str>> {
+        let mut index: HashMap<&str, Cow<'_, str>> = self
+            .dispatched_tasks
             .iter()
-            .find(|workspace| {
-                workspace
-                    .panes
-                    .values()
-                    .any(|pane| pane.run_id.as_deref() == Some(run_id))
-            })
-            .map(|workspace| workspace.name.as_str())
+            .map(|(run_id, task)| (run_id.as_str(), Cow::Owned(task.to_string())))
+            .collect();
+        for run in &self.runs {
+            if let Some(task) = bound_task(run) {
+                index.insert(run.run_id.as_str(), Cow::Borrowed(task));
+            }
+        }
+        index
     }
 
     /// The task a run is working on, if anything knows: the daemon's own binding first, then this
@@ -1241,8 +1287,7 @@ impl Dashboard {
             .runs
             .iter()
             .find(|run| run.run_id == run_id)
-            .map(|run| run.external_task_ref.trim())
-            .filter(|task| !task.is_empty())
+            .and_then(bound_task)
             .map(str::to_owned);
         bound.or_else(|| {
             self.dispatched_tasks
@@ -1263,12 +1308,14 @@ impl Dashboard {
                 self.pane_areas.insert(pane_id.clone(), area);
                 let pane = &workspace.panes[pane_id];
                 let focused = workspace.focused_pane_id == *pane_id;
-                let run_id = pane.run_id.clone();
+                // Borrowed from the workspace rather than copied out of it. The workspace is the
+                // caller's own, not `self`'s, so nothing here needs to own a run id or a pane
+                // name — and both used to be freshly allocated once per pane on every frame.
+                let run_id = pane.run_id.as_deref();
                 let (agent, state) = run_id
-                    .as_deref()
                     .and_then(|id| self.agents.get(id).copied())
                     .unwrap_or((None, AgentState::Idle));
-                let label = agent.map_or_else(|| pane.name.clone(), |kind| kind.label().to_owned());
+                let label: &str = agent.map_or(pane.name.as_str(), |kind| kind.label());
                 // A pane whose process is gone keeps painting its last frame forever. Without
                 // this the only difference between a live shell and a dead one is that typing
                 // stops working, so the title has to carry the news and the recovery key.
@@ -1292,9 +1339,8 @@ impl Dashboard {
                 // so. A flag rather than the mode itself: the render below needs `self`
                 // mutably for the resize bookkeeping, and `CopyMode` owns a whole cloned
                 // screen, so borrowing it across that — or, worse, cloning it — is not free.
-                let copying = run_id
-                    .as_deref()
-                    .is_some_and(|id| self.copy.as_ref().is_some_and(|mode| mode.is_for(id)));
+                let copying =
+                    run_id.is_some_and(|id| self.copy.as_ref().is_some_and(|mode| mode.is_for(id)));
                 // `title` already opens with a space, so the prefix needs none of its own.
                 let title = if copying {
                     Line::from(vec![
@@ -1374,7 +1420,7 @@ impl Dashboard {
                     block
                 };
                 let inner = block.inner(area);
-                self.queue_resize(&workspace.workspace_id, pane_id, run_id.as_deref(), inner);
+                self.queue_resize(&workspace.workspace_id, pane_id, run_id, inner);
                 frame.render_widget(block, area);
                 self.pane_inner_areas.insert(pane_id.clone(), inner);
                 if show_controls {
@@ -1393,13 +1439,11 @@ impl Dashboard {
                 // makes copy mode a freeze rather than a claim: the live parser keeps
                 // consuming every pushed delta behind it, and none of them reach the grid the
                 // selection was made against.
-                let copying = run_id
-                    .as_deref()
-                    .and_then(|id| self.copy.as_ref().filter(|mode| mode.is_for(id)));
+                let copying =
+                    run_id.and_then(|id| self.copy.as_ref().filter(|mode| mode.is_for(id)));
                 let painted = match &copying {
                     Some(mode) => Some(mode.frozen.screen()),
                     None => run_id
-                        .as_deref()
                         .and_then(|id| self.screens.get(id))
                         .map(PaneScreen::screen),
                 };
@@ -4304,6 +4348,72 @@ fn first_leaf(node: &LayoutNode) -> &str {
         LayoutNode::Split { first, .. } => first_leaf(first),
     }
 }
+/// One row of the agent roster: how badly the agent wants attention, what it is, the task it is
+/// on, and the workspace it is in. Borrowed out of the dashboard rather than copied, so an entry
+/// the sidebar turns out to have no room for costs nothing beyond the comparison that sorted it.
+type RosterEntry<'a> = (AgentState, &'a str, Option<Cow<'a, str>>, Option<&'a str>);
+
+/// The sidebar's rows as they are built: numbered as if all of them existed, kept only while
+/// they still fit inside the sidebar.
+///
+/// The sidebar used to build a `Line` for every workspace and every agent and hand the whole
+/// list to `Paragraph`, which draws the first `area.height` of them and drops the rest. On a
+/// busy runtime that was most of the sidebar's work — and most of a frame's allocations —
+/// spent formatting rows nobody could see, because the roster spans every workspace and costs
+/// up to two lines per agent. Every row is still *numbered* as though it had been built, since
+/// [`clickable_row`] addresses a row by its index and a menu whose rectangles slid up a row
+/// would send clicks to the wrong action.
+struct SidebarRows {
+    lines: Vec<Line<'static>>,
+    height: usize,
+    /// The index the next row will take, which keeps counting past `height` so that
+    /// [`clickable_row`] keeps answering `None` for everything below the fold.
+    next: usize,
+}
+
+impl SidebarRows {
+    fn new(height: u16) -> Self {
+        let height = usize::from(height);
+        Self {
+            lines: Vec::with_capacity(height),
+            height,
+            next: 0,
+        }
+    }
+
+    /// Adds the next row, building it only when there is somewhere to draw it. Taking a closure
+    /// rather than a `Line` is the whole point: an invisible row must cost nothing, and a row
+    /// passed by value has already paid for every `format!` inside it.
+    fn push(&mut self, line: impl FnOnce() -> Line<'static>) {
+        if self.next < self.height {
+            self.lines.push(line());
+        }
+        self.next += 1;
+    }
+
+    /// The index of the row just added, for [`clickable_row`].
+    fn last(&self) -> usize {
+        self.next.saturating_sub(1)
+    }
+
+    /// Whether the next row would land anywhere visible. Asked before formatting a whole roster
+    /// entry, which is more than one row's worth of work.
+    fn has_room(&self) -> bool {
+        self.next < self.height
+    }
+
+    fn into_lines(self) -> Vec<Line<'static>> {
+        self.lines
+    }
+}
+
+/// The task the daemon itself bound to a run, if it bound one. A blank reference means unbound
+/// rather than a task whose name happens to be empty, and the single lookup and the batch index
+/// have to agree about that or the roster and the pane title would disagree on screen.
+fn bound_task(run: &RuntimeSnapshot) -> Option<&str> {
+    Some(run.external_task_ref.trim()).filter(|task| !task.is_empty())
+}
+
 /// The one-row rectangle for the sidebar line at `index`, or `None` when that line falls past
 /// the bottom of the sidebar. A rectangle recorded off-screen would claim pointer coordinates
 /// belonging to whatever is drawn there instead, so a row that was never rendered is not
@@ -6863,6 +6973,110 @@ mod tests {
             .collect()
     }
 
+    /// The sidebar stops building rows the moment it runs out of sidebar, which is only a
+    /// saving for as long as the rows it does build are exactly the rows a taller terminal
+    /// would have put in the same places. It used to format every one of them — up to two
+    /// lines per agent, across every workspace — and hand the lot to a paragraph that drew
+    /// the first few and dropped the rest.
+    #[test]
+    fn a_roster_longer_than_the_sidebar_draws_the_rows_a_taller_terminal_would_have_drawn() {
+        let mut dashboard = dashboard();
+        for index in 0..40 {
+            dashboard.apply_event(Event::AgentStateChanged {
+                run_id: format!("run_{index}"),
+                agent: Some(AgentKind::Claude),
+                state: AgentState::Idle,
+            });
+        }
+        let short = sidebar_rows(&mut dashboard, 100, 30);
+        let tall = sidebar_rows(&mut dashboard, 100, 60);
+        // The premise: the roster really does run off the short sidebar, so the rows being
+        // compared are rows the short render had to decide not to build.
+        assert!(
+            !short.iter().any(|row| row.contains("LAUNCH AGENT")),
+            "the roster must overflow the short sidebar or this proves nothing: {short:#?}"
+        );
+        assert!(
+            tall.iter().any(|row| row.contains("LAUNCH AGENT")),
+            "{tall:#?}"
+        );
+        // Rows 0 and 1 are the header and the last two are the footer; everything between them
+        // is sidebar, and it must agree row for row.
+        assert_eq!(
+            short[2..28],
+            tall[2..28],
+            "short {short:#?}\ntall {tall:#?}"
+        );
+    }
+
+    /// The roster reads every agent's task out of one index rather than scanning the run list
+    /// once per agent, so that index has to answer exactly what a single lookup answers —
+    /// including for the run whose binding is blank, the run this dashboard dispatched itself,
+    /// and the run that is both.
+    #[test]
+    fn the_batch_task_index_answers_for_every_run_what_a_single_lookup_answers() {
+        let mut dashboard = dashboard();
+        let mut bound = snapshot();
+        bound.run_id = "bound".into();
+        bound.external_task_ref = "TASK-1".into();
+        let mut blank = snapshot();
+        blank.run_id = "blank".into();
+        // Whitespace, not text: a binding of spaces means unbound, and an index that took it
+        // literally would put a run on a task called "  ".
+        blank.external_task_ref = "   ".into();
+        let mut both = snapshot();
+        both.run_id = "both".into();
+        both.external_task_ref = "TASK-2".into();
+        dashboard.runs = vec![bound, blank, both];
+        dashboard.dispatched_tasks.insert("blank".into(), 7);
+        dashboard.dispatched_tasks.insert("both".into(), 9);
+        dashboard
+            .dispatched_tasks
+            .insert("only_dispatched".into(), 11);
+        let index = dashboard.tasks_by_run();
+        for run_id in [
+            "bound",
+            "blank",
+            "both",
+            "only_dispatched",
+            "never_heard_of",
+        ] {
+            assert_eq!(
+                dashboard.task_of(run_id).as_deref(),
+                index.get(run_id).map(AsRef::as_ref),
+                "the index and the single lookup disagree about {run_id}"
+            );
+        }
+        // And the answers themselves, so agreement on a wrong answer cannot pass.
+        assert_eq!(dashboard.task_of("bound").as_deref(), Some("TASK-1"));
+        assert_eq!(dashboard.task_of("blank").as_deref(), Some("7"));
+        assert_eq!(dashboard.task_of("both").as_deref(), Some("TASK-2"));
+    }
+
+    /// A run bound into two panes is a bug rather than two homes, so the index names the first
+    /// workspace it appears in — which is the answer the roster gave when it searched for one.
+    #[test]
+    fn the_workspace_index_names_the_first_workspace_a_run_appears_in() {
+        let mut dashboard = two_workspace_dashboard();
+        let first = dashboard.layout.workspaces[0].name.clone();
+        let pane = dashboard.layout.workspaces[0]
+            .panes
+            .values_mut()
+            .next()
+            .expect("the first workspace has a pane");
+        pane.run_id = Some("shared".into());
+        let pane = dashboard.layout.workspaces[1]
+            .panes
+            .values_mut()
+            .next()
+            .expect("the second workspace has a pane");
+        pane.run_id = Some("shared".into());
+        assert_eq!(
+            dashboard.workspaces_by_run().get("shared").copied(),
+            Some(first.as_str())
+        );
+    }
+
     /// Every clickable sidebar rectangle must sit on the row that actually carries its label.
     /// Recording rows from the logical line count while the paragraph wrapped meant a single
     /// long line pushed every rectangle below it off its own label, so the pointer hit the
@@ -8207,5 +8421,315 @@ mod tests {
             dashboard.error.is_some(),
             "an impossible command must explain itself rather than doing nothing"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Render measurement.
+    //
+    // Not an assertion: `#[ignore]`d so `cargo test` never spends a second on it, and run
+    // deliberately with
+    //
+    //     cargo test --release render_measurement -- --ignored --nocapture
+    //
+    // when a change is meant to make painting cheaper. The dashboard it paints is shaped like
+    // a busy afternoon rather than like a unit test, because every cost this exists to find is
+    // a cost that only appears once there are several workspaces, a dozen panes and an agent
+    // in each: per-frame deep copies of the layout, per-agent scans across every workspace's
+    // panes, and per-pane scans of the run list.
+    // ---------------------------------------------------------------------------
+
+    /// Counts every allocation the test binary makes, so a frame can be measured in
+    /// allocations as well as in milliseconds — the two costs this render path has are
+    /// walking cells and building strings nobody keeps, and only the second shows up here.
+    ///
+    /// `Relaxed` because the number is a diagnostic, not a synchronisation point; the
+    /// measurement is single-threaded and nothing branches on the count.
+    struct CountingAllocator;
+
+    static ALLOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static ALLOCATED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_add(layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn realloc(
+            &self,
+            pointer: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_add(new_size as u64, std::sync::atomic::Ordering::Relaxed);
+            unsafe { std::alloc::System.realloc(pointer, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAllocator = CountingAllocator;
+
+    /// Output with enough colour and enough width to make every cell of a pane cost what a
+    /// real agent's output costs. A blank screen is the one thing a render benchmark must not
+    /// measure: `PseudoTerminal` skips cells with no contents, so an empty pane is free and an
+    /// empty benchmark says painting is free.
+    fn benchmark_pane_content(seed: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for line in 0..140 {
+            bytes.extend_from_slice(
+                format!(
+                    "\x1b[38;5;{colour}m{line:>4}\x1b[0m \x1b[1mdock\x1b[0m run {seed} \
+                     · compiling crate {line} of 240 \x1b[32mok\x1b[0m \
+                     · src/dashboard.rs:{line} · {padding}\r\n",
+                    colour = (line % 200) + 16,
+                    padding = "▁".repeat(60),
+                )
+                .as_bytes(),
+            );
+        }
+        bytes
+    }
+
+    /// A balanced split tree over `pane_ids`, alternating axis by depth the way a person
+    /// splitting panes by hand ends up doing.
+    fn benchmark_layout_tree(pane_ids: &[String], depth: usize) -> LayoutNode {
+        if pane_ids.len() == 1 {
+            return LayoutNode::Pane {
+                pane_id: pane_ids[0].clone(),
+            };
+        }
+        let middle = pane_ids.len() / 2;
+        LayoutNode::Split {
+            axis: if depth.is_multiple_of(2) {
+                SplitAxis::Vertical
+            } else {
+                SplitAxis::Horizontal
+            },
+            ratio_milli: 500,
+            first: Box::new(benchmark_layout_tree(&pane_ids[..middle], depth + 1)),
+            second: Box::new(benchmark_layout_tree(&pane_ids[middle..], depth + 1)),
+        }
+    }
+
+    /// `workspaces` workspaces of `panes_each` panes, every pane bound to a run, every run
+    /// carrying an agent and a screen with real output on it.
+    fn benchmark_dashboard(workspaces: usize, panes_each: usize) -> Dashboard {
+        const KINDS: [AgentKind; 4] = [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Amp,
+            AgentKind::Gemini,
+        ];
+        const STATES: [AgentState; 4] = [
+            AgentState::Working,
+            AgentState::Blocked,
+            AgentState::Idle,
+            AgentState::Done,
+        ];
+        let mut dashboard = Dashboard::default();
+        for workspace in 0..workspaces {
+            let pane_ids: Vec<String> = (0..panes_each)
+                .map(|pane| format!("p{workspace}_{pane}"))
+                .collect();
+            let mut panes = BTreeMap::new();
+            for (index, pane_id) in pane_ids.iter().enumerate() {
+                let run_id = format!("run_{workspace}_{index}");
+                panes.insert(
+                    pane_id.clone(),
+                    PaneLayout {
+                        pane_id: pane_id.clone(),
+                        name: format!("pane {index} of workspace {workspace}"),
+                        run_id: Some(run_id.clone()),
+                        runtime: PaneRuntime::Running,
+                    },
+                );
+                let mut screen = PaneScreen::new(100, 220, 2000);
+                screen.feed(&benchmark_pane_content(workspace * panes_each + index));
+                dashboard.screens.insert(run_id.clone(), screen);
+                dashboard.agents.insert(
+                    run_id.clone(),
+                    (
+                        Some(KINDS[(workspace + index) % KINDS.len()]),
+                        STATES[index % STATES.len()],
+                    ),
+                );
+                let mut run = snapshot();
+                run.run_id = run_id;
+                run.workspace_id = format!("w{workspace}");
+                run.pane_id = pane_id.clone();
+                run.external_task_ref = format!("TASK-{}", workspace * panes_each + index);
+                dashboard.runs.push(run);
+            }
+            dashboard.layout.workspaces.push(WorkspaceLayout {
+                workspace_id: format!("w{workspace}"),
+                name: format!("workspace {workspace} · long enough to be ellipsised"),
+                focused_pane_id: pane_ids[0].clone(),
+                panes,
+                root: benchmark_layout_tree(&pane_ids, 0),
+            });
+        }
+        dashboard
+    }
+
+    /// Milliseconds and allocations for one frame, repainting the same dashboard at the same
+    /// size — which is the shape of an idle dashboard being repainted, and therefore the frame
+    /// worth making cheap.
+    ///
+    /// The time reported is the *fastest* of several rounds rather than the mean. A laptop
+    /// running a test suite has other work on it, and noise only ever makes a round slower, so
+    /// the minimum is the closest thing to the cost of the frame itself; a mean here moved by
+    /// 40% between back-to-back runs of the same binary and hid a real 25% improvement.
+    fn measure_frame(
+        dashboard: &mut Dashboard,
+        width: u16,
+        height: u16,
+        frames: u32,
+    ) -> (f64, u64, u64) {
+        const ROUNDS: u32 = 7;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        for _ in 0..5 {
+            terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        }
+        let mut fastest = f64::MAX;
+        let mut allocations = 0;
+        let mut bytes = 0;
+        for _ in 0..ROUNDS {
+            let before = ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+            let before_bytes = ALLOCATED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            for _ in 0..frames {
+                terminal.draw(|frame| dashboard.render(frame)).unwrap();
+            }
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);
+            fastest = fastest.min(elapsed);
+            allocations = (ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed) - before)
+                / u64::from(frames);
+            bytes = (ALLOCATED_BYTES.load(std::sync::atomic::Ordering::Relaxed) - before_bytes)
+                / u64::from(frames);
+        }
+        (fastest, allocations, bytes)
+    }
+
+    #[test]
+    #[ignore = "a measurement, not an assertion; cargo test --release render_measurement -- --ignored --nocapture"]
+    fn render_measurement_of_a_busy_dashboard_at_three_terminal_sizes() {
+        let mut dashboard = benchmark_dashboard(4, 12);
+        println!();
+        println!("4 workspaces × 12 panes, 48 runs, 48 agents");
+        println!(
+            "{:>10}  {:>10}  {:>12}  {:>12}",
+            "size", "ms/frame", "allocs/frame", "bytes/frame"
+        );
+        for (width, height, frames) in [(80u16, 24u16, 400u32), (200, 50, 200), (400, 100, 100)] {
+            let (milliseconds, allocations, bytes) =
+                measure_frame(&mut dashboard, width, height, frames);
+            println!(
+                "{:>10}  {milliseconds:>10.3}  {allocations:>12}  {bytes:>12}",
+                format!("{width}x{height}")
+            );
+        }
+    }
+
+    /// The same frame, broken into the pieces it is made of, so an optimisation is aimed at a
+    /// measured cost rather than at a suspected one.
+    ///
+    /// Every piece below is timed inside `Terminal::draw`, because a `Frame` cannot be built
+    /// any other way; the "empty draw" row at the bottom is what that costs on its own, and
+    /// every other row is only meaningful once it is subtracted.
+    #[test]
+    #[ignore = "a measurement, not an assertion; cargo test --release render_breakdown -- --ignored --nocapture"]
+    fn render_breakdown_of_a_busy_dashboard_by_the_work_it_does() {
+        let mut dashboard = benchmark_dashboard(4, 12);
+        for (width, height) in [(80u16, 24u16), (200, 50), (400, 100)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for _ in 0..5 {
+                terminal.draw(|frame| dashboard.render(frame)).unwrap();
+            }
+            let frames = 200u32;
+            let report = |name: &str, milliseconds: f64, allocations: u64| {
+                println!("{name:>34}  {milliseconds:>9.3} ms  {allocations:>8} allocs");
+            };
+            // Fastest round rather than the mean, for the reason `measure_frame` gives: a
+            // loaded laptop only ever makes a round slower, so the mean measures the machine
+            // and the minimum measures the code.
+            macro_rules! timed {
+                ($name:literal, $body:expr) => {{
+                    let mut fastest = f64::MAX;
+                    let mut allocations = 0;
+                    for _ in 0..7 {
+                        let before = ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+                        let start = std::time::Instant::now();
+                        for _ in 0..frames {
+                            std::hint::black_box($body);
+                        }
+                        fastest =
+                            fastest.min(start.elapsed().as_secs_f64() * 1000.0 / f64::from(frames));
+                        allocations = (ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed)
+                            - before)
+                            / u64::from(frames);
+                    }
+                    report($name, fastest, allocations);
+                }};
+            }
+            println!();
+            println!("  ---- {width}x{height} ----");
+            timed!(
+                "whole frame",
+                terminal.draw(|frame| dashboard.render(frame)).unwrap()
+            );
+            timed!("workspace().cloned()", dashboard.workspace().cloned());
+            timed!("agent_roster()", dashboard.agent_roster());
+            timed!("footer_line()", dashboard.footer_line());
+            let body_height = height.saturating_sub(5);
+            let sidebar = Rect::new(0, 3, 28, body_height);
+            timed!(
+                "render_sidebar()",
+                terminal
+                    .draw(|frame| dashboard.render_sidebar(frame, sidebar))
+                    .unwrap()
+            );
+            let panes = Rect::new(28, 3, width - 28, body_height);
+            let workspace = dashboard.workspace().cloned().unwrap();
+            timed!(
+                "render_node() over 12 panes",
+                terminal
+                    .draw(|frame| {
+                        dashboard.render_node(frame, panes, &workspace, &workspace.root);
+                    })
+                    .unwrap()
+            );
+            let screens: Vec<&PaneScreen> = workspace
+                .panes
+                .values()
+                .filter_map(|pane| dashboard.screens.get(pane.run_id.as_deref()?))
+                .collect();
+            timed!(
+                "PseudoTerminal alone, 12 panes",
+                terminal
+                    .draw(|frame| {
+                        // Each pane gets a twelfth of the body, so the cell count matches what
+                        // the real layout paints; only the chrome around it is gone.
+                        let pane_width = panes.width / 4;
+                        let pane_height = panes.height / 3;
+                        for (index, screen) in screens.iter().enumerate() {
+                            let area = Rect::new(
+                                panes.x + (index as u16 % 4) * pane_width,
+                                panes.y + (index as u16 / 4) * pane_height,
+                                pane_width,
+                                pane_height,
+                            );
+                            frame.render_widget(PseudoTerminal::new(screen.screen()), area);
+                        }
+                    })
+                    .unwrap()
+            );
+            timed!("empty draw", terminal.draw(|_frame| {}).unwrap());
+        }
     }
 }

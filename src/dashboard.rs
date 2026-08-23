@@ -130,6 +130,10 @@ pub struct Dashboard {
     /// Dock only ever writes tasks to its own.
     board_dir: Option<std::path::PathBuf>,
     board_is_personal: bool,
+    #[cfg(test)]
+    /// Stands in for what is installed on this machine. Tests must not ask the machine, or they
+    /// assert something about the laptop they ran on rather than about Dock.
+    pub(crate) installed_adapters: Option<Vec<AdapterId>>,
     /// Which task each run was dispatched onto, for runs this dashboard dispatched.
     ///
     /// A repository-bound run carries its task in the binding and the daemon reports it, so this
@@ -2787,6 +2791,18 @@ impl Dashboard {
     /// The last agent launched from the form wins, so an explicit choice is remembered; otherwise
     /// the first one actually installed. `None` means none of them are.
     pub fn dispatch_adapter(&self) -> Option<AdapterId> {
+        // Which agents exist is a property of the machine, and a test that reads it is a test that
+        // passes on a developer's laptop and fails on a build runner where none are installed —
+        // which is exactly what it did. The override pins the answer so these tests exercise the
+        // choosing, not the installing.
+        #[cfg(test)]
+        if let Some(pinned) = self.installed_adapters.as_ref() {
+            return pinned
+                .iter()
+                .find(|adapter| !adapter.prompt_arguments("probe").is_empty())
+                .or_else(|| pinned.first())
+                .cloned();
+        }
         let chosen = PROFILES
             .get(self.last_launch_profile)
             .map(|(profile, _)| AdapterId::from(*profile))
@@ -5109,6 +5125,14 @@ mod tests {
         );
     }
 
+    /// A dashboard whose available agents are pinned, so a dispatch test asserts the choosing
+    /// rather than whatever happens to be on the machine running it.
+    fn dashboard_with_agents(agents: &[AdapterId]) -> Dashboard {
+        let mut dashboard = bound_dashboard();
+        dashboard.installed_adapters = Some(agents.to_vec());
+        dashboard
+    }
+
     fn board_task(id: u64, title: &str, status: &str) -> BoardTask {
         BoardTask {
             id,
@@ -5131,7 +5155,7 @@ mod tests {
 
     #[test]
     fn a_dispatch_never_lands_on_the_test_fixture_and_says_who_it_will_land_on() {
-        let mut dashboard = bound_dashboard();
+        let mut dashboard = dashboard_with_agents(&[AdapterId::Amp, AdapterId::ClaudeCode]);
         dashboard.set_board_tasks(
             vec![board_task(1, "do the thing", "backlog")],
             crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
@@ -5141,22 +5165,24 @@ mod tests {
         // dashboard whose launch form was never opened used to send every task to a stub that
         // prints one line and exits — the task moved to in-progress and nothing worked on it.
         assert_ne!(dashboard.dispatch_adapter(), Some(AdapterId::Fixture));
-        // And of the agents present, one that can actually be handed the task wins: dispatch is
-        // for putting an agent on a specific piece of work, not merely opening one somewhere.
-        if let Some(adapter) = dashboard.dispatch_adapter() {
-            let any_takes_a_prompt = PROFILES.iter().any(|(profile, _)| {
-                let candidate = AdapterId::from(*profile);
-                candidate != AdapterId::Fixture
-                    && crate::adapter::builtin_available(&candidate)
-                    && !candidate.prompt_arguments("probe").is_empty()
-            });
-            if any_takes_a_prompt {
-                assert!(
-                    !adapter.prompt_arguments("probe").is_empty(),
-                    "{adapter:?} cannot be handed the task"
-                );
-            }
-        }
+        // Amp is listed first and takes no prompt positional, so profile order alone would pick
+        // it. Dispatch exists to put an agent on a specific piece of work, and one that cannot be
+        // handed the task opens in the right place knowing nothing about why.
+        assert_eq!(dashboard.dispatch_adapter(), Some(AdapterId::ClaudeCode));
+
+        // And with nothing installed there is nothing to choose, which the board has to say rather
+        // than dispatch into silence.
+        let mut bare = dashboard_with_agents(&[]);
+        assert_eq!(bare.dispatch_adapter(), None);
+        bare.set_board_tasks(
+            vec![board_task(1, "do the thing", "backlog")],
+            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+        );
+        bare.board.as_mut().unwrap().writable = true;
+        assert!(
+            render_to_string(&mut bare, 130, 32).contains("no agent installed"),
+            "the board must say so rather than choose silently"
+        );
         // And whichever it is, the board says so rather than choosing behind the reader's back.
         let frame = render_to_string(&mut dashboard, 130, 32);
         if let Some(adapter) = dashboard.dispatch_adapter() {
@@ -5228,7 +5254,7 @@ mod tests {
 
     #[test]
     fn taking_a_task_asks_for_a_worktree_and_an_agent_rather_than_switching_anything_locally() {
-        let mut dashboard = bound_dashboard();
+        let mut dashboard = dashboard_with_agents(&[AdapterId::Amp, AdapterId::ClaudeCode]);
         dashboard.set_board_tasks(
             vec![board_task(12, "Dashboard real agent dispatch", "review")],
             "/repo/real/kanban/tasks".into(),
@@ -5482,7 +5508,7 @@ mod tests {
 
     #[test]
     fn an_unbound_dispatch_still_remembers_which_task_it_was_for() {
-        let mut dashboard = bound_dashboard();
+        let mut dashboard = dashboard_with_agents(&[AdapterId::Amp, AdapterId::ClaudeCode]);
         dashboard.set_board_tasks(
             vec![board_task(4, "unbound work", "backlog")],
             crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),

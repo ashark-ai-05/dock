@@ -355,7 +355,10 @@ when a machine needs more patience than a developer laptop — CI uses `4`:
 DOCK_TEST_TIMEOUT_SCALE=4 cargo test --all-targets
 ```
 
-The smoke scripts are macOS-only and are not part of CI.
+The smoke scripts are macOS-only and now run in CI. They drive a real daemon
+over a real socket with a second client attaching to it — reconnect, layout
+persistence, signal delivery — none of which exists inside the unit suite. CI
+also fails if any run leaves a daemon behind.
 
 ## Licence
 

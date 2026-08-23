@@ -65,3 +65,27 @@ jobs:
 
     - name: Test
       run: cargo test --all-targets
+
+    # These drive a real daemon over a real socket with a real second client attaching to it —
+    # reconnect, layout persistence, signal delivery. None of that exists inside the unit suite,
+    # which is why a defect in it once survived four hundred passing tests. macOS only: they use
+    # BSD `stat -f` and `lsof`, and were written against Darwin's PTY behaviour.
+    - name: Smoke (real daemon, real PTY)
+      if: runner.os == 'macOS'
+      run: |
+        for script in scripts/smoke-slice6-macos.sh \
+                      scripts/smoke-slice61-macos.sh \
+                      scripts/smoke-slice62-nongit-macos.sh; do
+          echo "── $script ──"
+          sh "$script"
+        done
+
+    # A leaked daemon holds PTYs and child processes, and used to accumulate silently: the cleanup
+    # searched an unresolved socket path, found nothing, and skipped its own kill. Failing here
+    # keeps that from coming back unnoticed.
+    - name: No daemon was left behind
+      if: runner.os == 'macOS'
+      run: |
+        strays=$(pgrep -f 'dockd --socket=' | wc -l | tr -d ' ')
+        echo "daemons still running: $strays"
+        test "$strays" -eq 0

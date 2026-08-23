@@ -9,6 +9,19 @@ target="$tmp/target"
 mkdir -m 700 "$plain" "$runtime" "$tmp/trap-bin"
 git_log="$tmp/git-called"
 daemon_pid=
+# Finds the daemon holding this smoke run's socket.
+#
+# Dock canonicalises the socket path before spawning the daemon, so on macOS the daemon's argv
+# says /private/tmp/... while this script holds /tmp/... — the same file through a symlink, but
+# neither lsof nor pgrep matches across it. Searching the unresolved path found nothing, the
+# caller's [ -n "$daemon_pid" ] guard skipped the whole kill, and every run of this script left a
+# daemon holding PTYs behind while reporting success.
+find_daemon() {
+    resolved=$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)/$(basename "$1")
+    lsof -t "$resolved" 2>/dev/null | head -1 && return 0
+    pgrep -f "dockd --socket=$resolved" 2>/dev/null | head -1
+}
+
 cleanup() {
     status=$?
     trap - EXIT INT TERM
@@ -48,7 +61,7 @@ run second '<C-b>x<C-b>q' "$tmp/second.json" "$tmp/first.json"
 [ -z "$(find "$plain" -mindepth 1 -print -quit)" ]
 socket=$(find "$runtime" -name dockd.sock -type s | head -1)
 [ -n "$socket" ]
-daemon_pid=$(lsof -t "$socket" | head -1)
+daemon_pid=$(find_daemon "$socket")
 grep -Fq TERMINAL_RESTORED "$tmp/first.typescript"
 grep -Fq TERMINAL_RESTORED "$tmp/second.typescript"
 echo "Slice 6.2 foreground non-Git dock-only PTY launch/reconnect/stop smoke passed"

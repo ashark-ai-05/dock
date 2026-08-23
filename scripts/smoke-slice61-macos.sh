@@ -18,12 +18,25 @@ second_error="$tmp/second.stderr"
 first_result="$tmp/first.result.json"
 second_result="$tmp/second.result.json"
 daemon_pid=
+# Finds the daemon holding this smoke run's socket.
+#
+# Dock canonicalises the socket path before spawning the daemon, so on macOS the daemon's argv
+# says /private/tmp/... while this script holds /tmp/... — the same file through a symlink, but
+# neither lsof nor pgrep matches across it. Searching the unresolved path found nothing, the
+# caller's [ -n "$daemon_pid" ] guard skipped the whole kill, and every run of this script left a
+# daemon holding PTYs behind while reporting success.
+find_daemon() {
+    resolved=$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)/$(basename "$1")
+    lsof -t "$resolved" 2>/dev/null | head -1 && return 0
+    pgrep -f "dockd --socket=$resolved" 2>/dev/null | head -1
+}
+
 cleanup() {
     incoming_status=$?
     trap - EXIT INT TERM
     cleanup_status=0
     if [ -z "$daemon_pid" ] && [ -S "$socket" ]; then
-        daemon_pid=$(lsof -t "$socket" 2>/dev/null | head -1 || true)
+        daemon_pid=$(find_daemon "$socket" || true)
     fi
     if [ -n "$daemon_pid" ]; then
         if kill -0 "$daemon_pid" 2>/dev/null; then
@@ -113,7 +126,7 @@ socket=$(find "$runtime_base" -name dockd.sock -type s | head -1)
 [ ! -e "$repo/.dock" ]
 state="$(dirname "$socket")/state"
 [ "$(stat -f '%Lp' "$state")" = 700 ]
-daemon_pid=$(lsof -t "$socket" | head -1)
+daemon_pid=$(find_daemon "$socket")
 
 # Reconnect through the dashboard again; the persisted workspace must be visible there.
 run_pty "$second_log" "$second_error" '<C-b>q' second "$second_result" "$first_result"

@@ -49,32 +49,35 @@ fn set(patterns: &[&str], cell: &'static OnceLock<RegexSet>) -> &'static RegexSe
     cell.get_or_init(|| RegexSet::new(patterns).expect("embedded patterns must compile"))
 }
 
-/// Screens that mean the agent is sitting at its own input box with nothing left to do but wait
-/// for the user.
+/// The rules compiled into Dock, as `(blocked, working, awaiting)`.
 ///
-/// Per-agent, because the only dependable evidence is the chrome each CLI paints around that box,
-/// and no two paint the same one. Every pattern here was read from a real session captured through
-/// a PTY, never guessed: a wrong one reports an agent as wanting attention it does not want, which
-/// is the failure mode this whole roster exists to avoid.
+/// The awaiting patterns are per-agent, because the only dependable evidence is the chrome each
+/// CLI paints around its input box and no two paint the same one. Every one was read from a real
+/// session captured through a PTY, never guessed: a wrong one reports an agent as wanting
+/// attention it does not want, which is the failure this roster exists to avoid. An agent with no
+/// verified pattern gets none rather than inheriting another's, which would be a guess wearing the
+/// costume of a fact.
 ///
-/// An agent with no verified pattern gets none. It keeps the previous behaviour rather than
-/// inheriting another agent's chrome, which would be a guess wearing the costume of a fact.
-fn awaiting_input_set(agent: AgentKind) -> Option<&'static RegexSet> {
-    // Cached per agent like every other set here: this runs for every pane on every screen tick,
-    // so compiling a pattern here would be a cost paid thousands of times to answer the same
-    // question.
-    static CLAUDE: OnceLock<RegexSet> = OnceLock::new();
-    static CODEX: OnceLock<RegexSet> = OnceLock::new();
-    match agent {
-        // The mode footer sits directly under Claude Code's input box and is painted whenever it
-        // is accepting typing — on first launch and again after it finishes answering.
-        AgentKind::Claude => Some(set(&[r"(?i)\(shift\+tab to cycle\)"], &CLAUDE)),
-        // Codex prints this placeholder inside its input box only while that box is empty, which
-        // makes it a narrower but stricter signal than Claude's: it cannot fire on a half-typed
-        // message, and equally it will not fire on one, so a half-typed prompt reads as idle.
-        AgentKind::Codex => Some(set(&[r"(?i)ask codex to do anything"], &CODEX)),
-        _ => None,
-    }
+/// These are the starting point, not the last word: a manifest under
+/// `~/.config/dock/agent-detection/<agent>.json` replaces any of the three, so an agent that
+/// respells its prompts after this release is a file somebody edits rather than a version of Dock
+/// somebody waits for.
+pub(crate) fn built_in(
+    agent: AgentKind,
+) -> (
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+) {
+    (
+        BLOCKED_PATTERNS,
+        WORKING_PATTERNS,
+        match agent {
+            AgentKind::Claude => &[r"(?i)\(shift\+tab to cycle\)"],
+            AgentKind::Codex => &[r"(?i)ask codex to do anything"],
+            _ => &[],
+        },
+    )
 }
 
 /// Classifies an agent from the tail of its screen.
@@ -92,16 +95,16 @@ fn awaiting_input_set(agent: AgentKind) -> Option<&'static RegexSet> {
 /// nothing in the roster means anything. Unknown output stays `Idle`, since a wrong call to
 /// attention is worse than a missed one the next tick will catch.
 pub fn classify_screen(agent: AgentKind, tail: &str) -> AgentState {
-    static BLOCKED: OnceLock<RegexSet> = OnceLock::new();
-    static WORKING: OnceLock<RegexSet> = OnceLock::new();
     static DONE: OnceLock<RegexSet> = OnceLock::new();
-    if set(BLOCKED_PATTERNS, &BLOCKED).is_match(tail) {
+    // Through the manifest, so a rule someone edited is the rule that runs.
+    let rules = crate::detect::manifest::resolve(agent);
+    if rules.blocked.is_match(tail) {
         return AgentState::Blocked;
     }
-    if set(WORKING_PATTERNS, &WORKING).is_match(tail) {
+    if rules.working.is_match(tail) {
         return AgentState::Working;
     }
-    if awaiting_input_set(agent).is_some_and(|waiting| waiting.is_match(tail)) {
+    if rules.awaiting.is_match(tail) {
         return AgentState::Done;
     }
     if set(DONE_PATTERNS, &DONE).is_match(tail) {

@@ -167,6 +167,27 @@ state is sticky: it holds until the agent reports something else, because
 "finished" stays true until the next turn begins. Merging is per event and
 repeatable — your own hooks on those events are left alone.
 
+### When the state is wrong, fix it yourself
+
+Detection rules are files, not code. Ask what is in force and why:
+
+```bash
+dock detect claude                        # the rules, and where they came from
+dock detect claude --explain < screen.txt # which rule matched, and the verdict
+```
+
+Override any of them at `~/.config/dock/agent-detection/<agent>.json`. A file
+replaces only the states it names, so narrowing one does not mean restating the
+rest:
+
+```json
+{ "schema": 1, "blocked": ["(?i)approve this change\\?"] }
+```
+
+An unknown key is refused and names the valid ones, because a typo in a rules
+file is exactly where silence costs most — you are already looking at an answer
+you are trying to change.
+
 Agent states are distinct on purpose: **needs you** means the agent asked
 something and cannot continue (a permission prompt, a chooser); **your turn**
 means it finished and will wait indefinitely. Reporting the second as the first

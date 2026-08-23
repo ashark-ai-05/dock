@@ -30,7 +30,7 @@ use dock::{
     client::Client,
     client::{EventStream, StreamPoll},
     dashboard::{Dashboard, TaskDispatch, UiCommand},
-    detect::AgentState,
+    detect::{AgentKind, AgentState},
     git::GitAdapter,
     paths,
     protocol::{
@@ -97,6 +97,10 @@ fn run_noninteractive_legacy(args: &[String]) -> Result<bool, Box<dyn Error>> {
         .iter()
         .find_map(|argument| argument.strip_prefix("--dock-dir=").map(str::to_owned))
         .unwrap_or_else(|| ".dock/local".into());
+    if args.first().is_some_and(|first| first == "detect") {
+        detect_command(&args[1..])?;
+        return Ok(true);
+    }
     if args.first().is_some_and(|first| first == "agent-state") {
         agent_state_command(&args[1..])?;
         return Ok(true);
@@ -849,6 +853,85 @@ fn dispatch_task(
             "dispatched into its existing worktree"
         }
     ));
+    Ok(())
+}
+
+/// `dock detect <agent> [--explain]` — the rules in force, and what they make of a screen.
+///
+/// The reason this exists: every wrong classification so far has been invisible. The roster said a
+/// word and there was no way to ask why, so the only way to find out was to read Dock's source.
+/// With `--explain` a captured screen goes in on stdin and the matching rule comes out, which
+/// turns "the status is wrong" into a line somebody can point at and edit.
+fn detect_command(args: &[String]) -> io::Result<()> {
+    let name = args
+        .iter()
+        .find(|argument| !argument.starts_with("--"))
+        .ok_or_else(|| io::Error::other("dock detect <claude|codex|amp|copilot|…> [--explain]"))?;
+    let agent = AgentKind::from_executable(name)
+        .ok_or_else(|| io::Error::other(format!("unknown agent {name:?}")))?;
+
+    // Reported here rather than swallowed: a manifest that will not parse is exactly the moment
+    // somebody is staring at the answer their edit was meant to change.
+    if let Err(message) = dock::detect::manifest::read_override(agent) {
+        eprintln!("warning: ignoring a manifest that will not parse — {message}");
+    }
+    let rules = dock::detect::manifest::resolve(agent);
+    match &rules.source {
+        dock::detect::manifest::Source::BuiltIn => {
+            println!("{} — built-in rules", agent.label());
+            if let Some(directory) = dock::detect::manifest::override_dir() {
+                println!(
+                    "  override with {}/{}.json",
+                    directory.display(),
+                    agent.label()
+                );
+            }
+        }
+        dock::detect::manifest::Source::Override(path) => {
+            println!("{} — {}", agent.label(), path.display());
+        }
+    }
+    let (blocked, working, awaiting) = &rules.patterns;
+    for (state, patterns) in [
+        ("blocked ", blocked),
+        ("working ", working),
+        ("awaiting", awaiting),
+    ] {
+        if patterns.is_empty() {
+            println!("  {state}  (none)");
+        }
+        for pattern in patterns {
+            println!("  {state}  {pattern}");
+        }
+    }
+    if !args.iter().any(|argument| argument == "--explain") {
+        return Ok(());
+    }
+
+    let mut screen = String::new();
+    io::stdin().read_to_string(&mut screen)?;
+    println!("\nagainst {} bytes of screen:", screen.len());
+    let mut said_something = false;
+    for (state, set, patterns) in [
+        ("blocked", &rules.blocked, blocked),
+        ("working", &rules.working, working),
+        ("awaiting", &rules.awaiting, awaiting),
+    ] {
+        for index in set.matches(&screen).into_iter() {
+            println!("  {state} matched:  {}", patterns[index]);
+            said_something = true;
+        }
+    }
+    if !said_something {
+        println!("  nothing matched — this screen falls through to output-based detection");
+    }
+    println!(
+        "\nverdict from the screen alone: {:?}",
+        dock::detect::classify_screen(agent, &screen)
+    );
+    println!(
+        "(a hook report, where one is installed, overrides this; so does recent output for working)"
+    );
     Ok(())
 }
 

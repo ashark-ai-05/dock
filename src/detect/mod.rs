@@ -1,12 +1,13 @@
-mod heuristic;
+pub(crate) mod heuristic;
 mod process;
 
 pub use heuristic::classify_screen;
+pub mod manifest;
 pub use process::agent_in_process_table;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentKind {
     Claude,

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, time::Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -163,6 +163,25 @@ pub struct Dashboard {
     quick_action_areas: Vec<(PaneCommand, Rect)>,
     last_launch_profile: usize,
     last_repository_mode: bool,
+    /// The last text this dashboard put on the clipboard, and what a middle or right click
+    /// pastes back.
+    ///
+    /// Held in process rather than read back out of the OS clipboard, because reading it means
+    /// `pbpaste`, and spawning a subprocess on the render thread to answer a click is exactly
+    /// the stall this pass exists to remove. It is also what a middle click means everywhere
+    /// else: X11's PRIMARY selection is the last thing *selected*, not the last thing copied
+    /// with a keystroke, and it is per-application rather than global.
+    last_copied: Option<String>,
+    /// When and where the last left press inside a pane landed, and how many presses that run
+    /// has reached, so double and triple click can be derived.
+    last_click: Option<Click>,
+    /// A divider drag's latest ratio, held until the button comes up.
+    ///
+    /// Sending it per motion event made every divider drag a stream of blocking daemon round
+    /// trips — the resize, then `refresh`'s two more — so the divider moved in visible steps
+    /// behind the pointer. The local layout is still updated on every event, so the drag looks
+    /// live; only the authority call waits for the release.
+    pending_divider_resize: Option<(String, String, u16)>,
 }
 
 /// A control drawn on the focused pane's border. Each mirrors a published key, so the mouse
@@ -292,7 +311,31 @@ struct PaneDrag {
     /// The pane body at press time, so the pointer can be mapped to cells for the rest of
     /// the gesture even if a later frame moves the pane.
     inner: Rect,
+    /// Whether *this* gesture actually put text under a selection — by dragging, or by a
+    /// double or triple click. Release copies only when it did, so a plain click can never
+    /// re-copy a selection left standing from an earlier gesture and overwrite whatever the
+    /// user has put on their clipboard since.
+    selected: bool,
 }
+
+/// The previous left press, for deriving click counts.
+///
+/// crossterm reports presses, never how many of them arrived in a row, so double and triple
+/// click have to be inferred from the time and place of the last one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Click {
+    at: Instant,
+    column: u16,
+    row: u16,
+    count: u8,
+}
+
+/// How long after a press a second one still counts as part of the same click.
+///
+/// 450ms sits inside the range every desktop uses (macOS defaults to 500ms, GTK to 400ms) and
+/// is long enough that a deliberate double click is never missed, short enough that two
+/// separate clicks on the same word are not fused into one.
+const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(450);
 
 impl Dashboard {
     pub fn set_repository_catalog(
@@ -2661,7 +2704,12 @@ impl Dashboard {
         if edge != 0
             && let Some(screen) = self.screens.get_mut(&session.run_id)
         {
+            let before = screen.scroll_offset();
             screen.scroll_by(edge);
+            // Only the anchor. The cursor is what the user is deliberately moving, and it is
+            // pinned to the edge by the clamp in `move_cursor` below — which is exactly how
+            // `k` past the top row walks into history a row at a time.
+            session.shift_anchor(scrolled(before, screen.scroll_offset()), bounds);
         }
         session.move_cursor(rows, cols, bounds);
     }
@@ -2719,16 +2767,173 @@ impl Dashboard {
                 )
             }
         };
+        self.record_copy(text, &subject);
+    }
+
+    /// Sends one piece of text to the clipboard and reports, exactly, which routes ran.
+    ///
+    /// The notice deliberately no longer says "to the clipboard": OSC 52 is one-way and three
+    /// of the most common hosts (Terminal.app always, iTerm2 and tmux by default) drop it in
+    /// silence, so Dock naming the clipboard as a completed destination was a claim it had no
+    /// way to check. `ClipboardRoute::describe` says what was actually asked of whom.
+    fn record_copy(&mut self, text: String, subject: &str) {
         self.error = Some(match clipboard::copy(&text) {
-            Ok(route) => {
-                let route = match route {
-                    ClipboardRoute::Osc52 => "OSC 52",
-                    ClipboardRoute::Command(helper) => helper,
-                };
-                format!("copied {subject} to the clipboard via {route}")
+            Ok(routes) => {
+                let routes = routes
+                    .into_iter()
+                    .map(ClipboardRoute::describe)
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                // Remembered only when a route ran, so a middle click can never paste back
+                // text that no clipboard anywhere ever received.
+                self.last_copied = Some(text);
+                format!("copied {subject} \u{b7} {routes}")
             }
             Err(reason) => format!("copy failed: {reason}"),
         });
+    }
+
+    /// Copies whatever the pointer gesture just selected.
+    ///
+    /// Blank selections are dropped rather than copied: a press that jitters one cell, or a
+    /// drag across a pane's padding, would otherwise replace a clipboard the user had filled
+    /// deliberately with a run of spaces. Auto-copy is only worth having if it cannot destroy
+    /// something.
+    fn copy_pointer_selection(&mut self) {
+        let Some(session) = self.copy.clone() else {
+            return;
+        };
+        let Some((from, to)) = session.selection() else {
+            return;
+        };
+        let Some(text) = self
+            .screens
+            .get(&session.run_id)
+            .map(|screen| screen.selection_text(from, to))
+            .filter(|text| !text.trim().is_empty())
+        else {
+            return;
+        };
+        let subject = format!("{} characters", text.chars().count());
+        self.record_copy(text, &subject);
+    }
+
+    /// Pastes the last copied text into the pane under the pointer.
+    ///
+    /// Middle click is the X11 convention and right click is Windows', and terminals honour
+    /// whichever the platform uses; Dock takes both rather than guessing. The press must land
+    /// in the *focused* pane's body — a paste is destructive input, and a click that lands in
+    /// one pane must never be typed into another.
+    fn paste_last_copied(&mut self, column: u16, row: u16) -> UiCommand {
+        let over_focused = self
+            .workspace()
+            .map(|workspace| workspace.focused_pane_id.clone())
+            .and_then(|pane_id| self.pane_inner_areas.get(&pane_id).copied())
+            .is_some_and(|inner| contains(inner, column, row));
+        if !over_focused {
+            return UiCommand::None;
+        }
+        let Some(text) = self.last_copied.clone() else {
+            self.error = Some("nothing copied yet \u{b7} select some text first".into());
+            return UiCommand::None;
+        };
+        self.error = None;
+        // Through the same encoder the host's own bracketed paste uses, so a multi-line paste
+        // cannot execute line by line in a shell that asked for bracketing.
+        self.paste(text)
+    }
+
+    /// How many presses in a row this one is, for double- and triple-click selection.
+    ///
+    /// A press one column either side of the last still counts: a hand that moves a single
+    /// cell between two clicks meant to double-click, and requiring the exact same cell made
+    /// double click fail often enough to feel broken. Rows must match exactly — a press a row
+    /// away is a different line and unambiguously a new gesture.
+    fn count_click(&mut self, column: u16, row: u16) -> u8 {
+        let at = Instant::now();
+        let count = match self.last_click {
+            Some(previous)
+                if at.duration_since(previous.at) <= MULTI_CLICK_WINDOW
+                    && previous.row == row
+                    && previous.column.abs_diff(column) <= 1 =>
+            {
+                previous.count.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.last_click = Some(Click {
+            at,
+            column,
+            row,
+            count,
+        });
+        count
+    }
+
+    /// Selects the word or the line under a double or triple click.
+    ///
+    /// Nothing is selected when the click lands on blank padding, so a double click in the
+    /// empty half of a pane does not arm a copy of nothing.
+    fn select_by_click(&mut self, clicks: u8) {
+        let Some(drag) = self.pane_drag.clone() else {
+            return;
+        };
+        let Some((bounds, row_text)) = self
+            .screens
+            .get(&drag.run_id)
+            .map(|screen| (screen.size(), screen.visible_row(drag.origin.0)))
+        else {
+            return;
+        };
+        let selection = if clicks >= 3 {
+            line_bounds(&row_text)
+        } else {
+            word_bounds(&row_text, drag.origin.1)
+        };
+        let Some((first, last)) = selection else {
+            return;
+        };
+        if let Some(existing) = self.copy.clone()
+            && existing.run_id != drag.run_id
+        {
+            self.leave_copy_mode(&existing);
+        }
+        let mut session = CopySession::new(drag.run_id.clone(), (drag.origin.0, first));
+        session.begin_selection();
+        session.set_cursor((drag.origin.0, last), bounds);
+        self.copy = Some(session);
+        self.copy_searching = false;
+        self.error = None;
+        if let Some(armed) = self.pane_drag.as_mut() {
+            armed.selected = true;
+        }
+    }
+
+    /// Scrolls a pane, dragging any selection anchored in it along with the viewport.
+    ///
+    /// Selection endpoints are cells of the *visible* grid, so scrolling used to re-point them
+    /// at whatever text moved underneath: a selection made and then scrolled yanked rows the
+    /// highlight had never covered, silently. They are moved by however far the viewport
+    /// actually went — `scroll_by` clamps at both ends, so the request is not the answer — and
+    /// an anchor pushed off the screen ends the selection rather than clamping to an edge it
+    /// no longer means.
+    fn scroll_pane(&mut self, run_id: &str, delta: i32) {
+        let Some(screen) = self.screens.get_mut(run_id) else {
+            return;
+        };
+        let before = screen.scroll_offset();
+        screen.scroll_by(delta);
+        let moved = scrolled(before, screen.scroll_offset());
+        let bounds = screen.size();
+        if moved == 0 {
+            return;
+        }
+        if let Some(session) = self.copy.as_mut()
+            && session.run_id == run_id
+        {
+            session.shift_anchor(moved, bounds);
+            session.shift_cursor(moved, bounds);
+        }
     }
 
     /// Extends a pointer selection, entering copy mode on the first drag of the gesture.
@@ -3414,8 +3619,12 @@ impl Dashboard {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 // A fresh press ends any previous gesture, whatever swallowed its release.
-                // Without this a stale arming would hijack the next divider drag.
+                // Without this a stale arming would hijack the next divider drag, and a ratio
+                // left over from a divider drag whose release never arrived — a window resize
+                // clears `dragging` mid-gesture — would be sent on the release of whatever
+                // gesture came next.
                 self.pane_drag = None;
+                self.pending_divider_resize = None;
                 // Tab-strip chrome first: these sit beside the tabs, so testing tabs first would
                 // swallow clicks that landed on the controls.
                 if self
@@ -3513,20 +3722,46 @@ impl Dashboard {
                             run_id,
                             origin,
                             inner,
+                            selected: false,
                         })
                     });
                 self.pane_drag = armed;
+                let clicks = self.count_click(event.column, event.row);
+                if clicks > 1 {
+                    self.select_by_click(clicks);
+                }
+                // Read before the assignment below, which would otherwise make every pane look
+                // as though it had just been focused.
+                let already_focused = self
+                    .workspace()
+                    .is_some_and(|workspace| workspace.focused_pane_id == pane_id);
+                if already_focused {
+                    // Focusing the pane that already has focus cost three blocking daemon round
+                    // trips — this request, then `refresh`'s `Workspace(Inspect)` and `Inspect` —
+                    // on the press that begins every selection, and the daemon's inspect may
+                    // shell out to `ps` on a cache miss. That hitch was the first thing a user
+                    // felt when they went to select text, and it bought nothing: the answer was
+                    // always the focus the dashboard already had.
+                    return UiCommand::None;
+                }
                 self.layout.workspaces[self.workspace_index].focused_pane_id = pane_id.clone();
                 UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Focus {
                     workspace_id,
                     pane_id,
                 })))
             }
+            MouseEventKind::Down(MouseButton::Middle)
+            | MouseEventKind::Down(MouseButton::Right) => {
+                self.paste_last_copied(event.column, event.row)
+            }
             MouseEventKind::Drag(MouseButton::Left) => {
                 // A press landed either on a divider or in a pane body, never both, so this
                 // reads the pane gesture first and leaves the divider path below untouched.
                 if let Some(drag) = self.pane_drag.clone() {
                     self.drag_selection(&drag, event.column, event.row);
+                    if let Some(armed) = self.pane_drag.as_mut() {
+                        armed.selected = true;
+                    }
                     return UiCommand::None;
                 }
                 let Some(target) = self.dragging.as_ref() else {
@@ -3549,18 +3784,32 @@ impl Dashboard {
                     &pane_id,
                     ratio,
                 );
-                UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Resize {
-                    workspace_id,
-                    pane_id,
-                    ratio_milli: ratio,
-                })))
+                // Held rather than sent: the layout above already moved locally, so the
+                // divider tracks the pointer, and the daemon hears one ratio — the one the
+                // pointer finished on — when the button comes up.
+                self.pending_divider_resize = Some((workspace_id, pane_id, ratio));
+                UiCommand::None
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.dragging = None;
-                // The selection stands, and nothing is copied. Yank is always an explicit
-                // `y`, so a stray drag can never overwrite what the user copied earlier.
-                self.pane_drag = None;
-                UiCommand::None
+                // Auto-copy on release, which is what every modern terminal does and what a
+                // user coming from iTerm2, Ghostty or WezTerm expects: a selection that has to
+                // be confirmed with a second keystroke is a selection most people never copy.
+                // `y` still works, and still leaves copy mode.
+                let selected = self.pane_drag.take().is_some_and(|drag| drag.selected);
+                if selected {
+                    self.copy_pointer_selection();
+                }
+                match self.pending_divider_resize.take() {
+                    Some((workspace_id, pane_id, ratio_milli)) => {
+                        UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Resize {
+                            workspace_id,
+                            pane_id,
+                            ratio_milli,
+                        })))
+                    }
+                    None => UiCommand::None,
+                }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 // Three rows per notch matches what terminals send for a single wheel click.
@@ -3575,8 +3824,8 @@ impl Dashboard {
                     .find(|(_, area)| contains(**area, event.column, event.row))
                     .and_then(|(pane_id, _)| self.workspace()?.panes.get(pane_id))
                     .and_then(|pane| pane.run_id.clone());
-                if let Some(screen) = run_id.and_then(|id| self.screens.get_mut(&id)) {
-                    screen.scroll_by(delta);
+                if let Some(run_id) = run_id {
+                    self.scroll_pane(&run_id, delta);
                 }
                 UiCommand::None
             }
@@ -3765,6 +4014,62 @@ fn cell_at(buffer: &mut Buffer, inner: Rect, row: u16, column: u16) -> Option<&m
 fn contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
 }
+/// How far a viewport actually moved, as a signed row delta.
+///
+/// Positive means the visible rows moved *down* the screen, which is what going back into
+/// history does: the offset grows and the cell that was at row `r` is now at row `r + moved`.
+fn scrolled(before: usize, after: usize) -> i64 {
+    i64::try_from(after).unwrap_or(i64::MAX) - i64::try_from(before).unwrap_or(i64::MAX)
+}
+
+/// Whether a character belongs to the same word as its neighbours.
+///
+/// Terminal content is not prose. What a person double-clicks in a pane is a path, an
+/// identifier, a URL or a compiler's `file.rs:12:5`, so `/`, `.`, `-`, `_`, `~`, `+`, `@` and
+/// `:` are *inside* a word rather than between two. That is iTerm2's default set plus `@` and
+/// `:`, which is what makes `user@host`, `localhost:8080` and `src/main.rs:12` select whole
+/// instead of in fragments. `,` and `;` are deliberately left out: in terminal output they end
+/// a list item far more often than they appear inside one.
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || "/.-_~+@:".contains(character)
+}
+
+/// The word under `column`, as inclusive grid columns, or `None` on blank padding.
+///
+/// A run of punctuation counts as a word of its own, so double-clicking the `->` between two
+/// identifiers selects the arrow rather than silently selecting one of them.
+///
+/// Columns are character offsets rather than terminal cell widths, with exactly the caveat
+/// [`crate::copy::find_matches`] documents: a row carrying CJK or emoji ahead of the click is
+/// off by the count of those. Fixing it needs a width table this crate does not carry.
+fn word_bounds(row: &str, column: u16) -> Option<(u16, u16)> {
+    let characters: Vec<char> = row.chars().collect();
+    let index = usize::from(column);
+    let class = |position: usize| -> Option<bool> {
+        characters
+            .get(position)
+            .filter(|character| !character.is_whitespace())
+            .map(|character| is_word_character(*character))
+    };
+    let wanted = class(index)?;
+    let mut first = index;
+    while first > 0 && class(first - 1) == Some(wanted) {
+        first -= 1;
+    }
+    let mut last = index;
+    while class(last + 1) == Some(wanted) {
+        last += 1;
+    }
+    Some((u16::try_from(first).ok()?, u16::try_from(last).ok()?))
+}
+
+/// The whole line, as inclusive grid columns, trimmed of the trailing blanks that are grid
+/// padding rather than content. A blank row selects nothing.
+fn line_bounds(row: &str) -> Option<(u16, u16)> {
+    let last = row.trim_end().chars().count().checked_sub(1)?;
+    Some((0, u16::try_from(last).ok()?))
+}
+
 fn drag_ratio(divider: &Divider, x: u16, y: u16) -> u16 {
     let (position, length, minimum) = match divider.axis {
         SplitAxis::Vertical => (
@@ -4160,15 +4465,27 @@ mod tests {
         assert!(
             matches!(tab, UiCommand::Request(request) if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Focus { pane_id, .. }) if pane_id == "b"))
         );
+        // `Ctrl+B Tab` already moved focus to "b", so a press there has nothing to tell the
+        // daemon and must answer locally; the press that changes focus is the one on "a".
         let b = dashboard.pane_areas["b"];
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: b.x + 1,
+                row: b.y + 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None
+        );
+        let a = dashboard.pane_areas["a"];
         let focus = dashboard.mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: b.x + 1,
-            row: b.y + 1,
+            column: a.x + 1,
+            row: a.y + 1,
             modifiers: KeyModifiers::NONE,
         });
         assert!(
-            matches!(focus, UiCommand::Request(request) if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Focus { pane_id, .. }) if pane_id == "b"))
+            matches!(focus, UiCommand::Request(request) if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Focus { pane_id, .. }) if pane_id == "a"))
         );
         let divider = dashboard.dividers[0].area;
         dashboard.mouse(MouseEvent {
@@ -4177,8 +4494,18 @@ mod tests {
             row: divider.y,
             modifiers: KeyModifiers::NONE,
         });
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 0,
+                row: divider.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None,
+            "the ratio is held until the button comes up; see              a_divider_drag_asks_the_daemon_to_resize_once_when_the_button_comes_up"
+        );
         let resize = dashboard.mouse(MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
+            kind: MouseEventKind::Up(MouseButton::Left),
             column: 0,
             row: divider.y,
             modifiers: KeyModifiers::NONE,
@@ -6695,8 +7022,15 @@ mod tests {
         );
     }
 
+    /// REWRITTEN. This test used to pin the opposite contract — "releasing a drag must not
+    /// write to the clipboard" — on the reasoning that a stray drag could otherwise overwrite
+    /// what the user copied earlier. That reasoning is sound and it is now enforced somewhere
+    /// better (a gesture that selected nothing copies nothing; see the test below), while the
+    /// contract it protected cost Dock the behaviour every terminal a user arrives from
+    /// already has. iTerm2, Ghostty, WezTerm and GNOME Terminal all copy on release; a
+    /// selection that then needs `y` pressed reads as a selection that did not work.
     #[test]
-    fn dragging_across_a_pane_selects_without_writing_to_the_clipboard() {
+    fn releasing_a_drag_copies_the_selection_and_leaves_it_highlighted() {
         let mut dashboard = bound_dashboard();
         dashboard.apply_event(attach_event("run_1", b"drag over me\r\n"));
         render_to_string(&mut dashboard, 100, 30);
@@ -6740,15 +7074,357 @@ mod tests {
             dashboard.copy_mode(),
             "releasing finalises the selection but stays in copy mode"
         );
+        // Columns 1..=7 of "drag over me" inclusive at both ends, which is what the highlight
+        // covered — the same inclusive run `a_mid_row_selection_yanks_exactly_as_many_        // characters_as_it_highlights` pins.
+        assert_eq!(
+            dashboard.last_copied.as_deref(),
+            Some("rag ove"),
+            "release copies exactly what was highlighted"
+        );
+        let notice = dashboard.error.clone().unwrap_or_default();
         assert!(
-            dashboard.error.is_none(),
-            "releasing a drag must not write to the clipboard"
+            notice.contains("copied 7 characters"),
+            "the copy names itself, got {notice:?}"
+        );
+        assert!(
+            notice.contains("acknowledge"),
+            "an OSC 52 copy must not claim a clipboard it cannot check, got {notice:?}"
         );
         let rendered = render_to_string(&mut dashboard, 100, 30);
         assert!(
             rendered.contains("COPY"),
             "a pointer selection puts the pane in the same visible mode a keyboard one does"
         );
+    }
+
+    /// The guarantee the old contract was really protecting, kept: a gesture that selected
+    /// nothing must not touch the clipboard. Without this, every click that focused a pane
+    /// would re-copy whatever selection happened to still be standing and overwrite anything
+    /// the user had put on their clipboard from elsewhere in between.
+    #[test]
+    fn a_click_that_never_dragged_leaves_the_clipboard_alone() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"drag over me\r\n"));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        let press = |column: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        let release = |column: u16| MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        dashboard.mouse(press(area.x + 2));
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 8,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        dashboard.mouse(release(area.x + 8));
+        assert_eq!(dashboard.last_copied.as_deref(), Some("rag ove"));
+
+        dashboard.error = None;
+        // A press on a far-away cell, so it cannot be read as a second click of the first.
+        dashboard.mouse(press(area.x + 20));
+        dashboard.mouse(release(area.x + 20));
+        assert_eq!(
+            dashboard.last_copied.as_deref(),
+            Some("rag ove"),
+            "a click with no drag must leave the earlier copy standing"
+        );
+        assert!(
+            dashboard.error.is_none(),
+            "and it must not report a copy that did not happen"
+        );
+    }
+
+    /// Double click selects a word, triple click a line — the behaviour of every terminal, and
+    /// the reason `is_word_character` treats a path as one thing rather than five.
+    #[test]
+    fn a_double_click_selects_a_word_and_a_triple_click_the_whole_line() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"see src/main.rs:12 now"));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        // Column 6 of the row, which is inside "src/main.rs:12".
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1 + 6,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        dashboard.mouse(press);
+        dashboard.mouse(press);
+        assert_eq!(
+            dashboard
+                .copy
+                .as_ref()
+                .and_then(CopySession::selection)
+                .expect("the double click selected a word"),
+            ((0, 4), (0, 17)),
+            "a path with a line number is one word, not five"
+        );
+        dashboard.mouse(press);
+        assert_eq!(
+            dashboard
+                .copy
+                .as_ref()
+                .and_then(CopySession::selection)
+                .expect("the triple click selected a line"),
+            ((0, 0), (0, 21)),
+            "the line stops at its last character, not at the padded width of the grid"
+        );
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: press.column,
+            row: press.row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            dashboard.last_copied.as_deref(),
+            Some("see src/main.rs:12 now"),
+            "releasing a multi-click copies it like any other selection"
+        );
+    }
+
+    #[test]
+    fn a_middle_or_right_click_pastes_the_last_copied_text_into_the_focused_pane() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"paste me\r\n"));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        let inside = |kind| MouseEvent {
+            kind,
+            column: area.x + 2,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Nothing copied yet: the click says so rather than typing something arbitrary.
+        assert_eq!(
+            dashboard.mouse(inside(MouseEventKind::Down(MouseButton::Middle))),
+            UiCommand::None
+        );
+        assert!(
+            dashboard
+                .error
+                .as_deref()
+                .is_some_and(|notice| notice.contains("nothing copied yet")),
+            "got {:?}",
+            dashboard.error
+        );
+
+        dashboard.mouse(inside(MouseEventKind::Down(MouseButton::Left)));
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 5,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: area.x + 5,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(dashboard.last_copied.as_deref(), Some("aste"));
+
+        for button in [MouseButton::Middle, MouseButton::Right] {
+            assert_eq!(
+                dashboard.mouse(inside(MouseEventKind::Down(button))),
+                UiCommand::PaneInput(b"aste".to_vec()),
+                "{button:?} pastes what was last copied, through the paste encoder"
+            );
+        }
+        // A press outside the focused pane's body is not a paste into it: input is
+        // destructive, and a click that landed elsewhere must never be typed here.
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Middle),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None
+        );
+    }
+
+    /// A divider drag used to send a `Resize` per motion event, and each one cost a blocking
+    /// request plus `refresh`'s two more, so the divider crawled behind the pointer. The local
+    /// layout still moves on every event; only the daemon call waits for the release.
+    #[test]
+    fn a_divider_drag_asks_the_daemon_to_resize_once_when_the_button_comes_up() {
+        let mut dashboard = bound_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        let divider = dashboard
+            .dividers
+            .first()
+            .cloned()
+            .expect("a split divider");
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: divider.area.x,
+            row: divider.area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        for offset in 1..=6 {
+            assert_eq!(
+                dashboard.mouse(MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: divider.area.x + offset,
+                    row: divider.area.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                UiCommand::None,
+                "a divider drag must not put a blocking round trip on every motion event"
+            );
+        }
+        let released = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: divider.area.x + 6,
+            row: divider.area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let UiCommand::Request(request) = released else {
+            panic!("releasing a divider must ask the daemon for the ratio it finished on");
+        };
+        let Request::Workspace(WorkspaceRequest::Resize { ratio_milli, .. }) = *request else {
+            panic!("expected a resize");
+        };
+        assert!(
+            ratio_milli > 500,
+            "the ratio sent is where the pointer ended up, got {ratio_milli}"
+        );
+        assert!(
+            dashboard.pending_divider_resize.is_none(),
+            "the held ratio is consumed by the release, not resent on the next one"
+        );
+    }
+
+    /// Selection endpoints are cells of the visible grid, so a viewport that moves under them
+    /// leaves them pointing at different text. Before this, scrolling mid-selection silently
+    /// re-aimed the anchor and the yank covered rows the highlight never touched.
+    #[test]
+    fn scrolling_a_pane_carries_an_anchored_selection_along_with_the_text() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"seed\r\n"));
+        // Through a delta rather than the attach snapshot: a snapshot carries the screen only,
+        // so a replica seeded from one has no history for the wheel to reach.
+        let mut output = Vec::new();
+        for line in 1..=40 {
+            output.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        dashboard.apply_event(Event::PaneDelta {
+            run_id: "run_1".into(),
+            revision: 2,
+            bytes: STANDARD.encode(&output),
+        });
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1,
+            row: area.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 6,
+            row: area.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        let selected = |dashboard: &Dashboard| {
+            let session = dashboard.copy.as_ref().expect("a session");
+            let (from, to) = session.selection().expect("an anchored selection");
+            dashboard.screens["run_1"].selection_text(from, to)
+        };
+        let before = selected(&dashboard);
+        assert!(!before.trim().is_empty(), "the drag selected something");
+
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: area.x + 6,
+            row: area.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_ne!(
+            dashboard.screens["run_1"].scroll_offset(),
+            0,
+            "the wheel moved the viewport"
+        );
+        assert_eq!(
+            selected(&dashboard),
+            before,
+            "the selection must still hold the characters it was placed on"
+        );
+    }
+
+    #[test]
+    fn clicking_the_pane_that_already_has_focus_asks_the_daemon_for_nothing() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"already here\r\n"));
+        render_to_string(&mut dashboard, 100, 30);
+        let focused = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        let other = *dashboard.pane_areas.get("b").expect("pane b is rendered");
+        assert_eq!(
+            dashboard.workspace().expect("a workspace").focused_pane_id,
+            "a"
+        );
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: focused.x + 2,
+                row: focused.y + 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None,
+            "re-focusing the focused pane cost three blocking round trips and answered nothing"
+        );
+        // A press on a *different* pane still has something to tell the daemon.
+        let moved = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: other.x + 2,
+            row: other.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(
+                moved,
+                UiCommand::Request(ref request)
+                    if matches!(**request, Request::Workspace(WorkspaceRequest::Focus { .. }))
+            ),
+            "got {moved:?}"
+        );
+    }
+
+    #[test]
+    fn a_word_is_the_run_a_terminal_user_means_by_one() {
+        // Paths, identifiers, URLs and compiler locations select whole.
+        assert_eq!(word_bounds("see src/main.rs:12 now", 6), Some((4, 17)));
+        assert_eq!(word_bounds("cd ~/work/dock-2 ok", 5), Some((3, 15)));
+        assert_eq!(word_bounds("mail to a@b.test now", 9), Some((8, 15)));
+        // A hyphen binds, so `dock-2` above is one word and this is `-` joined to nothing.
+        assert_eq!(word_bounds("a -> b", 2), Some((2, 2)));
+        // A run of characters that bind to nothing is a word of its own rather than swallowing
+        // a neighbour: double-clicking the arrow selects the arrow.
+        assert_eq!(word_bounds("a => b", 2), Some((2, 3)));
+        // Padding selects nothing: nobody double-clicks blanks on purpose, and copying them
+        // would replace a clipboard the user filled deliberately.
+        assert_eq!(word_bounds("a  b", 1), None);
+        assert_eq!(word_bounds("short", 40), None);
+    }
+
+    #[test]
+    fn a_line_selection_stops_at_the_last_character_rather_than_the_padded_width() {
+        assert_eq!(line_bounds("hello world      "), Some((0, 10)));
+        assert_eq!(line_bounds("x"), Some((0, 0)));
+        assert_eq!(line_bounds("      "), None, "a blank row selects nothing");
+        assert_eq!(line_bounds(""), None);
     }
 
     #[test]

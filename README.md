@@ -230,14 +230,43 @@ always leaves immediately.
 
 Dragging with the mouse inside a pane enters copy mode and extends a
 selection the same way; a plain click still just focuses the pane. Releasing
-a drag finalises the selection but never copies anything by itself — yanking
-is always an explicit `y`.
+a drag **copies the selection**, which is what iTerm2, Ghostty, WezTerm and
+GNOME Terminal all do — a selection that then needs a second keystroke reads
+as a selection that did not work. The highlight stays up after the release,
+and `y` still works. A gesture that selected nothing copies nothing, so a
+plain click can never overwrite what is already on the clipboard.
 
-A yank tries OSC 52 first (works over SSH, since it asks the *host* terminal
-to set its clipboard) and falls back to `pbcopy`/`wl-copy`/`xclip` if that
-fails. The notice after a yank names which route was used, because OSC 52 is
-disabled by default in some terminals and a silent no-op would look
-identical to a working copy.
+Double-click selects the word under the pointer and triple-click selects the
+line, trimmed of trailing padding. "Word" is spelled for terminal content
+rather than prose: `/`, `.`, `-`, `_`, `~`, `+`, `@` and `:` all bind, so
+`src/main.rs:12`, `user@host` and `localhost:8080` select whole.
+
+Middle-click and right-click paste the last thing Dock copied into the
+focused pane, through the same bracketed-paste encoder the host's own paste
+uses. It is the last thing *this dashboard* copied rather than whatever the
+OS clipboard holds: reading the OS clipboard means running `pbpaste`, and
+spawning a process on the render thread to answer a click is exactly the
+stall this avoids. It is also what a middle click means on X11, where PRIMARY
+is per-application and holds the last selection.
+
+A copy is handed to the host terminal as OSC 52, which works over SSH since
+it asks the *host* terminal to set its clipboard. OSC 52 is one-way: the
+terminal never acknowledges it, Terminal.app disables it outright, iTerm2
+disables it by default and tmux ignores it without `set -g set-clipboard on`.
+Dock therefore says what it *asked for* rather than claiming a clipboard it
+cannot check. Set `DOCK_CLIPBOARD` to choose the route:
+
+| `DOCK_CLIPBOARD` | Route |
+| --- | --- |
+| unset, `auto`, `osc52` | OSC 52 only (default; the only route that works over SSH) |
+| `helper` | `pbcopy`/`wl-copy`/`xclip` only, for a terminal that refuses OSC 52 |
+| `both` | Both, when a terminal's OSC 52 support is unknown |
+| `off` | Neither |
+
+The helper is spawned and reaped off the render thread, so a copy never
+blocks a frame on a subprocess, and an unrecognised `DOCK_CLIPBOARD` value is
+refused rather than silently leaving you on the route you were trying to
+change.
 
 The mouse wheel scrolls a pane's history, and scrolling back to the bottom
 resumes following live output. The daemon streams each pane's raw output to

@@ -20,7 +20,7 @@ use std::{
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind,
+        Event, KeyCode, KeyEventKind, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -421,6 +421,28 @@ struct TerminalGuard {
     restored: bool,
 }
 
+/// Narrows mouse reporting from any-event tracking to button-held motion.
+///
+/// `EnableMouseCapture` turns on `?1000h ?1002h ?1003h ?1015h ?1006h`, and `?1003h` is
+/// *any-event* tracking: the terminal reports every pointer movement over the window, button
+/// held or not. Dock has nothing to do with idle motion — it falls through to
+/// `UiCommand::None` — but each report still woke the render loop for a complete repaint of
+/// every pane, plus a deep clone of the workspace tree, which is why simply moving the mouse
+/// across a dashboard made it feel heavy. `?1002` (report motion only while a button is down)
+/// is all a drag selection needs.
+///
+/// The `?1002h` after the reset is not redundant, and leaving it out breaks the mouse
+/// outright. xterm and the many emulators that copy it hold *one* mouse mode rather than a set
+/// of independent flags, and reset the whole thing to off for any of `?1000l`/`?1002l`/`?1003l`
+/// — so `?1003l` alone would have turned mouse reporting off completely and taken drag
+/// selection, the wheel and every clickable control with it. Re-asserting `?1002h` lands that
+/// single mode on button-event tracking; on a terminal that really does keep independent
+/// flags, it is a set of a flag that is already set. Both end up in the same place.
+///
+/// Nothing extra is needed to restore this: `DisableMouseCapture` emits `?1002l` among its
+/// inverses on both teardown paths below.
+const BUTTON_MOTION_ONLY: &str = "\x1b[?1003l\x1b[?1002h";
+
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         let guard = Self {
@@ -438,6 +460,8 @@ impl TerminalGuard {
             // on every restore path below, alongside mouse capture.
             EnableBracketedPaste
         )?;
+        write!(io::stdout(), "{BUTTON_MOTION_ONLY}")?;
+        io::stdout().flush()?;
         Ok(guard)
     }
 
@@ -493,6 +517,10 @@ fn run_dashboard(
     let (catalog_tx, catalog_rx) = mpsc::channel();
     let mut catalog_loading = false;
     let mut test_events = test_events()?;
+    // Events drained from the terminal in one burst and not yet handled. Handled one per
+    // iteration like any other, so each still gets its own paint; the burst is only *read* in
+    // one go, which is what lets the motion inside it be collapsed.
+    let mut pending_events: VecDeque<Event> = VecDeque::new();
     // A running dashboard holds two daemon connections: `client` for requests, and this one,
     // which the daemon turns into a one-way push channel and never reads again. Pane content
     // now arrives on it, which is what lets the timed Inspect poll below go away entirely: an
@@ -534,7 +562,12 @@ fn run_dashboard(
             .draw(|frame| dashboard.render(frame))
             .map_err(|e| e.to_string())?;
         for (workspace_id, pane_id, rows, cols) in dashboard.take_pending_resizes() {
-            let _ = client.request(&Request::PaneResize(PaneResizeRequest {
+            // `send` rather than `request`: the reply was already discarded, and waiting for it
+            // put a blocking daemon round trip inside the frame. A divider drag changes pane
+            // geometry on every motion event, so that was one blocking round trip per frame for
+            // as long as the pointer moved. Errors are not lost — the client counts the unread
+            // reply and `take_deferred_error` below surfaces it on the next drain.
+            let _ = client.send(&Request::PaneResize(PaneResizeRequest {
                 workspace_id,
                 pane_id,
                 rows,
@@ -546,11 +579,26 @@ fn run_dashboard(
         }
         let event = if let Some(event) = test_events.pop_front() {
             event
+        } else if let Some(event) = pending_events.pop_front() {
+            event
         } else {
             if !event::poll(Duration::from_millis(16)).map_err(|e| e.to_string())? {
                 continue;
             }
-            event::read().map_err(|e| e.to_string())?
+            let mut batch = vec![event::read().map_err(|e| e.to_string())?];
+            // Everything the terminal has already written is taken now, before the frame that
+            // would otherwise be painted once per event. A pointer crossing a pane delivers a
+            // report per cell, and each one used to cost a complete repaint of every pane plus
+            // a deep clone of the workspace tree; collapsed here, a whole burst costs one.
+            while batch.len() < MAX_COALESCED_EVENTS
+                && event::poll(Duration::ZERO).map_err(|e| e.to_string())?
+            {
+                batch.push(event::read().map_err(|e| e.to_string())?);
+            }
+            let mut batch = coalesce_motion(batch);
+            let first = batch.remove(0);
+            pending_events.extend(batch);
+            first
         };
         let command = match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => dashboard.key(key),
@@ -736,6 +784,57 @@ fn dispatch_prompt(task_id: u64, title: &str) -> String {
          dock handoff \"what you did\" --check=\"cargo test:pass\"\n\
          The handoff puts your result in front of the human with the evidence Dock measured itself."
     )
+}
+
+#[cfg(test)]
+mod hook_check_tests {
+    use super::{hook_events, missing_hook_events, resolve_on_path};
+
+    #[test]
+    fn a_settings_file_with_no_hooks_at_all_is_missing_every_event() {
+        // The state this bug actually presented in: hooks never installed, so nothing was ever
+        // reported, so every pane sat on screen-scraped state and nothing said why.
+        let missing = missing_hook_events(&serde_json::json!({}), &hook_events());
+        assert_eq!(missing.len(), 6, "{missing:?}");
+        assert!(missing.contains(&"Stop".to_owned()), "{missing:?}");
+    }
+
+    #[test]
+    fn what_install_writes_is_what_check_reads_back_as_wired() {
+        // The two halves have to agree about what "installed" means, or `--install` followed by
+        // `--check` reports work it just did as missing.
+        let expected = hook_events();
+        let settings = serde_json::json!({ "hooks": expected["hooks"].clone() });
+        assert!(missing_hook_events(&settings, &expected).is_empty());
+    }
+
+    #[test]
+    fn somebody_elses_hook_on_the_same_event_does_not_count_as_ours() {
+        // An event can carry several handlers. Ours being absent is what matters, not the slot
+        // being empty — the earlier merge logic is careful about this and the check must match it.
+        let expected = hook_events();
+        let settings = serde_json::json!({
+            "hooks": { "Stop": [{"hooks": [{"type": "command", "command": "make lint"}]}] }
+        });
+        let missing = missing_hook_events(&settings, &expected);
+        assert!(missing.contains(&"Stop".to_owned()), "{missing:?}");
+    }
+
+    #[test]
+    fn a_dock_that_is_not_on_path_is_found_to_be_missing_rather_than_assumed_present() {
+        // Hooks invoke `dock` by bare name, so this is its own failure mode: a Dock that works
+        // when you type its path and does nothing when a hook runs it.
+        assert_eq!(resolve_on_path(None, "dock"), None);
+        assert_eq!(resolve_on_path(Some(""), "dock"), None);
+        assert_eq!(
+            resolve_on_path(Some("/nonexistent:/also/nothing"), "dock"),
+            None
+        );
+        // And an entry that does hold the file resolves to it, empty segments notwithstanding.
+        let dir = std::env::current_dir().expect("cwd");
+        let found = resolve_on_path(Some(&format!(":{}", dir.display())), "Cargo.toml");
+        assert_eq!(found, Some(dir.join("Cargo.toml")));
+    }
 }
 
 #[cfg(test)]
@@ -962,14 +1061,19 @@ fn agent_state_command(args: &[String]) -> io::Result<()> {
     };
     let (Ok(run_id), Ok(socket)) = (std::env::var("DOCK_RUN"), std::env::var("DOCK_SOCKET")) else {
         // Not in a Dock pane. Nothing to report to, and nothing worth failing over.
+        hook_debug("DOCK_RUN and DOCK_SOCKET are not both set, so this is not a Dock pane");
         return Ok(());
     };
     let Ok(mut stream) = UnixStream::connect(&socket) else {
+        hook_debug(&format!("could not connect to the daemon at {socket}"));
         return Ok(());
     };
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(clone) => clone,
-        Err(_) => return Ok(()),
+        Err(error) => {
+            hook_debug(&format!("could not read from the daemon socket: {error}"));
+            return Ok(());
+        }
     });
     for request in [
         serde_json::to_string(&Request::Hello(dock::protocol::HelloRequest {
@@ -1555,6 +1659,52 @@ fn parse_test_events(value: &str) -> Result<VecDeque<Event>, String> {
     Ok(events)
 }
 
+/// How many events one drain takes before handing control back to the loop.
+///
+/// A bound rather than "everything pending" so a terminal producing reports faster than Dock
+/// consumes them cannot hold the loop away from painting indefinitely. 512 is far above any
+/// real burst — a pointer swept across a full-screen dashboard produces a few hundred at most.
+const MAX_COALESCED_EVENTS: usize = 512;
+
+/// Whether an event is pure pointer motion, and so safe to throw away when a newer one of the
+/// same kind is already in hand.
+fn motion_kind(event: &Event) -> Option<MouseEventKind> {
+    match event {
+        Event::Mouse(mouse) => match mouse.kind {
+            kind @ (MouseEventKind::Moved | MouseEventKind::Drag(_)) => Some(kind),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Collapses each run of consecutive same-kind pointer motion down to its most recent report.
+///
+/// Motion is the one event class where only the latest matters: the pointer's position is a
+/// state, not a message, and every intermediate cell it crossed is already implied by where it
+/// ended up. Nothing else may be touched, and this is deliberately conservative about it:
+///
+/// * Keys, pastes and resizes are messages — each one means something the next cannot replace —
+///   so they pass through untouched and in order.
+/// * Presses and releases bracket a gesture. Dropping either would leave a drag that never
+///   started or never ended, and reordering one past a motion event would anchor a selection on
+///   the wrong cell.
+/// * Only *consecutive* motion collapses, and only when the two reports are the same kind. A
+///   `Moved` and a `Drag` are different gestures, and collapsing a `Drag` into a following
+///   `Moved` would throw away the last position of a selection in progress.
+fn coalesce_motion(events: Vec<Event>) -> Vec<Event> {
+    let mut kept: Vec<Event> = Vec::with_capacity(events.len());
+    for event in events {
+        if let Some(kind) = motion_kind(&event)
+            && kept.last().and_then(motion_kind) == Some(kind)
+        {
+            kept.pop();
+        }
+        kept.push(event);
+    }
+    kept
+}
+
 fn request_layout(client: &mut Client) -> Result<dock::layout::LayoutSnapshot, String> {
     match client.request(&Request::Workspace(WorkspaceRequest::Inspect))? {
         Response::Layout { layout } => Ok(layout),
@@ -1584,6 +1734,109 @@ fn refresh(client: &mut Client, dashboard: &mut Dashboard) -> Result<(), String>
 mod terminal_tests {
     use super::*;
     use nix::pty::openpty;
+
+    /// The dominant cost of pointer input was never the work Dock does with a motion event —
+    /// it does none — but the complete repaint each one triggered on its way to being ignored.
+    /// A pointer crossing a pane delivers one report per cell, so this is the difference
+    /// between a burst costing one frame and costing forty.
+    #[test]
+    fn a_burst_of_pointer_motion_collapses_to_its_most_recent_report() {
+        let moved = |column: u16| {
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Moved,
+                column,
+                row: 4,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+        };
+        let dragged = |column: u16| {
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                column,
+                row: 4,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+        };
+
+        assert_eq!(
+            coalesce_motion(vec![moved(1), moved(2), moved(3)]),
+            vec![moved(3)],
+            "only where the pointer ended up matters"
+        );
+        assert_eq!(
+            coalesce_motion(vec![dragged(1), dragged(2), dragged(9)]),
+            vec![dragged(9)],
+            "a drag selects to the newest cell, so the ones it swept through are implied"
+        );
+        // A move and a drag are different gestures. Fusing them would let a trailing `Moved`
+        // throw away the last position of a selection in progress.
+        assert_eq!(
+            coalesce_motion(vec![dragged(1), dragged(2), moved(7), moved(8)]),
+            vec![dragged(2), moved(8)],
+            "runs collapse within a kind, never across two"
+        );
+    }
+
+    /// The other half of the contract, and the one that matters: motion is the *only* thing
+    /// safe to throw away. A dropped key is a keystroke the user typed and never saw, and a
+    /// dropped press or release is a selection that never starts or never ends.
+    #[test]
+    fn coalescing_motion_never_drops_or_reorders_a_key_paste_press_or_release() {
+        let mouse = |kind| {
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: 3,
+                row: 4,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })
+        };
+        let key = |character| {
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+        };
+        let batch = vec![
+            key('a'),
+            mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left)),
+            mouse(MouseEventKind::Drag(crossterm::event::MouseButton::Left)),
+            mouse(MouseEventKind::Drag(crossterm::event::MouseButton::Left)),
+            mouse(MouseEventKind::Up(crossterm::event::MouseButton::Left)),
+            Event::Paste("pasted".into()),
+            Event::Resize(80, 24),
+            key('b'),
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+        ];
+        let kept = coalesce_motion(batch.clone());
+        // Exactly one event is gone: the first of the two consecutive drags.
+        assert_eq!(kept.len(), batch.len() - 1, "got {kept:?}");
+        let survivors: Vec<&Event> = kept.iter().collect();
+        let expected: Vec<&Event> = batch
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 2)
+            .map(|(_, event)| event)
+            .collect();
+        assert_eq!(survivors, expected, "order and content are untouched");
+    }
+
+    /// Ordering matters more than it looks: xterm keeps one mouse mode rather than independent
+    /// flags and resets it to off for any of `?1000l`/`?1002l`/`?1003l`, so a sequence that
+    /// ended at `?1003l` would leave a dashboard with no mouse at all.
+    #[test]
+    fn narrowing_mouse_reporting_ends_by_re_asserting_button_event_tracking() {
+        assert!(
+            BUTTON_MOTION_ONLY.starts_with("\x1b[?1003l"),
+            "any-event tracking is what costs a frame per pointer movement"
+        );
+        assert!(
+            BUTTON_MOTION_ONLY.ends_with("\x1b[?1002h"),
+            "a terminal with a single mouse mode is left with drags, not with nothing"
+        );
+    }
 
     #[test]
     fn deterministic_events_represent_real_printable_and_named_keys() {

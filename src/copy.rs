@@ -50,6 +50,39 @@ impl CopySession {
         self.anchor.map(|anchor| (anchor, self.cursor))
     }
 
+    /// Moves the anchor with the viewport it was placed in.
+    ///
+    /// The anchor is a cell of the *visible* grid. Scrolling therefore used to leave it
+    /// pointing at whatever text had moved underneath it, so a selection made and then
+    /// scrolled — with the wheel, or with `k` past the top row — yanked rows the highlight had
+    /// never covered, with nothing on screen to say so. Shifting it by however far the
+    /// viewport moved keeps it on the characters it was put on.
+    ///
+    /// An anchor pushed past either edge cannot be represented in viewport coordinates at all,
+    /// so the selection ends rather than clamping to a row it does not mean. That is visible:
+    /// the highlight disappears, which is honest about having lost one end of the selection.
+    pub fn shift_anchor(&mut self, rows: i64, bounds: (u16, u16)) {
+        let Some(anchor) = self.anchor else {
+            return;
+        };
+        let row = i64::from(anchor.0) + rows;
+        if row < 0 || row >= i64::from(bounds.0) {
+            self.anchor = None;
+            return;
+        }
+        self.anchor = Some((u16::try_from(row).unwrap_or(0), anchor.1));
+    }
+
+    /// Moves the cursor with the viewport, clamping at the edges.
+    ///
+    /// Used for the wheel, where the whole selection should travel with the text. Keyboard
+    /// motion deliberately does *not* call this: there the cursor is what the user is moving,
+    /// and pinning it to the edge is what lets `k` walk into history a row at a time.
+    pub fn shift_cursor(&mut self, rows: i64, bounds: (u16, u16)) {
+        let row = i64::from(self.cursor.0) + rows;
+        self.set_cursor_absolute(row, i64::from(self.cursor.1), bounds);
+    }
+
     fn set_cursor_absolute(&mut self, row: i64, col: i64, bounds: (u16, u16)) {
         let last_row = i64::from(bounds.0.saturating_sub(1));
         let last_col = i64::from(bounds.1.saturating_sub(1));

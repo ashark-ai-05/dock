@@ -9,6 +9,56 @@ use std::{
 
 use crate::protocol::{Event, HelloRequest, PROTOCOL_VERSION, Request, Response, SubscribeRequest};
 
+/// The request's kind, for a message about a request that failed.
+///
+/// The whole value would carry pane input and dispatch prompts into a log and an error line, so
+/// only the shape is named. What went wrong is never which characters were typed.
+fn request_name(request: &Request) -> String {
+    match request {
+        Request::PaneInput(r) => format!("pane input for {}/{}", r.workspace_id, r.pane_id),
+        Request::PaneResize(r) => format!("a resize of {}/{}", r.workspace_id, r.pane_id),
+        Request::Inspect(_) => "an inspect".into(),
+        Request::Workspace(_) => "a workspace request".into(),
+        Request::Hello(_) => "the handshake".into(),
+        other => format!("{}", DebugKind(other)),
+    }
+}
+
+struct DebugKind<'a>(&'a Request);
+
+impl std::fmt::Display for DebugKind<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The variant name only: `Debug` on the whole request would print the payload.
+        let rendered = format!("{:?}", self.0);
+        let name = rendered
+            .split(['(', ' ', '{'])
+            .next()
+            .unwrap_or("a request");
+        write!(formatter, "{name}")
+    }
+}
+
+/// Appends one wire message to the file named by `DOCK_WIRE_DEBUG`, if it is set.
+///
+/// Off unless asked for, because this is the traffic of a working session and it is nobody's
+/// business by default. It exists because the failure it diagnoses is intermittent: the daemon
+/// refuses a message and closes, and the error surfaces on a later request that was fine, so the
+/// only way to see the real cause is to have been recording when it happened.
+fn wire_debug(tag: &str, length: usize, payload: &[u8]) {
+    let Some(path) = std::env::var_os("DOCK_WIRE_DEBUG") else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let text = String::from_utf8_lossy(&payload[..payload.len().min(400)]);
+        let _ = writeln!(file, "{tag} [{length}] {}", text.trim_end());
+    }
+}
+
 pub struct Client {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
@@ -84,7 +134,22 @@ impl Client {
     fn write_request(&mut self, request: &Request) -> Result<(), String> {
         let mut message = serde_json::to_vec(request).map_err(|e| e.to_string())?;
         message.push(b'\n');
-        self.stream.write_all(&message).map_err(|e| e.to_string())
+        wire_debug("C>D", message.len(), &message);
+        self.stream.write_all(&message).map_err(|error| {
+            // Naming the request is the whole point. The daemon closes the connection after
+            // refusing a message — too large, or one it could not parse — so the failure never
+            // lands on the message that caused it, it lands on the next innocent one. Reported
+            // bare, "Broken pipe (os error 32)" says only that the daemon is gone, which is the
+            // one thing that was already obvious.
+            let name = request_name(request);
+            wire_debug("C>D-ERR", message.len(), name.as_bytes());
+            format!(
+                "the daemon went away while sending {name} ({} bytes): {error}. It closes the \
+                 connection after refusing a message, so the cause is usually the request before \
+                 this one — set DOCK_WIRE_DEBUG=<path> and reproduce to see it.",
+                message.len()
+            )
+        })
     }
 
     fn read_reply(&mut self) -> Result<Response, String> {
@@ -95,8 +160,10 @@ impl Client {
             .map_err(|e| e.to_string())?
             == 0
         {
+            wire_debug("D>C-EOF", 0, b"daemon closed");
             return Err("daemon closed the connection".into());
         }
+        wire_debug("D>C", line.len(), line.as_bytes());
         serde_json::from_str(&line).map_err(|error| {
             // A response that does not end in a newline never finished being written, which
             // happens when the daemon goes away mid-message. Saying so beats reporting a column

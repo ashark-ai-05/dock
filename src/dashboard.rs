@@ -1035,7 +1035,7 @@ impl Dashboard {
         let label_width = inner_width.saturating_sub(3);
         let roster = self.agent_roster();
         let roster_is_empty = roster.is_empty();
-        for (state, label, task) in roster {
+        for (state, label, task, workspace) in roster {
             // The state is spelled out beside the name. The glyph and its colour say that
             // something is true of this agent; only the word says what, and "needs you" is the
             // whole reason to look at this list at all.
@@ -1043,10 +1043,23 @@ impl Dashboard {
             // The task rides with the name, because which agent is which is the question a roster
             // of three identical "claude" rows cannot answer.
             let named = match &task {
-                Some(task) => format!("{label} #{task}"),
+                Some(detail) => format!("{label} {detail}"),
                 None => label.to_owned(),
             };
             let name_width = label_width.saturating_sub(state_text.chars().count() + 2);
+            // The workspace goes inline when it fits and on its own line when it does not. The
+            // sidebar is narrow enough that appending it unconditionally ellipsised it away,
+            // which reads as a roster answering "which workspace" and in fact never saying. A
+            // second line costs a row and always says it.
+            let inline = workspace
+                .as_deref()
+                .map(|workspace| format!("{named} · {workspace}"))
+                .filter(|inline| inline.chars().count() <= name_width);
+            let overflow = match (&inline, &workspace) {
+                (None, Some(workspace)) => Some(workspace.clone()),
+                _ => None,
+            };
+            let named = inline.unwrap_or(named);
             let name = ellipsise(&named, name_width);
             let gap = label_width.saturating_sub(name.chars().count() + state_text.chars().count());
             lines.push(Line::from(vec![
@@ -1066,6 +1079,17 @@ impl Dashboard {
                     ),
                 ),
             ]));
+            if let Some(workspace) = overflow {
+                // Indented under its agent and muted, so the eye reads it as belonging to the row
+                // above rather than as another agent.
+                lines.push(Line::styled(
+                    format!(
+                        "   in {}",
+                        ellipsise(&workspace, label_width.saturating_sub(4))
+                    ),
+                    Style::default().fg(self.theme.muted),
+                ));
+            }
         }
         if roster_is_empty {
             lines.push(Line::styled(
@@ -1123,14 +1147,19 @@ impl Dashboard {
     /// Only a run whose agent was actually detected is an agent. `self.agents` also carries
     /// every pane's ambient shell, which reports no kind at all; listing those turned the
     /// roster into a list of run ids for processes that are not agents.
-    fn agent_roster(&self) -> Vec<(AgentState, &str, Option<String>)> {
+    fn agent_roster(&self) -> Vec<(AgentState, &str, Option<String>, Option<String>)> {
         // Joined to the run so the roster can say which task each agent is on. Three agents all
         // reading "claude" tell you only that three agents are running.
-        let mut roster: Vec<(AgentState, &str, Option<String>)> = self
+        let mut roster: Vec<(AgentState, &str, Option<String>, Option<String>)> = self
             .agents
             .iter()
             .filter_map(|(run_id, (kind, state))| {
-                Some((*state, kind.as_ref()?.label(), self.task_of(run_id)))
+                // The workspace rides alongside the task for the same reason the task rides
+                // with the name: this list spans every workspace, so "needs you" is actionable
+                // only once you know where to go.
+                let task = self.task_of(run_id).map(|task| format!("#{task}"));
+                let workspace = self.workspace_of(run_id).map(str::to_owned);
+                Some((*state, kind.as_ref()?.label(), task, workspace))
             })
             .collect();
         roster.sort_by(|left, right| {
@@ -1139,8 +1168,29 @@ impl Dashboard {
                 .cmp(&right.0.attention_rank())
                 .then_with(|| left.1.cmp(right.1))
                 .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.3.cmp(&right.3))
         });
         roster
+    }
+
+    /// The workspace a run is in, by the name a person gave it.
+    ///
+    /// The roster is the one view that spans workspaces, so it was also the only place an agent
+    /// could say it needs you without saying where to go and answer it.
+    ///
+    /// Read from the layout rather than the run list because the layout is what carries the name;
+    /// a snapshot knows only the id, and an id is what the name exists to avoid.
+    fn workspace_of(&self, run_id: &str) -> Option<&str> {
+        self.layout
+            .workspaces
+            .iter()
+            .find(|workspace| {
+                workspace
+                    .panes
+                    .values()
+                    .any(|pane| pane.run_id.as_deref() == Some(run_id))
+            })
+            .map(|workspace| workspace.name.as_str())
     }
 
     /// The task a run is working on, if anything knows: the daemon's own binding first, then this
@@ -6090,6 +6140,53 @@ mod tests {
     }
 
     #[test]
+    fn the_roster_says_which_workspace_each_agent_is_in() {
+        // The roster is the one view that spans workspaces, and it was also the only one that
+        // could tell you an agent needs you without telling you where to go and answer it.
+        let mut dashboard = bound_dashboard();
+        let mut run = snapshot();
+        run.run_id = "run_1".into();
+        run.external_task_ref = "7".into();
+        dashboard.runs = vec![run];
+        dashboard.agents.insert(
+            "run_1".into(),
+            (Some(AgentKind::Claude), AgentState::Blocked),
+        );
+
+        let rows = sidebar_rows(&mut dashboard, 100, 30).join("\n");
+        // "Daily" is the name a person gave the workspace; the id it also has is what the name
+        // exists to avoid, so the roster must not fall back to it while a name is available.
+        assert!(rows.contains("Daily"), "{rows:?}");
+        assert!(rows.contains("claude #7"), "{rows:?}");
+    }
+
+    #[test]
+    fn an_agent_the_layout_does_not_place_still_lists_without_inventing_a_workspace() {
+        // A run no pane holds must still appear: its state is the reason the roster exists. What
+        // it must not do is name somewhere the run is not.
+        let mut dashboard = bound_dashboard();
+        let mut run = snapshot();
+        run.run_id = "run_elsewhere".into();
+        run.external_task_ref = "9".into();
+        dashboard.runs = vec![run];
+        dashboard.agents.insert(
+            "run_elsewhere".into(),
+            (Some(AgentKind::Claude), AgentState::Working),
+        );
+
+        let rows = sidebar_rows(&mut dashboard, 100, 30).join("\n");
+        assert!(rows.contains("claude #9"), "{rows:?}");
+        assert!(
+            !rows.contains("claude #9 ·"),
+            "no dangling separator: {rows:?}"
+        );
+        assert!(
+            !rows.contains("   in "),
+            "no workspace line without a workspace: {rows:?}"
+        );
+    }
+
+    #[test]
     fn the_roster_says_which_agent_wants_you_rather_than_only_colouring_it() {
         let mut dashboard = bound_dashboard();
         dashboard.agents.insert(
@@ -6709,7 +6806,15 @@ mod tests {
         assert_eq!(dashboard.agents.len(), 2);
         assert_eq!(
             dashboard.agent_roster(),
-            vec![(AgentState::Blocked, AgentKind::Claude.label(), None)]
+            vec![(
+                AgentState::Blocked,
+                AgentKind::Claude.label(),
+                None,
+                // No workspace: this fixture binds no pane to `run_1`. The roster names where an
+                // agent is when the layout places it and says nothing when it cannot, rather than
+                // inventing somewhere for a run it does not hold.
+                None
+            )]
         );
         let rows = sidebar_rows(&mut dashboard, 100, 30);
         assert!(

@@ -172,7 +172,8 @@ impl AdapterId {
     /// guess here does not fail loudly, it launches the agent with the task text as a filename or
     /// a subcommand and leaves the person watching an error they did not cause. `amp` takes
     /// `[options] [command]` with no prompt positional at all, so it gets none — dispatching to it
-    /// opens the agent in the right place and the task is typed by hand.
+    /// opens the agent in the right place, and [`Self::opening_prompt_is_typed`] carries the task
+    /// the rest of the way.
     pub fn prompt_arguments(&self, prompt: &str) -> Vec<String> {
         let prompt = prompt.trim();
         if prompt.is_empty() {
@@ -189,6 +190,24 @@ impl AdapterId {
             Self::GithubCopilotCli => Vec::new(),
             // The fixture runs a fixed script, and a shell handed a sentence would try to run it.
             Self::Fixture | Self::Generic | Self::Shell => Vec::new(),
+        }
+    }
+
+    /// Whether an agent that took no prompt argument can be handed one by typing it instead.
+    ///
+    /// [`Self::prompt_arguments`] returns nothing for five adapters, but for two different reasons,
+    /// and only one of them can be made good. Amp and Copilot are agents with an input box: they
+    /// simply have nowhere on the command line to put a task, so typing it into the box once they
+    /// are up says the same thing. The other three have no box to type into — a shell handed a
+    /// sentence would try to *run* it, which is what `prompt_arguments` refuses them for, and
+    /// typing it would be that same mistake one step later.
+    pub const fn opening_prompt_is_typed(&self) -> bool {
+        match self {
+            Self::Amp | Self::GithubCopilotCli => true,
+            // Both take the prompt on the command line, so there is nothing left to type.
+            Self::ClaudeCode | Self::CodexCli => false,
+            // No agent, no input box, and a sentence at a shell prompt is a command.
+            Self::Fixture | Self::Generic | Self::Shell => false,
         }
     }
 
@@ -383,6 +402,30 @@ mod tests {
         }
         // An empty task title is never passed as an argument at all.
         assert!(AdapterId::ClaudeCode.prompt_arguments("   ").is_empty());
+    }
+
+    #[test]
+    fn a_task_is_typed_only_to_an_agent_that_has_somewhere_to_type_it() {
+        // The two that take no prompt argument but do have an input box: this is the gap that
+        // made a dispatched card open a silent pane.
+        for adapter in [AdapterId::Amp, AdapterId::GithubCopilotCli] {
+            assert!(adapter.prompt_arguments("a task").is_empty(), "{adapter:?}");
+            assert!(adapter.opening_prompt_is_typed(), "{adapter:?}");
+        }
+        // These take no prompt argument either, and typing one would be the mistake that
+        // `prompt_arguments` refuses them for: at a shell prompt a sentence is a command.
+        for adapter in [AdapterId::Shell, AdapterId::Generic, AdapterId::Fixture] {
+            assert!(adapter.prompt_arguments("a task").is_empty(), "{adapter:?}");
+            assert!(!adapter.opening_prompt_is_typed(), "{adapter:?}");
+        }
+        // And these already carried it on the command line, so there is nothing left to type.
+        for adapter in [AdapterId::ClaudeCode, AdapterId::CodexCli] {
+            assert!(
+                !adapter.prompt_arguments("a task").is_empty(),
+                "{adapter:?}"
+            );
+            assert!(!adapter.opening_prompt_is_typed(), "{adapter:?}");
+        }
     }
 
     #[test]

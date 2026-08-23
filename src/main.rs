@@ -574,6 +574,18 @@ fn run_dashboard(
                 cols,
             }));
         }
+        for (workspace_id, pane_id, prompt) in dashboard.take_opening_prompts() {
+            // Submitted, not merely typed. The user dispatched this card seconds ago and a Claude
+            // pane dispatched the same way is already working on it; leaving Amp's task sitting
+            // unsent in its box would make the same keypress mean two different things.
+            let mut input = prompt.into_bytes();
+            input.push(b'\r');
+            let _ = client.send(&Request::PaneInput(PaneInputRequest {
+                workspace_id,
+                pane_id,
+                input: PaneInputRequest::encode(&input),
+            }));
+        }
         if let Some(message) = client.take_deferred_error() {
             dashboard.error = Some(message);
         }
@@ -913,6 +925,15 @@ fn dispatch_task(
         if let Response::Error { message, .. } = client.request(&request)? {
             return Err(message);
         }
+        remember_opening_prompt(
+            dashboard,
+            adapter,
+            run_id,
+            workspace_id,
+            pane_id,
+            *task_id,
+            title,
+        );
         dashboard.error = Some(format!("task {task_id} dispatched here, unbound: {title}"));
         return Ok(());
     }
@@ -955,6 +976,15 @@ fn dispatch_task(
             dashboard.error = None;
         }
     }
+    remember_opening_prompt(
+        dashboard,
+        adapter,
+        run_id,
+        workspace_id,
+        pane_id,
+        *task_id,
+        title,
+    );
     // The footer carries one status line, which the codebase already uses for outcomes as well as
     // failures — a yank reports the same way.
     dashboard.error = Some(format!(
@@ -966,6 +996,31 @@ fn dispatch_task(
         }
     ));
     Ok(())
+}
+
+/// Notes a task that its agent's command line could not carry, to be typed in once it is up.
+///
+/// Only for the agents that have somewhere to type it. `prompt_arguments` returns nothing for five
+/// adapters and only two of them are agents with an input box; the rest are shells and fixtures,
+/// where a sentence is a command rather than a request.
+fn remember_opening_prompt(
+    dashboard: &mut Dashboard,
+    adapter: &dock::adapter::AdapterId,
+    run_id: &str,
+    workspace_id: &str,
+    pane_id: &str,
+    task_id: u64,
+    title: &str,
+) {
+    if !adapter.opening_prompt_is_typed() {
+        return;
+    }
+    dashboard.expect_opening_prompt(
+        run_id,
+        workspace_id,
+        pane_id,
+        &dispatch_prompt(task_id, title),
+    );
 }
 
 /// `dock detect <agent> [--explain]` — the rules in force, and what they make of a screen.

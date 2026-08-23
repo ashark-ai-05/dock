@@ -84,6 +84,11 @@ pub struct Dashboard {
     /// Latest agent identity and state per run, as pushed by the daemon.
     pub agents: HashMap<String, (Option<AgentKind>, AgentState)>,
     revisions: HashMap<String, u64>,
+    /// Tasks dispatched to an agent whose command line had nowhere to carry them, waiting for
+    /// that agent to be up enough to be typed into. Keyed by run, emptied on first delivery.
+    opening_prompts: HashMap<String, OpeningPrompt>,
+    /// Opening prompts whose moment arrived, waiting for the render loop to send them.
+    pending_opening_prompts: Vec<(String, String, String)>,
     needs_refresh: bool,
     pending_resizes: Vec<(String, String, u16, u16)>,
     /// The run and inner geometry last announced for each pane, so an unchanged frame
@@ -221,6 +226,19 @@ pub struct GitOverlay {
     pub facts: GitFacts,
     pub diff: Vec<String>,
     pub scroll: usize,
+}
+
+/// A task that has to be typed to the agent it was dispatched to, and where to type it.
+///
+/// Amp and Copilot have no prompt positional, so a dispatched card reached them as an empty pane
+/// and the task existed only in the head of whoever pressed the key. The pane is remembered
+/// alongside the run because the prompt has to reach *that* pane whether or not it still has
+/// focus by the time the agent finishes starting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpeningPrompt {
+    workspace_id: String,
+    pane_id: String,
+    prompt: String,
 }
 
 /// Everything needed to give a task a worktree and put an agent on it.
@@ -406,6 +424,19 @@ impl Dashboard {
                 agent,
                 state,
             } => {
+                // An agent reaching `Done` for the first time is saying its input box is up and
+                // waiting, which is the earliest moment a task can be typed into it. Taken from
+                // the map rather than read, so a later turn — every one of which ends in `Done` —
+                // never sends the task a second time.
+                if state == AgentState::Done
+                    && let Some(opening) = self.opening_prompts.remove(&run_id)
+                {
+                    self.pending_opening_prompts.push((
+                        opening.workspace_id,
+                        opening.pane_id,
+                        opening.prompt,
+                    ));
+                }
                 self.agents.insert(run_id, (agent, state));
             }
             Event::PaneState { .. } | Event::LayoutChanged => self.needs_refresh = true,
@@ -433,7 +464,39 @@ impl Dashboard {
     pub fn set_runs(&mut self, runs: Vec<RuntimeSnapshot>) {
         self.agents
             .retain(|run_id, _| runs.iter().any(|run| &run.run_id == run_id));
+        // An agent that died before it ever finished starting is never going to be typed into,
+        // and its task would otherwise sit here waiting for a `Done` that cannot arrive — and
+        // then be delivered to whatever run next inherited the id.
+        self.opening_prompts
+            .retain(|run_id, _| runs.iter().any(|run| &run.run_id == run_id));
         self.runs = runs;
+    }
+
+    /// Remembers a task to type into an agent that had nowhere to carry it on its command line.
+    ///
+    /// Deliberately not queued as ordinary work: every guard on a queue is about an agent that is
+    /// already running, and one still starting has satisfied none of them, so a queued opening
+    /// prompt would wait for conditions that had already passed.
+    pub fn expect_opening_prompt(
+        &mut self,
+        run_id: &str,
+        workspace_id: &str,
+        pane_id: &str,
+        prompt: &str,
+    ) {
+        self.opening_prompts.insert(
+            run_id.to_owned(),
+            OpeningPrompt {
+                workspace_id: workspace_id.to_owned(),
+                pane_id: pane_id.to_owned(),
+                prompt: prompt.to_owned(),
+            },
+        );
+    }
+
+    /// Opening prompts whose agent has come up, as `(workspace_id, pane_id, prompt)`.
+    pub fn take_opening_prompts(&mut self) -> Vec<(String, String, String)> {
+        std::mem::take(&mut self.pending_opening_prompts)
     }
 
     /// True once when a pushed event invalidated the run list or layout. The render loop uses
@@ -4401,6 +4464,55 @@ mod tests {
                 if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Respawn { workspace_id, pane_id })
                     if workspace_id == "w" && pane_id == "a")
         ));
+    }
+
+    #[test]
+    fn a_task_an_agent_could_not_be_launched_with_is_typed_to_it_once_it_is_up() {
+        // Amp and Copilot have no prompt positional, so a dispatched card used to reach them as
+        // an empty pane and the task lived only in the head of whoever pressed the key.
+        let mut dashboard = bound_dashboard();
+        dashboard.expect_opening_prompt("run_1", "w", "a", "fix the retry path");
+        // Nothing is sent while the agent is still coming up.
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_1".into(),
+            agent: Some(AgentKind::Amp),
+            state: AgentState::Working,
+        });
+        assert!(dashboard.take_opening_prompts().is_empty());
+        // Its first `Done` is the agent saying its input box is up and waiting.
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_1".into(),
+            agent: Some(AgentKind::Amp),
+            state: AgentState::Done,
+        });
+        assert_eq!(
+            dashboard.take_opening_prompts(),
+            vec![("w".into(), "a".into(), "fix the retry path".into())]
+        );
+        // Every later turn also ends in `Done`, and none of them may resend the task.
+        for _ in 0..3 {
+            dashboard.apply_event(Event::AgentStateChanged {
+                run_id: "run_1".into(),
+                agent: Some(AgentKind::Amp),
+                state: AgentState::Done,
+            });
+        }
+        assert!(dashboard.take_opening_prompts().is_empty());
+    }
+
+    #[test]
+    fn a_task_waiting_on_an_agent_that_died_is_dropped_rather_than_left_pending() {
+        // Otherwise it waits for a `Done` that cannot arrive, and is then delivered to whatever
+        // run next inherits the id.
+        let mut dashboard = bound_dashboard();
+        dashboard.expect_opening_prompt("run_1", "w", "a", "fix the retry path");
+        dashboard.set_runs(vec![]);
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_1".into(),
+            agent: Some(AgentKind::Amp),
+            state: AgentState::Done,
+        });
+        assert!(dashboard.take_opening_prompts().is_empty());
     }
 
     #[test]

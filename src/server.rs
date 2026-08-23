@@ -4,6 +4,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     os::unix::{
         fs::PermissionsExt,
+        io::AsRawFd,
         net::{UnixListener, UnixStream},
     },
     path::Path,
@@ -436,6 +437,9 @@ fn stream_events(
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(());
         }
+        if !subscriber_is_present(stream) {
+            return Ok(());
+        }
         // `pulse` rather than `inspect`: this runs every 16ms for every run, and a full snapshot
         // rebuilds a run's whole identity — around ten strings, two of them formatted from paths —
         // when the loop reads six fields and none of them are those.
@@ -540,6 +544,30 @@ fn stream_events(
         }
         thread::sleep(STREAM_POLL_INTERVAL);
     }
+}
+
+/// Whether the client at the other end of a subscription is still there.
+///
+/// `stream_events` never reads from its socket — after `Subscribe` the client sends nothing on it
+/// — so the only thing that ever told the push loop its dashboard had gone was a write failing.
+/// An idle daemon has nothing to write, which is exactly the case that matters: a dashboard killed
+/// while its panes were quiet left the loop polling every run sixty-two times a second, and
+/// spawning a `ps` on its behalf, for the rest of the daemon's life. That is what a forgotten
+/// daemon burning CPU while apparently idle turned out to be.
+///
+/// A zero-length `send` is the probe, because EOF is not one. Reading EOF cannot tell a client
+/// that has gone from one that has merely shut down the write half it was never going to use
+/// again, and on macOS `poll` reports `POLLHUP` for both — measured, not assumed. A zero-length
+/// send puts nothing on the wire, succeeds for a peer that is only half-closed, and fails with
+/// `EPIPE` once the peer is really gone. Anything else it might fail with is treated as present,
+/// so a probe that cannot answer never ends a live subscription.
+fn subscriber_is_present(stream: &UnixStream) -> bool {
+    let nothing: [u8; 0] = [];
+    // SAFETY: `send` reads `len` bytes from the buffer it is given and writes nothing through it.
+    // `len` is zero, so the pointer is never dereferenced, and it is a live non-null pointer to a
+    // zero-length array regardless. The fd is owned by `stream` and outlives the call.
+    let sent = unsafe { nix::libc::send(stream.as_raw_fd(), nothing.as_ptr().cast(), 0, 0) };
+    sent >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(nix::libc::EPIPE)
 }
 
 /// What one poll owes one subscriber for one run.
@@ -794,6 +822,13 @@ mod tests {
     }
 
     fn registry() -> TestRegistry {
+        registry_with_scrollback(64)
+    }
+
+    /// Sixty-four rows is enough for a test that only wants a pane to exist. A measurement wants
+    /// the retained history a real daemon carries, because the cost of handing a subscriber its
+    /// bytes is bounded by it.
+    fn registry_with_scrollback(scrollback_rows: usize) -> TestRegistry {
         let state = std::env::current_dir()
             .unwrap()
             .join("target")
@@ -802,7 +837,7 @@ mod tests {
                 std::process::id(),
                 SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
-        let registry = RuntimeRegistry::new(&state, 64).expect("test registry");
+        let registry = RuntimeRegistry::new(&state, scrollback_rows).expect("test registry");
         TestRegistry {
             registry: Arc::new(registry),
             state,
@@ -1173,6 +1208,67 @@ mod tests {
             admission.active.load(Ordering::Acquire),
             0,
             "the handler's permit must be released when the connection ends"
+        );
+    }
+
+    /// The stale-daemon defect. `stream_events` never reads from its socket — after `Subscribe` a
+    /// client sends nothing on it — so the only thing that ever told the push loop its dashboard
+    /// had gone was a write failing, and an idle daemon has nothing to write. A dashboard killed
+    /// while its panes were quiet left this loop polling every run sixty-two times a second, and
+    /// spawning a `ps` on its behalf twice a second, for the rest of the daemon's life: measured
+    /// at 10.7% of a core, sustained, by a daemon nobody was talking to.
+    ///
+    /// Deliberately not asserted through EOF, which is what the first attempt used. A client that
+    /// has gone and one that has merely shut down the write half it was never going to use again
+    /// read identically — this suite's own `exchange` does the second — so EOF would have ended
+    /// live subscriptions.
+    #[test]
+    fn a_subscriber_whose_client_has_gone_stops_being_polled() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        let shared = runtime.shared();
+        let handler = thread::spawn(move || {
+            handle_connection_with_timeout(
+                &mut server,
+                &shared,
+                ReadTimeouts::PRODUCTION,
+                // Long enough that reaching it would be a failure rather than the answer: the
+                // loop has to stop because its client left, not because it ran out of time.
+                Some(Instant::now() + crate::testing::budget(120)),
+            )
+        });
+        client
+            .set_read_timeout(Some(crate::testing::budget(30)))
+            .expect("read timeout");
+        let mut reader = BufReader::new(client.try_clone().expect("clone client"));
+        send_line(&mut client, &hello());
+        assert!(matches!(
+            next_response(&mut reader),
+            Response::Hello {
+                version: PROTOCOL_VERSION
+            }
+        ));
+        send_line(&mut client, &subscribe_line());
+        // Waits for the first pushed frame, so the loop is certainly streaming before its client
+        // walks away. Without this the test could pass by ending the connection before it began.
+        assert!(matches!(
+            next_response(&mut reader),
+            Response::Stream { .. }
+        ));
+        drop(reader);
+        drop(client);
+
+        let started = Instant::now();
+        assert_eq!(
+            handler.join().expect("the push loop must not panic"),
+            Ok(()),
+            "a subscriber whose client has gone must end its loop cleanly"
+        );
+        assert!(
+            started.elapsed() < crate::testing::budget(30),
+            "the push loop took {:?} to notice its client had gone",
+            started.elapsed()
         );
     }
 
@@ -2229,5 +2325,253 @@ mod tests {
         assert!(
             matches!(&responses[4], Response::Layout { layout } if layout.workspaces[0].focused_pane_id=="pane_one")
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Measurement harness.
+    //
+    // Not a test: nothing below asserts anything. It exists because every performance claim
+    // made about this daemon before it was written was made from reading, and two of them were
+    // wrong — the process table was believed to cost the daemon nothing once it was cached, and
+    // the classification memo was believed to be a memo. Run it with
+    //
+    //     cargo test --release --lib -- --ignored --nocapture measure_the_daemon_hot_path
+    //
+    // and compare the numbers a change claims to move against the numbers it actually moved.
+    // ---------------------------------------------------------------------------------------
+
+    /// How many panes the measurement drives, overridable with `DOCK_BENCH_PANES`.
+    ///
+    /// Sixteen is a dashboard somebody actually has open: four workspaces of four panes. The
+    /// brief's range is twelve to thirty and the interesting costs are all linear in this, so a
+    /// number in the middle reads the slope as well as either end would.
+    fn bench_panes() -> usize {
+        std::env::var("DOCK_BENCH_PANES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(16)
+    }
+
+    /// CPU seconds burned by this process and, separately, by the children it has reaped.
+    ///
+    /// Both halves matter, and the second is the one that hid the problem. The daemon learns
+    /// which agent runs under a pane by spawning `ps`, and a subprocess's CPU is charged to the
+    /// subprocess — so a daemon paying for a 35ms `ps` twice a second shows almost nothing in
+    /// `top` against its own name. Reading only `RUSAGE_SELF` is how an idle daemon came to look
+    /// free while a core was being spent on its behalf.
+    fn cpu_seconds() -> (f64, f64) {
+        fn read(who: i32) -> f64 {
+            // SAFETY: `getrusage` writes a fully-initialised `rusage` into the pointer it is
+            // given and reads nothing else. The zeroed value is a valid `rusage`.
+            let mut usage: nix::libc::rusage = unsafe { std::mem::zeroed() };
+            let taken = unsafe { nix::libc::getrusage(who, &raw mut usage) };
+            if taken != 0 {
+                return 0.0;
+            }
+            let seconds = |value: nix::libc::timeval| {
+                value.tv_sec as f64 + value.tv_usec as f64 / 1_000_000.0
+            };
+            seconds(usage.ru_utime) + seconds(usage.ru_stime)
+        }
+        (
+            read(nix::libc::RUSAGE_SELF),
+            read(nix::libc::RUSAGE_CHILDREN),
+        )
+    }
+
+    /// One line of timing statistics, in the units a 16ms poll is judged against.
+    fn report_durations(label: &str, panes: usize, mut samples: Vec<Duration>) {
+        samples.sort_unstable();
+        let micros = |value: Duration| value.as_secs_f64() * 1_000.0;
+        let at = |fraction: f64| {
+            micros(samples[((samples.len() as f64 - 1.0) * fraction).round() as usize])
+        };
+        let total: f64 = samples.iter().map(|sample| micros(*sample)).sum();
+        let mean = total / samples.len() as f64;
+        println!(
+            "{label:<44} n={:<5} mean={mean:7.3}ms  p50={:7.3}ms  p99={:7.3}ms  max={:7.3}ms  \
+             per-pane-mean={:7.3}ms",
+            samples.len(),
+            at(0.5),
+            at(0.99),
+            at(1.0),
+            mean / panes as f64,
+        );
+    }
+
+    /// A workspace of `panes` real pane shells, sized as a dashboard would size them.
+    fn bench_workspace(runtime: &RuntimeRegistry, panes: usize) -> Vec<String> {
+        runtime
+            .workspace(crate::protocol::WorkspaceRequest::Create {
+                workspace_id: "bench".into(),
+                name: "Bench".into(),
+                pane_id: "p0".into(),
+            })
+            .expect("create the bench workspace");
+        let mut pane_ids = vec!["p0".to_owned()];
+        for index in 1..panes {
+            let pane_id = format!("p{index}");
+            runtime
+                .workspace(crate::protocol::WorkspaceRequest::Split {
+                    workspace_id: "bench".into(),
+                    pane_id: pane_ids[index - 1].clone(),
+                    new_pane_id: pane_id.clone(),
+                    axis: crate::layout::SplitAxis::Vertical,
+                })
+                .expect("split a bench pane");
+            pane_ids.push(pane_id);
+        }
+        // A pane the dashboard has never measured is 24x80. A real one is not, and the whole
+        // screen is what classification reads, so measuring at the default would understate
+        // every cost that scales with cell count.
+        for pane_id in &pane_ids {
+            runtime
+                .pane_resize("bench", pane_id, 40, 160)
+                .expect("size a bench pane like a dashboard would");
+        }
+        pane_ids
+    }
+
+    #[test]
+    #[ignore = "a measurement, not an assertion: cargo test --release --lib -- --ignored --nocapture"]
+    fn measure_the_daemon_hot_path_under_a_dashboard_sized_load() {
+        let panes = bench_panes();
+        let runtime = registry_with_scrollback(2_000);
+        let pane_ids = bench_workspace(&runtime, panes);
+        // Long enough for every shell to have execed, painted its prompt and gone quiet, so the
+        // idle phase below measures an idle daemon rather than sixteen starting ones.
+        thread::sleep(Duration::from_millis(2_500));
+        println!("\n--- {panes} panes, {} rows of scrollback ---", 2_000);
+
+        for phase in [BenchPhase::Idle, BenchPhase::Streaming] {
+            let feeding = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let feeder = matches!(phase, BenchPhase::Streaming).then(|| {
+                let shared = runtime.shared();
+                let pane_ids = pane_ids.clone();
+                let feeding = Arc::clone(&feeding);
+                thread::spawn(move || {
+                    // Typed into the pane rather than run by it: the line discipline echoes
+                    // every byte straight back out of the PTY, which is output arriving in the
+                    // emulator continuously and under the harness's control. Running a printing
+                    // loop in each shell instead would measure the machine's ability to fork
+                    // `sleep` sixteen times a frame, not the daemon.
+                    while feeding.load(std::sync::atomic::Ordering::Relaxed) {
+                        for pane_id in &pane_ids {
+                            let _ = shared.pane_input(
+                                "bench",
+                                pane_id,
+                                b"streaming a line of agent output into the pane\r",
+                            );
+                        }
+                        thread::sleep(Duration::from_millis(32));
+                    }
+                })
+            });
+            thread::sleep(Duration::from_millis(400));
+            let label = phase.label();
+
+            let mut pulses = Vec::new();
+            let mut inspects = Vec::new();
+            let started = Instant::now();
+            let (self_before, children_before) = cpu_seconds();
+            while started.elapsed() < Duration::from_secs(4) {
+                let tick = Instant::now();
+                let _ = runtime.pulse();
+                pulses.push(tick.elapsed());
+                thread::sleep(STREAM_POLL_INTERVAL);
+            }
+            let (self_after, children_after) = cpu_seconds();
+            let window = started.elapsed().as_secs_f64();
+            for _ in 0..40 {
+                let tick = Instant::now();
+                let _ = runtime.inspect(None);
+                inspects.push(tick.elapsed());
+                thread::sleep(STREAM_POLL_INTERVAL);
+            }
+
+            report_durations(&format!("pulse [{label}]"), panes, pulses);
+            report_durations(&format!("inspect [{label}]"), panes, inspects);
+            println!(
+                "cpu [{label:<9}]                             daemon={:5.2}%  spawned `ps` and \
+                 pane shells={:5.2}%  total={:5.2}%",
+                (self_after - self_before) / window * 100.0,
+                (children_after - children_before) / window * 100.0,
+                (self_after - self_before + children_after - children_before) / window * 100.0,
+            );
+
+            feeding.store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(feeder) = feeder {
+                feeder.join().expect("stop the feeder");
+            }
+            thread::sleep(Duration::from_millis(1_500));
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum BenchPhase {
+        Idle,
+        Streaming,
+    }
+
+    impl BenchPhase {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Idle => "idle",
+                Self::Streaming => "streaming",
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "a measurement, not an assertion: cargo test --release --lib -- --ignored --nocapture"]
+    fn measure_what_a_subscriber_whose_client_has_gone_still_costs() {
+        // The stale-daemon question. `stream_events` never reads from its socket, so a
+        // subscriber whose dashboard died is noticed only when a write fails — and an idle
+        // daemon has nothing to write. This measures what that loop costs while nobody is
+        // listening, which is what a forgotten daemon costs for the rest of its life.
+        let panes = bench_panes();
+        let runtime = registry_with_scrollback(2_000);
+        bench_workspace(&runtime, panes);
+        thread::sleep(Duration::from_millis(2_500));
+        println!("\n--- {panes} idle panes, subscriber's client gone ---");
+
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("read timeout");
+        send_line(&mut client, &hello());
+        send_line(&mut client, &subscribe_line());
+        let shared = runtime.shared();
+        let window = Duration::from_secs(6);
+        let handler = thread::spawn(move || {
+            handle_connection_with_timeout(
+                &mut server,
+                &shared,
+                ReadTimeouts::PRODUCTION,
+                // Ample headroom: the question this asks is whether the loop stops when its
+                // client leaves, and a deadline that could plausibly have stopped it first
+                // would answer a different one.
+                Some(Instant::now() + window + Duration::from_secs(30)),
+            )
+        });
+        // Let the seed frames land, then walk away exactly as a killed dashboard does.
+        thread::sleep(Duration::from_millis(1_000));
+        drop(client);
+
+        let started = Instant::now();
+        let (self_before, children_before) = cpu_seconds();
+        thread::sleep(window);
+        let (self_after, children_after) = cpu_seconds();
+        let elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "cpu with a departed subscriber                daemon={:5.2}%  spawned `ps`={:5.2}%  \
+             total={:5.2}%",
+            (self_after - self_before) / elapsed * 100.0,
+            (children_after - children_before) / elapsed * 100.0,
+            (self_after - self_before + children_after - children_before) / elapsed * 100.0,
+        );
+        let still_running = !handler.is_finished();
+        println!("the push loop is still running after the client left: {still_running}");
+        let _ = handler.join();
     }
 }

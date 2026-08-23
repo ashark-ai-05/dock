@@ -146,6 +146,62 @@ pub fn classify_screen(agent: AgentKind, tail: &str) -> AgentState {
     AgentState::Idle
 }
 
+/// What one pane's classification actually costs, since the daemon's own measurement harness
+/// cannot reach it.
+///
+/// `RuntimeRegistry::resolve_agent` only reads a screen when an agent is running under the pane,
+/// and no test in this repository can conjure one into the process table — a measurement driven
+/// through the registry drives pane shells, where detection finds nothing and this code is never
+/// entered. So the cost is measured here, against a real captured screen, and multiplied by the
+/// callers who were paying it: before the memo was split, every pane on the screen paid this twice
+/// a second whether or not a byte had arrived, simply because a new process table had landed.
+///
+///     cargo test --release --lib -- --ignored --nocapture measure_what_classifying
+#[cfg(test)]
+mod classification_cost {
+    use super::*;
+    use crate::terminal::VtTerminal;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "a measurement, not an assertion: cargo test --release --lib -- --ignored --nocapture"]
+    fn measure_what_classifying_one_pane_screen_costs() {
+        // A pane the size a dashboard actually gives one, filled the way an agent fills it.
+        let mut screen = VtTerminal::new(40, 160, 2_000);
+        screen.feed(b"\x1b]0;claude - dock\x07");
+        for line in 0..38 {
+            screen.feed(
+                format!("  {line:3}  read src/dispatch.rs, and thought about what it said\r\n")
+                    .as_bytes(),
+            );
+        }
+        screen.feed("  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\r\n".as_bytes());
+
+        let mut built = Vec::new();
+        let mut classified = Vec::new();
+        for _ in 0..2_000 {
+            let started = Instant::now();
+            let text = screen.classifiable_text();
+            built.push(started.elapsed());
+            let started = Instant::now();
+            let state = classify_screen(AgentKind::Claude, &text);
+            classified.push(started.elapsed());
+            assert_eq!(state, AgentState::Done);
+        }
+        let mean = |samples: &[std::time::Duration]| {
+            samples.iter().map(|s| s.as_secs_f64()).sum::<f64>() / samples.len() as f64 * 1_000.0
+        };
+        println!(
+            "classifiable_text() {:.4}ms + classify_screen() {:.4}ms = {:.4}ms per pane per pass, \
+             {} bytes of screen",
+            mean(&built),
+            mean(&classified),
+            mean(&built) + mean(&classified),
+            screen.classifiable_text().len(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod awaiting_input_tests {
     use super::*;

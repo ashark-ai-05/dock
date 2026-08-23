@@ -11,6 +11,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -33,8 +34,45 @@ use crate::{
     terminal::{PaneOutput, PaneScreen},
 };
 
-/// One memoised classification: the output mark it was computed from, and what it produced.
-type ClassifiedAgent = ((u64, u64, u64), Option<AgentKind>, AgentState);
+/// What one poll has already established about a run before its agent is resolved.
+///
+/// Gathered by the caller rather than read again inside [`RuntimeRegistry::resolve_agent`], because
+/// the process table now needs the same output marks to decide whether taking a fresh one could
+/// say anything new. Read twice they could disagree, and a mark that disagreed with itself would
+/// look exactly like a stale classification.
+struct RunObservation<'a> {
+    run_id: &'a str,
+    mark: OutputMark,
+    /// The pane's geometry. A resize reflows the screen without appending a byte, so it belongs
+    /// beside the mark rather than being inferred from it.
+    size: (u16, u16),
+    process_group_id: Option<i32>,
+}
+
+/// How far one run's output log had got, and how many bytes of it there are.
+///
+/// The pair, rather than the length alone, because the log rotates: a run whose history has been
+/// trimmed can have the same end offset it had before and hold entirely different bytes.
+type OutputMark = (u64, u64);
+
+/// One memoised classification, and the exact inputs each half of it was computed from.
+///
+/// Two keys rather than one, because the two halves answer to different things and used to be
+/// invalidated together. Which agent runs under a pane can only change when a fresh process table
+/// says so; what that agent's screen says can only change when new bytes arrive or the pane is
+/// resized. Sharing one key meant every pane on the screen re-read its whole screen and ran three
+/// regex sets over it every time a new process table landed — twice a second, with nothing on any
+/// of those screens having moved.
+#[derive(Debug, Clone, Copy)]
+struct ClassifiedAgent {
+    /// Which process-table snapshot `agent` was read from.
+    generation: u64,
+    agent: Option<AgentKind>,
+    /// The output mark and pane geometry the screen was read at. A resize reflows the screen
+    /// without appending a byte, so the mark alone would not notice it.
+    screen: (OutputMark, (u16, u16)),
+    from_screen: AgentState,
+}
 
 /// Everything one run's state inference remembers between polls.
 ///
@@ -211,9 +249,11 @@ pub struct RuntimeRegistry {
     /// measured pane starts at the size the client is drawing rather than the fallback. This is
     /// a leaf lock: it is never taken while `runs` or `layout` is held.
     pane_sizes: Mutex<HashMap<String, PtySize>>,
-    /// The last process-table snapshot, when it was taken, and which snapshot it is. The
-    /// generation is what lets a memoised classification know the table underneath it changed.
-    process_table: Mutex<Option<(Instant, u64, Arc<ProcessTree>)>>,
+    /// The last process-table snapshot and whether another is already being taken.
+    ///
+    /// Behind its own `Arc` because a refresh runs on its own thread and installs the result under
+    /// this same lock; see [`RuntimeRegistry::process_table`] for why it is not taken inline.
+    process_table: Arc<Mutex<ProcessTableCache>>,
     /// Agent state per run, keyed by the exact output the screen was built from. Classification is
     /// a pure function of that screen, so nothing but new bytes can change its answer.
     agent_states: Mutex<HashMap<String, ClassifiedAgent>>,
@@ -484,7 +524,7 @@ impl RuntimeRegistry {
             capacity,
             layout: Mutex::new(layout),
             pane_sizes: Mutex::new(HashMap::new()),
-            process_table: Mutex::new(None),
+            process_table: Arc::new(Mutex::new(ProcessTableCache::default())),
             agent_states: Mutex::new(HashMap::new()),
             output_marks: Mutex::new(HashMap::new()),
             reported_states: Mutex::new(HashMap::new()),
@@ -2082,44 +2122,58 @@ impl RuntimeRegistry {
     fn resolve_agent(
         &self,
         runtime: &OwnedRuntime,
-        run_id: &str,
-        process_group_id: Option<i32>,
+        observed: RunObservation<'_>,
         generation: u64,
         table: Option<&ProcessTree>,
     ) -> (Option<AgentKind>, AgentState) {
-        // Both inputs to the answer, so a pane that has written nothing since the last poll and is
-        // looking at the same process-table snapshot costs one hash lookup — no table parsing and
-        // no screen scan. That is most panes, most of the time, and parsing a 79KB table per pane
-        // per poll was the cost that made this hot.
-        let mark = runtime.with_output(|output| (output.log().epoch(), output.log().end()));
-        let key = (generation, mark.0, mark.1);
+        let RunObservation {
+            run_id,
+            mark,
+            size,
+            process_group_id,
+        } = observed;
+        // The two halves are memoised against different keys because different things change
+        // them, and keying both on both is what made a quiet pane pay for a new process table:
+        // every one bumped the generation, and every generation bump re-read every pane's whole
+        // screen and ran three regex sets over it to reach the answer it already had.
         let mut cached = self
             .agent_states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((seen, kind, state)) = cached.get(run_id)
-            && *seen == key
-        {
-            let (kind, state) = (*kind, *state);
-            drop(cached);
-            return (kind, self.resolve_state(run_id, kind, state, mark));
-        }
-        // Detection walks *down* from the pane's process-group leader by parentage, because a
-        // job-control shell puts every command the user starts into a new process group of its own.
-        let agent = process_group_id
-            .zip(table)
-            .and_then(|(leader_pid, tree)| tree.agent_under(leader_pid));
-        // The whole screen, not a tail. An agent's chooser leaves the cursor on the highlighted
-        // option and prints its instructions underneath, so a cursor-anchored tail cannot contain
-        // the very chrome that says the agent is waiting — every pattern matched against one was
-        // unreachable.
-        let from_screen = match agent {
-            Some(kind) => {
-                runtime.with_screen(|screen| classify_screen(kind, &screen.classifiable_text()))
-            }
-            None => AgentState::Idle,
+        let previous = cached.get(run_id).copied();
+        let agent = match previous {
+            Some(previous) if previous.generation == generation => previous.agent,
+            // Detection walks *down* from the pane's process-group leader by parentage, because a
+            // job-control shell puts every command the user starts into a new process group of
+            // its own.
+            _ => process_group_id
+                .zip(table)
+                .and_then(|(leader_pid, tree)| tree.agent_under(leader_pid)),
         };
-        cached.insert(run_id.to_owned(), (key, agent, from_screen));
+        let from_screen = match previous {
+            Some(previous) if previous.agent == agent && previous.screen == (mark, size) => {
+                previous.from_screen
+            }
+            // The whole screen, not a tail. An agent's chooser leaves the cursor on the
+            // highlighted option and prints its instructions underneath, so a cursor-anchored tail
+            // cannot contain the very chrome that says the agent is waiting — every pattern
+            // matched against one was unreachable.
+            _ => match agent {
+                Some(kind) => {
+                    runtime.with_screen(|screen| classify_screen(kind, &screen.classifiable_text()))
+                }
+                None => AgentState::Idle,
+            },
+        };
+        cached.insert(
+            run_id.to_owned(),
+            ClassifiedAgent {
+                generation,
+                agent,
+                screen: (mark, size),
+                from_screen,
+            },
+        );
         drop(cached);
         (agent, self.resolve_state(run_id, agent, from_screen, mark))
     }
@@ -2137,7 +2191,7 @@ impl RuntimeRegistry {
         run_id: &str,
         agent: Option<AgentKind>,
         from_screen: AgentState,
-        mark: (u64, u64),
+        mark: OutputMark,
     ) -> AgentState {
         // Read before the output marks are locked: this is a leaf lock and taking the two in one
         // order everywhere is what keeps it one.
@@ -2244,25 +2298,81 @@ impl RuntimeRegistry {
             .retain(|run_id, _| live.contains(run_id));
     }
 
-    /// The process table, taken afresh only when the last snapshot has aged out.
-    fn process_table(&self) -> Option<(u64, Arc<ProcessTree>)> {
-        let mut cached = self
+    /// The process table, taken afresh only when a fresh one could say something new, and never
+    /// on the thread that is polling.
+    ///
+    /// Both halves of that came out of measurement. `ps -axo pid=,ppid=,pgid=,comm=` on an
+    /// ordinary machine — 949 processes, 92KB of output — costs about 35ms of CPU and 60ms of
+    /// wall time, and it is a *subprocess*, so that CPU is charged to `ps` rather than to the
+    /// daemon. A daemon with one subscriber and nothing at all happening was taking one twice a
+    /// second: ten percent of a core, spent where no tool shows it against the daemon's own name.
+    /// That is precisely the shape of the complaint that forgotten daemons burn CPU while looking
+    /// idle — measured here at 11.2% total against 1.0% for the daemon process itself.
+    ///
+    /// So the table is now reused, however old it is, on any poll where no run has written a byte
+    /// since it was taken. The question it answers is which agent runs beneath a pane, and both
+    /// ways that answer can change announce themselves in the pane's own output: an agent starting
+    /// prints its banner, an agent exiting hands back a shell that prints its prompt. A run
+    /// appearing or departing counts as a change too, since the marks are compared as a whole.
+    /// [`PROCESS_TABLE_QUIET_TTL`] is the backstop for the case the inference cannot cover.
+    ///
+    /// And the refresh itself runs on its own thread. Taken inline it stalled a sixteen-
+    /// millisecond poll loop for sixty milliseconds twice a second — four frames dropped, which
+    /// measured as a p99 of 69ms against a p50 of 0.07ms. The cost of that is an answer at most
+    /// one refresh older, which is far inside the dwell the roster already applies to every state
+    /// change it shows.
+    fn process_table(
+        &self,
+        marks: &HashMap<String, OutputMark>,
+    ) -> Option<(u64, Arc<ProcessTree>)> {
+        let mut cache = self
             .process_table
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((taken, generation, table)) = cached.as_ref()
-            && taken.elapsed() < PROCESS_TABLE_TTL
-        {
-            return Some((*generation, Arc::clone(table)));
+        let Some(latest) = cache.latest.as_ref() else {
+            // Nothing to answer from at all, so this caller pays for the table it needs. Only the
+            // first poll of a daemon's life reaches here; deferring it would mean reporting every
+            // pane as agentless until a refresh landed.
+            let taken = ProcessTableSnapshot::take(0, marks.clone())?;
+            let answer = (taken.generation, Arc::clone(&taken.tree));
+            cache.latest = Some(taken);
+            return Some(answer);
+        };
+        let answer = (latest.generation, Arc::clone(&latest.tree));
+        let age = latest.taken.elapsed();
+        let due =
+            (age >= PROCESS_TABLE_TTL && latest.marks != *marks) || age >= PROCESS_TABLE_QUIET_TTL;
+        let generation = latest.generation + 1;
+        if due && !cache.refreshing {
+            cache.refreshing = true;
+            let marks = marks.clone();
+            let cache_handle = Arc::clone(&self.process_table);
+            // Detached deliberately: it owns everything it touches and publishes its result under
+            // the same lock every reader takes, so there is nothing for anyone to join.
+            let spawned = thread::Builder::new()
+                .name("dock-process-table".into())
+                .spawn(move || {
+                    let taken = ProcessTableSnapshot::take(generation, marks);
+                    let mut cache = cache_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match taken {
+                        Some(taken) => cache.latest = Some(taken),
+                        // `ps` failed. The floor still applies, or a machine that cannot run it
+                        // would be asked to sixty times a second.
+                        None => {
+                            if let Some(latest) = cache.latest.as_mut() {
+                                latest.taken = Instant::now();
+                            }
+                        }
+                    }
+                    cache.refreshing = false;
+                });
+            if spawned.is_err() {
+                cache.refreshing = false;
+            }
         }
-        // Indexed once and shared. Every pane asks the same snapshot the same question, and
-        // building a private index per pane was two dozen full parses a second on a busy layout.
-        let table = Arc::new(ProcessTree::parse(&read_process_table()?));
-        let generation = cached
-            .as_ref()
-            .map_or(0, |(_, generation, _)| generation + 1);
-        *cached = Some((Instant::now(), generation, Arc::clone(&table)));
-        Some((generation, table))
+        Some(answer)
     }
 
     /// The little the event stream needs from every run, sixty times a second.
@@ -2283,29 +2393,41 @@ impl RuntimeRegistry {
             )
         };
         self.forget_departed_runs(live_runs);
-        let mut pulses: Vec<(Arc<OwnedRuntime>, RunPulse)> = runtimes
+        // Read here rather than inside `resolve_agent` because the process table now needs them
+        // too: whether a fresh one could say anything new is answered by whether any pane has
+        // written since the last one was taken.
+        let mut pulses: Vec<(Arc<OwnedRuntime>, RunPulse, OutputMark)> = runtimes
             .into_iter()
             .map(|runtime| {
                 let pulse = runtime.pulse();
-                (runtime, pulse)
+                let mark = runtime.with_output(output_mark);
+                (runtime, pulse, mark)
             })
             .collect();
         pulses.sort_by(|a, b| a.1.run_id.cmp(&b.1.run_id));
+        let marks: HashMap<String, OutputMark> = pulses
+            .iter()
+            .map(|(_, pulse, mark)| (pulse.run_id.clone(), *mark))
+            .collect();
         let table = pulses
             .iter()
-            .any(|(_, pulse)| pulse.process_group_id.is_some())
-            .then(|| self.process_table())
+            .any(|(_, pulse, _)| pulse.process_group_id.is_some())
+            .then(|| self.process_table(&marks))
             .flatten();
         let generation = table
             .as_ref()
             .map_or(u64::MAX, |(generation, _)| *generation);
         pulses
             .into_iter()
-            .map(|(runtime, mut pulse)| {
+            .map(|(runtime, mut pulse, mark)| {
                 let (agent, state) = self.resolve_agent(
                     &runtime,
-                    &pulse.run_id,
-                    pulse.process_group_id,
+                    RunObservation {
+                        run_id: &pulse.run_id,
+                        mark,
+                        size: (pulse.rows, pulse.cols),
+                        process_group_id: pulse.process_group_id,
+                    },
                     generation,
                     table.as_ref().map(|(_, tree)| tree.as_ref()),
                 );
@@ -2350,23 +2472,29 @@ impl RuntimeRegistry {
             .into_iter()
             .map(|runtime| {
                 let snapshot = runtime.snapshot();
-                (runtime, snapshot)
+                let mark = runtime.with_output(output_mark);
+                (runtime, snapshot, mark)
             })
             .collect();
         runs.sort_by(|a, b| a.1.run_id.cmp(&b.1.run_id));
+        let marks: HashMap<String, OutputMark> = runs
+            .iter()
+            .map(|(_, snapshot, mark)| (snapshot.run_id.clone(), *mark))
+            .collect();
         // Exactly one `ps` per call, shared by every run: one per run would make this hot path
-        // cost a subprocess spawn for each pane on the screen.
+        // cost a subprocess spawn for each pane on the screen. Often none at all — see
+        // `process_table` for when a poll can reuse the table it already has.
         let table = runs
             .iter()
-            .any(|(_, snapshot)| snapshot.process_group_id.is_some())
-            .then(|| self.process_table())
+            .any(|(_, snapshot, _)| snapshot.process_group_id.is_some())
+            .then(|| self.process_table(&marks))
             .flatten();
         let generation = table
             .as_ref()
             .map_or(u64::MAX, |(generation, _)| *generation);
         Ok(runs
             .into_iter()
-            .map(|(runtime, mut snapshot)| {
+            .map(|(runtime, mut snapshot, mark)| {
                 // The pane's process-group leader pid. Dock's pane children call `setsid` before
                 // `exec`, so the group id and the leader's pid are the same number by
                 // construction, and it is a pid Dock's own spawn produced. Detection walks
@@ -2378,8 +2506,12 @@ impl RuntimeRegistry {
                 // parsing a 79KB table per pane per poll was the cost that made this hot.
                 let (agent, state) = self.resolve_agent(
                     &runtime,
-                    &snapshot.run_id,
-                    snapshot.process_group_id,
+                    RunObservation {
+                        run_id: &snapshot.run_id,
+                        mark,
+                        size: (snapshot.rows, snapshot.cols),
+                        process_group_id: snapshot.process_group_id,
+                    },
                     generation,
                     table.as_ref().map(|(_, tree)| tree.as_ref()),
                 );
@@ -3312,6 +3444,51 @@ const PANE_SHELL_RUN_ID_PREFIX: &str = "dock_sh_";
 /// the point anyone notices a new agent appearing and roughly thirty times cheaper.
 const PROCESS_TABLE_TTL: Duration = Duration::from_millis(500);
 
+/// The longest a process-table snapshot is reused when not one pane has written a byte.
+///
+/// [`RuntimeRegistry::process_table`] reuses a snapshot indefinitely while every run's output mark
+/// stands still, on the grounds that an agent starting or exiting writes something. This is the
+/// backstop for a case that reasoning cannot cover — an agent that starts and prints nothing at
+/// all, in a pane that prints nothing at all — so the worst the inference can cost is a slower
+/// answer rather than a permanently wrong one. Five seconds is two hundred times cheaper than the
+/// unconditional half-second refresh and still well under the time it takes somebody to look up.
+const PROCESS_TABLE_QUIET_TTL: Duration = Duration::from_secs(5);
+
+/// The last process table taken, and whether another is on its way.
+#[derive(Default)]
+struct ProcessTableCache {
+    latest: Option<ProcessTableSnapshot>,
+    /// Set while a refresh thread is out, so a poll loop running at 62Hz starts one `ps` rather
+    /// than one per tick for as long as the first takes to answer.
+    refreshing: bool,
+}
+
+/// One process table, and the state of the world it was taken against.
+struct ProcessTableSnapshot {
+    taken: Instant,
+    /// Bumped for each new table, so a memoised classification can tell that the table underneath
+    /// it changed without comparing the tables themselves.
+    generation: u64,
+    tree: Arc<ProcessTree>,
+    /// Every run's output mark as at the moment this table was taken. A later poll whose marks all
+    /// match cannot be a poll where a new agent appeared, because starting one writes to the pane.
+    marks: HashMap<String, OutputMark>,
+}
+
+impl ProcessTableSnapshot {
+    fn take(generation: u64, marks: HashMap<String, OutputMark>) -> Option<Self> {
+        // Indexed once and shared. Every pane asks the same snapshot the same question, and
+        // building a private index per pane was two dozen full parses a second on a busy layout.
+        let tree = Arc::new(ProcessTree::parse(&read_process_table()?));
+        Some(Self {
+            taken: Instant::now(),
+            generation,
+            tree,
+            marks,
+        })
+    }
+}
+
 /// How recently a pane must have written for its agent to count as working.
 ///
 /// This is the signal that does not need to know what any agent looks like. An agent that is
@@ -3365,6 +3542,15 @@ const STATE_DWELL: Duration = Duration::from_millis(600);
 /// was written to catch.
 fn output_looks_like_work(quiet_for: Duration, growing_for: Duration) -> bool {
     quiet_for < WORKING_SILENCE && growing_for >= SUSTAINED_OUTPUT
+}
+
+/// How far one run's output log has got, read under the pane's own lock.
+///
+/// A free function rather than a closure at each call site, because three of them now need the
+/// same pair and a pane's mark meaning something different in one of them would be a bug that
+/// looked like a caching bug.
+fn output_mark(output: &PaneOutput) -> OutputMark {
+    (output.log().epoch(), output.log().end())
 }
 
 /// One snapshot of the process table, shared by every run in a single `inspect` and reused across
@@ -7364,5 +7550,140 @@ mod tests {
                 Err((ErrorCode::InvalidHandoff, _))
             ));
         }
+    }
+
+    /// Which process-table snapshot the registry is currently answering from.
+    ///
+    /// `u64::MAX` for a registry that has never taken one, so a test asserting that none was taken
+    /// cannot pass by coincidence against a generation that happens to be zero.
+    fn process_table_generation(registry: &RuntimeRegistry) -> u64 {
+        registry
+            .process_table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .latest
+            .as_ref()
+            .map_or(u64::MAX, |latest| latest.generation)
+    }
+
+    /// Polls at the rate the event stream does, for as long as it is given.
+    fn poll_for(registry: &RuntimeRegistry, window: Duration) {
+        let until = Instant::now() + window;
+        while Instant::now() < until {
+            registry.pulse();
+            thread::sleep(Duration::from_millis(16));
+        }
+    }
+
+    /// The cost behind this: `ps -axo pid=,ppid=,pgid=,comm=` on an ordinary machine of 949
+    /// processes costs about 35ms of CPU, and it is a *subprocess*, so that CPU is charged to `ps`
+    /// rather than to the daemon. Taking one every [`PROCESS_TABLE_TTL`] regardless was ten
+    /// percent of a core burned by a daemon doing nothing whatsoever — measured at 9.8% total
+    /// against 0.6% for the daemon process itself, which is why it went unexplained for so long.
+    ///
+    /// A run that never writes is the case the inference rests on: no pane has produced a byte, so
+    /// no agent has started or exited, so a fresh table cannot say anything the last one did not.
+    #[test]
+    fn a_daemon_whose_runs_are_all_silent_stops_taking_process_tables() {
+        let repo = Repo::new("quiet-process-table");
+        let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
+        *registry.suppress_pane_shells.lock().unwrap() = true;
+        let mut request = repo.request("dock_quiet_run");
+        // Silent for the whole test, on purpose. A pane shell would paint a prompt and, depending
+        // on whose shell it is, keep repainting it, which is the one thing this test must rule out
+        // rather than measure.
+        request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
+        registry.dispatch(request).expect("dispatch a silent run");
+        // Long enough for the run to be launched and the first table — the one every later poll
+        // reuses — to have been taken.
+        poll_for(&registry, Duration::from_millis(700));
+        let taken = process_table_generation(&registry);
+        assert_ne!(
+            taken,
+            u64::MAX,
+            "a run with a process group must have caused one table to be taken"
+        );
+
+        // Three times the floor between refreshes and comfortably inside the quiet backstop, so
+        // the old behaviour would have taken three more tables across this window.
+        poll_for(&registry, PROCESS_TABLE_TTL * 3);
+        assert_eq!(
+            process_table_generation(&registry),
+            taken,
+            "a poll where no run has written a byte must reuse the table it already has"
+        );
+        let _ = registry.lifecycle("dock_quiet_run", LifecycleOperation::Stop);
+    }
+
+    /// The other half of the bargain: reuse is conditional on silence, and a pane that writes is a
+    /// pane where an agent may just have started. Starting one prints a banner and leaving one
+    /// hands back a shell that prints a prompt, so output is the signal, and it has to be acted on
+    /// within the same half-second the old unconditional refresh offered.
+    #[test]
+    fn a_run_that_writes_is_given_a_fresh_process_table_within_the_usual_interval() {
+        let repo = Repo::new("writing-process-table");
+        let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
+        *registry.suppress_pane_shells.lock().unwrap() = true;
+        let mut request = repo.request("dock_writing_run");
+        request.adapter.arguments = vec![
+            "-c".into(),
+            "while :; do echo the agent is printing; sleep 0.1; done".into(),
+        ];
+        registry.dispatch(request).expect("dispatch a writing run");
+        poll_for(&registry, Duration::from_millis(700));
+        let taken = process_table_generation(&registry);
+
+        poll_for(&registry, PROCESS_TABLE_TTL * 3);
+        let refreshed = process_table_generation(&registry);
+        assert!(
+            refreshed > taken,
+            "a run that is writing must still get fresh process tables, but the generation stayed \
+             at {taken}"
+        );
+        let _ = registry.lifecycle("dock_writing_run", LifecycleOperation::Stop);
+    }
+
+    /// A refresh runs on its own thread because taking one inline stalled the sixteen-millisecond
+    /// poll loop for the sixty milliseconds `ps` takes to answer — twice a second, four frames
+    /// dropped each time, measured as a p99 of 55ms against a p50 of 0.02ms. Only the very first
+    /// table is taken inline, because a daemon that has none cannot answer at all without it.
+    #[test]
+    fn taking_a_fresh_process_table_does_not_stall_the_poll_it_was_asked_on() {
+        let repo = Repo::new("unstalled-process-table");
+        let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
+        *registry.suppress_pane_shells.lock().unwrap() = true;
+        let mut request = repo.request("dock_unstalled_run");
+        request.adapter.arguments = vec![
+            "-c".into(),
+            "while :; do echo the agent is printing; sleep 0.1; done".into(),
+        ];
+        registry.dispatch(request).expect("dispatch a writing run");
+        // Past the first, inline, table.
+        poll_for(&registry, Duration::from_millis(700));
+        let taken = process_table_generation(&registry);
+
+        let mut slowest = Duration::ZERO;
+        let until = Instant::now() + PROCESS_TABLE_TTL * 4;
+        while Instant::now() < until {
+            let polled = Instant::now();
+            registry.pulse();
+            slowest = slowest.max(polled.elapsed());
+            thread::sleep(Duration::from_millis(16));
+        }
+        assert!(
+            process_table_generation(&registry) > taken,
+            "this window has to contain a refresh or it proves nothing about refreshes"
+        );
+        // Not a claim about how fast a poll is. The two populations this has to tell apart are a
+        // poll that reads a cached table, which is tens of microseconds, and a poll that spawns
+        // `ps` and waits for it, which measured 55ms at the ninety-ninth percentile on an idle
+        // machine and 426ms under load. Forty milliseconds sits between them with room on both
+        // sides, and scales with the suite's timeout scale for a contended runner.
+        assert!(
+            slowest < crate::testing::budget_millis(40),
+            "a poll took {slowest:?}, which is long enough to have taken a process table on the \
+             thread the event stream is polling from"
+        );
+        let _ = registry.lifecycle("dock_unstalled_run", LifecycleOperation::Stop);
     }
 }

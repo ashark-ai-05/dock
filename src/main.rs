@@ -885,13 +885,15 @@ fn agent_state_command(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-/// `dock hooks` — the Claude Code hook configuration that makes state exact.
+/// The turn boundaries Dock needs, in the vocabulary Claude Code and Codex both use.
 ///
-/// Printed rather than installed by default. This writes into a file the user shares with every
-/// other tool that reads it, and a program that edits your settings because you asked it a
-/// question is not one you leave installed.
-fn hooks_command(args: &[String]) -> io::Result<()> {
-    let hooks = serde_json::json!({
+/// The two agents converged on the same event names and the same handler shape, so one description
+/// serves both and only the destination differs. Amp is not here: its lifecycle is a plugin system
+/// with its own names (`agent.start`, `agent.end`), so it stays on the output-and-screen tier until
+/// somebody writes that adapter. Copilot is not here because nothing of its interface has been
+/// verified, and inventing one would produce a config that silently never fires.
+fn hook_events() -> serde_json::Value {
+    serde_json::json!({
         "hooks": {
             "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "dock agent-state working"}]}],
             "PreToolUse": [{"hooks": [{"type": "command", "command": "dock agent-state working"}]}],
@@ -900,12 +902,29 @@ fn hooks_command(args: &[String]) -> io::Result<()> {
             "Stop": [{"hooks": [{"type": "command", "command": "dock agent-state done"}]}],
             "SessionEnd": [{"hooks": [{"type": "command", "command": "dock agent-state idle"}]}]
         }
-    });
+    })
+}
+
+/// `dock hooks` — the hook configuration that makes agent state exact rather than inferred.
+///
+/// Printed rather than installed by default. This writes into files shared with every other tool
+/// that reads them, and a program that edits your settings because you asked it a question is not
+/// one you leave installed.
+fn hooks_command(args: &[String]) -> io::Result<()> {
+    let hooks = hook_events();
     let pretty = serde_json::to_string_pretty(&hooks)?;
     if !args.iter().any(|argument| argument == "--install") {
         println!("{pretty}");
+        eprintln!("\nClaude Code: .claude/settings.json — or `dock hooks --install` to merge it.");
         eprintln!(
-            "\nAdd this to .claude/settings.json, or run `dock hooks --install` to merge it in."
+            "Codex: the same events and shape, in hooks.json or an inline [hooks] table, and it \
+             needs `hooks = true` under [features]. Added by hand: Dock has not verified where \
+             your Codex build reads that file from, and a config written to the wrong path is one \
+             that silently never fires."
+        );
+        eprintln!(
+            "Amp: not supported — its lifecycle is a plugin system with different event names, so \
+             it stays on Dock's output-and-screen detection."
         );
         return Ok(());
     }
@@ -939,6 +958,7 @@ fn hooks_command(args: &[String]) -> io::Result<()> {
     }
     fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
     println!("merged Dock's hooks into {}", path.display());
+    println!("Codex uses the same events — run `dock hooks` to print them for it.");
     Ok(())
 }
 

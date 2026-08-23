@@ -271,12 +271,51 @@ pub struct ReviewOverlay {
     pub pending: Option<(ReviewRoute, String)>,
 }
 
+/// One of the surfaces Dock can put over the canvas.
+///
+/// Each still owns its own state on `Dashboard` and its own hand-written `render_*`/`key_*`
+/// pair; this names them so the *order* they are drawn and routed in can be stated once,
+/// instead of once per site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayKind {
+    Help,
+    Rename,
+    LaunchForm,
+    Picker,
+    Review,
+    Board,
+    Git,
+    Copy,
+}
+
+/// Every overlay, in the one order that governs both drawing and key routing.
+///
+/// Drawing and key routing were two hardcoded lists of the same eight surfaces, written in two
+/// different orders. Drawing went `launch, help, rename, picker, review, git, board`; routing
+/// went `help, rename, launch, picker, review, board, git, copy`. The launch form was drawn
+/// before help and rename but routed after them, and the board was drawn after the Git overlay
+/// but routed before it. Nothing was ever observable, because at most one overlay is open at a
+/// time — which is precisely the hazard: the disagreement could not be caught by using Dock, and
+/// the ninth surface would have inherited whichever list its author happened to read.
+///
+/// Both sites now derive from this array, so adding a surface is one entry in one place and
+/// there is no second list to get half right.
+const OVERLAY_ORDER: [OverlayKind; 8] = [
+    OverlayKind::Help,
+    OverlayKind::Rename,
+    OverlayKind::LaunchForm,
+    OverlayKind::Picker,
+    OverlayKind::Review,
+    OverlayKind::Board,
+    OverlayKind::Git,
+    OverlayKind::Copy,
+];
+
 /// What an open picker does with the row the user takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerPurpose {
     Workspace,
     File,
-    Task,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -598,6 +637,72 @@ impl Dashboard {
         self.layout.workspaces.get(self.workspace_index)
     }
 
+    /// Whether one named overlay is on screen right now.
+    ///
+    /// The single place that knows which field stands for which surface, so `OVERLAY_ORDER` can
+    /// be a list of names rather than a list of conditions repeated at every site.
+    fn overlay_is_open(&self, kind: OverlayKind) -> bool {
+        match kind {
+            OverlayKind::Help => self.help_open,
+            OverlayKind::Rename => self.rename_form.is_some(),
+            OverlayKind::LaunchForm => self.launch_form.is_some(),
+            OverlayKind::Picker => self.picker.is_some(),
+            OverlayKind::Review => self.review.is_some(),
+            OverlayKind::Board => self.board.is_some(),
+            OverlayKind::Git => self.git.is_some(),
+            OverlayKind::Copy => self.copy.is_some(),
+        }
+    }
+
+    /// The overlays that are open, in `OVERLAY_ORDER`. Drawing walks it; key routing takes its
+    /// first entry.
+    fn open_overlays(&self) -> impl Iterator<Item = OverlayKind> + '_ {
+        OVERLAY_ORDER
+            .into_iter()
+            .filter(|kind| self.overlay_is_open(*kind))
+    }
+
+    /// Draws one overlay over the whole canvas.
+    ///
+    /// Copy mode draws nothing here, and that is deliberate rather than an omission: it is
+    /// anchored to its pane's rectangle rather than to the screen's, so `render_node` paints it
+    /// where the pane is. It keeps its place in `OVERLAY_ORDER` because the order is about
+    /// precedence among open surfaces, and copy mode has one.
+    fn render_overlay(&mut self, kind: OverlayKind, frame: &mut Frame, area: Rect) {
+        match kind {
+            OverlayKind::Help => self.render_help(frame, area),
+            OverlayKind::Rename => self.render_rename(frame, area),
+            OverlayKind::LaunchForm => self.render_launch_form(frame, area),
+            OverlayKind::Picker => self.render_picker(frame, area),
+            OverlayKind::Review => self.render_review(frame, area),
+            OverlayKind::Board => self.render_board(frame, area),
+            OverlayKind::Git => self.render_git(frame, area),
+            OverlayKind::Copy => {}
+        }
+    }
+
+    /// Hands one key to one overlay.
+    ///
+    /// Help is answered inline because it has no state to hold: it is a page, and the only keys
+    /// it takes are the two that close it. Every other surface keeps the handler it already had.
+    fn overlay_key(&mut self, kind: OverlayKind, key: KeyEvent) -> UiCommand {
+        match kind {
+            OverlayKind::Help => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
+                    self.help_open = false;
+                }
+                UiCommand::None
+            }
+            OverlayKind::Rename => self.rename_key(key),
+            OverlayKind::LaunchForm => self.launch_key(key),
+            OverlayKind::Picker => self.picker_key(key),
+            OverlayKind::Review => self.review_key(key),
+            OverlayKind::Board => self.board_key(key),
+            OverlayKind::Git => self.git_key(key),
+            OverlayKind::Copy => self.copy_key(key),
+        }
+    }
+
     pub fn render(&mut self, frame: &mut Frame) {
         self.pane_areas.clear();
         self.pane_inner_areas.clear();
@@ -683,26 +788,18 @@ impl Dashboard {
         }) {
             self.dragging = None;
         }
-        if self.launch_form.is_some() {
-            self.render_launch_form(frame, area);
-        }
-        if self.help_open {
-            self.render_help(frame, area);
-        }
-        if self.rename_form.is_some() {
-            self.render_rename(frame, area);
-        }
-        if self.picker.is_some() {
-            self.render_picker(frame, area);
-        }
-        if self.review.is_some() {
-            self.render_review(frame, area);
-        }
-        if self.git.is_some() {
-            self.render_git(frame, area);
-        }
-        if self.board.is_some() {
-            self.render_board(frame, area);
+        // Drawn in `OVERLAY_ORDER`, later entries over earlier ones, so the sequence on screen is
+        // the sequence the key router walks.
+        //
+        // Written as a loop over the constant rather than over `open_overlays` on purpose: this
+        // runs on every frame, and the iterator borrows `self` immutably while each `render_*`
+        // needs it back mutably, so the obvious spelling would have to collect into a `Vec` and
+        // pay an allocation per frame for eight `Copy` discriminants. This compiles to the same
+        // eight checks the hand-written chain was.
+        for kind in OVERLAY_ORDER {
+            if self.overlay_is_open(kind) {
+                self.render_overlay(kind, frame, area);
+            }
         }
         // The which-key bar publishes every binding, and there are now more bindings than two rows
         // can hold. Rather than shaving words off the table until the last entry fits — which
@@ -929,7 +1026,6 @@ impl Dashboard {
         let title = match purpose {
             PickerPurpose::Workspace => " WORKSPACES ",
             PickerPurpose::File => " FILES ",
-            PickerPurpose::Task => " BOARD ",
         };
         let width = area.width.min(58);
         let height = area.height.min(14);
@@ -960,25 +1056,13 @@ impl Dashboard {
             Line::from(""),
         ];
         if picker.is_empty() {
-            // A board says what to do about being empty; the other pickers have nothing to offer
-            // but the fact. An empty board is the normal first state of every board.
-            let query = picker.query().trim().to_owned();
-            let hint = match (purpose, query.is_empty(), self.board_is_personal) {
-                (PickerPurpose::Task, true, true) => {
-                    "  nothing here yet — type a title and press Enter".to_owned()
-                }
-                (PickerPurpose::Task, false, true) => {
-                    format!("  Enter writes it down: {query}")
-                }
-                (PickerPurpose::Task, true, false) => {
-                    "  nothing here yet — kanban-md owns this board".to_owned()
-                }
-                (PickerPurpose::Task, false, false) => {
-                    "  no match · this board is the repository's".to_owned()
-                }
-                _ => "  no match".to_owned(),
-            };
-            lines.push(Line::styled(hint, Style::default().fg(self.theme.muted)));
+            // A picker has nothing to offer about an empty result but the fact of it. Writing a
+            // task down from an empty query is the board overlay's job, and the board overlay
+            // says so itself.
+            lines.push(Line::styled(
+                "  no match",
+                Style::default().fg(self.theme.muted),
+            ));
         }
         // The detail column is right-aligned against the popup's inner width so the counts form a
         // column rather than trailing each name at a different offset.
@@ -1016,17 +1100,6 @@ impl Dashboard {
             ]));
         }
         self.picker_row_areas = row_areas;
-        if *purpose == PickerPurpose::Task
-            && let Some(directory) = self.board_dir.as_ref()
-        {
-            // Which board this is, said plainly: a workspace's board and a repository's look
-            // identical once open, and adding a task to the wrong one is quietly annoying.
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                format!("  {}", directory.display()),
-                Style::default().fg(self.theme.muted),
-            ));
-        }
         frame.render_widget(
             Paragraph::new(lines)
                 .style(Style::default().fg(self.theme.text).bg(self.theme.surface))
@@ -1729,37 +1802,15 @@ impl Dashboard {
     }
 
     pub fn key(&mut self, key: KeyEvent) -> UiCommand {
-        if self.help_open {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
-                self.help_open = false;
-            }
-            return UiCommand::None;
-        }
-        if self.rename_form.is_some() {
-            return self.rename_key(key);
-        }
-        if self.launch_form.is_some() {
-            return self.launch_key(key);
-        }
-        // Ahead of the keymap for the same reason copy mode is: an open picker is taking a query,
-        // so every printable key belongs to the query rather than to the PTY or to a binding.
-        if self.picker.is_some() {
-            return self.picker_key(key);
-        }
-        if self.review.is_some() {
-            return self.review_key(key);
-        }
-        if self.board.is_some() {
-            return self.board_key(key);
-        }
-        if self.git.is_some() {
-            return self.git_key(key);
-        }
-        // Ahead of the keymap on purpose: copy mode owns every key while it is active, so its
-        // motions (`h`, `j`, `k`, `l`) and its verbs (`v`, `y`) can never be forwarded to the
-        // PTY as ordinary input.
-        if self.copy.is_some() {
-            return self.copy_key(key);
+        // The first open overlay in `OVERLAY_ORDER` takes the key, and the same array decides
+        // what is drawn — so the two can no longer be edited apart.
+        //
+        // The whole stack sits ahead of the keymap on purpose: an open picker is taking a query
+        // and copy mode owns every motion (`h`, `j`, `k`, `l`) and verb (`v`, `y`), so neither
+        // can be allowed to reach a binding or the PTY as ordinary input.
+        let overlay = self.open_overlays().next();
+        if let Some(kind) = overlay {
+            return self.overlay_key(kind, key);
         }
         // Esc answers the armed workspace close before it reaches the pane. The confirmation is
         // a question the dashboard put on screen, and the key that dismisses every other thing
@@ -2198,7 +2249,7 @@ impl Dashboard {
             return UiCommand::None;
         }
         if title.trim().is_empty() {
-            self.error = Some("type a title first, then Ctrl+N adds it".into());
+            self.error = Some("type a title first, then Enter adds it".into());
             return UiCommand::None;
         }
         match crate::board::create(&directory, title) {
@@ -2330,7 +2381,54 @@ impl Dashboard {
         };
         let key = task.id.to_string();
         self.board = None;
-        self.take_picked(PickerPurpose::Task, &key)
+        self.task_dispatch_for(&key)
+    }
+
+    /// Assembles the dispatch for one card: the workspace and pane it lands in, the task it
+    /// carries, and the agent that will run it.
+    ///
+    /// Dispatching is the one thing the board does that changes something outside Dock, so this
+    /// carries the whole context the dispatch needs rather than leaving the caller to rebuild it
+    /// from a stale view of the layout. It reads the card out of `board_tasks` by id rather than
+    /// taking the one in hand, because the board is files on disk and the card may have been
+    /// removed since the overlay was opened.
+    ///
+    /// This was an arm of `take_picked` until the list-style board picker went away. Nothing
+    /// opened that picker any more, so the arm was reachable only through this one call and the
+    /// enum variant that named it was a purpose no picker ever had.
+    fn task_dispatch_for(&mut self, task_key: &str) -> UiCommand {
+        let Some(workspace) = self.workspace() else {
+            self.error = Some("cannot dispatch: create a workspace first".into());
+            return UiCommand::None;
+        };
+        let workspace_id = workspace.workspace_id.clone();
+        let pane_id = workspace.focused_pane_id.clone();
+        let Some(task) = self
+            .board_tasks
+            .iter()
+            .find(|task| task.id.to_string() == task_key)
+        else {
+            self.error = Some("that task is no longer on the board".into());
+            return UiCommand::None;
+        };
+        let (task_id, title) = (task.id, task.title.clone());
+        let Some(adapter) = self.dispatch_adapter() else {
+            self.error = Some(
+                "cannot dispatch: no agent is installed (claude, codex, amp or copilot)".into(),
+            );
+            return UiCommand::None;
+        };
+        self.error = None;
+        let run_id = self.next_unique_id("dock_task");
+        self.dispatched_tasks.insert(run_id.clone(), task_id);
+        UiCommand::DispatchTask(TaskDispatch {
+            workspace_id,
+            pane_id,
+            run_id,
+            task_id,
+            title,
+            adapter,
+        })
     }
 
     /// Receives the pending handoffs and opens the review overlay over them.
@@ -2686,26 +2784,8 @@ impl Dashboard {
                         self.picker = None;
                         return self.take_picked(purpose, &key);
                     }
-                    // Nothing matched what was typed. On a board that is not a dead end — it is
-                    // the ordinary way a task gets written down, so Enter means "make it".
-                    None if *purpose == PickerPurpose::Task => {
-                        let title = picker.query().to_owned();
-                        self.picker = None;
-                        return self.create_task(&title);
-                    }
                     None => self.picker = None,
                 }
-            }
-            // Ctrl+N turns what has been typed into a task. It is the one key the query does not
-            // swallow, and only on Dock's own board: a repository's board belongs to kanban-md and
-            // to whoever else commits to it.
-            KeyCode::Char('n' | 'N')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && *purpose == PickerPurpose::Task =>
-            {
-                let title = picker.query().to_owned();
-                self.picker = None;
-                return self.create_task(&title);
             }
             // Every printable character is query text. Only the chording modifiers are excluded —
             // SHIFT must not be, because crossterm reports it on every capital letter and a
@@ -2741,44 +2821,6 @@ impl Dashboard {
                     None => self.error = Some("that workspace is gone".into()),
                 }
                 UiCommand::None
-            }
-            // Taking a task is the one picker row that changes something outside Dock, so it
-            // carries the whole context the dispatch needs rather than leaving the caller to
-            // rebuild it from a stale view of the layout.
-            PickerPurpose::Task => {
-                let Some(workspace) = self.workspace() else {
-                    self.error = Some("cannot dispatch: create a workspace first".into());
-                    return UiCommand::None;
-                };
-                let workspace_id = workspace.workspace_id.clone();
-                let pane_id = workspace.focused_pane_id.clone();
-                let Some(task) = self
-                    .board_tasks
-                    .iter()
-                    .find(|task| task.id.to_string() == key)
-                else {
-                    self.error = Some("that task is no longer on the board".into());
-                    return UiCommand::None;
-                };
-                let (task_id, title) = (task.id, task.title.clone());
-                let Some(adapter) = self.dispatch_adapter() else {
-                    self.error = Some(
-                        "cannot dispatch: no agent is installed (claude, codex, amp or copilot)"
-                            .into(),
-                    );
-                    return UiCommand::None;
-                };
-                self.error = None;
-                let run_id = self.next_unique_id("dock_task");
-                self.dispatched_tasks.insert(run_id.clone(), task_id);
-                UiCommand::DispatchTask(TaskDispatch {
-                    workspace_id,
-                    pane_id,
-                    run_id,
-                    task_id,
-                    title,
-                    adapter,
-                })
             }
             // The path is typed into the pane rather than opened, because Dock cannot know which
             // verb was wanted. Reaching for it after `vim ` opens it; reaching for it mid-sentence
@@ -5970,6 +6012,7 @@ mod tests {
             status: status.into(),
             priority: "high".into(),
             file: std::path::PathBuf::from(format!("kanban/tasks/{id}.md")),
+            body: format!("# Outcome\n\n{title}"),
         }
     }
 
@@ -7398,6 +7441,64 @@ mod tests {
         assert!(dashboard.copy_mode(), "Ctrl+B [ must enter copy mode");
         dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!dashboard.copy_mode(), "Esc always leaves copy mode");
+    }
+
+    /// Drawing and key routing were two hardcoded lists of the same eight overlays, written in
+    /// two different orders. The launch form was drawn beneath help and rename but routed after
+    /// them; the board was drawn over the Git overlay but routed before it. Neither disagreement
+    /// was reachable by using Dock — at most one overlay is open at a time — so nothing but a
+    /// test could catch it, and no test could be written while the two orders lived in two `if`
+    /// chains with nothing in common to assert about.
+    ///
+    /// Opening all eight at once is the only way to make the orders observable, which is why
+    /// this test does something a user never can.
+    #[test]
+    fn every_open_overlay_takes_keys_in_the_same_order_it_is_drawn() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"hello world\r\n"));
+        // Copy mode goes first because it is entered through the keymap, and every other overlay
+        // is ahead of the keymap: with one of them open the prefix would never arrive.
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert!(dashboard.copy_mode(), "copy mode is the eighth surface");
+        dashboard.help_open = true;
+        dashboard.rename_form = Some((RenameTarget::Pane, "ledger".into()));
+        dashboard.open_launch();
+        dashboard.picker = Some((PickerPurpose::Workspace, Picker::new(Vec::new())));
+        dashboard.set_review_inbox(vec![(handoff("dock_01J9", "DOCK-7"), None)]);
+        dashboard.set_board_tasks(
+            vec![board_task(1, "do the thing", "backlog")],
+            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+        );
+        dashboard.set_git(git_facts(), "diff --git a/x b/x".into());
+
+        // What `render` walks: every open overlay, in `OVERLAY_ORDER`, later ones over earlier.
+        assert_eq!(
+            dashboard.open_overlays().collect::<Vec<_>>(),
+            OVERLAY_ORDER.to_vec(),
+            "with all eight open the draw sequence is OVERLAY_ORDER entire"
+        );
+
+        // What `key` walks: the first open overlay takes the key. Measured rather than asserted
+        // against the constant directly — each Esc is answered by whichever surface actually
+        // holds the keyboard, so this is the routing order as a user would experience it.
+        let mut routed = Vec::new();
+        loop {
+            let Some(kind) = dashboard.open_overlays().next() else {
+                break;
+            };
+            routed.push(kind);
+            dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(
+                !dashboard.overlay_is_open(kind),
+                "Esc reached {kind:?}, so {kind:?} must have closed"
+            );
+        }
+        assert_eq!(
+            routed,
+            OVERLAY_ORDER.to_vec(),
+            "the order keys are routed in must be the order overlays are drawn in"
+        );
     }
 
     /// The defect copy mode was named for. `apply_event` keeps feeding every pushed

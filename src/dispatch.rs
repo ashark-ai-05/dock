@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     adapter::AdapterSelection,
-    detect::{AgentKind, AgentState, agent_in_process_table, classify_screen},
+    detect::{AgentKind, AgentState, classify_screen, process::ProcessTree},
     git::GitAdapter,
     layout::{LayoutRegistry, LayoutSnapshot, PaneRuntime, WorkspaceLayout},
     model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
@@ -28,7 +28,7 @@ use crate::{
         DurableProgrammeGate, ErrorCode, GateState, LifecycleOperation, ProgrammeSnapshot,
         RepositoryPortfolioSnapshot, RuntimeSnapshot, WorkspaceRequest,
     },
-    runtime::{OwnedRuntime, PtySize, RunBinding},
+    runtime::{OwnedRuntime, PtySize, RunBinding, RunPulse},
     storage::LocalStore,
     terminal::{PaneOutput, PaneScreen},
 };
@@ -53,7 +53,7 @@ pub struct RuntimeRegistry {
     pane_sizes: Mutex<HashMap<String, PtySize>>,
     /// The last process-table snapshot, when it was taken, and which snapshot it is. The
     /// generation is what lets a memoised classification know the table underneath it changed.
-    process_table: Mutex<Option<(Instant, u64, Arc<str>)>>,
+    process_table: Mutex<Option<(Instant, u64, Arc<ProcessTree>)>>,
     /// Agent state per run, keyed by the exact output the screen was built from. Classification is
     /// a pure function of that screen, so nothing but new bytes can change its answer.
     agent_states: Mutex<HashMap<String, ClassifiedAgent>>,
@@ -1897,6 +1897,55 @@ impl RuntimeRegistry {
         }
     }
 
+    /// Which agent is under a run and what it is doing, memoised on everything that can change it.
+    ///
+    /// Shared by `inspect` and `pulse` so the two cannot drift: they answer the same question and
+    /// a difference between them would show as a state that changed when nothing did.
+    fn resolve_agent(
+        &self,
+        runtime: &OwnedRuntime,
+        run_id: &str,
+        process_group_id: Option<i32>,
+        generation: u64,
+        table: Option<&ProcessTree>,
+    ) -> (Option<AgentKind>, AgentState) {
+        // Both inputs to the answer, so a pane that has written nothing since the last poll and is
+        // looking at the same process-table snapshot costs one hash lookup — no table parsing and
+        // no screen scan. That is most panes, most of the time, and parsing a 79KB table per pane
+        // per poll was the cost that made this hot.
+        let mark = runtime.with_output(|output| (output.log().epoch(), output.log().end()));
+        let key = (generation, mark.0, mark.1);
+        let mut cached = self
+            .agent_states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((seen, kind, state)) = cached.get(run_id)
+            && *seen == key
+        {
+            let (kind, state) = (*kind, *state);
+            drop(cached);
+            return (kind, self.resolve_state(run_id, kind, state, mark));
+        }
+        // Detection walks *down* from the pane's process-group leader by parentage, because a
+        // job-control shell puts every command the user starts into a new process group of its own.
+        let agent = process_group_id
+            .zip(table)
+            .and_then(|(leader_pid, tree)| tree.agent_under(leader_pid));
+        // The whole screen, not a tail. An agent's chooser leaves the cursor on the highlighted
+        // option and prints its instructions underneath, so a cursor-anchored tail cannot contain
+        // the very chrome that says the agent is waiting — every pattern matched against one was
+        // unreachable.
+        let from_screen = match agent {
+            Some(kind) => {
+                runtime.with_screen(|screen| classify_screen(kind, &screen.classifiable_text()))
+            }
+            None => AgentState::Idle,
+        };
+        cached.insert(run_id.to_owned(), (key, agent, from_screen));
+        drop(cached);
+        (agent, self.resolve_state(run_id, agent, from_screen, mark))
+    }
+
     /// Combines what the screen says with whether the pane is still writing.
     ///
     /// The screen is only asked one narrow question — is this agent blocked on something it needs
@@ -1979,7 +2028,7 @@ impl RuntimeRegistry {
     }
 
     /// The process table, taken afresh only when the last snapshot has aged out.
-    fn process_table(&self) -> Option<(u64, Arc<str>)> {
+    fn process_table(&self) -> Option<(u64, Arc<ProcessTree>)> {
         let mut cached = self
             .process_table
             .lock()
@@ -1989,14 +2038,61 @@ impl RuntimeRegistry {
         {
             return Some((*generation, Arc::clone(table)));
         }
-        // Shared rather than cloned: it is around 79KB on an ordinary machine, and every event
-        // stream reads it on every poll.
-        let table: Arc<str> = Arc::from(read_process_table()?);
+        // Indexed once and shared. Every pane asks the same snapshot the same question, and
+        // building a private index per pane was two dozen full parses a second on a busy layout.
+        let table = Arc::new(ProcessTree::parse(&read_process_table()?));
         let generation = cached
             .as_ref()
             .map_or(0, |(_, generation, _)| generation + 1);
         *cached = Some((Instant::now(), generation, Arc::clone(&table)));
         Some((generation, table))
+    }
+
+    /// The little the event stream needs from every run, sixty times a second.
+    ///
+    /// `inspect` returns a full snapshot, which allocates around ten strings per run — the
+    /// repository root and worktree are formatted from paths every time — and the stream loop uses
+    /// six fields, none of them those. Those fields are also fixed for a run's whole life, so
+    /// rebuilding them at frame rate is work whose answer cannot have changed.
+    pub fn pulse(&self) -> Vec<RunPulse> {
+        let runtimes: Vec<Arc<OwnedRuntime>> = {
+            let runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+            runs.values()
+                .filter_map(RuntimeSlot::active)
+                .map(|run| Arc::clone(&run.runtime))
+                .collect()
+        };
+        let mut pulses: Vec<(Arc<OwnedRuntime>, RunPulse)> = runtimes
+            .into_iter()
+            .map(|runtime| {
+                let pulse = runtime.pulse();
+                (runtime, pulse)
+            })
+            .collect();
+        pulses.sort_by(|a, b| a.1.run_id.cmp(&b.1.run_id));
+        let table = pulses
+            .iter()
+            .any(|(_, pulse)| pulse.process_group_id.is_some())
+            .then(|| self.process_table())
+            .flatten();
+        let generation = table
+            .as_ref()
+            .map_or(u64::MAX, |(generation, _)| *generation);
+        pulses
+            .into_iter()
+            .map(|(runtime, mut pulse)| {
+                let (agent, state) = self.resolve_agent(
+                    &runtime,
+                    &pulse.run_id,
+                    pulse.process_group_id,
+                    generation,
+                    table.as_ref().map(|(_, tree)| tree.as_ref()),
+                );
+                pulse.agent = agent;
+                pulse.agent_state = state;
+                pulse
+            })
+            .collect()
     }
 
     pub fn inspect(
@@ -2057,43 +2153,15 @@ impl RuntimeRegistry {
                 // poll and is looking at the same process-table snapshot costs one hash lookup —
                 // no table parsing and no screen scan. That is most panes, most of the time, and
                 // parsing a 79KB table per pane per poll was the cost that made this hot.
-                let mark = runtime.with_output(|output| (output.log().epoch(), output.log().end()));
-                let key = (generation, mark.0, mark.1);
-                let mut cached = self
-                    .agent_states
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some((seen, kind, state)) = cached.get(&snapshot.run_id)
-                    && *seen == key
-                {
-                    snapshot.agent = *kind;
-                    snapshot.agent_state =
-                        self.resolve_state(&snapshot.run_id, *kind, *state, mark);
-                    return snapshot;
-                }
-                let agent = snapshot
-                    .process_group_id
-                    .zip(table.as_ref().map(|(_, table)| table.as_ref()))
-                    .and_then(|(leader_pid, table)| agent_in_process_table(table, leader_pid));
-                // Classification reads the whole screen through several pattern sets, and this
-                // runs for every pane on every poll of the event stream. It is a pure function of
-                // the screen, and the screen is a pure function of the bytes written to it, so the
-                // output log's (epoch, end) pair says exactly when the answer can have changed.
-                // A pane that has written nothing since the last poll — which is most panes, most
-                // of the time — costs a hash lookup instead of a full scan.
-                // The whole screen, not a tail. An agent's chooser leaves the cursor on the
-                // highlighted option and prints its instructions underneath, so a cursor-anchored
-                // tail cannot contain the very chrome that says the agent is waiting — every
-                // pattern matched against one was unreachable.
-                let state = match agent {
-                    Some(kind) => runtime
-                        .with_screen(|screen| classify_screen(kind, &screen.classifiable_text())),
-                    None => AgentState::Idle,
-                };
-                cached.insert(snapshot.run_id.clone(), (key, agent, state));
-                drop(cached);
-                snapshot.agent_state = self.resolve_state(&snapshot.run_id, agent, state, mark);
+                let (agent, state) = self.resolve_agent(
+                    &runtime,
+                    &snapshot.run_id,
+                    snapshot.process_group_id,
+                    generation,
+                    table.as_ref().map(|(_, tree)| tree.as_ref()),
+                );
                 snapshot.agent = agent;
+                snapshot.agent_state = state;
                 snapshot
             })
             .collect())

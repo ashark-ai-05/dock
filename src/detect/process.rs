@@ -12,50 +12,77 @@ use crate::detect::AgentKind;
 /// the product's own default workflow undetectable; parentage is the relation that survives it.
 ///
 /// `table` is the output of `ps -axo pid=,ppid=,pgid=,comm=`.
+/// The process table, indexed once so many panes can ask about it cheaply.
+///
+/// Building the index is linear in the table — around 839 rows and 79KB on an ordinary machine —
+/// and every pane used to build its own copy to answer a question about one shared snapshot. With
+/// a dozen panes and a table that refreshes twice a second that was two dozen full parses per
+/// second to learn nothing new.
+///
+/// Only agent commands are kept. Almost nothing in a process table is an agent, and a map of every
+/// command string on the machine is far larger than the answer needs.
+#[derive(Debug, Default)]
+pub struct ProcessTree {
+    children: HashMap<i32, Vec<i32>>,
+    agents: HashMap<i32, AgentKind>,
+}
+
+impl ProcessTree {
+    pub fn parse(table: &str) -> Self {
+        let mut tree = Self::default();
+        for line in table.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(pid) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+                continue;
+            };
+            let Some(ppid) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+                continue;
+            };
+            // The pgid column is parsed only to keep the field positions honest; it is not a
+            // filter.
+            if fields.next().is_none() {
+                continue;
+            }
+            let Some(command) = fields.next() else {
+                continue;
+            };
+            // A row cannot be its own parent. Recording one would build a self-loop that the
+            // visited set would still absorb, but dropping it keeps the relation acyclic at the
+            // root.
+            if ppid != pid {
+                tree.children.entry(ppid).or_default().push(pid);
+            }
+            if let Some(kind) = executable_kind(command) {
+                tree.agents.insert(pid, kind);
+            }
+        }
+        tree
+    }
+
+    /// The agent running anywhere beneath `leader_pid`, if any.
+    pub fn agent_under(&self, leader_pid: i32) -> Option<AgentKind> {
+        // An explicit work list rather than recursion: a malformed or adversarial table must not
+        // be able to drive stack depth, and `visited` makes any cycle terminate after one pass.
+        let mut queue = VecDeque::from([leader_pid]);
+        let mut visited = HashSet::new();
+        while let Some(pid) = queue.pop_front() {
+            if !visited.insert(pid) {
+                continue;
+            }
+            if let Some(kind) = self.agents.get(&pid) {
+                return Some(*kind);
+            }
+            if let Some(descendants) = self.children.get(&pid) {
+                queue.extend(descendants.iter().copied());
+            }
+        }
+        None
+    }
+}
+
+/// One-shot lookup, for callers with a single question to ask of a table.
 pub fn agent_in_process_table(table: &str, leader_pid: i32) -> Option<AgentKind> {
-    let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
-    let mut commands: HashMap<i32, &str> = HashMap::new();
-    for line in table.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(pid) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
-            continue;
-        };
-        let Some(ppid) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
-            continue;
-        };
-        // The pgid column is parsed only to keep the field positions honest; it is not a filter.
-        if fields.next().is_none() {
-            continue;
-        }
-        let Some(command) = fields.next() else {
-            continue;
-        };
-        // A row cannot be its own parent. Recording one would build a self-loop that the visited
-        // set would still absorb, but dropping it keeps the relation itself acyclic at the root.
-        if ppid != pid {
-            children.entry(ppid).or_default().push(pid);
-        }
-        commands.insert(pid, command);
-    }
-    // An explicit work list rather than recursion: a malformed or adversarial table must not be
-    // able to drive stack depth, and `visited` makes any cycle terminate after one pass.
-    let mut queue = VecDeque::from([leader_pid]);
-    let mut visited = HashSet::new();
-    while let Some(pid) = queue.pop_front() {
-        if !visited.insert(pid) {
-            continue;
-        }
-        if let Some(kind) = commands
-            .get(&pid)
-            .and_then(|command| executable_kind(command))
-        {
-            return Some(kind);
-        }
-        if let Some(descendants) = children.get(&pid) {
-            queue.extend(descendants.iter().copied());
-        }
-    }
-    None
+    ProcessTree::parse(table).agent_under(leader_pid)
 }
 
 fn executable_kind(command: &str) -> Option<AgentKind> {

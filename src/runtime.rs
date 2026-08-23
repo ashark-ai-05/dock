@@ -56,6 +56,19 @@ impl PtySize {
     }
 }
 
+/// What the event stream needs from a run, and nothing more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPulse {
+    pub run_id: String,
+    pub rows: u16,
+    pub cols: u16,
+    pub state: ProcessState,
+    pub process_group_id: Option<i32>,
+    /// Filled in by the registry, which owns the process table and the classification cache.
+    pub agent: Option<crate::detect::AgentKind>,
+    pub agent_state: crate::detect::AgentState,
+}
+
 pub struct OwnedRuntime {
     binding: RunBinding,
     command: Vec<String>,
@@ -255,6 +268,42 @@ impl OwnedRuntime {
             scrollback_rows,
             size,
         )
+    }
+
+    /// The handful of facts the event stream reads from every run on every poll.
+    ///
+    /// Deliberately not a `RuntimeSnapshot`: that carries the run's whole identity, most of it
+    /// fixed for the run's lifetime and two fields formatted from paths, and rebuilding all of it
+    /// sixty times a second is work whose answer cannot have changed.
+    pub fn pulse(&self) -> RunPulse {
+        let state = if self.launch_error.is_some() {
+            ProcessState::FailedToLaunch
+        } else {
+            match &*self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                LifecycleState::Exited(status) => ProcessState::Exited {
+                    code: status.code(),
+                },
+                LifecycleState::Running => ProcessState::Running,
+                LifecycleState::Unavailable(_) => ProcessState::Unavailable,
+            }
+        };
+        let (rows, cols) = self.with_screen(|screen| screen.size());
+        RunPulse {
+            run_id: self.binding.run_id.clone(),
+            rows,
+            cols,
+            state,
+            process_group_id: self
+                .owned_process_group
+                .as_ref()
+                .map(|group| group.0.as_raw()),
+            agent: None,
+            agent_state: crate::detect::AgentState::Idle,
+        }
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {

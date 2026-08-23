@@ -436,7 +436,10 @@ fn stream_events(
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(());
         }
-        for snapshot in runtime.inspect(None).unwrap_or_default() {
+        // `pulse` rather than `inspect`: this runs every 16ms for every run, and a full snapshot
+        // rebuilds a run's whole identity — around ten strings, two of them formatted from paths —
+        // when the loop reads six fields and none of them are those.
+        for snapshot in runtime.pulse() {
             // A resize invalidates the row-by-row diff (vt100 zips the two grids, so rows
             // beyond the smaller one would never be transmitted). Re-seed from a full frame
             // instead of diffing across a geometry change.

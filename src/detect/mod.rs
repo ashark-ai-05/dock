@@ -1,5 +1,5 @@
 pub(crate) mod heuristic;
-mod process;
+pub mod process;
 
 pub use heuristic::classify_screen;
 pub mod manifest;

@@ -158,6 +158,9 @@ pub struct Dashboard {
     new_workspace_area: Option<Rect>,
     rename_workspace_area: Option<Rect>,
     close_workspace_area: Option<Rect>,
+    /// Where the armed close's confirm target is. Separate from the cancel target because a
+    /// destructive answer must not share a cell with the click that asked the question.
+    confirm_close_workspace_area: Option<Rect>,
     /// The workspace whose close control has been clicked once and is waiting to be clicked
     /// again. Held as an id rather than a flag so a refresh that reorders or drops workspaces
     /// cannot turn a primed confirmation into consent to destroy a different one.
@@ -608,6 +611,7 @@ impl Dashboard {
         self.new_workspace_area = None;
         self.rename_workspace_area = None;
         self.close_workspace_area = None;
+        self.confirm_close_workspace_area = None;
         self.pane_control_areas.clear();
         let area = frame.area();
         // Painted first so every widget that leaves cells untouched still sits on the theme's
@@ -774,16 +778,36 @@ impl Dashboard {
                     .collect::<Vec<_>>(),
             );
         }
+        // Built before the chain because it needs the workspace's own name and contents; the
+        // other arms are constants.
+        let armed_close_summary = self.close_workspace_armed.as_ref().map(|_| {
+            let name = self.workspace().map(|w| w.name.as_str()).unwrap_or("this");
+            let panes = self.workspace().map(|w| w.panes.len()).unwrap_or(0);
+            let agents = self.running_agents_here();
+            let agents = if agents == 1 {
+                "1 running agent".to_owned()
+            } else {
+                format!("{agents} running agents")
+            };
+            let panes = if panes == 1 { "1 pane".to_owned() } else { format!("{panes} panes") };
+            format!(
+                "CLOSE \u{201c}{name}\u{201d} · {panes}, {agents} · Enter or ✓ closes · Esc or ✘ cancels"
+            )
+        }).unwrap_or_default();
         let summary = if self.help_open {
             "HELP · Esc or ? closes"
         } else if self.rename_form.is_some() {
             "RENAME · type a pane name · Enter saves · Esc cancels"
         } else if self.launch_form.is_some() {
             "LAUNCH · type to filter · Enter reviews · Esc cancels"
+        } else if self.close_workspace_armed.is_some() {
+            // The one destructive mode said nothing here, so the keys that answered it were
+            // undiscoverable and what it would destroy went unsaid.
+            &armed_close_summary
         } else {
             "keys go to the focused pane · Ctrl+B ? help"
         };
-        Line::styled(summary, Style::default().fg(self.theme.muted))
+        Line::styled(summary.to_owned(), Style::default().fg(self.theme.muted))
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -851,11 +875,13 @@ impl Dashboard {
             if active {
                 let armed =
                     self.close_workspace_armed.as_deref() == Some(workspace.workspace_id.as_str());
-                let label = if armed { " × confirm? " } else { " × " };
-                let width = label.chars().count() as u16;
-                if x.saturating_add(width) <= area.right() {
-                    let close = Rect::new(x, area.y, width, 1);
-                    let style = if armed {
+                // Cancel keeps the cell the close control had, and confirm is the new target to
+                // its right. Putting confirm first read better and was a trap: the second press
+                // of a double-click would land on it and destroy the workspace the first press
+                // had only asked about.
+                if x.saturating_add(3) <= area.right() {
+                    let cancel = Rect::new(x, area.y, 3, 1);
+                    let cancel_style = if armed {
                         Style::default()
                             .bg(self.theme.blocked)
                             .fg(self.theme.surface)
@@ -863,9 +889,24 @@ impl Dashboard {
                     } else {
                         style
                     };
-                    frame.render_widget(Paragraph::new(Line::styled(label, style)), close);
-                    self.close_workspace_area = Some(close);
-                    x = x.saturating_add(width);
+                    frame.render_widget(Paragraph::new(Line::styled(" ✘ ", cancel_style)), cancel);
+                    self.close_workspace_area = Some(cancel);
+                    x = x.saturating_add(3);
+                }
+                if armed && x.saturating_add(3) <= area.right() {
+                    let confirm = Rect::new(x, area.y, 3, 1);
+                    frame.render_widget(
+                        Paragraph::new(Line::styled(
+                            " ✓ ",
+                            Style::default()
+                                .bg(self.theme.blocked)
+                                .fg(self.theme.surface)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        confirm,
+                    );
+                    self.confirm_close_workspace_area = Some(confirm);
+                    x = x.saturating_add(3);
                 }
             }
             x = x.saturating_add(1);
@@ -1679,6 +1720,12 @@ impl Dashboard {
         // Esc answers the armed workspace close before it reaches the pane. The confirmation is
         // a question the dashboard put on screen, and the key that dismisses every other thing
         // Dock asks has to dismiss this one too rather than leaving it primed.
+        // Enter answers the armed close, so the question is answerable without the mouse that
+        // asked it. Ahead of the keymap because while a destructive question is on screen it is
+        // the only thing Enter can sensibly mean.
+        if self.close_workspace_armed.is_some() && key.code == KeyCode::Enter {
+            return self.confirm_close_workspace();
+        }
         if self.close_workspace_armed.is_some() && key.code == KeyCode::Esc {
             self.disarm_workspace_close();
             return UiCommand::None;
@@ -1734,6 +1781,7 @@ impl Dashboard {
             PaneCommand::Zoom => self.zoom(),
             PaneCommand::Rename => self.rename(),
             PaneCommand::Close => self.close(),
+            PaneCommand::CloseWorkspace => self.close_workspace(),
             PaneCommand::Respawn => self.respawn(),
             PaneCommand::Launch => {
                 self.open_launch();
@@ -3666,11 +3714,53 @@ impl Dashboard {
             return UiCommand::None;
         };
         let workspace_id = workspace.workspace_id.clone();
+        // Asked only when there is something to lose. A prompt on every empty workspace is one
+        // that gets dismissed by reflex, and reflex is exactly what has to fail on the workspace
+        // that is holding three agents mid-task.
+        if self.running_agents_here() == 0 {
+            return self.close_workspace_now();
+        }
         if self.close_workspace_armed.as_deref() != Some(workspace_id.as_str()) {
             self.close_workspace_armed = Some(workspace_id);
             self.error = None;
             return UiCommand::None;
         }
+        self.confirm_close_workspace()
+    }
+
+    /// How many agents are running in the visible workspace.
+    ///
+    /// Counted from detected agents rather than live processes, because every pane holds a shell
+    /// from the moment it exists, so "has a process" is true of all of them and would make the
+    /// question meaningless. The cost is honest and worth stating: a long command running in a
+    /// plain shell is not an agent and does not raise the prompt.
+    fn running_agents_here(&self) -> usize {
+        let Some(workspace) = self.workspace() else {
+            return 0;
+        };
+        workspace
+            .panes
+            .values()
+            .filter_map(|pane| pane.run_id.as_deref())
+            .filter(|run_id| {
+                self.agents
+                    .get(*run_id)
+                    .is_some_and(|(kind, _)| kind.is_some())
+            })
+            .count()
+    }
+
+    /// Closes the visible workspace, having been answered rather than merely asked.
+    fn confirm_close_workspace(&mut self) -> UiCommand {
+        self.close_workspace_now()
+    }
+
+    fn close_workspace_now(&mut self) -> UiCommand {
+        let Some(workspace) = self.workspace() else {
+            self.error = Some("close unavailable: create a workspace first".into());
+            return UiCommand::None;
+        };
+        let workspace_id = workspace.workspace_id.clone();
         let requests = workspace
             .panes
             .keys()
@@ -3858,9 +3948,22 @@ impl Dashboard {
                     return self.run_command(PaneCommand::NewWorkspace);
                 }
                 if self
+                    .confirm_close_workspace_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    return self.confirm_close_workspace();
+                }
+                if self
                     .close_workspace_area
                     .is_some_and(|area| contains(area, event.column, event.row))
                 {
+                    // Armed, this cell is the cancel. It keeps the position the close control
+                    // had, so the second press of a double-click lands on "no" rather than
+                    // destroying the workspace the first press only meant to ask about.
+                    if self.close_workspace_armed.is_some() {
+                        self.disarm_workspace_close();
+                        return UiCommand::None;
+                    }
                     return self.close_workspace();
                 }
                 // Every other press is an answer of "no" to a pending workspace close. A primed
@@ -4507,6 +4610,17 @@ mod tests {
 
     /// A second, single-pane workspace so switching has somewhere to go. Its pane is bound so
     /// the switch has a PTY whose geometry must be announced.
+    /// A two-workspace dashboard whose visible workspace holds a running agent, so closing it
+    /// has something to lose and therefore asks before it acts.
+    fn two_workspace_dashboard_with_an_agent() -> Dashboard {
+        let mut dashboard = two_workspace_dashboard();
+        dashboard.agents.insert(
+            "run_1".into(),
+            (Some(AgentKind::Claude), AgentState::Working),
+        );
+        dashboard
+    }
+
     fn two_workspace_dashboard() -> Dashboard {
         let mut dashboard = bound_dashboard();
         dashboard.layout.workspaces.push(WorkspaceLayout {
@@ -6355,20 +6469,26 @@ mod tests {
 
     #[test]
     fn closing_a_workspace_from_its_tab_asks_first_and_then_closes_every_pane() {
-        let mut dashboard = two_workspace_dashboard();
+        let mut dashboard = two_workspace_dashboard_with_an_agent();
         render_to_string(&mut dashboard, 110, 30);
-        let close = dashboard
+        let cancel = dashboard
             .close_workspace_area
             .expect("the active tab carries a close affordance");
-        // One click on a three-cell target is not consent to end two panes and whatever is
-        // running in them, so the first click only asks.
-        assert_eq!(click(&mut dashboard, close), UiCommand::None);
+        // One click on a three-cell target is not consent to end two panes and the agent running
+        // in them, so the first click only asks.
+        assert_eq!(click(&mut dashboard, cancel), UiCommand::None);
         let frame = render_to_string(&mut dashboard, 110, 30);
-        assert!(frame.contains("× confirm?"), "{frame:?}");
+        // The footer names what would be lost and the keys that answer. Neither was said before,
+        // so the one destructive question Dock asks was also the one it explained least.
+        assert!(frame.contains("CLOSE"), "{frame:?}");
+        assert!(frame.contains("1 running agent"), "{frame:?}");
+        assert!(frame.contains("Esc"), "{frame:?}");
 
-        let close = dashboard.close_workspace_area.expect("the armed control");
-        let UiCommand::Requests(requests) = click(&mut dashboard, close) else {
-            panic!("the second click must close the workspace");
+        let confirm = dashboard
+            .confirm_close_workspace_area
+            .expect("the armed tab carries a confirm target");
+        let UiCommand::Requests(requests) = click(&mut dashboard, confirm) else {
+            panic!("the confirm target must close the workspace");
         };
         // The daemon has no close-workspace operation and needs none: it drops a workspace with
         // its last pane, so every pane is named rather than the protocol being widened.
@@ -6396,8 +6516,55 @@ mod tests {
     }
 
     #[test]
-    fn an_armed_workspace_close_is_given_up_by_any_other_click() {
+    fn a_double_click_on_close_cancels_rather_than_destroying_the_workspace() {
+        // The whole point of asking. Arming and confirming used to share one cell, so a double
+        // click armed and then fired, and the workspace was gone without the question ever
+        // having been visible. Cancel now keeps that cell and confirm is somewhere else.
+        let mut dashboard = two_workspace_dashboard_with_an_agent();
+        render_to_string(&mut dashboard, 110, 30);
+        let control = dashboard.close_workspace_area.expect("close affordance");
+        assert_eq!(click(&mut dashboard, control), UiCommand::None);
+        render_to_string(&mut dashboard, 110, 30);
+        // The same cell, pressed again the way a double click does.
+        assert_eq!(click(&mut dashboard, control), UiCommand::None);
+        assert_eq!(
+            dashboard.close_workspace_armed, None,
+            "the second press must cancel"
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_nothing_running_closes_without_being_asked_about() {
+        // Friction belongs where the loss is. A prompt on every empty workspace is one that gets
+        // dismissed by reflex, and reflex is what has to fail on the workspace holding an agent.
         let mut dashboard = two_workspace_dashboard();
+        render_to_string(&mut dashboard, 110, 30);
+        let control = dashboard.close_workspace_area.expect("close affordance");
+        let UiCommand::Requests(requests) = click(&mut dashboard, control) else {
+            panic!("a workspace with no agent running closes on the first click");
+        };
+        assert_eq!(requests.len(), 2);
+        assert_eq!(dashboard.close_workspace_armed, None);
+    }
+
+    #[test]
+    fn the_keyboard_can_close_a_workspace_and_answer_the_question_it_raises() {
+        // There was no keyboard path to this at all: closing a workspace was reachable only by
+        // clicking a three-cell target, alone among everything Dock does.
+        let mut dashboard = two_workspace_dashboard_with_an_agent();
+        assert_eq!(command(&mut dashboard, KeyCode::Char('X')), UiCommand::None);
+        assert_eq!(dashboard.close_workspace_armed.as_deref(), Some("w"));
+        let UiCommand::Requests(requests) =
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter answers the armed close");
+        };
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn an_armed_workspace_close_is_given_up_by_any_other_click() {
+        let mut dashboard = two_workspace_dashboard_with_an_agent();
         render_to_string(&mut dashboard, 110, 30);
         let close = dashboard.close_workspace_area.expect("close affordance");
         click(&mut dashboard, close);
@@ -6409,12 +6576,12 @@ mod tests {
         // workspace have to be adjacent, or a stale arming turns an ordinary click into a close.
         assert_eq!(dashboard.close_workspace_armed, None);
         let frame = render_to_string(&mut dashboard, 110, 30);
-        assert!(!frame.contains("confirm?"), "{frame:?}");
+        assert!(!frame.contains("CLOSE \u{201c}"), "{frame:?}");
     }
 
     #[test]
     fn an_armed_workspace_close_is_given_up_by_escape_and_by_leaving_the_workspace() {
-        let mut dashboard = two_workspace_dashboard();
+        let mut dashboard = two_workspace_dashboard_with_an_agent();
         render_to_string(&mut dashboard, 110, 30);
         let close = dashboard.close_workspace_area.expect("close affordance");
         click(&mut dashboard, close);

@@ -43,6 +43,8 @@ pub enum PaneCommand {
     Zoom,
     Rename,
     Close,
+    /// Close the visible workspace, and everything running in it.
+    CloseWorkspace,
     /// Give an exited pane a fresh shell. The keyboard recovery path out of a dead pane.
     Respawn,
     Launch,
@@ -140,6 +142,9 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Char('z') => PaneCommand::Zoom,
         KeyCode::Char('r') => PaneCommand::Rename,
         KeyCode::Char('x') => PaneCommand::Close,
+        // Uppercase for the same reason `R` is: closing a workspace takes every pane in it, and
+        // that must not be one slipped finger away from closing a single pane with `x`.
+        KeyCode::Char('X') => PaneCommand::CloseWorkspace,
         // Uppercase so it cannot be reached by the same finger slip that hits `r` for rename:
         // respawning is a state change, and `r` is already taken.
         KeyCode::Char('R') => PaneCommand::Respawn,

@@ -1104,6 +1104,15 @@ mod tests {
     fn a_client_that_closes_releases_its_admission_slot_without_waiting_for_a_deadline() {
         // Nothing about the long idle bound may delay reclamation of a connection whose peer
         // has gone: a closed socket reads as EOF, which ends the loop on its own.
+        //
+        // Both bounds below are deliberately loose, because the deadline this test exists to rule
+        // out is the ten minutes given to `idle`. Discriminating at five seconds made two claims
+        // the test never set out to make — that the daemon answers a hello within five seconds,
+        // and that a thread is scheduled within five seconds of the socket closing — and on a
+        // machine running the whole suite at once neither is a claim worth staking a red build on.
+        // A bound two orders of magnitude under the deadline separates "noticed the EOF" from
+        // "waited out the deadline" just as decisively, and separates nothing else.
+        let idle = Duration::from_secs(600);
         let runtime = registry();
         let admission = Arc::new(ClientAdmission::new(2));
         let permit = admission.try_acquire().expect("permit");
@@ -1116,14 +1125,14 @@ mod tests {
                 &mut server,
                 &shared,
                 ReadTimeouts {
-                    idle: Duration::from_secs(600),
-                    in_flight: Duration::from_secs(600),
+                    idle,
+                    in_flight: idle,
                 },
                 None,
             )
         });
         client
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(crate::testing::budget(30)))
             .expect("read timeout");
         let mut reader = BufReader::new(client.try_clone().expect("clone client"));
         send_line(&mut client, &hello());
@@ -1137,11 +1146,28 @@ mod tests {
         drop(client);
 
         let start = Instant::now();
-        assert_eq!(handler.join().expect("handler thread"), Ok(()));
+        // Says what went wrong rather than `Any { .. }`. This has failed during whole-suite runs
+        // and left behind nothing but the fact that the handler had not returned `Ok`, which is
+        // not enough to tell a missed EOF from an exhausted machine. Whatever ends it next — the
+        // error the daemon reported, or the message it panicked with — belongs in the failure.
+        let outcome = handler.join().unwrap_or_else(|panic| {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a payload that is not a string".into());
+            panic!("the connection handler panicked: {detail}");
+        });
         let reclaimed = start.elapsed();
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "a departed client must end its handler cleanly on EOF"
+        );
         assert!(
-            reclaimed < Duration::from_secs(5),
-            "a departed client waited {reclaimed:?} to be noticed, so a deadline reclaimed it rather than its EOF"
+            reclaimed < crate::testing::budget(30),
+            "a departed client waited {reclaimed:?} to be noticed, out of an idle bound of \
+             {idle:?}, so a deadline reclaimed it rather than its EOF"
         );
         assert_eq!(
             admission.active.load(Ordering::Acquire),

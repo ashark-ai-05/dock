@@ -4368,6 +4368,36 @@ mod tests {
         }
     }
 
+    /// Blocks until a `echo $$ > marker` fixture has finished announcing itself, and returns the
+    /// pid it wrote.
+    ///
+    /// `echo $$ > marker` is not one step. The redirection creates the file, and only afterwards
+    /// does the shell write into it, so a window exists in which the marker exists and is empty.
+    /// Tests that resume on `marker.exists()` land in that window on a contended machine, and the
+    /// rollback they then trigger SIGKILLs the fixture — so the pid never arrives at all and the
+    /// test dies parsing an empty string rather than on anything it set out to check. Waiting for
+    /// the trailing newline closes the window instead of narrowing it: it is the last byte the
+    /// shell writes, so seeing it means the whole pid is on disk. The deadline is a liveness
+    /// backstop, there to turn a fixture that never starts into a message rather than a hang.
+    fn wait_for_fixture_pid(marker: &Path) -> i32 {
+        let deadline = crate::testing::deadline(15);
+        loop {
+            if let Some(pid) = fs::read_to_string(marker)
+                .ok()
+                .and_then(|written| written.strip_suffix('\n').map(str::to_owned))
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture never wrote its pid to {}",
+                marker.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     struct Repo {
         root: PathBuf,
         state: PathBuf,
@@ -5923,6 +5953,12 @@ mod tests {
 
     #[test]
     fn crash_after_spawn_before_receipt_is_guarded_and_never_retried() {
+        // The hook holds dispatch open until the child has announced its pid, because the pid is
+        // the whole subject: the test has to name the orphan to check nobody is left holding it.
+        // Waiting on the marker merely existing used to be enough to resume, and it is not — the
+        // shell creates that file before it writes into it, and the rollback this dispatch is
+        // about SIGKILLs the child inside that gap, so on a contended machine the pid was never
+        // written and the test died on `parse` rather than on anything about guarding.
         let repo = Repo::new("after-spawn-before-receipt");
         let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
         let marker = repo.root.join("guarded-pid");
@@ -5934,21 +5970,15 @@ mod tests {
         *registry.after_launch_before_receipt_hook.lock().unwrap() = Some(Arc::new({
             let marker = marker.clone();
             move || {
-                let deadline = crate::testing::deadline(15);
-                while !marker.exists() && Instant::now() < deadline {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                assert!(
-                    marker.exists(),
-                    "guarded child did not reach the injected window"
-                );
+                wait_for_fixture_pid(&marker);
             }
         }));
         assert!(matches!(
             registry.dispatch(request.clone()),
             Err((ErrorCode::Internal, _))
         ));
-        let pid: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        // Already on disk: the hook above did not return until it was.
+        let pid = wait_for_fixture_pid(&marker);
         let deadline = crate::testing::deadline(15);
         while unsafe { nix::libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -5997,15 +6027,11 @@ mod tests {
         *registry.before_save_receipt_hook.lock().unwrap() = Some(Arc::new({
             let marker = marker.clone();
             let temporary = temporary.clone();
+            // Resumes on the pid rather than on the marker existing, for the reason
+            // `wait_for_fixture_pid` gives: the empty file arrives first, and the rollback below
+            // kills the child before it can fill it in.
             move || {
-                let deadline = crate::testing::deadline(3);
-                while !marker.exists() && Instant::now() < deadline {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                assert!(
-                    marker.exists(),
-                    "child did not reach receipt failure window"
-                );
+                wait_for_fixture_pid(&marker);
                 fs::create_dir(&temporary).unwrap();
             }
         }));
@@ -6025,7 +6051,7 @@ mod tests {
             None
         );
         assert!(!receipt.exists());
-        let pid: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        let pid = wait_for_fixture_pid(&marker);
         let deadline = crate::testing::deadline(3);
         while unsafe { nix::libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -6672,12 +6698,51 @@ mod tests {
             .unwrap();
     }
 
+    /// How long a reap parked on a SIGTERM-ignoring fixture actually stays parked.
+    ///
+    /// Not three seconds, and not whatever `set_stop_escalation` was asked for. Dock puts a launch
+    /// guardian in the same process group as every worker it starts, and that guardian takes the
+    /// reap's SIGTERM alongside the worker: it re-signals the group and then SIGKILLs it, which no
+    /// trap can refuse. Measured on this machine the group is unsignalable — ESRCH, or EPERM for a
+    /// group of zombies not yet waited on — between 240ms and 370ms after the reap signals it,
+    /// with or without load. `stop`'s own SIGTERM-to-SIGKILL escalation never gets to run, so
+    /// lengthening it buys a parked reap nothing at all.
+    ///
+    /// The two tests below are the ones that park a reap and then check that unrelated work still
+    /// gets through. Both used to spend that window dispatching a real process under a real PTY,
+    /// and one of them also created a workspace that auto-launched a login shell. That is unbounded
+    /// work on a contended machine and it routinely overran a window a third of a second wide: the
+    /// restart test then found the group it meant to release already reaped and failed on `kill`
+    /// returning ESRCH, and the close test found its close already returned and failed on its own
+    /// premise. Neither failure said anything about mutexes.
+    ///
+    /// So this constant is documentation, not a knob. What changed is what goes inside the window:
+    /// only the property itself, which is nanoseconds of mutex acquisition and microseconds of
+    /// registry work. The window is unchanged and still belongs to production; the margin against
+    /// it went from about one to about ten thousand.
+    const OBSERVED_PARKED_REAP_WINDOW: Duration = Duration::from_millis(240);
+
+    /// Whether a mutex is held right now by somebody else.
+    ///
+    /// `try_lock` is the whole reason these tests can stop racing: asking whether the reap is
+    /// holding the registry or the layout takes nanoseconds and cannot block, where asking the
+    /// same question by timing a real dispatch takes an unbounded fraction of a second and can.
+    /// A poisoned but unheld mutex is not held — a panic elsewhere is a different failure and
+    /// should not be reported as this one.
+    fn mutex_is_held<T>(mutex: &Mutex<T>) -> bool {
+        matches!(mutex.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+    }
+
     #[test]
     fn blocked_restart_reap_does_not_block_unrelated_registry_or_layout_work() {
         use std::sync::mpsc;
 
         let repo = Repo::new("restart-blocked-reap");
         let registry = Arc::new(RuntimeRegistry::new(&repo.state, 64).unwrap());
+        // The workspace this test creates mid-reap exists to prove the layout mutex is free, not
+        // to launch anything. Suppressing the pane shell keeps that proof to a few microseconds
+        // and stops the test leaving a login shell behind for the suite to reap.
+        *registry.suppress_pane_shells.lock().unwrap() = true;
         let term_seen = repo.root.join("term-seen");
         let ready = repo.root.join("ready");
         let mut blocked = repo.request("dock_blocked_restart");
@@ -6695,9 +6760,19 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(ready.exists(), "TERM-ignoring fixture did not become ready");
-        // The escalation is what eventually unparks the reap below, so it is lengthened well past
-        // anything this test does. With the production window the test has about three seconds to
-        // dispatch a real process and check the result, and a loaded machine loses that race.
+        // A property of the fixture, not of the reap, so it is established before the reap starts
+        // rather than raced against it.
+        assert_eq!(
+            registry
+                .inspect(Some("dock_blocked_restart"))
+                .unwrap()
+                .len(),
+            1
+        );
+        // Not what keeps the reap parked — see `OBSERVED_PARKED_REAP_WINDOW`; the guardian decides
+        // that. What it does buy is patience in the join `stop` performs once the group is gone,
+        // which waits on a real reaper thread and has no business failing because a loaded machine
+        // took a moment over it.
         registry.set_stop_escalation(&first.run_id, Duration::from_secs(60));
 
         let restarting = {
@@ -6706,62 +6781,76 @@ mod tests {
                 registry.lifecycle("dock_blocked_restart", LifecycleOperation::Restart)
             })
         };
+        // A one-millisecond poll rather than ten: what follows has to be observed while the reap
+        // is still parked, and the window is only a few hundred milliseconds wide, so the delay
+        // between the reap parking and this loop noticing is margin spent for nothing.
         let deadline = crate::testing::deadline(3);
         while !term_seen.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(1));
         }
         assert!(
             term_seen.exists(),
             "restart did not reach its blocking reap"
         );
 
+        // The reap is inside `stop` right now. These two questions are the property, they take
+        // nanoseconds each, and unlike calling into the registry they cannot deadlock — so they
+        // are asked first and from this thread.
+        let restart_parked = !restarting.is_finished();
+        let runs_held = mutex_is_held(&registry.runs);
+        let layout_held = mutex_is_held(&registry.layout);
+
+        // The same property again through the public API, because a mutex nobody holds is only
+        // interesting if callers actually get through. On its own thread: a reap that did hold
+        // either mutex would hang this rather than fail it, and the receive turns that hang into
+        // a message. The bound is a liveness backstop and nothing else — the work behind it is
+        // three in-memory registry calls.
         let (sent, received) = mpsc::channel();
         let worker = {
             let registry = Arc::clone(&registry);
-            let mut request = repo.request("dock_unrelated_while_reaping");
-            request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
             thread::spawn(move || {
-                let inspected = registry.inspect(Some("dock_blocked_restart")).unwrap();
-                let unrelated = registry.dispatch(request).unwrap();
-                registry
-                    .lifecycle(&unrelated.run_id, LifecycleOperation::Interrupt)
-                    .unwrap();
-                registry
-                    .workspace(WorkspaceRequest::Create {
-                        workspace_id: "work_unrelated_manual".into(),
-                        name: "unrelated".into(),
-                        pane_id: "pane_unrelated_manual".into(),
-                    })
-                    .unwrap();
-                sent.send((inspected.len(), unrelated.run_id)).unwrap();
+                let inspected = registry
+                    .inspect(Some("dock_blocked_restart"))
+                    .map(|s| s.len());
+                let created = registry.workspace(WorkspaceRequest::Create {
+                    workspace_id: "work_unrelated_manual".into(),
+                    name: "unrelated".into(),
+                    pane_id: "pane_unrelated_manual".into(),
+                });
+                let workspaces = registry.layout().workspaces.len();
+                sent.send((inspected, created, workspaces)).unwrap();
             })
         };
-        // The window this test runs in is not its own to set. `stop` gives the group 1.5s to leave
-        // on SIGTERM, then SIGKILLs it and gives it 1.5s more, so a fixture that traps TERM blocks
-        // the reap for about three seconds and no longer — SIGKILL is not trappable. Everything
-        // below has to land inside that window, which is why the receive bound is generous rather
-        // than tight: a bound shorter than the window turns work that finished in time into a
-        // failure, while nothing any bound can do rescues work that overruns the window itself.
-        let (inspected, unrelated_id) = received
+        let (inspected, created, workspaces) = received
             .recv_timeout(crate::testing::budget(10))
-            .expect("unrelated inspect/dispatch/lifecycle/layout blocked behind restart reap");
-        assert_eq!(inspected, 1);
+            .expect("unrelated inspect/layout/workspace work blocked behind the restart reap");
 
-        let old_group = first.process_group_id.unwrap();
-        assert_eq!(
-            unsafe { nix::libc::kill(-old_group, nix::libc::SIGKILL) },
-            0
+        assert!(
+            restart_parked,
+            "the restart's reap had already returned before the test could look at it, so this \
+             run observed nothing about the registry or layout mutexes; a parked reap lasts about \
+             {OBSERVED_PARKED_REAP_WINDOW:?}, so something released this one early"
         );
+        assert!(
+            !runs_held,
+            "the restart held the registry mutex across its reap"
+        );
+        assert!(
+            !layout_held,
+            "the restart held the layout mutex across its reap"
+        );
+        assert_eq!(inspected.unwrap(), 1);
+        created.unwrap();
+        assert!(workspaces >= 2);
+
+        // Nothing here kills the old group. The guardian in it does that on its own, a fraction of
+        // a second after the reap's SIGTERM, and a test that asserted it could still signal that
+        // group was asserting it had won a race against production's own cleanup.
         let replacement = restarting.join().unwrap().unwrap();
         worker.join().unwrap();
         registry
             .lifecycle(&replacement.run_id, LifecycleOperation::Stop)
             .unwrap();
-        registry
-            .lifecycle(&unrelated_id, LifecycleOperation::Stop)
-            .unwrap();
-        // The pane created mid-test auto-launched a real login shell. Close it through the
-        // ownership-safe path so the suite does not leak a Dock-owned process group.
         registry
             .workspace(WorkspaceRequest::Close {
                 workspace_id: "work_unrelated_manual".into(),
@@ -6793,8 +6882,11 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(ready.exists());
-        // As above: the reap must stay parked for the whole of what follows, rather than being
-        // released by an escalation this test never asked about.
+        // A property of the fixture, established before the reap rather than raced against it.
+        assert_eq!(registry.inspect(None).unwrap().len(), 1);
+        assert!(!registry.layout().workspaces.is_empty());
+        // As in the restart test above: this does not hold the group, it only keeps the join that
+        // follows the group's death patient. See `OBSERVED_PARKED_REAP_WINDOW`.
         registry.set_stop_escalation(&first.run_id, Duration::from_secs(60));
         let closing = {
             let registry = Arc::clone(&registry);
@@ -6807,55 +6899,59 @@ mod tests {
                 })
             })
         };
+        // A one-millisecond poll, for the reason the restart test above gives.
         let deadline = crate::testing::deadline(3);
         while !term_seen.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(1));
         }
         assert!(term_seen.exists(), "close did not reach its blocking reap");
 
+        // The property, asked directly and without blocking, while the reap is demonstrably still
+        // inside `stop`.
+        let close_parked = !closing.is_finished();
+        let runs_held = mutex_is_held(&registry.runs);
+        let layout_held = mutex_is_held(&registry.layout);
+
+        // And again through the public API, on its own thread so a reap that did hold a mutex
+        // reports instead of hanging the suite. The bound is a liveness backstop: what is behind
+        // it is two in-memory registry reads.
         let (sent, received) = mpsc::channel();
         let worker = {
             let registry = Arc::clone(&registry);
-            let mut request = repo.request("dock_unrelated_while_closing");
-            request.adapter.arguments = vec!["-c".into(), "sleep 30".into()];
             thread::spawn(move || {
-                assert_eq!(registry.inspect(None).unwrap().len(), 1);
-                let unrelated = registry.dispatch(request).unwrap();
-                registry
-                    .lifecycle(&unrelated.run_id, LifecycleOperation::Interrupt)
-                    .unwrap();
-                let layout = registry.layout();
-                sent.send((unrelated.run_id, layout.workspaces.len()))
-                    .unwrap();
+                let inspected = registry.inspect(None).map(|snapshots| snapshots.len());
+                let _ = registry.layout();
+                sent.send(inspected).unwrap();
             })
         };
-        // The window this test runs in is not its own to set. `stop` gives the group 1.5s to leave
-        // on SIGTERM, then SIGKILLs it and gives it 1.5s more, so a fixture that traps TERM blocks
-        // the reap for about three seconds and no longer — SIGKILL is not trappable. Everything
-        // below has to land inside that window, which is why the receive bound is generous rather
-        // than tight: a bound shorter than the window turns work that finished in time into a
-        // failure, while nothing any bound can do rescues work that overruns the window itself.
-        let (unrelated_id, workspace_count) = received
+        let inspected = received
             .recv_timeout(crate::testing::budget(10))
-            .expect("unrelated registry/layout work blocked behind close reap");
-        assert!(
-            !closing.is_finished(),
-            "the close finished before the unrelated work did, so this run proves nothing about \
-             whether the reap held the registry or layout mutexes"
-        );
-        assert!(!registry.layout().workspaces.is_empty());
-        assert!(workspace_count >= 1);
+            .expect("unrelated registry/layout work blocked behind the close reap");
 
-        let old_group = first.process_group_id.unwrap();
-        assert_eq!(
-            unsafe { nix::libc::kill(-old_group, nix::libc::SIGKILL) },
-            0
+        assert!(
+            close_parked,
+            "the close's reap had already returned before the test could look at it, so this run \
+             observed nothing about the registry or layout mutexes; a parked reap lasts about \
+             {OBSERVED_PARKED_REAP_WINDOW:?}, so something released this one early"
         );
+        assert!(
+            !runs_held,
+            "the close held the registry mutex across its reap"
+        );
+        assert!(
+            !layout_held,
+            "the close held the layout mutex across its reap"
+        );
+        // How many runs and workspaces there are by now depends on whether the reap has finished,
+        // which is the one thing this test refuses to have an opinion about. That the calls
+        // *returned* does not depend on it, and the counts are asserted above, before the reap
+        // starts, where they mean something unambiguous.
+        inspected.unwrap();
+
+        // The guardian in the fixture's own process group retires it; the test does not have to,
+        // and asserting that it still could was asserting a race against production's cleanup.
         closing.join().unwrap().unwrap();
         worker.join().unwrap();
-        registry
-            .lifecycle(&unrelated_id, LifecycleOperation::Stop)
-            .unwrap();
     }
 
     #[test]

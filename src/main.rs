@@ -783,15 +783,48 @@ fn run_dashboard(
 /// worktree top-level inside the repository before it will bind a run to it. So the client
 /// proposes a worktree and the daemon still refuses anything that is not one — Dock did not gain
 /// the power to dispatch into an arbitrary directory by gaining the power to make a worktree.
+/// How much of a card's body is carried into the prompt.
+///
+/// A body is Markdown a person may write as much of as they like, and the prompt it goes into is
+/// an argv entry for the adapters whose command line takes one and a sentence typed into a pane
+/// for the rest. Neither wants a chapter. Cutting it here, with somewhere to read the remainder,
+/// beats discovering the limit at exec time or watching Dock type for a minute and a half.
+const MAX_PROMPT_BODY_BYTES: usize = 4096;
+
 /// What a dispatched agent is told: the task, and how to record that it finished.
+///
+/// The task is the card's title *and its body*. The body is where a person writes the outcome,
+/// the acceptance criteria and what was ruled out; sending only the title dispatched an agent
+/// against a headline and left the description it was written under sitting on disk.
 ///
 /// The instruction is part of the prompt rather than something Dock works out afterwards. Dock
 /// could watch the pane and move the task when the agent looks done, but "looks done" is a regex
 /// over a screen, and the board is the durable record of what happened — moving a real task on a
 /// guess is how a board stops being trustworthy. Telling the agent costs one line and is true.
-fn dispatch_prompt(task_id: u64, title: &str) -> String {
+fn dispatch_prompt(task_id: u64, title: &str, body: &str) -> String {
+    let body = body.trim();
+    // An empty body is the common case on a personal board, where a card is a title and nothing
+    // else, and it must leave no gap: a prompt opening on a blank paragraph reads like a card
+    // that failed to load rather than one with nothing more to say.
+    let card = if body.is_empty() {
+        String::new()
+    } else if body.len() <= MAX_PROMPT_BODY_BYTES {
+        format!("\n\n{body}")
+    } else {
+        // Back off to a character boundary rather than slicing on the byte: prose puts multi-byte
+        // characters wherever it likes and `&body[..n]` panics in the middle of one.
+        let mut end = MAX_PROMPT_BODY_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!(
+            "\n\n{}\n\n[This card is longer than the prompt can carry. Read the rest with \
+             `dock task show {task_id}`.]",
+            &body[..end]
+        )
+    };
     format!(
-        "{title}\n\nThis is task #{task_id} on the Dock board. When you finish:\n    \
+        "{title}{card}\n\nThis is task #{task_id} on the Dock board. When you finish:\n    \
          dock task move {task_id} review\n    \
          dock handoff \"what you did\" --check=\"cargo test:pass\"\n\
          The handoff puts your result in front of the human with the evidence Dock measured itself."
@@ -862,11 +895,11 @@ mod hook_check_tests {
 
 #[cfg(test)]
 mod dispatch_prompt_tests {
-    use super::dispatch_prompt;
+    use super::{MAX_PROMPT_BODY_BYTES, dispatch_prompt};
 
     #[test]
     fn a_dispatched_agent_is_told_the_task_and_how_to_close_it() {
-        let prompt = dispatch_prompt(7, "fix the retry path");
+        let prompt = dispatch_prompt(7, "fix the retry path", "");
         assert!(prompt.starts_with("fix the retry path"), "{prompt}");
         // The instruction is explicit because the alternative is Dock watching the pane and
         // guessing when the agent is finished, which would move a durable record on a regex.
@@ -875,6 +908,88 @@ mod dispatch_prompt_tests {
         // the review queue could previously only be filled by hand-authoring a JSON packet.
         assert!(prompt.contains("dock handoff"), "{prompt}");
         assert!(prompt.contains("#7"), "{prompt}");
+    }
+
+    #[test]
+    fn an_agent_is_sent_what_the_card_says_and_not_only_its_headline() {
+        // A title is a filename-length summary. The acceptance criteria, the constraints and the
+        // out-of-scope list are all in the body, and dispatching used to drop every word of it —
+        // so the agent was asked to do work nobody had described to it.
+        let prompt = dispatch_prompt(
+            7,
+            "fix the retry path",
+            "# Outcome\n\nRetries stop after three attempts.\n",
+        );
+        assert!(
+            prompt.starts_with("fix the retry path\n\n# Outcome"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Retries stop after three attempts."),
+            "{prompt}"
+        );
+        // The closing instruction still comes after the card rather than being buried in it.
+        assert!(prompt.contains("dock task move 7 review"), "{prompt}");
+    }
+
+    #[test]
+    fn a_card_with_no_body_leaves_no_hole_where_one_would_have_been() {
+        // Most cards on a personal board are a title and nothing else; that prompt has to read
+        // as a sentence rather than as a paragraph that failed to load.
+        let prompt = dispatch_prompt(7, "fix the retry path", "\n\n   \n");
+        assert!(
+            prompt.starts_with("fix the retry path\n\nThis is task #7"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn a_card_longer_than_a_prompt_can_carry_is_cut_with_somewhere_to_read_the_rest() {
+        // The prompt is an argv entry for the adapters whose command line takes one and typed
+        // into a pane for the rest, and a body is Markdown a person may write as much of as they
+        // like. Cutting it here beats finding out at exec time, and the agent is told where the
+        // whole card is rather than left with a sentence that stops mid-word.
+        let body = "x".repeat(MAX_PROMPT_BODY_BYTES * 2);
+        let prompt = dispatch_prompt(7, "fix the retry path", &body);
+        assert!(prompt.len() < body.len(), "{}", prompt.len());
+        assert!(prompt.contains("dock task show 7"), "{prompt}");
+        // And the instruction survives the cut, which is the reason the body is what gets cut.
+        assert!(prompt.contains("dock task move 7 review"), "{prompt}");
+    }
+
+    #[test]
+    fn cutting_a_card_never_splits_a_character_in_half() {
+        // A body is prose, so the byte at the limit is as likely as not to sit inside a
+        // multi-byte character, and slicing there panics rather than truncating.
+        let body = "☃".repeat(MAX_PROMPT_BODY_BYTES);
+        let prompt = dispatch_prompt(7, "snowed under", &body);
+        assert!(prompt.contains("dock task show 7"), "{prompt}");
+        assert!(prompt.contains('☃'), "{prompt}");
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::claim_task;
+    use std::fs;
+
+    #[test]
+    fn a_claim_is_never_written_to_a_board_that_is_not_docks_own() {
+        // The claim moved to after the daemon accepts, and the rule it has to keep on the way is
+        // this one: a repository's board belongs to kanban-md and to whoever commits to it, and
+        // Dock moving a card there is that tool's business rather than this one's.
+        let directory = std::env::temp_dir().join(format!("dock-claim-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("a board that is not under ~/.dock/boards");
+        fs::write(
+            directory.join("001-a.md"),
+            "---\nid: 1\ntitle: 'Theirs'\nstatus: backlog\n---\n",
+        )
+        .expect("seed a task");
+
+        claim_task(Some(&directory), 1);
+
+        assert_eq!(dock::board::load(&directory)[0].status, "backlog");
+        let _ = fs::remove_dir_all(&directory);
     }
 }
 
@@ -891,18 +1006,19 @@ fn dispatch_task(
         title,
         adapter,
     } = task;
-    // Putting an agent on a task is a claim on it, so the board says so before the agent starts.
-    // Only on Dock's own board: a repository's belongs to kanban-md and to whoever commits to it,
-    // and moving a task there is that tool's business, not this one's.
-    if let Some(board) = dock::board::tasks_dir(
+    let board = dock::board::tasks_dir(
         &dashboard.repository_root,
         dashboard.workspace_id().unwrap_or_default(),
-    ) && dock::board::is_personal(&board)
-    {
-        // Best effort: a board that will not move a task is not a reason to refuse the work. The
-        // dispatch is what the user asked for; the status is bookkeeping around it.
-        let _ = dock::board::set_status(&board, *task_id, "in-progress");
-    }
+    );
+    // Read off disk rather than out of the dashboard's copy: the board is files, and the card may
+    // have been edited since the list in hand was loaded. What the agent is sent should be what
+    // the file says at the moment it is dispatched.
+    let body = board
+        .as_ref()
+        .map(|directory| dock::board::load(directory))
+        .and_then(|tasks| tasks.into_iter().find(|task| task.id == *task_id))
+        .map(|task| task.body)
+        .unwrap_or_default();
     let repository_root = PathBuf::from(dashboard.repository_root.clone());
     // Without a repository there is no worktree to isolate the work in, and nothing to isolate it
     // from. The agent is launched where the dashboard already is, with the task as its opening
@@ -920,11 +1036,12 @@ fn dispatch_task(
             run_id: run_id.to_owned(),
             profile,
             runtime_directory: dashboard.runtime_directory.clone(),
-            arguments: adapter.prompt_arguments(&dispatch_prompt(*task_id, title)),
+            arguments: adapter.prompt_arguments(&dispatch_prompt(*task_id, title, &body)),
         });
         if let Response::Error { message, .. } = client.request(&request)? {
             return Err(message);
         }
+        claim_task(board.as_deref(), *task_id);
         remember_opening_prompt(
             dashboard,
             adapter,
@@ -933,6 +1050,7 @@ fn dispatch_task(
             pane_id,
             *task_id,
             title,
+            &body,
         );
         dashboard.error = Some(format!("task {task_id} dispatched here, unbound: {title}"));
         return Ok(());
@@ -966,7 +1084,7 @@ fn dispatch_task(
                 // repository-bound dispatch built a branch and a worktree and then opened the
                 // agent into silence, while the unbound path — the casual one — handed it
                 // everything. That was backwards.
-                arguments: adapter.prompt_arguments(&dispatch_prompt(*task_id, title)),
+                arguments: adapter.prompt_arguments(&dispatch_prompt(*task_id, title, &body)),
             },
         },
     });
@@ -976,6 +1094,7 @@ fn dispatch_task(
             dashboard.error = None;
         }
     }
+    claim_task(board.as_deref(), *task_id);
     remember_opening_prompt(
         dashboard,
         adapter,
@@ -984,6 +1103,7 @@ fn dispatch_task(
         pane_id,
         *task_id,
         title,
+        &body,
     );
     // The footer carries one status line, which the codebase already uses for outcomes as well as
     // failures — a yank reports the same way.
@@ -998,11 +1118,31 @@ fn dispatch_task(
     Ok(())
 }
 
+/// Marks a card as claimed, once the dispatch it was claimed for has actually been accepted.
+///
+/// This used to run first, before the profile check, before the worktree, and before the daemon
+/// round trip — so a dispatch that failed at any of those three left a card sitting in
+/// `in-progress` with nothing whatsoever working on it, and the board said a person was busy on
+/// work that had never started. The claim is still best effort, because a board that will not
+/// move a task is no reason to disown a run the daemon has already begun; it is just no longer
+/// speculative.
+///
+/// Only on Dock's own board: a repository's belongs to `kanban-md` and to whoever commits to it,
+/// and moving a task there is that tool's business, not this one's.
+fn claim_task(board: Option<&Path>, task_id: u64) {
+    if let Some(directory) = board
+        && dock::board::is_personal(directory)
+    {
+        let _ = dock::board::set_status(directory, task_id, "in-progress");
+    }
+}
+
 /// Notes a task that its agent's command line could not carry, to be typed in once it is up.
 ///
 /// Only for the agents that have somewhere to type it. `prompt_arguments` returns nothing for five
 /// adapters and only two of them are agents with an input box; the rest are shells and fixtures,
 /// where a sentence is a command rather than a request.
+#[allow(clippy::too_many_arguments)]
 fn remember_opening_prompt(
     dashboard: &mut Dashboard,
     adapter: &dock::adapter::AdapterId,
@@ -1011,6 +1151,7 @@ fn remember_opening_prompt(
     pane_id: &str,
     task_id: u64,
     title: &str,
+    body: &str,
 ) {
     if !adapter.opening_prompt_is_typed() {
         return;
@@ -1019,7 +1160,7 @@ fn remember_opening_prompt(
         run_id,
         workspace_id,
         pane_id,
-        &dispatch_prompt(task_id, title),
+        &dispatch_prompt(task_id, title, body),
     );
 }
 

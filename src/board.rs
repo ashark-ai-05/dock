@@ -19,6 +19,13 @@ pub struct BoardTask {
     pub status: String,
     pub priority: String,
     pub file: PathBuf,
+    /// Everything below the front matter: the Markdown the task was actually written in.
+    ///
+    /// The front matter is bookkeeping — an id, a column, a priority — and the title is a
+    /// filename-length summary of it. What the work *is* is down here: the outcome, the
+    /// acceptance criteria, what was ruled out. Dispatching a card sent an agent the title and
+    /// nothing else, which asked it to do work nobody had described to it.
+    pub body: String,
 }
 
 /// The order statuses are shown in, which is the order work moves through them.
@@ -149,21 +156,51 @@ pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
     // Single quotes around the title, matching the front matter these files already use, with any
     // quote of its own removed rather than escaped: a title is not worth a YAML quoting dialect.
     let safe_title = title.replace('\'', "");
-    let body = format!(
-        "---\nid: {id}\ntitle: '{safe_title}'\nstatus: backlog\npriority: medium\nclass: standard\n---\n\n# Outcome\n\n{safe_title}\n"
+    // Built apart from the front matter it is written under, so what this returns is what `load`
+    // will read back rather than a second description of the same file.
+    let body = format!("# Outcome\n\n{safe_title}");
+    let contents = format!(
+        "---\nid: {id}\ntitle: '{safe_title}'\nstatus: backlog\npriority: medium\nclass: standard\n---\n\n{body}\n"
     );
-    fs::write(&file, body).map_err(|error| format!("could not write the task: {error}"))?;
+    fs::write(&file, contents).map_err(|error| format!("could not write the task: {error}"))?;
     Ok(BoardTask {
         id,
         title: safe_title,
         status: "backlog".into(),
         priority: "medium".into(),
         file,
+        body,
     })
 }
 
 /// The statuses a task moves through, in the order work moves through them.
+///
+/// Not the whole truth about any particular board, and deliberately not treated as such: this
+/// repository's own `kanban/config.yml` declares `needs-input`, which is not in here. Use
+/// [`statuses`] for the columns a board actually has.
 pub const STATUSES: [&str; 5] = ["backlog", "todo", "in-progress", "review", "done"];
+
+/// The columns one board actually has: the statuses Dock knows, plus any the board itself uses.
+///
+/// The constant above and `kanban/config.yml` disagree, and everything that filtered by the
+/// constant simply dropped the difference — a card a person had moved to `needs-input` by hand
+/// was invisible in the column view and could not be moved back off it, even though `load` sorted
+/// it perfectly well. Taking the union fixes that for whatever status a board uses rather than
+/// for that one word, needs no second file format, and moves no column anybody is used to: the
+/// known statuses keep their order and the unfamiliar ones are appended in the order
+/// [`status_rank`] already sorts cards by, which is where an unfamiliar column already sorted.
+pub fn statuses(tasks: &[BoardTask]) -> Vec<String> {
+    let mut columns: Vec<String> = STATUSES.iter().map(|status| (*status).to_owned()).collect();
+    let mut extra: Vec<&str> = tasks
+        .iter()
+        .map(|task| task.status.as_str())
+        .filter(|status| !STATUSES.contains(status))
+        .collect();
+    extra.sort_by(|a, b| status_rank(a).cmp(&status_rank(b)).then_with(|| a.cmp(b)));
+    extra.dedup();
+    columns.extend(extra.into_iter().map(str::to_owned));
+    columns
+}
 
 /// Moves a task to a new status, rewriting only that line of its front matter.
 ///
@@ -171,15 +208,21 @@ pub const STATUSES: [&str; 5] = ["backlog", "todo", "in-progress", "review", "do
 /// another tool wrote there — is preserved byte for byte, because a board is shared with
 /// `kanban-md`, with editors, and with whoever commits to it, and a tool that reformats other
 /// people's files on the way past is a tool nobody keeps.
+///
+/// The destination is checked against [`statuses`] rather than the constant, so a column this
+/// board plainly has is a place a card can be put; a typo is still refused, which is what the
+/// check was for.
 pub fn set_status(directory: &Path, id: u64, status: &str) -> Result<BoardTask, String> {
     let status = status.trim();
-    if !STATUSES.contains(&status) {
+    let tasks = load(directory);
+    let columns = statuses(&tasks);
+    if !columns.iter().any(|known| known == status) {
         return Err(format!(
             "unknown status {status:?}; expected one of {}",
-            STATUSES.join(", ")
+            columns.join(", ")
         ));
     }
-    let task = load(directory)
+    let task = tasks
         .into_iter()
         .find(|task| task.id == id)
         .ok_or_else(|| format!("no task {id} on this board"))?;
@@ -252,14 +295,26 @@ fn status_rank(status: &str) -> usize {
 /// own lines, and the rest of the front matter is lists (`tags`, `depends_on`) whose indented items
 /// must not be mistaken for keys — so only unindented lines between the `---` fences are read, and
 /// everything else is ignored rather than interpreted.
+///
+/// The body needs no scanner at all: it is whatever follows the closing fence, trimmed. Which is
+/// also why the fields stop at that fence rather than at the last one in the file — `---` is a
+/// horizontal rule in Markdown, and a card that uses one would otherwise have its prose read as
+/// front matter and everything above the rule read as no body.
 fn parse(text: &str, path: &Path) -> Option<BoardTask> {
-    let mut lines = text.lines();
-    if lines.next()?.trim() != "---" {
+    // Lines with their terminators kept, so the offset the body starts at is a real byte offset
+    // into `text` rather than a count that has lost every newline it walked past.
+    let mut lines = text.split_inclusive('\n');
+    let opening = lines.next()?;
+    if opening.trim() != "---" {
         return None;
     }
     let (mut id, mut title, mut status, mut priority) = (None, None, None, None);
+    let mut body_start = text.len();
+    let mut offset = opening.len();
     for line in lines {
+        offset += line.len();
         if line.trim() == "---" {
+            body_start = offset;
             break;
         }
         if line.starts_with(char::is_whitespace) {
@@ -283,6 +338,7 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
         status: status.unwrap_or_else(|| "unknown".into()),
         priority: priority.unwrap_or_default(),
         file: path.to_path_buf(),
+        body: text[body_start..].trim().to_owned(),
     })
 }
 
@@ -353,6 +409,40 @@ mod tests {
     }
 
     #[test]
+    fn a_task_carries_the_markdown_its_author_wrote_under_the_front_matter() {
+        // The front matter is bookkeeping; the body is the task. Dispatching sent an agent only
+        // the title, so the acceptance criteria a person wrote under it never reached the work.
+        let board = Board::new();
+        board.task("001-a.md", &task_file(1, "Wire the parser", "backlog"));
+        let tasks = load(&board.0.join("kanban/tasks"));
+        assert_eq!(tasks[0].body, "# Outcome\n\nSomething.");
+    }
+
+    #[test]
+    fn a_rule_in_the_body_is_body_rather_than_a_second_front_matter() {
+        // `---` is a horizontal rule in Markdown. Reading the body as "everything after the last
+        // fence" would drop the paragraph above it, and reading fields past the first closing
+        // fence would let prose below overwrite a real field.
+        let board = Board::new();
+        board.task(
+            "001-a.md",
+            "---\nid: 4\ntitle: 'Ruled'\nstatus: review\n---\n\nAbove.\n\n---\n\nstatus: prose\n",
+        );
+        let tasks = load(&board.0.join("kanban/tasks"));
+        assert_eq!(tasks[0].status, "review");
+        assert_eq!(tasks[0].body, "Above.\n\n---\n\nstatus: prose");
+    }
+
+    #[test]
+    fn a_card_with_nothing_under_its_front_matter_has_an_empty_body() {
+        // Most cards on a personal board are a title and nothing else, and the empty string is
+        // what tells a prompt builder there is nothing to add rather than a blank paragraph.
+        let board = Board::new();
+        board.task("001-a.md", "---\nid: 2\ntitle: 'Bare'\nstatus: done\n---\n");
+        assert_eq!(load(&board.0.join("kanban/tasks"))[0].body, "");
+    }
+
+    #[test]
     fn list_items_in_the_front_matter_are_never_mistaken_for_fields() {
         // `tags` and `depends_on` hold indented `- value` items. A naive `split_once(':')` over
         // every line would read them as keys and could overwrite a real field.
@@ -415,6 +505,9 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].title, "Track the weather agent");
         assert_eq!(listed[0].id, 1);
+        // What `create` hands back has to be what the file says, body included, or the task it
+        // returns is a description of a file it did not write.
+        assert_eq!(made.body, listed[0].body);
     }
 
     #[test]
@@ -518,6 +611,27 @@ mod tests {
     }
 
     #[test]
+    fn a_status_the_board_already_uses_is_a_destination_the_constant_never_heard_of() {
+        // `kanban/config.yml` declares `needs-input` and `STATUSES` does not. Refusing to move a
+        // card into a column the board plainly has is the same defect as not drawing it.
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        board
+            .task("001-a.md", &task_file(1, "Wire it", "backlog"))
+            .task(
+                "002-b.md",
+                &task_file(2, "Waiting on a person", "needs-input"),
+            );
+        assert_eq!(
+            set_status(&dir, 1, "needs-input").expect("move").status,
+            "needs-input"
+        );
+        // And a typo is still refused, which is the whole reason the check is there.
+        let refused = set_status(&dir, 1, "needs-inpt").expect_err("refused");
+        assert!(refused.contains("needs-input"), "{refused}");
+    }
+
+    #[test]
     fn moving_a_task_that_is_not_there_says_so() {
         let board = Board::new();
         assert!(set_status(&board.0.join("kanban/tasks"), 99, "done").is_err());
@@ -543,6 +657,107 @@ mod tests {
         assert!(load(Path::new("/nonexistent-dock-board")).is_empty());
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Load measurement.
+    //
+    // Not an assertion: `#[ignore]`d so `cargo test` never spends a second on it, and run
+    // deliberately with
+    //
+    //     cargo test --release --lib -- --ignored --nocapture measure_board_load
+    //
+    // It exists because `BoardTask` gaining a `body` changed what `load` keeps: it used to read
+    // every file and throw away everything under the front matter, so a card's length cost a
+    // read and nothing else. Now the bodies are retained, and the board is loaded on every
+    // refresh — so "does keeping them cost anything at a board size somebody actually has" is a
+    // question to answer with numbers rather than with a shrug.
+    //
+    // The answer, measured against the same harness on the commit before the body was kept, was
+    // no: fastest of six alternating runs, 335/1602/6360/6417µs against 333/1566/6281/6329µs for
+    // the rows below. `load` costs about 32µs per task and is entirely per-file syscall; copying
+    // a kilobyte of body out of a buffer already in hand is a rounding error beside opening the
+    // file it came from, and a quarter-megabyte card does not show up either. The first pass at
+    // this measurement said 11–15% slower, which was three other builds running on the machine.
+    // ---------------------------------------------------------------------------------------
+
+    /// A task file with roughly `body_bytes` of body under the front matter every card carries.
+    fn bench_task_file(id: u64, body_bytes: usize) -> String {
+        let paragraph =
+            "Acceptance: the retry path stops after three attempts and says which one failed. ";
+        let mut body = String::with_capacity(body_bytes + paragraph.len());
+        while body.len() < body_bytes {
+            body.push_str(paragraph);
+        }
+        format!(
+            "---\nid: {id}\ntitle: 'Bench task {id}'\nstatus: backlog\npriority: medium\ncreated: 2026-08-21T12:55:48+10:00\ntags:\n    - runtime\n    - tui\nclass: standard\n---\n\n# Outcome\n\n{body}\n"
+        )
+    }
+
+    /// A board of `tasks` cards, one of which may be far longer than the rest — which is what a
+    /// real board looks like, since the one card somebody wrote a design into dwarfs the others.
+    fn bench_board(tasks: usize, body_bytes: usize, one_giant: Option<usize>) -> Board {
+        let board = Board::new();
+        let directory = board.0.join("kanban/tasks");
+        for id in 1..=tasks as u64 {
+            let bytes = if id == 1 {
+                one_giant.unwrap_or(body_bytes)
+            } else {
+                body_bytes
+            };
+            fs::write(
+                directory.join(format!("{id:03}-bench.md")),
+                bench_task_file(id, bytes),
+            )
+            .unwrap();
+        }
+        board
+    }
+
+    /// The fastest of several rounds rather than the mean.
+    ///
+    /// This machine's mean swings by tens of percent between identical runs depending on what
+    /// else is on it, which is wide enough to hide a real regression — and has. The fastest
+    /// round is the one that was interrupted least, which is the closest thing to the cost of
+    /// the code rather than the cost of the afternoon.
+    fn fastest_load(directory: &Path, rounds: u32) -> std::time::Duration {
+        let mut fastest = std::time::Duration::MAX;
+        for _ in 0..rounds {
+            let start = std::time::Instant::now();
+            let loaded = load(directory);
+            let elapsed = start.elapsed();
+            assert!(!loaded.is_empty(), "the bench board must have parsed");
+            fastest = fastest.min(elapsed);
+        }
+        fastest
+    }
+
+    #[test]
+    #[ignore = "a measurement, not an assertion: cargo test --release --lib -- --ignored --nocapture measure_board_load"]
+    fn measure_board_load_across_the_board_sizes_people_actually_have() {
+        println!();
+        println!(
+            "{:>8}  {:>12}  {:>12}  {:>12}",
+            "tasks", "bodies", "total µs", "µs/task"
+        );
+        for (tasks, body_bytes, one_giant) in [
+            (10usize, 1024usize, None),
+            (50, 1024, None),
+            (200, 1024, None),
+            (200, 1024, Some(256 * 1024)),
+        ] {
+            let board = bench_board(tasks, body_bytes, one_giant);
+            let fastest = fastest_load(&board.0.join("kanban/tasks"), 30);
+            let micros = fastest.as_secs_f64() * 1e6;
+            println!(
+                "{tasks:>8}  {:>12}  {micros:>12.1}  {:>12.2}",
+                match one_giant {
+                    Some(bytes) => format!("1KB + {}KB", bytes / 1024),
+                    None => "1KB".to_owned(),
+                },
+                micros / tasks as f64,
+            );
+        }
+    }
+
     #[test]
     fn this_repositorys_own_board_parses() {
         // The format is not hypothetical: Dock's own tasks are the fixture.
@@ -550,6 +765,9 @@ mod tests {
         assert!(!tasks.is_empty(), "Dock's own kanban/tasks must parse");
         assert!(tasks.iter().all(|task| task.id > 0));
         assert!(tasks.iter().all(|task| !task.title.is_empty()));
+        // And the body is where the work is actually described, on real files rather than on a
+        // fixture written to make the parser look good.
+        assert!(tasks.iter().any(|task| task.body.contains("Acceptance")));
     }
 }
 
@@ -558,23 +776,36 @@ mod tests {
 /// Kept apart from the drawing so the awkward parts — an empty column, a column that empties when
 /// its last card moves out of it, the edges — are decided by something that can be tested without
 /// a terminal.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BoardView {
     tasks: Vec<BoardTask>,
+    /// The columns this board has, from [`statuses`]. Held rather than recomputed per call so
+    /// every cursor rule agrees about how many columns there are.
+    statuses: Vec<String>,
     column: usize,
     row: usize,
+}
+
+impl Default for BoardView {
+    /// A board with nothing on it still has the columns Dock knows, so a cursor on an empty
+    /// board is a cursor somewhere rather than a cursor nowhere.
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 impl BoardView {
     /// Opens on the leftmost column that has anything in it, so a board whose backlog is empty
     /// does not open staring at nothing.
     pub fn new(tasks: Vec<BoardTask>) -> Self {
-        let column = STATUSES
+        let statuses = statuses(&tasks);
+        let column = statuses
             .iter()
             .position(|status| tasks.iter().any(|task| task.status == *status))
             .unwrap_or(0);
         Self {
             tasks,
+            statuses,
             column,
             row: 0,
         }
@@ -582,6 +813,16 @@ impl BoardView {
 
     pub fn tasks(&self) -> &[BoardTask] {
         &self.tasks
+    }
+
+    /// The columns to draw, which is what to iterate instead of [`STATUSES`].
+    pub fn statuses(&self) -> &[String] {
+        &self.statuses
+    }
+
+    /// The status the cursor is in, or `None` for a board with no columns at all.
+    pub fn status(&self) -> Option<&str> {
+        self.statuses.get(self.column).map(String::as_str)
     }
 
     pub fn column(&self) -> usize {
@@ -601,7 +842,7 @@ impl BoardView {
     }
 
     pub fn selected(&self) -> Option<&BoardTask> {
-        self.cards(STATUSES[self.column]).into_iter().nth(self.row)
+        self.cards(self.status()?).into_iter().nth(self.row)
     }
 
     /// Moves across columns, saturating rather than wrapping, and keeps the cursor on a card that
@@ -610,7 +851,7 @@ impl BoardView {
         self.column = self
             .column
             .saturating_add_signed(delta)
-            .min(STATUSES.len() - 1);
+            .min(self.statuses.len().saturating_sub(1));
         self.clamp_row();
     }
 
@@ -620,7 +861,11 @@ impl BoardView {
     }
 
     fn clamp_row(&mut self) {
-        let last = self.cards(STATUSES[self.column]).len().saturating_sub(1);
+        let last = self
+            .status()
+            .map(|status| self.cards(status).len())
+            .unwrap_or(0)
+            .saturating_sub(1);
         self.row = self.row.min(last);
     }
 
@@ -628,11 +873,14 @@ impl BoardView {
     /// under the cursor instead of the cursor staying over a column position.
     pub fn follow(&mut self, id: u64) {
         if let Some(task) = self.tasks.iter().find(|task| task.id == id)
-            && let Some(column) = STATUSES.iter().position(|status| *status == task.status)
+            && let Some(column) = self
+                .statuses
+                .iter()
+                .position(|status| *status == task.status)
         {
             self.column = column;
             self.row = self
-                .cards(STATUSES[column])
+                .cards(&self.statuses[column])
                 .iter()
                 .position(|card| card.id == id)
                 .unwrap_or(0);
@@ -651,6 +899,7 @@ mod view_tests {
             status: status.into(),
             priority: "medium".into(),
             file: PathBuf::from(format!("{id}.md")),
+            body: format!("# Outcome\n\ntask {id}"),
         }
     }
 
@@ -703,6 +952,42 @@ mod view_tests {
         view.follow(2);
         assert_eq!(STATUSES[view.column()], "in-progress");
         assert_eq!(view.selected().map(|task| task.id), Some(2));
+    }
+
+    #[test]
+    fn a_status_the_constant_does_not_know_is_still_a_column_the_cursor_can_reach() {
+        // This repository's own `config.yml` declares `needs-input`, which `STATUSES` has never
+        // heard of, and the view filtered by the constant — so a card a person had moved there by
+        // hand was invisible on the board and could not be moved back off it either.
+        let mut view = BoardView::new(vec![task(1, "backlog"), task(2, "needs-input")]);
+        view.move_column(9);
+        assert_eq!(view.status(), Some("needs-input"));
+        assert_eq!(view.selected().map(|task| task.id), Some(2));
+        // And back off it again, which is the half `<` could not do.
+        view.move_column(-9);
+        assert_eq!(view.status(), Some("backlog"));
+        assert_eq!(view.selected().map(|task| task.id), Some(1));
+    }
+
+    #[test]
+    fn unfamiliar_columns_are_appended_rather_than_reordering_the_board() {
+        // The union must not move a column anybody is used to: the known statuses keep the order
+        // work moves through them, and whatever else the board uses lands after them, in the
+        // order `status_rank` already sorts cards by.
+        let view = BoardView::new(vec![task(1, "needs-input"), task(2, "blocked")]);
+        let columns: Vec<&str> = view.statuses().iter().map(String::as_str).collect();
+        assert_eq!(
+            columns,
+            [
+                "backlog",
+                "todo",
+                "in-progress",
+                "review",
+                "done",
+                "blocked",
+                "needs-input"
+            ]
+        );
     }
 
     #[test]

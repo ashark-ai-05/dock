@@ -76,11 +76,18 @@ screen."* That warning names this project. §2 answers it.
 and never reads again"* (`client.rs:495`). A history request cannot ride the subscription. `Client::request`
 (`client.rs:100`) is a separate one-shot connection and is where it goes.
 
-**vt100's scrollback offset is measured from the bottom and does not self-adjust.**
+**vt100's scrollback offset is measured from the bottom, and it self-adjusts as rows arrive.**
 `grid.set_scrollback` is `self.scrollback_offset = rows.min(self.scrollback.len())` (`grid.rs:198`), and
-nothing touches `scrollback_offset` when rows are appended. Two consequences, one good and one a bug:
-a rebuilt parser with more history above keeps pointing at the same content (§4), and a scrolled-up view
-slides downward under incoming output (§4).
+`scroll_up` bumps the offset for every row it pushes into scrollback while the view is scrolled
+(`grid.rs:571-574`). So a scrolled-up pane stays pinned to the content the reader is looking at, and a
+rebuilt parser with more history above keeps pointing at the same content too (§4).
+
+**Corrected 2026-08-25.** An earlier revision of this section claimed "nothing touches `scrollback_offset`
+when rows are appended", and §4 accordingly specified a drift-compensation fix. That was wrong — read from
+`set_scrollback` alone without grepping for other writers — and the compensation would have double-counted
+vt100's own increment, un-pinning the very content it was meant to hold. The behaviour is now pinned by a
+characterisation test instead, because `terminal/mod.rs:14` names `PaneScreen` a swap point for the terminal
+engine and a replacement engine that lacked this would break scrolling everywhere with no other alarm.
 
 **vt100 exposes no scrollback-length getter.** `Grid::scrollback_len()` (`grid.rs:190`) returns the configured
 *capacity* and `Grid` is private; `Screen::scrollback()` (`screen.rs:122`) returns the current offset. The

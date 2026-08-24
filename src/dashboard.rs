@@ -43,17 +43,41 @@ use crate::{
 /// rows — several screens of scrolling — for a rebuild that stays inside a frame.
 const PANE_PAGE_BACK_BYTES: u32 = 2 << 20;
 
+/// How far a pane's byte log is allowed past its budget before it is trimmed back to it.
+///
+/// Trimming is a memmove of the whole log, and at the 16 MiB budget that is a third of a
+/// millisecond — paid on the event-drain path, ahead of render, for a daemon that pushes every
+/// 16 ms. Trimming on every delta would spend it on every delta. Letting the log run a
+/// megabyte past its budget and then cutting all the way back spends it once per megabyte of
+/// output instead, which is hundreds of deltas, in exchange for a megabyte of headroom per
+/// pane. The daemon's own `OutputLog` sidesteps the copy entirely with a `VecDeque` of whole
+/// writes; a client's log is replayed as one contiguous slice, so it buys the same amortisation
+/// with slack rather than with a second data structure.
+const PANE_HISTORY_TRIM_SLACK: usize = 1 << 20;
+
 /// What a pane's replica holds, and where it would ask for more.
 ///
-/// `from` is the sequence its own byte log begins at, which is exactly the cursor a
-/// `PaneHistory` request names. `epoch` is the byte stream those sequences belong to: a run
-/// that restarted has a new one, and an answer carrying the old one names positions in a
-/// stream this replica is no longer showing. `complete` is the daemon saying there is nothing
-/// older still retained.
+/// The bytes live here rather than in a map of their own because every part of this is written
+/// together and read together: a cursor that named a position in a log it was not attached to
+/// would be the one bug this whole mechanism can produce.
+///
+/// `from` is the sequence `log` begins at, which is exactly the cursor a `PaneHistory` request
+/// names. `epoch` is the byte stream those sequences belong to: a run that restarted has a new
+/// one, and an answer carrying the old one names positions in a stream this replica is no
+/// longer showing. `complete` is the daemon saying there is nothing older still retained.
 struct PaneHistoryCursor {
     epoch: u64,
     from: u64,
     complete: bool,
+    /// Set once this log has dropped bytes off its front, after which `from` no longer names
+    /// where it starts and no request can be built from it. See `retain_history_bytes`.
+    wrapped: bool,
+    /// Every byte this replica has been fed, seed and deltas alike.
+    ///
+    /// Kept because a `vt100` parser cannot have rows prepended to it: the only way older
+    /// output enters a replica is to replay it, followed by everything the replica already
+    /// saw, through a brand new parser.
+    log: Vec<u8>,
 }
 
 /// Copy mode's bindings, published in the footer for as long as the mode is active. It is
@@ -104,15 +128,10 @@ pub struct Dashboard {
     /// This client's own emulator for each run, advanced by pushed deltas. The daemon holds the
     /// authoritative screen; this is the local replica the dashboard actually paints from.
     pub screens: HashMap<String, PaneScreen>,
-    /// Where each replica's own history starts, and whether anything older is still to be had.
+    /// Each replica's own byte log, where it starts, and whether anything older is still to
+    /// be had. Bounded by `PANE_HISTORY_BYTES`, so a pane that runs for a week costs the same
+    /// as one that just started.
     history: HashMap<String, PaneHistoryCursor>,
-    /// Every byte each replica has been fed, seed and deltas alike.
-    ///
-    /// Kept because a `vt100` parser cannot have rows prepended to it: the only way older
-    /// output enters a replica is to replay it, followed by everything the replica already
-    /// saw, through a brand new parser. Bounded by `PANE_HISTORY_BYTES` and trimmed from the
-    /// front, so a pane that runs for a week costs the same as one that just started.
-    history_bytes: HashMap<String, Vec<u8>>,
     /// Latest agent identity and state per run, as pushed by the daemon.
     pub agents: HashMap<String, (Option<AgentKind>, AgentState)>,
     revisions: HashMap<String, u64>,
@@ -730,9 +749,10 @@ impl Dashboard {
                         epoch,
                         from: history_from,
                         complete: false,
+                        wrapped: false,
+                        log: seed,
                     },
                 );
-                self.history_bytes.insert(run_id.clone(), seed);
                 self.revisions.insert(run_id.clone(), revision);
                 self.end_copy_mode_for(&run_id, "the pane was re-attached");
             }
@@ -746,7 +766,6 @@ impl Dashboard {
                     self.screens.remove(&run_id);
                     self.revisions.remove(&run_id);
                     self.history.remove(&run_id);
-                    self.history_bytes.remove(&run_id);
                     self.end_copy_mode_for(&run_id, "the pane lost sync and is re-seeding");
                     return;
                 }
@@ -796,7 +815,6 @@ impl Dashboard {
         // re-attaches with a new seed and a new cursor, and a log kept across that would be
         // replayed in front of bytes it already contains.
         self.history.clear();
-        self.history_bytes.clear();
         // The frozen screen would happily outlive the replica it was cloned from — nothing in
         // it points back at one — but a selection over a pane that is about to be rebuilt from
         // a fresh snapshot is a selection of rows the user is no longer being shown.
@@ -812,36 +830,43 @@ impl Dashboard {
     /// Records bytes a replica has been fed, so its parser can be rebuilt from them later.
     ///
     /// Trimmed from the front, never the back: the newest bytes are the ones on screen, and a
-    /// log missing its tail would rebuild a pane that has forgotten what it just printed.
-    /// Dropping the front moves where this log starts, so the paging cursor moves with it —
-    /// otherwise the next request would ask for bytes before a point the log no longer
-    /// reaches, and the answer would be spliced in with a hole between it and the rest.
+    /// log missing its tail would rebuild a pane that has forgotten what it just printed. The
+    /// trim runs only once the log has passed `PANE_HISTORY_TRIM_SLACK` beyond its budget and
+    /// then cuts all the way back, so the copy is paid once per slack rather than once per
+    /// delta.
+    ///
+    /// **A trim ends this pane's paging, and the arithmetic to avoid that does not exist.**
+    /// The obvious repair — advance `from` by the bytes dropped — is wrong, and subtly:
+    /// `from` counts *stream* sequence, while the log also holds the cursor-addressed
+    /// corrections `SubscriberView::next_delta` appends (`src/server.rs`), which occupy log
+    /// space and consume no sequence at all. Dropping `c` corrective bytes would leave `from`
+    /// naming a sequence `c` past where the log truly starts, the daemon's next contiguous
+    /// answer would overlap the log head by `c`, and the rebuild would replay those bytes
+    /// twice into a screen the pane never showed. A client cannot tell the two kinds of byte
+    /// apart, so the flag says so instead of guessing. Nothing is lost: reaching this point
+    /// takes a whole budget of output, which is hundreds of thousands of rows, and the
+    /// `PANE_HISTORY_MAX_ROWS` capacity stop has long since ended the paging anyway.
     fn retain_history_bytes(&mut self, run_id: &str, bytes: &[u8]) {
-        let Some(log) = self.history_bytes.get_mut(run_id) else {
+        let Some(cursor) = self.history.get_mut(run_id) else {
             return;
         };
-        log.extend_from_slice(bytes);
-        let overflow = log.len().saturating_sub(PANE_HISTORY_BYTES);
-        if overflow == 0 {
+        cursor.log.extend_from_slice(bytes);
+        if cursor.log.len() <= PANE_HISTORY_BYTES + PANE_HISTORY_TRIM_SLACK {
             return;
         }
-        log.drain(..overflow);
-        if let Some(cursor) = self.history.get_mut(run_id) {
-            cursor.from += overflow as u64;
-            // `complete` is deliberately left alone. It says the daemon had nothing older when
-            // it last answered, and a pane that has since produced a whole budget of output
-            // has aged those same bytes out of the daemon's log too; re-asking would fetch
-            // bytes only to drop them again on the next write.
-        }
+        cursor.log.drain(..cursor.log.len() - PANE_HISTORY_BYTES);
+        cursor.wrapped = true;
     }
 
     /// A request for the next chunk of history, when this pane is scrolled near the top of
     /// what it holds and there is any point asking for more.
     ///
-    /// Two separate things say there is no point. The daemon's `complete` means nothing older
-    /// is retained. A replica already holding its full row budget means nothing older can be
-    /// *shown*: `vt100` drops the oldest row for every row added, so those bytes would be
-    /// replayed at the cost of a full rebuild and then immediately discarded.
+    /// Three separate things say there is no point. The daemon's `complete` means nothing
+    /// older is retained. A replica already holding its full row budget means nothing older
+    /// can be *shown*: `vt100` drops the oldest row for every row added, so those bytes would
+    /// be replayed at the cost of a full rebuild and then immediately discarded. And a log
+    /// that has wrapped can no longer name the sequence it starts at, so there is no honest
+    /// request to send — see `retain_history_bytes`.
     ///
     /// Takes `&mut self` because `history_rows` does: reading the row count means moving the
     /// scroll offset to the clamp and putting it back.
@@ -853,7 +878,7 @@ impl Dashboard {
             return None;
         }
         let before = match self.history.get(run_id) {
-            Some(cursor) if !cursor.complete => cursor.from,
+            Some(cursor) if !cursor.complete && !cursor.wrapped => cursor.from,
             _ => return None,
         };
         let screen = self.screens.get_mut(run_id)?;
@@ -898,6 +923,11 @@ impl Dashboard {
             }
             return;
         };
+        // Every handle and every reason to give up comes first, so there is no ordering in
+        // which the cursor advances over a log that was never extended.
+        let Some(screen) = self.screens.get_mut(&run_id) else {
+            return;
+        };
         let Some(cursor) = self.history.get_mut(&run_id) else {
             return;
         };
@@ -912,22 +942,16 @@ impl Dashboard {
         };
         cursor.from = from;
         cursor.complete = complete;
-        let Some(log) = self.history_bytes.get_mut(&run_id) else {
-            return;
-        };
         // Not trimmed to `PANE_HISTORY_BYTES` here, unlike the live path: the front of this log
         // is exactly what was just asked for, and trimming it would discard the answer. The
         // total stays bounded anyway, because the daemon can only ever serve what it retains.
-        log.splice(0..0, older);
-        let Some(screen) = self.screens.get_mut(&run_id) else {
-            return;
-        };
+        cursor.log.splice(0..0, older);
         let (rows, cols) = screen.size();
         let offset = screen.scroll_offset();
         // Read off the screen being replaced rather than carried on the cursor, so the rebuild
         // cannot disagree with what it replaces about how much history a pane may keep.
         let mut rebuilt = PaneScreen::new(rows, cols, screen.history_capacity());
-        rebuilt.feed(log);
+        rebuilt.feed(&cursor.log);
         rebuilt.scroll_by(i32::try_from(offset).unwrap_or(i32::MAX));
         *screen = rebuilt;
     }
@@ -9919,28 +9943,54 @@ mod tests {
     }
 
     /// The cap on a client's own byte log, which is what keeps a pane that has run all week
-    /// costing the same as one that just started. Dropping the front moves where the log
-    /// begins, so the paging cursor moves with it: left behind, the next request would name a
-    /// point the log no longer reaches and the answer would be spliced in with a hole in it.
+    /// costing the same as one that just started — and the slack above it, which is what keeps
+    /// the copy that enforces the cap off the path every delta takes.
     #[test]
-    fn a_byte_log_that_outgrows_its_budget_is_trimmed_from_the_front_and_carries_the_cursor() {
+    fn a_byte_log_is_copied_only_once_it_passes_the_mark_above_its_budget() {
         let mut dashboard = bound_dashboard();
         dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
-        let seed = dashboard.history_bytes["run_1"].len();
-        let overflow = 1024;
+        let seed = dashboard.history["run_1"].log.len();
+        let brim = PANE_HISTORY_BYTES + PANE_HISTORY_TRIM_SLACK;
         // Fed straight to the log rather than through a delta: the point is the budget, and
-        // parsing sixteen megabytes to reach it would make this test the slowest in the file.
-        let written = vec![b'.'; PANE_HISTORY_BYTES + overflow - seed];
-        dashboard.retain_history_bytes("run_1", &written);
+        // parsing seventeen megabytes to reach it would make this test the slowest in the file.
+        dashboard.retain_history_bytes("run_1", &vec![b'.'; brim - seed]);
         assert_eq!(
-            dashboard.history_bytes["run_1"].len(),
-            PANE_HISTORY_BYTES,
-            "the log must stay inside the budget"
+            dashboard.history["run_1"].log.len(),
+            brim,
+            "up to the mark the log is left alone, so no delta pays for a copy"
         );
+        dashboard.retain_history_bytes("run_1", b".");
         assert_eq!(
-            dashboard.history["run_1"].from,
-            4096 + overflow as u64,
-            "the cursor must name the sequence the trimmed log now begins at"
+            dashboard.history["run_1"].log.len(),
+            PANE_HISTORY_BYTES,
+            "past it, one copy takes the log all the way back to its budget"
+        );
+    }
+
+    /// A trimmed log no longer knows the sequence it starts at, and cannot work it out: it
+    /// holds cursor-addressed corrections as well as stream bytes, and those take up room
+    /// without advancing the sequence. Rather than page from a cursor that is wrong by however
+    /// many corrective bytes were dropped — which would have the daemon's next answer overlap
+    /// the log and replay bytes twice — such a pane stops asking.
+    #[test]
+    fn a_pane_whose_byte_log_has_wrapped_stops_asking_rather_than_guessing_where_it_starts() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        for _ in 0..200 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert!(
+            dashboard.history_request_for("run_1").is_some(),
+            "before the log wrapped this pane was ready to page"
+        );
+        dashboard.retain_history_bytes(
+            "run_1",
+            &vec![b'.'; PANE_HISTORY_BYTES + PANE_HISTORY_TRIM_SLACK + 1],
+        );
+        assert!(
+            dashboard.history_request_for("run_1").is_none(),
+            "a cursor that cannot name where its log begins must not be sent"
         );
     }
 
@@ -11291,6 +11341,68 @@ mod tests {
                 / u64::from(frames);
         }
         (fastest, allocations, bytes)
+    }
+
+    /// What holding a pane's byte log costs on the path every delta takes.
+    ///
+    /// This is the measurement that chose `PANE_HISTORY_TRIM_SLACK`. Enforcing the budget means
+    /// moving the whole log down, and a full log is sixteen megabytes; done on every delta that
+    /// arrives past the cap, that lands on the event drain, ahead of render, for a daemon that
+    /// pushes every 16 ms. Both policies are reported so the difference is the number, not the
+    /// argument.
+    #[test]
+    #[ignore = "a measurement, not an assertion; cargo test --release measure_what_keeping -- --ignored --nocapture"]
+    fn measure_what_keeping_a_panes_byte_log_costs() {
+        const DELTA: usize = 4 << 10;
+        let delta = vec![b'x'; DELTA];
+
+        // What every delta used to pay: a trim the moment the log is over its budget, which
+        // memmoves the entire budget down by the size of the delta.
+        let mut fastest_eager = f64::MAX;
+        for _ in 0..7 {
+            let mut log = vec![b'x'; PANE_HISTORY_BYTES + DELTA];
+            let start = std::time::Instant::now();
+            log.drain(..DELTA);
+            fastest_eager = fastest_eager.min(start.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(&log);
+        }
+
+        // What a delta pays now: an append, and a share of one copy per slack of output.
+        let mut dashboard = Dashboard::default();
+        dashboard.history.insert(
+            "run_1".into(),
+            PaneHistoryCursor {
+                epoch: 1,
+                from: 0,
+                complete: false,
+                wrapped: false,
+                log: vec![b'x'; PANE_HISTORY_BYTES],
+            },
+        );
+        // Four times the slack, so the amortised copy is included several times over rather
+        // than landing on a round boundary.
+        let deltas = (PANE_HISTORY_TRIM_SLACK / DELTA) * 4;
+        let mut fastest_amortised = f64::MAX;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            for _ in 0..deltas {
+                dashboard.retain_history_bytes("run_1", &delta);
+            }
+            let per_delta = start.elapsed().as_secs_f64() * 1000.0 / deltas as f64;
+            fastest_amortised = fastest_amortised.min(per_delta);
+        }
+
+        println!();
+        println!(
+            "a {DELTA}-byte delta into a full {}MiB log",
+            PANE_HISTORY_BYTES >> 20
+        );
+        println!("{:>34}  {:>10}", "policy", "ms/delta");
+        println!("{:>34}  {fastest_eager:>10.4}", "trim on every delta");
+        println!(
+            "{:>34}  {fastest_amortised:>10.4}",
+            format!("trim past {}MiB of slack", PANE_HISTORY_TRIM_SLACK >> 20)
+        );
     }
 
     /// What a page-back costs, which is the cost of the wheel notch that asks for it.

@@ -1674,7 +1674,10 @@ impl Dashboard {
                 Some(task) => {
                     let _ = write!(text, "#{task}");
                 }
-                None => text.push('—'),
+                // Said rather than punctuated. A bare dash here is correct and reads as "a value
+                // is missing", when what it means is that this agent was launched by hand rather
+                // than dispatched from a card, and so has no card to be linked to.
+                None => text.push_str("no card"),
             }
             let _ = write!(
                 text,
@@ -4850,6 +4853,24 @@ fn render_board_columns(
     if statuses.is_empty() || area.width < statuses.len() as u16 || area.height < 3 {
         return;
     }
+    // A board with nothing on it drew five headings reading `· 0` above four dashes and filled
+    // the pane with them, which reads as broken rather than as empty — and prompts the question
+    // of why the agent in the lane above is not in one of the columns. Empty is a state worth
+    // saying out loud, with the key that changes it.
+    if view.tasks().is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled("  no tasks on this board", Style::default().fg(theme.muted)),
+                Line::from(""),
+                Line::styled(
+                    "  Ctrl+B k opens it · n adds a task",
+                    Style::default().fg(theme.muted),
+                ),
+            ]),
+            area,
+        );
+        return;
+    }
     let column_width = area.width / statuses.len() as u16;
     let card_rows = area.height.saturating_sub(2);
 
@@ -6636,6 +6657,48 @@ mod tests {
 
     /// A dashboard whose visible workspace holds one terminal pane and one board pane, with a
     /// live agent in a second workspace so the runs lane has something to show.
+    #[test]
+    fn a_board_with_no_cards_says_so_rather_than_painting_five_empty_columns() {
+        // What real use turned up: a workspace whose board directory does not exist yet drew
+        // five headings reading `· 0` over four dashes and nothing else, filling the pane. It
+        // reads as broken rather than as empty, and the first question it prompts is why the
+        // agent running above it is not in one of the columns.
+        let mut dashboard = dashboard_with_a_board_pane();
+        dashboard.set_board_pane_tasks(Vec::new(), std::path::PathBuf::from("/tmp/none"));
+        let frame = render_to_string(&mut dashboard, 160, 40);
+
+        assert!(
+            frame.contains("no tasks on this board"),
+            "an empty board must say it is empty: {frame:?}"
+        );
+        assert!(
+            frame.contains("Ctrl+B k"),
+            "and name the way to add one: {frame:?}"
+        );
+        // The columns are what made it look broken, so they must not be drawn at all.
+        assert!(
+            !frame.contains("BACKLOG"),
+            "no column headings over an empty board: {frame:?}"
+        );
+        // The runs lane above it is unaffected: an empty backlog says nothing about live agents.
+        assert!(frame.contains("RUNS"), "{frame:?}");
+    }
+
+    #[test]
+    fn a_run_that_came_from_no_card_says_so_in_words() {
+        // The lane wrote a bare em dash where a card id goes, which is correct and unreadable —
+        // it was read as "something is missing" rather than "this agent was launched by hand".
+        let mut dashboard = dashboard_with_a_board_pane();
+        for run in &mut dashboard.runs {
+            run.external_task_ref = String::new();
+        }
+        let frame = render_to_string(&mut dashboard, 160, 40);
+        assert!(
+            frame.contains("no card"),
+            "a hand-launched agent should say why it has no task: {frame:?}"
+        );
+    }
+
     fn dashboard_with_a_board_pane() -> Dashboard {
         let mut dashboard = bound_dashboard();
         let workspace = &mut dashboard.layout.workspaces[0];

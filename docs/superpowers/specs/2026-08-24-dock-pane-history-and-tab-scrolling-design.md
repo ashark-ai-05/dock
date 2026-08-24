@@ -190,8 +190,13 @@ fetch the older chunk, prepend, rebuild the parser from the whole log. One round
 rebuild. The alternative — asking the daemon for `from`-to-`end` and re-sending bytes the client already has
 — makes every page-back re-transmit the entire history.
 
-The client's log is capped at the **same byte budget the daemon announces**, so the two never disagree about
-how much history exists and the client cannot accumulate more than the daemon can re-serve.
+The client's log is capped by **its own copy of `PANE_HISTORY_BYTES`** (`terminal/mod.rs`), not by anything
+the daemon announces. **Corrected 2026-08-25**: nothing byte-valued is on the wire. The attach frame carries
+`scrollback_rows`, which is a row count, so `dockd --pane-history-bytes=N` moves the daemon's retention and
+leaves the client's 16 MB log cap exactly where it is. Both sides happen to agree because both read the same
+constant from the same source, and the flag exists to be *lowered*: a smaller daemon budget simply means less
+to re-serve, and the client's cap is then never the binding one. Raising it past 16 MB buys a client nothing,
+because the client stops logging at its own constant however much the daemon retains.
 
 Per-run state: `{ epoch, from, complete }`. When a scroll leaves the viewport **within one screen height of
 the top** of what the parser holds, and `complete` is not set, the client requests the next **2 MB**. An
@@ -249,7 +254,7 @@ carries. Renaming it is deliberately deferred to v13 in step 3 rather than done 
 
 **Scroll surface.** The wheel is unchanged. Added: `Ctrl+B PgUp` / `Ctrl+B PgDn` for half a page, and
 `Ctrl+B End` to snap back to following live output. While `scroll_offset() > 0` the pane chrome shows
-`▲ 1,240 rows · End to follow`, because a pane that has silently stopped following live output is
+`▲ 1240 rows · End to follow`, because a pane that has silently stopped following live output is
 indistinguishable from a hung agent.
 
 ## 5. The tab strip scrolls
@@ -311,9 +316,20 @@ Each step ends green and shippable.
 
 ## 8. Risks
 
-**16 MB × pane count is real memory.** Eight panes is 128 MB worst case, though a typical pane holds far
-less — the log is bytes, not vt100 cell grids, and the cap is a ceiling rather than an allocation. Measured
-in step 1 and reported; the flag exists so it can be lowered.
+**16 MB × pane count is real memory on the daemon — and on the client the cells cost several times the
+bytes.** Eight daemon panes is 128 MB worst case, though a typical pane holds far less: *there* the log is
+bytes, not vt100 cell grids, and the cap is a ceiling rather than an allocation. **Corrected 2026-08-25: on
+the client that reassurance is backwards.** A replica keeps parsed cells, and `vt100` allocates a full row of
+them for every retained scrollback row — `Row::new(cols)` eagerly allocates `cols` cells and a `Cell` is
+exactly 32 bytes, whatever the row holds. Measured with an instrumented allocator: **2.6 KB per retained row
+at 80 columns, 5.2 KB at 160**, per pane, per attached run.
+
+`PANE_HISTORY_MAX_ROWS` (`terminal/mod.rs`) is therefore the client's real memory bound, and it shipped at
+50,000 — **124 MiB per pane at 24×80 and 246 MiB at 40×160**, dwarfing the 16 MiB byte log beside it.
+**Lowered to 10,000 before merge**: roughly **26 MB and 52 MB** per pane, still five times the 2000 rows a
+replica held before this project, and further back than anyone scrolls to read. The figures come from
+`measure_what_freezing_a_pane_for_copy_mode_costs` (`dashboard.rs`), which prices the row because copy mode's
+freeze clones every one of them; the daemon flag exists so its side can be lowered too.
 
 **Page-back hitches on a large rebuild.** Replaying 16 MB through vt100 is not free. Mitigated by paging in
 2 MB chunks rather than the whole log, and measured in step 4. If it proves visible, the fallback is a

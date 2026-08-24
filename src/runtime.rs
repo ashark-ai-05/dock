@@ -18,10 +18,12 @@ use nix::{
     unistd::{Pid, setsid},
 };
 
+#[cfg(test)]
+use crate::terminal::PANE_HISTORY_BYTES;
 use crate::{
     adapter::{AdapterCapabilities, AdapterId, ProcessCapabilities, ResolvedAdapter},
     protocol::{BindingKind, ProcessState, ProviderState, RuntimeSnapshot},
-    terminal::{PANE_HISTORY_BYTES, PaneOutput, PaneScreen},
+    terminal::{PaneOutput, PaneScreen},
 };
 
 #[derive(Debug, Clone)]
@@ -126,15 +128,24 @@ impl OwnedRuntime {
         binding: RunBinding,
         adapter: ResolvedAdapter,
         scrollback_rows: usize,
+        history_bytes: usize,
         size: PtySize,
     ) -> Self {
-        Self::launch_with_before_lifecycle_publish(binding, adapter, scrollback_rows, size, || {})
+        Self::launch_with_before_lifecycle_publish(
+            binding,
+            adapter,
+            scrollback_rows,
+            history_bytes,
+            size,
+            || {},
+        )
     }
 
     fn launch_with_before_lifecycle_publish(
         binding: RunBinding,
         adapter: ResolvedAdapter,
         scrollback_rows: usize,
+        history_bytes: usize,
         size: PtySize,
         before_lifecycle_publish: impl FnOnce() + Send + 'static,
     ) -> Self {
@@ -145,7 +156,7 @@ impl OwnedRuntime {
             size.rows,
             size.cols,
             scrollback_rows,
-            PANE_HISTORY_BYTES,
+            history_bytes,
         )));
         let dock_variables = dock_environment(&binding);
         match launch_child(
@@ -275,6 +286,7 @@ impl OwnedRuntime {
                 },
             },
             scrollback_rows,
+            PANE_HISTORY_BYTES,
             size,
         )
     }
@@ -1516,6 +1528,7 @@ mod tests {
                 capabilities: AdapterCapabilities::default(),
             },
             64,
+            PANE_HISTORY_BYTES,
             FIXTURE_SIZE,
             move || {
                 reaped_tx.send(()).expect("report child reaped");

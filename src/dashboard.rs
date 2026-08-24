@@ -2127,6 +2127,26 @@ impl Dashboard {
                 // screen, so borrowing it across that — or, worse, cloning it — is not free.
                 let copying =
                     run_id.is_some_and(|id| self.copy.as_ref().is_some_and(|mode| mode.is_for(id)));
+                // A pane that has stopped following live output looks exactly like a pane whose
+                // agent has hung. It has to say which it is, and say how to undo it: someone who
+                // scrolled by accident with the wheel has no other way to find out. The title is
+                // shortened to make room for it rather than the other way around — `fit_scroll_marker`
+                // reserves room for the marker first and only ellipsises the title into what is
+                // left, because the two are painted as independent titles on the same border row
+                // and neither knows the other is there; without a shared reservation the one
+                // rendered last (the marker) simply paints over the other.
+                let scroll_offset = run_id
+                    .and_then(|id| self.screens.get(id))
+                    .map(PaneScreen::scroll_offset)
+                    .filter(|offset| *offset > 0);
+                let copy_prefix_width = if copying { " COPY".chars().count() } else { 0 };
+                let title_row_budget = usize::from(area.width)
+                    .saturating_sub(2) // borders
+                    .saturating_sub(copy_prefix_width);
+                let (title, scroll_marker) = match scroll_offset {
+                    Some(offset) => fit_scroll_marker(&title, title_row_budget, offset),
+                    None => (title, None),
+                };
                 // `title` already opens with a space, so the prefix needs none of its own.
                 let title = if copying {
                     Line::from(vec![
@@ -2173,35 +2193,6 @@ impl Dashboard {
                 // attempt at this truncated that hint to "Ctrl+B R resta ×". The bottom border is
                 // empty on every pane, so the controls cost nothing to put there.
                 let show_controls = focused && area.width >= controls_width + 4;
-                // A pane that has stopped following live output looks exactly like a pane whose
-                // agent has hung. It has to say which it is, and say how to undo it: someone who
-                // scrolled by accident with the wheel has no other way to find out. Kept as a
-                // second, right-aligned title on the same row rather than folded into the title
-                // string, so it never shortens the pane's own identity to make room for itself —
-                // any pane wide enough for both shows both, side by side on the one border row.
-                let scroll_marker = run_id
-                    .and_then(|id| self.screens.get(id))
-                    .map(PaneScreen::scroll_offset)
-                    .filter(|offset| *offset > 0)
-                    .and_then(|offset| {
-                        let note = format!("▲ {offset} rows · End to follow");
-                        let budget = usize::from(area.width).saturating_sub(2); // borders
-                        if budget == 0 {
-                            return None;
-                        }
-                        if note.chars().count() <= budget {
-                            return Some(note);
-                        }
-                        // "End to follow" is the one thing this marker exists to say, so on a
-                        // pane too narrow for the whole sentence it is the numeric detail in
-                        // front of it that gives way, not the instruction. `ellipsise` keeps
-                        // the head of a string and drops its tail, which is backwards for a
-                        // sentence whose tail is the part that must survive — so it runs on the
-                        // sentence reversed, and the answer is reversed back, to drop the head
-                        // behind an ellipsis instead.
-                        let reversed: String = note.chars().rev().collect();
-                        Some(ellipsise(&reversed, budget).chars().rev().collect())
-                    });
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(Theme::border_type())
@@ -5855,6 +5846,43 @@ fn ellipsise(value: &str, width: usize) -> String {
         .take(width.saturating_sub(1))
         .chain(std::iter::once('…'))
         .collect()
+}
+
+/// Picks the richest form of the "stopped following" marker that still leaves room for some of
+/// the pane's own title, and returns the title shortened to whatever is left.
+///
+/// The marker and the title are painted as two independent titles on the same border row (see
+/// the call site), and neither one knows the other is there — so without a shared reservation,
+/// whichever is drawn last simply paints over the other. This is the reservation: it tries the
+/// marker's forms from richest to sparsest, and takes the first one that still leaves
+/// `MIN_TITLE_WIDTH` columns of the title standing.
+///
+/// The bare glyph is never dropped for want of room to explain itself: a pane that has silently
+/// stopped following its own output is the exact failure this marker exists to catch, and
+/// hiding it on the narrowest panes reintroduces that failure exactly where panes are most
+/// cramped. What gives way instead is the title, shortened rather than erased — and if even the
+/// bare glyph would leave nothing of the title standing, there is no marker at all rather than a
+/// title reduced to nothing.
+fn fit_scroll_marker(title: &str, budget: usize, offset: usize) -> (String, Option<String>) {
+    /// However short a pane's own name gets, this many columns of it must stay recognisable —
+    /// enough for the state glyph, the opening space, and the whole of a short label like
+    /// "editor" or "agent".
+    const MIN_TITLE_WIDTH: usize = 8;
+    const SEPARATOR: usize = 1;
+    for candidate in [
+        format!("▲ {offset} rows · End to follow"),
+        format!("▲ {offset} rows"),
+        "▲".to_owned(),
+    ] {
+        let marker_width = candidate.chars().count();
+        if budget >= marker_width + SEPARATOR + MIN_TITLE_WIDTH {
+            return (
+                ellipsise(title, budget - marker_width - SEPARATOR),
+                Some(candidate),
+            );
+        }
+    }
+    (title.to_owned(), None)
 }
 
 fn runtime_label(runtime: PaneRuntime) -> &'static str {
@@ -9965,8 +9993,71 @@ mod tests {
         dashboard.scroll_pane("run_1", 12);
         let rendered = render_to_string(&mut dashboard, 80, 24);
         assert!(
-            rendered.contains("End to follow"),
+            rendered.contains('▲'),
             "a pane that stopped following live output is indistinguishable from a hung agent: {rendered}"
+        );
+    }
+
+    /// The marker degrades through a ladder as the pane narrows — the full sentence, then just
+    /// the row count, then a bare glyph — and at every rung the pane's own title is still on
+    /// screen. A pane too narrow for both must shorten the title, never erase it: this is the
+    /// property `a_scrolled_pane_says_so_rather_than_looking_hung` cannot see on its own, because
+    /// it only ever renders at one width.
+    #[test]
+    fn the_scroll_marker_shortens_the_title_rather_than_erasing_it_at_every_width() {
+        let scrolled_dashboard_at = |width: u16| {
+            let mut dashboard = bound_dashboard();
+            dashboard.apply_event(attach_event("run_1", b""));
+            for line in 0..100 {
+                dashboard.apply_event(delta_event(
+                    "run_1",
+                    line + 2,
+                    format!("line {line}\r\n").as_bytes(),
+                ));
+            }
+            dashboard.scroll_pane("run_1", 12);
+            render_to_string(&mut dashboard, width, 24)
+        };
+
+        // Narrow: only a bare glyph fits beside the title, so that is all that is asked for.
+        let narrow = scrolled_dashboard_at(60);
+        assert!(
+            narrow.contains("editor"),
+            "a narrow pane must shorten its title for the marker, not erase it: {narrow}"
+        );
+        assert!(
+            narrow.contains('▲'),
+            "even the narrowest pane that can say anything must say it stopped following: {narrow}"
+        );
+        assert!(
+            !narrow.contains("rows"),
+            "a pane too narrow for the row count must not overwrite its own title to show it anyway: {narrow}"
+        );
+
+        // Mid: room for the row count, still not the whole sentence.
+        let mid = scrolled_dashboard_at(75);
+        assert!(
+            mid.contains("editor"),
+            "a mid-width pane must still show its own title: {mid}"
+        );
+        assert!(
+            mid.contains("rows"),
+            "a mid-width pane has room for more than the bare glyph: {mid}"
+        );
+        assert!(
+            !mid.contains("End to follow"),
+            "a mid-width pane must not claim room for the full sentence it does not have: {mid}"
+        );
+
+        // Wide: room for everything, so the pane gets everything.
+        let wide = scrolled_dashboard_at(110);
+        assert!(
+            wide.contains("editor"),
+            "a wide pane has no excuse to shorten the title at all: {wide}"
+        );
+        assert!(
+            wide.contains("End to follow"),
+            "a wide pane must show the full instruction once there is room for it: {wide}"
         );
     }
 

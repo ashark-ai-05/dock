@@ -1344,6 +1344,13 @@ mod tests {
         let mut ignore = std::mem::MaybeUninit::<nix::libc::sigaction>::zeroed();
         // SAFETY: both actions are fully written before use, and the previous action is captured
         // so `RestoredDisposition` can put this process back exactly as it was found.
+        // Whatever this process was holding before, which is not always SIG_DFL: run the suite
+        // from a background job — `cargo test &`, or several suites at once from a script — and
+        // the harness itself inherits the ignore this test exists to reproduce. Asserting a
+        // return to SIG_DFL therefore failed every time the tests were run the way the thing
+        // under test is run, which read as flakiness under parallelism and was nothing of the
+        // sort.
+        let before = signal_disposition(nix::libc::SIGINT);
         let restored = unsafe {
             (*ignore.as_mut_ptr()).sa_sigaction = nix::libc::SIG_IGN;
             nix::libc::sigemptyset(&raw mut (*ignore.as_mut_ptr()).sa_mask);
@@ -1359,7 +1366,11 @@ mod tests {
         assert_probe_reports_every_terminal_signal_defaulted(&runtime);
         let _ = runtime.stop();
         drop(restored);
-        assert_eq!(signal_disposition(nix::libc::SIGINT), "SIG_DFL");
+        assert_eq!(
+            signal_disposition(nix::libc::SIGINT),
+            before,
+            "the disposition must be put back as it was found, whatever that was"
+        );
     }
 
     #[test]

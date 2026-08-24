@@ -78,6 +78,20 @@ impl ScreenSync {
 /// an agent printed, and scrollback depth is not worth writing that to disk for.
 pub const PANE_HISTORY_BYTES: usize = 16 << 20;
 
+/// The most scrollback rows a client's replica is ever asked to retain.
+///
+/// A second budget is needed because the two sides pay in different currencies. The daemon
+/// keeps raw bytes, which are cheap; a replica keeps parsed cells, and `vt100` allocates a
+/// full row of them per scrollback row — `cols × 32` bytes, whatever the row actually
+/// contains. Deriving rows from the byte budget alone therefore prices history at roughly a
+/// thousandth of what it costs, and at 160 columns the 16 MiB budget would authorise about
+/// ten gigabytes of cells per pane.
+///
+/// This cap, not the byte budget, is what bounds a client's memory: a replica is fed the live
+/// delta stream indefinitely, not merely the bytes the daemon can re-serve. Fifty thousand
+/// rows is twenty-five times the old retention and further back than anyone scrolls.
+pub const PANE_HISTORY_MAX_ROWS: usize = 50_000;
+
 /// A bounded, in-memory record of the raw bytes a pane's child has written, addressed by a
 /// monotonic byte sequence.
 ///

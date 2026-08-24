@@ -59,6 +59,14 @@ fn wire_debug(tag: &str, length: usize, payload: &[u8]) {
     }
 }
 
+/// How many un-read replies may be outstanding before the next send stops to collect them.
+///
+/// Chosen well under what actually breaks rather than close to it: replies are around ninety
+/// bytes and the socket holds eight kilobytes, so trouble starts in the low hundreds. Thirty-two
+/// keeps the buffer under a tenth full, and means thirty-one keystrokes in thirty-two still cost
+/// nothing at all.
+const MAX_UNREAD_REPLIES: usize = 32;
+
 pub struct Client {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
@@ -90,6 +98,17 @@ impl Client {
     }
 
     pub fn request(&mut self, request: &Request) -> Result<Response, String> {
+        self.drain_replies()?;
+        self.write_request(request)?;
+        self.read_reply()
+    }
+
+    /// Reads every reply owed for a fire-and-forget send, so the socket does not fill with them.
+    ///
+    /// Not a round trip despite blocking: the daemon answers requests in the order they arrive, so
+    /// by the time this is called the replies it waits for have already been written and are
+    /// sitting in this end's buffer.
+    fn drain_replies(&mut self) -> Result<(), String> {
         while self.unread_replies > 0 {
             let reply = self.read_reply()?;
             self.unread_replies -= 1;
@@ -97,8 +116,7 @@ impl Client {
                 self.deferred_error = Some(message);
             }
         }
-        self.write_request(request)?;
-        self.read_reply()
+        Ok(())
     }
 
     /// Writes a request and returns immediately without reading its reply.
@@ -115,6 +133,15 @@ impl Client {
             matches!(request, Request::PaneInput(_) | Request::PaneResize(_)),
             "send() is only for requests the daemon acknowledges exactly once, not {request:?}"
         );
+        // Drained before the count can grow enough to close the connection. The replies nobody
+        // has read sit in a socket buffer that is eight kilobytes on macOS, and the daemon writes
+        // one per request; past roughly two hundred and forty of them its own write blocks, times
+        // out after five seconds and it hangs up. Typing a long prompt into a pane did exactly
+        // that, and the error then landed on the next innocent keystroke rather than on any of the
+        // ones that caused it.
+        if self.unread_replies >= MAX_UNREAD_REPLIES {
+            self.drain_replies()?;
+        }
         self.write_request(request)?;
         self.unread_replies += 1;
         Ok(())
@@ -290,6 +317,69 @@ impl EventStream {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_long_burst_of_pane_input_does_not_fill_the_socket_and_hang_up() {
+        // The bug this exists for: every keystroke was sent without reading its acknowledgement,
+        // the daemon writes one per request, and the socket holds eight kilobytes of them. Typing
+        // a couple of hundred characters into a pane without anything else needing a round trip
+        // filled it, the daemon's own write blocked, and five seconds later it closed the
+        // connection. The error then surfaced on whatever keystroke came next, which was never
+        // the one at fault.
+        let socket = socket_path("input-burst");
+        let listener = UnixListener::bind(&socket.0).expect("bind");
+        let daemon = std::thread::spawn(move || {
+            let (mut stream, mut reader) = accept_handshake(&listener);
+            write_line(
+                &mut stream,
+                &Response::Hello {
+                    version: PROTOCOL_VERSION,
+                },
+            );
+            // Answers every request and never reads ahead, exactly as the daemon does. The small
+            // buffer stands in for the real one so the test is quick rather than lucky.
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+            let mut answered = 0usize;
+            while answered < BURST {
+                let request = line(&mut reader);
+                if request.trim().is_empty() {
+                    break;
+                }
+                write_line(
+                    &mut stream,
+                    &Response::PaneInputAccepted {
+                        workspace_id: "w".into(),
+                        pane_id: "p".into(),
+                        bytes: 1,
+                    },
+                );
+                answered += 1;
+            }
+            answered
+        });
+
+        let mut client = Client::connect(&socket.0).expect("connect");
+        for index in 0..BURST {
+            client
+                .send(&Request::PaneInput(PaneInputRequest {
+                    workspace_id: "w".into(),
+                    pane_id: "p".into(),
+                    input: PaneInputRequest::encode(b"x"),
+                }))
+                .unwrap_or_else(|error| panic!("keystroke {index} was refused: {error}"));
+        }
+        // Never more than the cap is left outstanding, which is what keeps the buffer far from
+        // full however long somebody types.
+        assert!(
+            client.unread_replies <= MAX_UNREAD_REPLIES,
+            "{} replies left unread",
+            client.unread_replies
+        );
+        assert_eq!(daemon.join().expect("daemon thread"), BURST);
+    }
+
+    /// Comfortably past the couple of hundred that closed the connection before the drain existed.
+    const BURST: usize = 600;
+
     #[test]
     fn a_reply_cut_short_blames_the_daemon_rather_than_the_json() {
         // What a client saw when a daemon died mid-write: `to_writer` emitted the value in

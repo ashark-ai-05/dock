@@ -2173,6 +2173,35 @@ impl Dashboard {
                 // attempt at this truncated that hint to "Ctrl+B R resta ×". The bottom border is
                 // empty on every pane, so the controls cost nothing to put there.
                 let show_controls = focused && area.width >= controls_width + 4;
+                // A pane that has stopped following live output looks exactly like a pane whose
+                // agent has hung. It has to say which it is, and say how to undo it: someone who
+                // scrolled by accident with the wheel has no other way to find out. Kept as a
+                // second, right-aligned title on the same row rather than folded into the title
+                // string, so it never shortens the pane's own identity to make room for itself —
+                // any pane wide enough for both shows both, side by side on the one border row.
+                let scroll_marker = run_id
+                    .and_then(|id| self.screens.get(id))
+                    .map(PaneScreen::scroll_offset)
+                    .filter(|offset| *offset > 0)
+                    .and_then(|offset| {
+                        let note = format!("▲ {offset} rows · End to follow");
+                        let budget = usize::from(area.width).saturating_sub(2); // borders
+                        if budget == 0 {
+                            return None;
+                        }
+                        if note.chars().count() <= budget {
+                            return Some(note);
+                        }
+                        // "End to follow" is the one thing this marker exists to say, so on a
+                        // pane too narrow for the whole sentence it is the numeric detail in
+                        // front of it that gives way, not the instruction. `ellipsise` keeps
+                        // the head of a string and drops its tail, which is backwards for a
+                        // sentence whose tail is the part that must survive — so it runs on the
+                        // sentence reversed, and the answer is reversed back, to drop the head
+                        // behind an ellipsis instead.
+                        let reversed: String = note.chars().rev().collect();
+                        Some(ellipsise(&reversed, budget).chars().rev().collect())
+                    });
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(Theme::border_type())
@@ -2204,6 +2233,13 @@ impl Dashboard {
                     )
                 } else {
                     block
+                };
+                let block = match &scroll_marker {
+                    Some(note) => block.title_top(
+                        Line::styled(note.clone(), Style::default().fg(self.theme.muted))
+                            .right_aligned(),
+                    ),
+                    None => block,
                 };
                 let inner = block.inner(area);
                 self.queue_resize(&workspace.workspace_id, pane_id, run_id, inner);
@@ -2442,6 +2478,7 @@ impl Dashboard {
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
+            Line::from("PageUp/PageDown scroll history   End back to live output"),
             Line::styled("POINTER", heading),
             Line::from("Tab strip: click a tab to switch   ✎ rename   × close (twice)"),
             Line::from("+ at the end of the strip makes a workspace"),
@@ -2619,6 +2656,9 @@ impl Dashboard {
                 self.open_launch();
                 UiCommand::LoadCatalog
             }
+            PaneCommand::ScrollPageUp => self.scroll_page_back(),
+            PaneCommand::ScrollPageDown => self.scroll_page_forward(),
+            PaneCommand::ScrollToLive => self.scroll_to_live(),
             PaneCommand::CopyMode => self.enter_copy_mode(),
             // The daemon owns every run, so leaving the dashboard signals nothing and tears
             // nothing down. Detaching and quitting are therefore the same act here.
@@ -4005,6 +4045,48 @@ impl Dashboard {
         if let Some(screen) = self.screens.get_mut(run_id) {
             screen.scroll_by(delta);
         }
+    }
+
+    /// `Ctrl+B PageUp`: half a screen back into history, the keyboard's equivalent of a few
+    /// wheel notches. Also asks for more history exactly as the wheel does — without this the
+    /// keyboard would silently stop paging at the seed boundary the wheel keeps going past.
+    fn scroll_page_back(&mut self) -> UiCommand {
+        let Some(run_id) = self.focused_run_id().map(str::to_owned) else {
+            return UiCommand::None;
+        };
+        let Some((rows, _)) = self.screens.get(&run_id).map(PaneScreen::size) else {
+            return UiCommand::None;
+        };
+        self.scroll_pane(&run_id, i32::from(rows) / 2);
+        match self.history_request_for(&run_id) {
+            Some(request) => UiCommand::Request(Box::new(request)),
+            None => UiCommand::None,
+        }
+    }
+
+    /// `Ctrl+B PageDown`: half a screen forward, toward live output. Never asks for more
+    /// history: paging forward only ever moves toward rows the pane already holds.
+    fn scroll_page_forward(&mut self) -> UiCommand {
+        let Some(run_id) = self.focused_run_id().map(str::to_owned) else {
+            return UiCommand::None;
+        };
+        let Some((rows, _)) = self.screens.get(&run_id).map(PaneScreen::size) else {
+            return UiCommand::None;
+        };
+        self.scroll_pane(&run_id, -(i32::from(rows) / 2));
+        UiCommand::None
+    }
+
+    /// `Ctrl+B End`: back to following live output, from wherever the pane was scrolled to.
+    fn scroll_to_live(&mut self) -> UiCommand {
+        let Some(run_id) = self.focused_run_id().map(str::to_owned) else {
+            return UiCommand::None;
+        };
+        let Some(offset) = self.screens.get(&run_id).map(PaneScreen::scroll_offset) else {
+            return UiCommand::None;
+        };
+        self.scroll_pane(&run_id, -(i32::try_from(offset).unwrap_or(i32::MAX)));
+        UiCommand::None
     }
 
     /// Extends a pointer selection, entering copy mode on the first drag of the gesture.
@@ -6494,6 +6576,7 @@ mod tests {
             "l launch",
             "q quit",
             "runs keep running",
+            "PageUp/PageDown scroll history",
         ] {
             assert!(text.contains(key), "missing published mnemonic: {key}");
         }
@@ -9839,6 +9922,72 @@ mod tests {
             command,
             UiCommand::None,
             "hundreds of rows above the viewport are already held locally"
+        );
+    }
+
+    #[test]
+    fn the_prefix_and_page_keys_scroll_the_focused_pane() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        for line in 0..100 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(
+            dashboard.screens["run_1"].scroll_offset() > 0,
+            "Ctrl+B PageUp must scroll the focused pane back"
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(
+            dashboard.screens["run_1"].scroll_offset(),
+            0,
+            "Ctrl+B End must return the pane to following live output"
+        );
+    }
+
+    #[test]
+    fn a_scrolled_pane_says_so_rather_than_looking_hung() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        for line in 0..100 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        dashboard.scroll_pane("run_1", 12);
+        let rendered = render_to_string(&mut dashboard, 80, 24);
+        assert!(
+            rendered.contains("End to follow"),
+            "a pane that stopped following live output is indistinguishable from a hung agent: {rendered}"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_page_down_scrolls_the_focused_pane_forward_toward_live_output() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        for line in 0..100 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        dashboard.scroll_pane("run_1", 40);
+        let before = dashboard.screens["run_1"].scroll_offset();
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(
+            dashboard.screens["run_1"].scroll_offset() < before,
+            "Ctrl+B PageDown must scroll the focused pane forward, toward live output"
         );
     }
 

@@ -5848,31 +5848,35 @@ fn ellipsise(value: &str, width: usize) -> String {
         .collect()
 }
 
-/// Picks the richest form of the "stopped following" marker that still leaves room for some of
-/// the pane's own title, and returns the title shortened to whatever is left.
+/// Picks the richest form of the "stopped following" marker that fits, and returns the title
+/// shortened to make room for it.
 ///
 /// The marker and the title are painted as two independent titles on the same border row (see
 /// the call site), and neither one knows the other is there — so without a shared reservation,
-/// whichever is drawn last simply paints over the other. This is the reservation: it tries the
-/// marker's forms from richest to sparsest, and takes the first one that still leaves
-/// `MIN_TITLE_WIDTH` columns of the title standing.
+/// whichever is drawn last simply paints over the other. For the two explanatory rungs — the
+/// full sentence and the row count alone — this is the reservation: try each from richest to
+/// sparsest, and take the first that still leaves `MIN_TITLE_WIDTH` columns of the title
+/// standing, so a pane wide enough to explain itself always keeps a recognisable title beside
+/// the explanation.
 ///
-/// The bare glyph is never dropped for want of room to explain itself: a pane that has silently
-/// stopped following its own output is the exact failure this marker exists to catch, and
-/// hiding it on the narrowest panes reintroduces that failure exactly where panes are most
-/// cramped. What gives way instead is the title, shortened rather than erased — and if even the
-/// bare glyph would leave nothing of the title standing, there is no marker at all rather than a
-/// title reduced to nothing.
+/// The bare glyph is a different, unconditional floor: a pane that has silently stopped
+/// following its own output is the exact failure this marker exists to catch, and a divider can
+/// be dragged to widths well under `MIN_TITLE_WIDTH` routinely — a pane that narrow already has
+/// no readable title of its own to protect. So the glyph rung asks only that the glyph and its
+/// one-column separator fit inside the border; the title gets whatever is left, down to nothing.
+/// Only below that — not even two columns for the glyph itself — is there no marker at all, and
+/// the title is left exactly as it was.
 fn fit_scroll_marker(title: &str, budget: usize, offset: usize) -> (String, Option<String>) {
     /// However short a pane's own name gets, this many columns of it must stay recognisable —
     /// enough for the state glyph, the opening space, and the whole of a short label like
-    /// "editor" or "agent".
+    /// "editor" or "agent". Guards only the two explanatory rungs: the bare glyph is the floor
+    /// the marker itself is never dropped below, so it does not compete with the title for
+    /// this room at all — see the bare-glyph arm below.
     const MIN_TITLE_WIDTH: usize = 8;
     const SEPARATOR: usize = 1;
     for candidate in [
         format!("▲ {offset} rows · End to follow"),
         format!("▲ {offset} rows"),
-        "▲".to_owned(),
     ] {
         let marker_width = candidate.chars().count();
         if budget >= marker_width + SEPARATOR + MIN_TITLE_WIDTH {
@@ -5881,6 +5885,22 @@ fn fit_scroll_marker(title: &str, budget: usize, offset: usize) -> (String, Opti
                 Some(candidate),
             );
         }
+    }
+    // The bare glyph is the floor this function never drops below for want of room to explain
+    // itself: a pane that has silently stopped following its own output is the exact failure
+    // this marker exists to catch, and on the narrowest panes — the ones a divider drag reaches
+    // routinely, well below `MIN_TITLE_WIDTH` — the title is already unreadable on its own. So
+    // this rung asks only that the glyph and its separator fit inside the border, and the title
+    // takes whatever is left, even if that is nothing.
+    // "▲" is one `char` (a single Unicode scalar value), so this is a literal rather than
+    // `"▲".chars().count()`: the latter is not a `const fn` on stable, and the former is
+    // exactly as informative for exactly one character of literal text.
+    const BARE_MARKER_WIDTH: usize = 1;
+    if budget >= BARE_MARKER_WIDTH + SEPARATOR {
+        return (
+            ellipsise(title, budget - BARE_MARKER_WIDTH - SEPARATOR),
+            Some("▲".to_owned()),
+        );
     }
     (title.to_owned(), None)
 }
@@ -10003,6 +10023,93 @@ mod tests {
     /// screen. A pane too narrow for both must shorten the title, never erase it: this is the
     /// property `a_scrolled_pane_says_so_rather_than_looking_hung` cannot see on its own, because
     /// it only ever renders at one width.
+    /// `MIN_TITLE_WIDTH` protects the two explanatory rungs, but the bare glyph is the floor
+    /// the marker itself must never be dropped below — and a divider dragged all the way to one
+    /// side reaches pane widths well under that floor routinely, not hypothetically. This drives
+    /// the real mouse-drag path, the same one `resize_to_narrow_during_drag_clears_stale_divider_safely`
+    /// uses, so the pane width is whatever `drag_ratio`'s own `MIN_PANE_WIDTH` clamp produces
+    /// rather than a width chosen by the test.
+    #[test]
+    fn the_bare_glyph_marker_survives_a_divider_dragged_to_the_minimum_pane_width() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        for line in 0..100 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        dashboard.scroll_pane("run_1", 12);
+        // Wide, so the divider has somewhere to go — a narrow terminal would clamp the drag
+        // before it ever reached `MIN_PANE_WIDTH`.
+        render_to_string(&mut dashboard, 200, 24);
+        let divider = dashboard.dividers[0].area;
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: divider.x,
+            row: divider.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        // All the way to column 0: `drag_ratio` clamps this to `MIN_PANE_WIDTH`, exactly what a
+        // user dragging a divider as far as it will go produces.
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 0,
+            row: divider.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let rendered = render_to_string(&mut dashboard, 200, 24);
+        let area = dashboard.pane_areas["a"];
+        assert!(
+            area.width <= MIN_PANE_WIDTH + 2,
+            "a divider dragged fully to one side should land at or near MIN_PANE_WIDTH: {area:?}"
+        );
+        assert!(
+            rendered.contains('▲'),
+            "the bare glyph must survive a pane dragged down to its minimum width, not just the \
+             wider panes a terminal-size sweep happens to hit: {rendered}"
+        );
+    }
+
+    /// The exact widths the review reproduced the defect at (6, 8, 10, 12 columns — all well
+    /// under `MIN_PANE_WIDTH`'s neighbourhood and all reachable by setting the split ratio
+    /// directly on a wide terminal, the same state a divider drag produces). At every one of
+    /// them the bare glyph must survive; below the two-column floor there is nowhere left to
+    /// put it and no marker is asserted.
+    #[test]
+    fn the_bare_glyph_marker_is_present_at_widths_where_it_previously_vanished() {
+        for width in [4u16, 6, 8, 10, 12] {
+            let mut dashboard = bound_dashboard();
+            dashboard.apply_event(attach_event("run_1", b""));
+            for line in 0..100 {
+                dashboard.apply_event(delta_event(
+                    "run_1",
+                    line + 2,
+                    format!("line {line}\r\n").as_bytes(),
+                ));
+            }
+            dashboard.scroll_pane("run_1", 12);
+            render_to_string(&mut dashboard, 300, 24);
+            // A wide terminal so any ratio_milli from 0..=1000 can place pane "a" at any width
+            // from 0 up to most of the terminal; searching it lands exactly on `width` rather
+            // than approximating it with a hand-picked ratio that would go stale if the layout
+            // arithmetic ever changed.
+            let landed = (0u16..=1000).any(|ratio| {
+                set_parent_ratio(&mut dashboard.layout.workspaces[0].root, "b", ratio);
+                render_to_string(&mut dashboard, 300, 24);
+                dashboard.pane_areas["a"].width == width
+            });
+            assert!(landed, "no split ratio placed pane \"a\" at width {width}");
+            let rendered = render_to_string(&mut dashboard, 300, 24);
+            assert!(
+                rendered.contains('▲'),
+                "pane width {width} (reachable by dragging a divider) lost the bare glyph \
+                 entirely instead of shortening the title for it: {rendered}"
+            );
+        }
+    }
+
     #[test]
     fn the_scroll_marker_shortens_the_title_rather_than_erasing_it_at_every_width() {
         let scrolled_dashboard_at = |width: u16| {

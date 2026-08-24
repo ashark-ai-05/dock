@@ -206,9 +206,14 @@ second scroll cannot arrive while a history request is outstanding. A failed req
 (`grid.rs:198`), adding rows above leaves the same offset pointing at the same content. Nothing needs to be
 recomputed; the property needs a test so a later change cannot quietly break it.
 
-**Drift while scrolled is a real bug, and it must be fixed here or deep scrolling is pointless.** Nothing
-adjusts `scrollback_offset` when rows are appended, so today a scrolled-up view slides downward under
-incoming output. In a 2000-row pane that is a nuisance; in a 200k-row pane it makes scrolling unusable.
+**Drift while scrolled would make deep scrolling pointless — and vt100 already prevents it.** This section
+originally asserted that nothing adjusts `scrollback_offset` when rows are appended, and specified a fix.
+That was wrong: `Grid::scroll_up` bumps the offset for every row it pushes into scrollback while the view is
+scrolled (`grid.rs:571-574`), so a scrolled pane stays pinned on its own. Adding a second increment on top of
+vt100's would have un-pinned the content the fix was meant to hold — measured landing at offset 30 where 20
+was correct. **Corrected 2026-08-25**; what ships instead is a characterisation test pinning vt100's
+behaviour, because `terminal/mod.rs:14` names `PaneScreen` a swap point for the terminal engine and a
+replacement lacking this would break every scrolled pane with no other alarm.
 
 The row count is readable through the public API, since `set_scrollback` clamps to the actual length. This
 becomes a method on `VtTerminal` (`terminal/vt.rs`), beside the existing `scroll_by` and `scroll_offset`, so
@@ -224,8 +229,9 @@ fn history_rows(screen: &mut Screen) -> usize {
 }
 ```
 
-Sample either side of a delta; when the pane is scrolled, add the difference to the offset. O(1), no clone,
-and it pins the content the user is reading while output keeps arriving beneath it.
+`history_rows` survives the withdrawn compensation because §4's paging needs it for a different question:
+whether the replica is already holding as many rows as it is allowed to, which is the local stopping
+condition that keeps a client from asking for history it could never display. O(1), and no clone.
 
 **This is why scrolling does not freeze the pane.** Copy mode freezes by cloning the grid and the scrollback
 (`vt.rs:206`, *"costs a full copy of the grid **and** the scrollback"*). Correct at 2000 rows, unaffordable
@@ -272,8 +278,8 @@ would paint a full-screen program over a user's history, and it is the one the o
 `protocol.rs:769` updated.
 
 **Client** — paging fires at the top and exactly once while pending; `complete` stops it; an `epoch` mismatch
-discards the response; the scroll offset is preserved across a rebuild; drift compensation pins content while
-deltas arrive.
+discards the response; the scroll offset is preserved across a rebuild; and a characterisation test pins
+vt100's own offset compensation, which is what keeps content still while deltas arrive.
 
 **Tabs** — the active tab is fully visible including affordances at every scroll position; markers appear and
 disappear with hidden tabs; marker clicks and wheel scroll the strip; a single tab still renders with no
@@ -297,8 +303,9 @@ Each step ends green and shippable.
    Wire only; no client behaviour yet.
 4. **Client paging** — the client-side byte log, page-back on scroll, epoch and `complete` handling, offset
    preservation. **History from before attach becomes reachable here.**
-5. **Drift compensation** — `history_rows` sampling and offset adjustment. Independent of 1–4 and could ship
-   first; it is placed last because its value is only visible once there is depth to scroll through.
+5. **Drift guard** — a characterisation test pinning vt100's own offset compensation. Originally specified as
+   a compensation Dock would implement; the investigation found vt100 already does it and that a second
+   increment would un-pin the content, so what remains is the test and no production change.
 6. **Tab strip** — entirely independent of 1–5, and safe to build in parallel or first if the pane work
    stalls.
 

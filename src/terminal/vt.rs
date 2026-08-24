@@ -45,6 +45,7 @@ fn parse_cwd(url: &str) -> Option<String> {
 pub struct VtTerminal {
     parser: vt100::Parser<TerminalHooks>,
     signals: Arc<Mutex<ShellSignals>>,
+    history_capacity: usize,
 }
 
 impl VtTerminal {
@@ -54,6 +55,7 @@ impl VtTerminal {
         Self {
             parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback_rows, hooks),
             signals,
+            history_capacity: scrollback_rows,
         }
     }
 
@@ -186,6 +188,27 @@ impl VtTerminal {
 
     pub fn scroll_offset(&self) -> usize {
         self.parser.screen().scrollback()
+    }
+
+    /// How many rows of history this terminal actually holds, as opposed to how many it is
+    /// allowed to.
+    ///
+    /// `vt100` exposes no getter for it, but `set_scrollback` clamps to the real length
+    /// (`grid.rs:198`), so setting it past the end and reading it back reports that length.
+    /// The offset found on entry is restored, which is why this takes `&mut self` for what
+    /// reads like a getter.
+    pub fn history_rows(&mut self) -> usize {
+        let saved = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let rows = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(saved);
+        rows
+    }
+
+    /// Rows of history this terminal may retain, fixed when it was built. Recorded here
+    /// because `vt100` keeps the configured capacity to itself.
+    pub fn history_capacity(&self) -> usize {
+        self.history_capacity
     }
 
     pub fn scroll_to_live(&mut self) {
@@ -532,5 +555,44 @@ mod tests {
         assert_eq!(forward, reversed);
         assert!(forward.contains("line 7"));
         assert!(forward.contains("line 9"));
+    }
+
+    #[test]
+    fn a_terminal_reports_how_many_rows_of_history_it_actually_holds() {
+        let mut term = VtTerminal::new(2, 20, 100);
+        assert_eq!(term.history_rows(), 0);
+        for line in 0..10 {
+            term.feed(format!("line {line}\r\n").as_bytes());
+        }
+        assert!(
+            term.history_rows() >= 8,
+            "ten lines through a two-row screen"
+        );
+    }
+
+    #[test]
+    fn reading_the_history_row_count_leaves_the_viewport_where_it_found_it() {
+        let mut term = VtTerminal::new(2, 20, 100);
+        for line in 0..10 {
+            term.feed(format!("line {line}\r\n").as_bytes());
+        }
+        term.scroll_by(3);
+        assert_eq!(term.scroll_offset(), 3);
+        let _ = term.history_rows();
+        assert_eq!(
+            term.scroll_offset(),
+            3,
+            "the clamp trick moves the offset to read it and must put it back"
+        );
+    }
+
+    #[test]
+    fn a_terminal_reports_the_history_capacity_it_was_built_with() {
+        let term = VtTerminal::new(2, 20, 100);
+        assert_eq!(
+            term.history_capacity(),
+            100,
+            "vt100 does not expose this either"
+        );
     }
 }

@@ -21,7 +21,7 @@ use nix::{
 use crate::{
     adapter::{AdapterCapabilities, AdapterId, ProcessCapabilities, ResolvedAdapter},
     protocol::{BindingKind, ProcessState, ProviderState, RuntimeSnapshot},
-    terminal::{PANE_OUTPUT_LOG_BYTES, PaneOutput, PaneScreen},
+    terminal::{PANE_HISTORY_BYTES, PaneOutput, PaneScreen},
 };
 
 #[derive(Debug, Clone)]
@@ -145,7 +145,7 @@ impl OwnedRuntime {
             size.rows,
             size.cols,
             scrollback_rows,
-            PANE_OUTPUT_LOG_BYTES,
+            PANE_HISTORY_BYTES,
         )));
         let dock_variables = dock_environment(&binding);
         match launch_child(
@@ -1888,7 +1888,7 @@ mod tests {
             FIXTURE_SIZE.rows,
             FIXTURE_SIZE.cols,
             128,
-            PANE_OUTPUT_LOG_BYTES,
+            PANE_HISTORY_BYTES,
         )));
         let unrelated = Mutex::new(None);
         let (mut guardian, pid, control, _pty_input, _pty_control) =

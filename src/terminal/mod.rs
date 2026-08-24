@@ -56,13 +56,20 @@ impl ScreenSync {
     }
 }
 
-/// How many bytes of raw child output each pane retains for subscribers that have not read
-/// them yet. It bounds only the *undelivered* window, not history: the scrollback the user
-/// scrolls through lives in each side's parser, not here. A megabyte is far more than the
-/// 16 ms between stream polls can produce for any interactive program, so overrunning it
-/// means a subscriber has genuinely stalled — which `OutputLog::since` reports rather than
-/// papering over.
-pub const PANE_OUTPUT_LOG_BYTES: usize = 1 << 20;
+/// How many bytes of raw child output each pane retains, and therefore how far back a person
+/// can scroll.
+///
+/// This bounds two things that used to be one small thing. It is still the *undelivered*
+/// window — a subscriber that has fallen further behind than this must re-seed, which
+/// `OutputLog::since` reports rather than papering over — and it is now also the pane's
+/// history: the seed a client is given is a replay of this log, so what is retained here is
+/// what anyone can scroll back to. One number for both is right because a subscriber more
+/// than 16 MB behind has genuinely stalled, and 16 MB of raw output is hundreds of thousands
+/// of lines.
+///
+/// It is deliberately in-memory only. A pane's output is every token, secret, and file body
+/// an agent printed, and scrollback depth is not worth writing that to disk for.
+pub const PANE_HISTORY_BYTES: usize = 16 << 20;
 
 /// A bounded, in-memory record of the raw bytes a pane's child has written, addressed by a
 /// monotonic byte sequence.
@@ -148,6 +155,73 @@ impl OutputLog {
             pending.extend_from_slice(&chunk[offset.min(chunk.len())..]);
         }
         Some(pending)
+    }
+
+    /// The newest `max` bytes or fewer, and the sequence they begin at.
+    ///
+    /// Whole writes, oldest-first, so a replay begins where the child began one — the closest
+    /// thing to a safe parser entry point this log has. It is not a guarantee: a write
+    /// boundary is not an escape-sequence boundary, so the oldest row of a replayed tail may
+    /// carry one malformed glyph. The visible screen is repaired by `ScreenSync` regardless,
+    /// which is what makes replaying an arbitrary tail safe at all.
+    ///
+    /// The newest write is always included even when it alone exceeds `max`, for the same
+    /// reason `append` never drops it: a caller given nothing cannot make progress.
+    pub fn tail(&self, max: usize) -> (u64, Vec<u8>) {
+        let mut first = self.chunks.len();
+        let mut bytes = 0;
+        for (index, (_, chunk)) in self.chunks.iter().enumerate().rev() {
+            if bytes + chunk.len() > max && bytes > 0 {
+                break;
+            }
+            bytes += chunk.len();
+            first = index;
+        }
+        let from = self.chunks.get(first).map_or(self.end, |(start, _)| *start);
+        let mut out = Vec::with_capacity(bytes);
+        for (_, chunk) in self.chunks.iter().skip(first) {
+            out.extend_from_slice(chunk);
+        }
+        (from, out)
+    }
+
+    /// The `max` bytes immediately preceding `before`, for a reader extending its history
+    /// backwards.
+    ///
+    /// Where [`since`](Self::since) refuses with `None`, this clamps. That difference is the
+    /// point: `since` serves the delta path, where skipping bytes renders as corruption with
+    /// nothing to attribute it to, and this serves the history path, where "that is all I
+    /// still have" is a true and useful answer.
+    ///
+    /// A `before` that falls inside a write is truncated to it rather than skipping that
+    /// write, so the answer always abuts the caller's cursor exactly. Returns the sequence the
+    /// answer begins at, and whether it reached the oldest byte still retained — once that is
+    /// true there is nothing older to ask for.
+    pub fn before(&self, before: u64, max: usize) -> (u64, Vec<u8>, bool) {
+        let mut pieces: Vec<(u64, &[u8])> = Vec::new();
+        let mut bytes = 0;
+        for (start, chunk) in self.chunks.iter().rev() {
+            if *start >= before {
+                continue;
+            }
+            let usable = usize::try_from(before - start)
+                .unwrap_or(chunk.len())
+                .min(chunk.len());
+            if usable == 0 {
+                continue;
+            }
+            if bytes + usable > max && !pieces.is_empty() {
+                break;
+            }
+            bytes += usable;
+            pieces.push((*start, &chunk[..usable]));
+        }
+        let from = pieces.last().map_or(before, |(start, _)| *start);
+        let mut out = Vec::with_capacity(bytes);
+        for (_, piece) in pieces.iter().rev() {
+            out.extend_from_slice(piece);
+        }
+        (from, out, from <= self.start())
     }
 }
 
@@ -257,5 +331,74 @@ mod tests {
             Some(b"hello\r\n".as_slice())
         );
         assert!(output.screen().text_tail(1).contains("hello"));
+    }
+
+    #[test]
+    fn a_tail_returns_the_newest_bytes_and_the_sequence_they_begin_at() {
+        let mut log = OutputLog::new(1024);
+        log.append(b"oldest");
+        log.append(b"middle");
+        log.append(b"newest");
+        let (from, bytes) = log.tail(12);
+        assert_eq!(bytes, b"middlenewest");
+        assert_eq!(from, 6);
+    }
+
+    #[test]
+    fn a_tail_keeps_the_newest_write_even_when_it_alone_exceeds_the_budget() {
+        let mut log = OutputLog::new(1024);
+        log.append(b"old");
+        log.append(b"a_single_enormous_write");
+        let (from, bytes) = log.tail(4);
+        assert_eq!(bytes, b"a_single_enormous_write");
+        assert_eq!(from, 3);
+    }
+
+    #[test]
+    fn a_tail_of_an_empty_log_begins_at_the_end_and_carries_nothing() {
+        let log = OutputLog::new(1024);
+        assert_eq!(log.tail(64), (0, Vec::new()));
+    }
+
+    #[test]
+    fn history_before_a_cursor_extends_backwards_without_a_gap() {
+        let mut log = OutputLog::new(1024);
+        log.append(b"aaaa");
+        log.append(b"bbbb");
+        log.append(b"cccc");
+        // The client holds everything from sequence 8; ask for what precedes it.
+        let (from, bytes, complete) = log.before(8, 4);
+        assert_eq!(bytes, b"bbbb");
+        assert_eq!(from, 4);
+        assert!(!complete, "sequence 0 is still retained and unasked for");
+        let (from, bytes, complete) = log.before(from, 4);
+        assert_eq!(bytes, b"aaaa");
+        assert_eq!(from, 0);
+        assert!(complete, "nothing older is retained");
+    }
+
+    #[test]
+    fn history_before_a_cursor_inside_a_write_stops_exactly_at_the_cursor() {
+        let mut log = OutputLog::new(1024);
+        log.append(b"abcdefgh");
+        // A cursor that is not a write boundary must not pull in bytes the caller already has,
+        // and must not leave a gap between what it returns and where the caller starts.
+        let (from, bytes, complete) = log.before(5, 64);
+        assert_eq!(bytes, b"abcde");
+        assert_eq!(from, 0);
+        assert!(complete);
+    }
+
+    #[test]
+    fn history_before_the_oldest_retained_byte_is_empty_and_complete() {
+        let mut log = OutputLog::new(8);
+        log.append(b"aaaa");
+        log.append(b"bbbb");
+        log.append(b"cccc");
+        let (_, dropped, _) = log.before(4, 64);
+        assert!(
+            dropped.is_empty(),
+            "the first write was evicted at capacity"
+        );
     }
 }

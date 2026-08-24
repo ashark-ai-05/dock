@@ -129,8 +129,9 @@ pub struct Dashboard {
     /// authoritative screen; this is the local replica the dashboard actually paints from.
     pub screens: HashMap<String, PaneScreen>,
     /// Each replica's own byte log, where it starts, and whether anything older is still to
-    /// be had. Bounded by `PANE_HISTORY_BYTES`, so a pane that runs for a week costs the same
-    /// as one that just started.
+    /// be had. Bounded by `PANE_HISTORY_BYTES + PANE_HISTORY_TRIM_SLACK` (the trim only fires
+    /// once the log has passed the slack, see `retain_history_bytes`), so a pane that runs for
+    /// a week costs the same as one that just started.
     history: HashMap<String, PaneHistoryCursor>,
     /// Latest agent identity and state per run, as pushed by the daemon.
     pub agents: HashMap<String, (Option<AgentKind>, AgentState)>,
@@ -9287,6 +9288,52 @@ mod tests {
         // The re-seed adopted the daemon's revision, which never restarts across a re-seed, so
         // the deltas above were contiguous rather than read as a gap and dropped.
         assert_eq!(dashboard.revisions.get("run_1"), Some(&8));
+    }
+
+    /// Not a regression test: this is a characterisation guard on `vt100` itself.
+    ///
+    /// A scrolled viewport is an offset counted from the *bottom* of history, so appending
+    /// rows underneath it should, in principle, need something to keep it pointed at the same
+    /// content. Investigating this exact failure mode turned up that `vt100` already does that
+    /// internally — `Grid::scroll_up` (`grid.rs:571-574` in `vt100` 0.16.2) advances
+    /// `scrollback_offset` by one for every row it pushes into scrollback while the offset is
+    /// non-zero — so no compensation code was added here; adding the naive fix on top of it
+    /// was tried and confirmed to double-count that same growth and slide the viewport the
+    /// *other* way (see `task-6-report.md` for the probe).
+    ///
+    /// `src/terminal/mod.rs:14` names `PaneScreen` as a swap point for the terminal engine
+    /// and calls out `rio-vt` as a candidate replacement. Nothing else in this codebase
+    /// pins the behaviour this test pins: swap the engine for one that does not self-adjust
+    /// the scroll offset on append, and every scrolled pane would silently slide under live
+    /// output again, with no other test positioned to catch it. Keep this test red-line: if
+    /// it ever starts failing, the replacement engine needs its own compensation added to the
+    /// `PaneDelta` arm of `Dashboard::apply_event`, which is exactly the fix this task
+    /// originally set out to write.
+    #[test]
+    fn output_arriving_under_a_scrolled_pane_does_not_slide_it_downwards() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        for line in 0..50 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        dashboard.scroll_pane("run_1", 10);
+        let pinned = dashboard.screens["run_1"].screen().contents();
+        for line in 50..60 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        assert_eq!(
+            dashboard.screens["run_1"].screen().contents(),
+            pinned,
+            "a person reading scrollback must not have it pulled out from under them"
+        );
     }
 
     #[test]

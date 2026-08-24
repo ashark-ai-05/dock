@@ -153,14 +153,21 @@ pub struct Dashboard {
     /// The daemon-wide kill switch, as the daemon last reported it. Independent of every pane's
     /// own arming, so the lane must be able to say "armed, and paused anyway".
     queues_paused: bool,
-    /// The runs-lane row a board pane's keys act on, named by the pane it points at rather than
-    /// by its position in the lane.
+    /// The board's one cursor: which column, and what in it.
     ///
-    /// An index would be the smaller field and the wrong one: the lane sorts blocked agents to
-    /// the top, so an agent two rows down going `Blocked` silently slides a different pane under
-    /// the cursor — and the key on this cursor is the one that lets Dock type into an agent
-    /// unattended. Naming the pane means a reordered lane moves the highlight, never the target.
-    board_lane_selection: Option<(String, String)>,
+    /// One grid means one cursor. There used to be two — a lane cursor keyed by pane and the
+    /// view's own column/row — and deleting the lane without merging them would have left `a`
+    /// and `>` pointing at different things on the same screen.
+    ///
+    /// The target is named rather than numbered for the reason the lane's cursor was: `ACTIVE`
+    /// sorts blocked agents to the top, so an agent going `Blocked` two rows down would slide a
+    /// different pane under an index — and this is the cursor that arms an agent. `None` means
+    /// the cursor has not been moved yet and the view's own opening position stands.
+    ///
+    /// The inner `Option` is a column with nothing in it, which is a place the cursor is allowed
+    /// to be: a board whose todo column is empty must still be walkable across, and refusing to
+    /// enter one would make `l` skip a column silently.
+    board_cursor: Option<(usize, Option<BoardTarget>)>,
     #[cfg(test)]
     /// Stands in for what is installed on this machine. Tests must not ask the machine, or they
     /// assert something about the laptop they ran on rather than about Dock.
@@ -236,14 +243,14 @@ pub enum RenameTarget {
     Workspace,
 }
 
-/// A row in the runs lane: one live agent pane, as it is right now.
+/// One live agent pane, as it is right now.
 ///
 /// Assembled per frame from the run list and the agent roster, and stored nowhere — because a
-/// run that ends must leave the lane the moment its run does, and anything cached would keep a
+/// run that ends must leave the board the moment its run does, and anything cached would keep a
 /// finished agent on screen until something thought to evict it. Borrowed from the dashboard's
 /// own state rather than owned, because this is built on a path that runs at 60fps.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunLaneRow<'a> {
+pub struct LiveRun<'a> {
     pub run_id: &'a str,
     pub workspace_id: &'a str,
     pub pane_id: &'a str,
@@ -260,6 +267,138 @@ pub struct RunLaneRow<'a> {
     /// Why auto-feed last declined to fire, in the daemon's own words. Borrowed, because it is
     /// the daemon's sentence and rewording it here would give a stalled queue two explanations.
     pub holding_because: Option<&'a str>,
+}
+
+/// The status whose column is drawn as `ACTIVE`.
+///
+/// The constant, the file on disk and every `status:` line stay `in-progress`; only the heading
+/// changes, because the column now holds live agents that have no card as well as the cards that
+/// are in progress, and "in progress" is not what a hand-launched agent is.
+const ACTIVE_STATUS: &str = "in-progress";
+
+/// What the board's cursor is on: named, never numbered.
+///
+/// `ACTIVE` re-sorts itself as its agents change state, and the key on this cursor is the one
+/// that lets Dock type into an agent unattended — so an index would silently point at a different
+/// pane the moment an agent went `Blocked`. This is the rule the old runs lane's cursor was built
+/// for, applied to the whole grid rather than to one strip of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoardTarget {
+    Card(u64),
+    /// A live agent with no card in `ACTIVE`, named by the pane it is in — the pane is what
+    /// arming names, and it outlives the run that is in it.
+    Pane(String, String),
+}
+
+/// One entry in the `ACTIVE` column.
+///
+/// Two shapes rather than one, because the column genuinely holds two kinds of thing: work the
+/// board knows about, and work only the daemon knows about. Neither is ever written back — see
+/// [`active_entries`].
+#[derive(Debug, Clone, Copy)]
+enum ActiveEntry<'a> {
+    /// A card whose status is `in-progress`, joined to the run it was dispatched to if that run
+    /// is still there. `None` is the card whose agent has gone, which is the card most worth
+    /// showing and the one a hiding rule would hide.
+    Card(&'a BoardTask, Option<&'a LiveRun<'a>>),
+    /// A live agent with no card in this column: launched by hand, or bound to a card that is
+    /// somewhere else on the board.
+    Loose(&'a LiveRun<'a>),
+}
+
+impl<'a> ActiveEntry<'a> {
+    fn run(self) -> Option<&'a LiveRun<'a>> {
+        match self {
+            Self::Card(_, run) => run,
+            Self::Loose(run) => Some(run),
+        }
+    }
+
+    fn target(self) -> BoardTarget {
+        match self {
+            Self::Card(task, _) => BoardTarget::Card(task.id),
+            Self::Loose(run) => {
+                BoardTarget::Pane(run.workspace_id.to_owned(), run.pane_id.to_owned())
+            }
+        }
+    }
+
+    /// Attention first, matching `attention_rank` — then the agent's name and its id, so two
+    /// equally urgent entries do not swap places between frames. A card with no live run sorts
+    /// last: there is nothing happening on it to look at.
+    fn rank(self) -> (u8, &'a str, u64, &'a str) {
+        match self.run() {
+            Some(run) => (
+                run.state.attention_rank(),
+                run.agent.label(),
+                run.task_id.unwrap_or(u64::MAX),
+                run.pane_id,
+            ),
+            None => (u8::MAX, "", self.target_id(), ""),
+        }
+    }
+
+    fn target_id(self) -> u64 {
+        match self {
+            Self::Card(task, _) => task.id,
+            Self::Loose(_) => u64::MAX,
+        }
+    }
+}
+
+/// The live half of the board, joined to the cards once per frame.
+///
+/// The join is by `external_task_ref`, which is the daemon's own record of which card a run was
+/// dispatched onto — the same join the runs lane did, kept because it is the only thing that can
+/// say a card and an agent are the same work.
+struct BoardLive<'a> {
+    runs: &'a [LiveRun<'a>],
+    /// The run on each card, for the badge every column draws and the entry `ACTIVE` draws.
+    /// A map rather than a scan per card: a busy canvas has dozens of agents and a board has
+    /// hundreds of cards, and this is a path that repaints at 60fps.
+    by_task: HashMap<u64, &'a LiveRun<'a>>,
+}
+
+impl<'a> BoardLive<'a> {
+    fn new(runs: &'a [LiveRun<'a>]) -> Self {
+        Self {
+            runs,
+            by_task: runs
+                .iter()
+                .filter_map(|run| Some((run.task_id?, run)))
+                .collect(),
+        }
+    }
+}
+
+/// The `ACTIVE` column: the cards that are in progress, and every live agent that is not on one.
+///
+/// Derived on every frame and written nowhere. That is the rule this whole column rests on: the
+/// status detector calls a 1.8-second pause "finished", and a derived column that gets an agent
+/// wrong shows one wrong card for one frame and then corrects itself, where a column that wrote
+/// what it derived would leave a wrong `status:` line on disk for somebody to find tomorrow.
+///
+/// Nothing appears twice: a card carries its own run, so the run is not also listed as an agent
+/// with no card. Nothing disappears either — an agent whose card is in another column is still
+/// listed here, because that card's badge cannot be armed and an agent nobody can reach is an
+/// agent nobody can disarm.
+fn active_entries<'a>(view: &'a BoardView, live: &'a BoardLive<'a>) -> Vec<ActiveEntry<'a>> {
+    let cards = view.cards(ACTIVE_STATUS);
+    let mut entries: Vec<ActiveEntry<'a>> = cards
+        .iter()
+        .map(|task| ActiveEntry::Card(task, live.by_task.get(&task.id).copied()))
+        .chain(
+            live.runs
+                .iter()
+                .filter(|run| {
+                    run.task_id
+                        .is_none_or(|task| !cards.iter().any(|card| card.id == task))
+                })
+                .map(ActiveEntry::Loose),
+        )
+        .collect();
+    entries.sort_by(|left, right| left.rank().cmp(&right.rank()));
+    entries
 }
 
 /// The board, laid out as columns of cards.
@@ -1423,8 +1562,8 @@ impl Dashboard {
     /// A pane with no agent in it is not a row. `AgentState::Idle` does not mean "the agent is
     /// resting", it means no agent was detected in this pane at all, so a lane that admitted them
     /// would list every shell on the canvas under a state none of them is in.
-    fn run_lane_rows(&self) -> Vec<RunLaneRow<'_>> {
-        let mut rows: Vec<RunLaneRow<'_>> = self
+    fn live_runs(&self) -> Vec<LiveRun<'_>> {
+        let mut rows: Vec<LiveRun<'_>> = self
             .runs
             .iter()
             .filter_map(|run| {
@@ -1433,7 +1572,7 @@ impl Dashboard {
                 // queue: a queue outlives the run it was filled for, and a pane that is
                 // relaunched must not come back with somebody else's queue behind it.
                 let queue = self.queue_for(run.workspace_id.as_str(), run.pane_id.as_str());
-                Some(RunLaneRow {
+                Some(LiveRun {
                     run_id: run.run_id.as_str(),
                     workspace_id: run.workspace_id.as_str(),
                     pane_id: run.pane_id.as_str(),
@@ -1499,71 +1638,165 @@ impl Dashboard {
         }
     }
 
-    /// Which row of the runs lane the board pane's keys act on.
+    /// The board the cursor is on: the overlay's when one is open, the pane's otherwise.
     ///
-    /// Resolved against the rows as they are now rather than remembered as a position, and falls
-    /// back to the first row when the pane it named has left the lane — a lane that kept pointing
-    /// at a departed pane would answer `a` by arming nothing and saying nothing.
-    fn selected_lane_index(&self, rows: &[RunLaneRow<'_>]) -> Option<usize> {
-        if rows.is_empty() {
-            return None;
-        }
-        let Some((workspace_id, pane_id)) = self.board_lane_selection.as_ref() else {
-            return Some(0);
-        };
-        Some(
-            rows.iter()
-                .position(|row| row.workspace_id == workspace_id && row.pane_id == pane_id)
-                .unwrap_or(0),
-        )
+    /// One cursor over two surfaces, because they are two ways of looking at one board rather
+    /// than two boards. Whichever is taking keys is the one the cursor resolves against, and
+    /// both hold the same tasks — `set_board_tasks` fills them together.
+    fn cursor_view(&self) -> Option<&BoardView> {
+        self.board
+            .as_ref()
+            .map(|board| &board.view)
+            .or(self.board_pane_view.as_ref())
     }
 
-    /// The runs lane's cursor, moved by rows and clamped rather than wrapped.
+    /// Where the cursor is now, as a column and a position in it, resolved against what is on
+    /// the board this frame rather than remembered as a pair of numbers.
     ///
-    /// Clamped because the one key this cursor carries arms an agent: wrapping from the last row
-    /// to the first would put a held `j` on a pane the user was moving *away* from.
-    fn move_lane_selection(&mut self, delta: isize) -> UiCommand {
-        let rows = self.run_lane_rows();
-        let Some(current) = self.selected_lane_index(&rows) else {
-            return UiCommand::None;
+    /// Falls back to the first entry when the thing the cursor named has left the board — a
+    /// cursor still pointing at a departed pane would answer `a` by arming nothing and saying
+    /// nothing. Before it has been moved at all the view's own opening position stands, so a
+    /// board still opens on the leftmost column that has anything in it.
+    fn board_cursor_at(&self, view: &BoardView, live: &BoardLive<'_>) -> (usize, usize) {
+        let last = view.statuses().len().saturating_sub(1);
+        let (column, wanted) = match self.board_cursor.as_ref() {
+            Some((column, target)) => ((*column).min(last), target.as_ref()),
+            None => (view.column(), None),
         };
-        let next = current
-            .saturating_add_signed(delta)
-            .min(rows.len().saturating_sub(1));
-        let row = &rows[next];
-        let selection = (row.workspace_id.to_owned(), row.pane_id.to_owned());
-        self.board_lane_selection = Some(selection);
+        let targets = column_targets(view, live, column);
+        let index = match wanted {
+            Some(target) => targets
+                .iter()
+                .position(|entry| entry == target)
+                .unwrap_or(0),
+            None => view.row(),
+        };
+        (column, index.min(targets.len().saturating_sub(1)))
+    }
+
+    /// What the cursor would be on after a move, without touching anything.
+    fn next_board_target(
+        &self,
+        columns: isize,
+        rows: isize,
+    ) -> Option<(usize, Option<BoardTarget>)> {
+        let view = self.cursor_view()?;
+        let runs = self.live_runs();
+        let live = BoardLive::new(&runs);
+        let (column, index) = self.board_cursor_at(view, &live);
+        // Saturating rather than wrapping, for the reason the lane's cursor was: the key this
+        // carries arms an agent, and wrapping off the last entry would put a held `j` on the
+        // agent the user was moving away from.
+        let column = column
+            .saturating_add_signed(columns)
+            .min(view.statuses().len().saturating_sub(1));
+        let targets = column_targets(view, &live, column);
+        // The index is kept across a column move and clamped there, the way `move_column` keeps
+        // a row: a taller column to the left leaves it past the end of a shorter one.
+        let index = index
+            .saturating_add_signed(rows)
+            .min(targets.len().saturating_sub(1));
+        Some((column, targets.into_iter().nth(index)))
+    }
+
+    /// The board's cursor, moved by columns and by entries. Nothing here asks the daemon
+    /// anything: the whole grid is already in this client's hands.
+    fn move_board_cursor(&mut self, columns: isize, rows: isize) -> UiCommand {
+        if let Some((column, target)) = self.next_board_target(columns, rows) {
+            self.set_board_cursor(column, target);
+        }
         UiCommand::None
     }
 
-    /// Arms or disarms auto-feed for the selected pane, and nothing else.
+    /// Puts the cursor somewhere and takes both views with it.
+    ///
+    /// A card target is followed into each view, so everything that still reads a view's own
+    /// cursor — `<` and `>` moving a card, the overlay opened over a pane — agrees with the one
+    /// cursor instead of keeping a second opinion about where the user is.
+    fn set_board_cursor(&mut self, column: usize, target: Option<BoardTarget>) {
+        if let Some(BoardTarget::Card(id)) = target {
+            if let Some(view) = self.board_pane_view.as_mut() {
+                view.follow(id);
+            }
+            if let Some(board) = self.board.as_mut() {
+                board.view.follow(id);
+            }
+        }
+        self.board_cursor = Some((column, target));
+    }
+
+    /// The card the cursor is on, if it is on a card at all.
+    fn cursor_card(&self) -> Option<u64> {
+        let view = self.cursor_view()?;
+        let runs = self.live_runs();
+        let live = BoardLive::new(&runs);
+        let (column, index) = self.board_cursor_at(view, &live);
+        match column_targets(view, &live, column).into_iter().nth(index)? {
+            BoardTarget::Card(id) => Some(id),
+            BoardTarget::Pane(..) => None,
+        }
+    }
+
+    /// The agent under the cursor, as everything `a` needs to act on it: where the cursor is,
+    /// which pane is running it, and whether the daemon already has that pane armed.
+    ///
+    /// Owned rather than borrowed on purpose — the caller sets `self.error`, and the borrows
+    /// this is assembled from all point back into `self`.
+    fn cursor_agent(&self) -> Result<(usize, BoardTarget, String, String, bool), String> {
+        let Some(view) = self.cursor_view() else {
+            return Err("no board to arm anything on".into());
+        };
+        let runs = self.live_runs();
+        let live = BoardLive::new(&runs);
+        let (column, index) = self.board_cursor_at(view, &live);
+        if view.statuses().get(column).map(String::as_str) != Some(ACTIVE_STATUS) {
+            return Err("a arms an agent: move the cursor into ACTIVE first".into());
+        }
+        let entries = active_entries(view, &live);
+        let Some(entry) = entries.get(index).copied() else {
+            return Err("no agent to arm: nothing is running on this board".into());
+        };
+        let Some(run) = entry.run() else {
+            return Err("that card has no agent running on it to arm".into());
+        };
+        Ok((
+            column,
+            entry.target(),
+            run.workspace_id.to_owned(),
+            run.pane_id.to_owned(),
+            run.auto_feed,
+        ))
+    }
+
+    /// Arms or disarms auto-feed for the pane under the cursor, and nothing else.
     ///
     /// One pane per press, named explicitly, and the toggle reads the pane's current state from
     /// the daemon's own listing rather than from anything this client decided — so `a` on an
     /// armed pane disarms it and `a` on a pane the daemon never armed asks for arming. There is
-    /// deliberately no key that arms the lane: arming is the one act that lets Dock type into an
-    /// agent while nobody is watching, and "arm all" would make one keystroke's worth of
+    /// deliberately no key that arms the column: arming is the one act that lets Dock type into
+    /// an agent while nobody is watching, and "arm all" would make one keystroke's worth of
     /// deliberateness stand in for a whole canvas of it.
-    fn toggle_lane_auto_feed(&mut self) -> UiCommand {
-        let rows = self.run_lane_rows();
-        let Some(index) = self.selected_lane_index(&rows) else {
-            self.error = Some("no agent to arm: the runs lane is empty".into());
-            return UiCommand::None;
+    fn toggle_auto_feed(&mut self) -> UiCommand {
+        let (column, target, workspace_id, pane_id, armed) = match self.cursor_agent() {
+            Ok(agent) => agent,
+            Err(message) => {
+                self.error = Some(message);
+                return UiCommand::None;
+            }
         };
-        let row = &rows[index];
         let request = Request::Queue(QueueRequest::SetAuto {
-            workspace_id: row.workspace_id.to_owned(),
-            pane_id: row.pane_id.to_owned(),
-            enabled: !row.auto_feed,
+            workspace_id,
+            pane_id,
+            enabled: !armed,
         });
-        // The cursor follows the pane that was acted on, so the answer lands on the row the user
-        // was looking at even if the lane reorders around it before the frame after.
-        self.board_lane_selection = Some((row.workspace_id.to_owned(), row.pane_id.to_owned()));
+        // The cursor stays on the entry that was acted on, so the answer lands on what the user
+        // was looking at even if `ACTIVE` re-sorts around it before the frame after.
+        self.set_board_cursor(column, Some(target));
         self.error = None;
         UiCommand::Request(Box::new(request))
     }
 
-    /// The keys a Board pane takes, which is the runs lane's cursor and its one verb.
+    /// The keys a Board pane takes, which is the board's cursor and its one verb.
     ///
     /// This exists because a Board pane has no PTY and must never be given one. Ordinary panes
     /// reach the daemon through `send_to_pane`, which is unchanged and still drops input for a
@@ -1572,173 +1805,76 @@ impl Dashboard {
     /// guessed at — a board is not a keyboard surface, it has a cursor and a switch.
     fn board_pane_key(&mut self, key: KeyEvent) -> UiCommand {
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.move_lane_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_lane_selection(-1),
-            KeyCode::Char('a') => self.toggle_lane_auto_feed(),
+            KeyCode::Char('j') | KeyCode::Down => self.move_board_cursor(0, 1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_board_cursor(0, -1),
+            KeyCode::Char('h') | KeyCode::Left => self.move_board_cursor(-1, 0),
+            KeyCode::Char('l') | KeyCode::Right => self.move_board_cursor(1, 0),
+            KeyCode::Char('a') => self.toggle_auto_feed(),
             _ => UiCommand::None,
         }
     }
 
-    /// The agent state to badge each board card with, keyed by card id.
+    /// A Board pane: one grid, and the live agents drawn in the column they belong in.
     ///
-    /// Display-only, and that is a rule rather than an implementation detail. `needs-input` on the
-    /// board means what `AgentState::Blocked` means, so it is tempting to move the card when its
-    /// agent blocks — but Dock measures and the agent reports, and a badge vanishes with the run
-    /// that produced it while a status write outlives whatever misread produced it.
-    fn board_badges(&self) -> HashMap<u64, AgentState> {
-        badges_from(&self.run_lane_rows())
-    }
-
-    /// A Board pane: the runs lane across the top, the backlog columns below.
-    ///
-    /// Two stacked regions rather than two column sets, because a run is not a status — appending
-    /// a "runs" pseudo-column would put the same card in two columns at once.
+    /// There used to be a runs lane stacked above the columns, on the theory that a run is not a
+    /// status. It is not — but the first person to open this pane watched their own agent
+    /// running in that strip and asked why their work "was not in the table". `ACTIVE` is the
+    /// `in-progress` column with the live entries derived on top of it, which answers that
+    /// without ever putting a card in two columns at once.
     fn render_board_pane(&self, frame: &mut Frame, inner: Rect, focused: bool) {
-        use std::fmt::Write as _;
-
         if inner.height < 4 || inner.width < 12 {
             return;
         }
-        let rows = self.run_lane_rows();
-        // Only drawn on the focused board. A cursor on a pane that is not taking keys points at a
-        // row nothing is about to happen to, and the row it points at is the one `a` would arm.
-        let selected = focused.then(|| self.selected_lane_index(&rows)).flatten();
-        // The lane is given what it needs and no more, so a board with two agents on it does not
-        // spend half the pane on empty rows. It never takes more than half: the backlog is the
-        // half a person curates, and a busy runtime must not squeeze it off the screen.
-        // Heading, rule, the rows themselves, and one blank so the backlog's own headings do not
-        // read as a fourth line of the lane.
-        let wanted = u16::try_from(rows.len().max(1))
-            .unwrap_or(u16::MAX)
-            .saturating_add(3);
-        let lane_height = wanted.min(inner.height / 2).max(3);
-        let lane = Rect::new(inner.x, inner.y, inner.width, lane_height);
-
-        // The heading carries the daemon-wide kill switch, because it is the one thing that makes
-        // an *armed* pane feed nothing: without it a paused daemon looks like a broken one.
-        let mut heading = format!("RUNS · {}", rows.len());
-        if self.queues_paused {
-            heading.push_str(" · PAUSED · every queue is held");
-        }
-        if focused && !rows.is_empty() {
-            heading.push_str(" · j/k choose · a arms auto-feed");
-        }
-        ellipsise_in_place(&mut heading, usize::from(lane.width));
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                heading,
-                Style::default()
-                    .fg(if self.queues_paused {
-                        self.theme.blocked
-                    } else {
-                        self.theme.muted
-                    })
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Rect::new(lane.x, lane.y, lane.width, 1),
-        );
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                "─".repeat(usize::from(lane.width)),
-                Style::default().fg(self.theme.border),
-            )),
-            Rect::new(lane.x, lane.y + 1, lane.width, 1),
-        );
-        if rows.is_empty() {
+        let Some(view) = self.board_pane_view.as_ref() else {
             frame.render_widget(
-                Paragraph::new(Line::styled(
-                    "no agents running",
-                    Style::default().fg(self.theme.border),
-                )),
-                Rect::new(lane.x, lane.y + 2, lane.width, 1),
-            );
-        }
-        for (index, row) in rows
-            .iter()
-            .take(usize::from(lane_height.saturating_sub(2)))
-            .enumerate()
-        {
-            let here = selected == Some(index);
-            // The state is spelled out, not left to the glyph. A coloured dot says that something
-            // is true of this agent without saying what, and "needs you" is the one state worth
-            // crossing the room for. Built into one buffer rather than assembled from formatted
-            // pieces: this is a line per agent per frame on a path that runs at 60fps.
-            //
-            // Sized for a row without a hold reason on it, which is almost all of them. The lane
-            // is as wide as the pane and a row is a fraction of that, so asking for the pane's
-            // width would reserve four hundred bytes to hold fifty.
-            let mut text = String::with_capacity(64);
-            text.push_str(if here { "▸ " } else { "  " });
-            let _ = write!(text, "{} {} · ", row.state.glyph(), row.agent.label());
-            match row.task_id {
-                Some(task) => {
-                    let _ = write!(text, "#{task}");
-                }
-                // Said rather than punctuated. A bare dash here is correct and reads as "a value
-                // is missing", when what it means is that this agent was launched by hand rather
-                // than dispatched from a card, and so has no card to be linked to.
-                None => text.push_str("no card"),
-            }
-            let _ = write!(
-                text,
-                " · {} · {} · {} queued",
-                row.state.label(),
-                row.pane_id,
-                // Always, including zero. A lane that mentions a queue only when it has something
-                // in it cannot be used to check that a queue is empty, which is the question
-                // somebody about to arm a pane is actually asking.
-                row.queued
-            );
-            if row.auto_feed {
-                text.push_str(" · armed");
-            }
-            if row.awaiting_ack {
-                text.push_str(" · fed · waiting for the agent to pick it up");
-            }
-            // Only with something to hold. `holding_because` is set whenever auto-feed declined,
-            // and on an empty queue it declines for the uninteresting reason that there was
-            // nothing to feed — printing that on every row would bury the one row that is stuck.
-            if row.queued > 0
-                && let Some(why) = row.holding_because
-            {
-                let _ = write!(text, " · holding: {why}");
-            }
-            ellipsise_in_place(&mut text, usize::from(lane.width));
-            let style = Style::default().fg(self.theme.agent(row.state));
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    text,
-                    if here {
-                        style.add_modifier(Modifier::BOLD)
-                    } else {
-                        style
-                    },
-                )),
-                Rect::new(lane.x, lane.y + 2 + index as u16, lane.width, 1),
-            );
-        }
-
-        let backlog = Rect::new(
-            inner.x,
-            inner.y + lane_height,
-            inner.width,
-            inner.height.saturating_sub(lane_height),
-        );
-        match self.board_pane_view.as_ref() {
-            // Derived from the rows already in hand rather than asked for again: assembling the
-            // lane is a pass over every run on the canvas, and this pane was doing it twice per
-            // frame to answer two questions about the same list.
-            Some(view) => {
-                render_board_columns(frame, &self.theme, view, backlog, &badges_from(&rows))
-            }
-            None => frame.render_widget(
                 Paragraph::new(Line::styled(
                     "reading the board…",
                     Style::default().fg(self.theme.muted),
                 )),
-                backlog,
+                inner,
+            );
+            return;
+        };
+        // Assembled once and used for every answer below. Building this is a pass over every run
+        // on the canvas, and this pane used to do it twice per frame to ask two questions of the
+        // same list.
+        let runs = self.live_runs();
+        let live = BoardLive::new(&runs);
+        // Resolved once and handed to both the grid and the footer. Resolving it is a pass over
+        // a column's entries, and the two of them asking separately made that two passes for one
+        // answer that cannot have changed in between.
+        let cursor = self.board_cursor_at(view, &live);
+        render_board_columns(
+            frame,
+            &self.theme,
+            view,
+            Rect::new(
+                inner.x,
+                inner.y,
+                inner.width,
+                inner.height.saturating_sub(1),
             ),
-        }
+            &live,
+            cursor,
+        );
+
+        // One row, as wide as the pane, under a grid whose cards are thirty cells wide. It is
+        // the only place the daemon-wide kill switch and a stalled queue's own sentence fit, and
+        // it is the pane's only chrome: a board pane has no footer of its own the way the
+        // overlay does.
+        let mut footer = board_pane_footer(view, &live, cursor, self.queues_paused, focused);
+        ellipsise_in_place(&mut footer, usize::from(inner.width));
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                footer,
+                Style::default().fg(if self.queues_paused {
+                    self.theme.blocked
+                } else {
+                    self.theme.muted
+                }),
+            )),
+            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+        );
     }
 
     fn render_node(
@@ -2362,13 +2498,26 @@ impl Dashboard {
         let Some(board) = self.board.as_ref() else {
             return;
         };
+        // Assembled before the popup is sized, because `ACTIVE` is one of the columns being
+        // measured and how tall it is depends on what is running.
+        let runs = self.live_runs();
+        let live = BoardLive::new(&runs);
         // Sized to the tallest column rather than filling the screen: a board with four cards on
         // it should look like a board with four cards on it, not like one that has lost the rest.
+        // `ACTIVE` counts double and can hold more entries than it has cards, so it is measured
+        // in rows rather than in cards — sizing this to the card count alone clipped the bottom
+        // of the one column that grew.
         let tallest = board
             .view
             .statuses()
             .iter()
-            .map(|status| board.view.cards(status).len())
+            .map(|status| {
+                if status == ACTIVE_STATUS {
+                    active_entries(&board.view, &live).len() * 2
+                } else {
+                    board.view.cards(status).len()
+                }
+            })
             .max()
             .unwrap_or(0);
         let chrome = 7;
@@ -2407,7 +2556,8 @@ impl Dashboard {
         // The cards are drawn by the same function the Board pane uses, over the rectangle the
         // footer below does not want. There is no second renderer and no second data path: a
         // pane and an overlay differ in the rectangle they are handed and in whether Esc closes
-        // them, which is the whole reason keeping the overlay costs nothing.
+        // them, which is the whole reason keeping the overlay costs nothing. They share the
+        // cursor too — one board, one place the user is on it.
         render_board_columns(
             frame,
             &self.theme,
@@ -2418,7 +2568,8 @@ impl Dashboard {
                 inner.width,
                 inner.height.saturating_sub(2),
             ),
-            &self.board_badges(),
+            &live,
+            self.board_cursor_at(&board.view, &live),
         );
 
         // The footer carries the board's identity and its controls, which is where a person looks
@@ -2662,10 +2813,13 @@ impl Dashboard {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.board = None,
-            KeyCode::Left | KeyCode::Char('h') => board.view.move_column(-1),
-            KeyCode::Right | KeyCode::Char('l') => board.view.move_column(1),
-            KeyCode::Up | KeyCode::Char('k') => board.view.move_row(-1),
-            KeyCode::Down | KeyCode::Char('j') => board.view.move_row(1),
+            // Through the board's own cursor rather than through the view's, because `ACTIVE`
+            // holds entries no view can name: the cursor walks what the grid draws, in the order
+            // the grid draws it, or `j` would jump about wherever that column has re-sorted.
+            KeyCode::Left | KeyCode::Char('h') => return self.move_board_cursor(-1, 0),
+            KeyCode::Right | KeyCode::Char('l') => return self.move_board_cursor(1, 0),
+            KeyCode::Up | KeyCode::Char('k') => return self.move_board_cursor(0, -1),
+            KeyCode::Down | KeyCode::Char('j') => return self.move_board_cursor(0, 1),
             KeyCode::Char('n') if board.writable => board.composing = Some(String::new()),
             KeyCode::Char('n') => {
                 self.error =
@@ -2690,10 +2844,25 @@ impl Dashboard {
             self.error = Some("this board is the repository's — move tasks with kanban-md".into());
             return UiCommand::None;
         }
-        let Some(task) = board.view.selected() else {
+        // Through the board's one cursor rather than the view's own row, because the cursor can
+        // be on a live agent that has no card: `>` on one of those has nothing to move, and
+        // moving whatever card the view's row happened to be over would move the wrong thing.
+        let Some(id) = self.cursor_card() else {
+            self.error = Some("that is a running agent, not a card".into());
             return UiCommand::None;
         };
-        let (id, status) = (task.id, task.status.clone());
+        let Some(board) = self.board.as_ref() else {
+            return UiCommand::None;
+        };
+        let Some(status) = board
+            .view
+            .tasks()
+            .iter()
+            .find(|task| task.id == id)
+            .map(|task| task.status.clone())
+        else {
+            return UiCommand::None;
+        };
         // The board's own columns, not the constant's. A card sitting in a status Dock has never
         // heard of is exactly the card a person most wants to move, and resolving its position
         // through `STATUSES` made that the one card `<` and `>` refused to touch.
@@ -2724,6 +2893,10 @@ impl Dashboard {
                     board.view = BoardView::new(tasks);
                     board.view.follow(id);
                 }
+                // The one cursor goes with the card, which is what `follow` does for each view:
+                // a card moved out from under the cursor would otherwise leave it on whatever
+                // slid into that position.
+                self.set_board_cursor(next, Some(BoardTarget::Card(id)));
                 self.error = None;
             }
             Err(message) => self.error = Some(message),
@@ -2733,14 +2906,16 @@ impl Dashboard {
 
     /// Puts an agent on the selected card.
     fn dispatch_selected_task(&mut self) -> UiCommand {
-        let Some(board) = self.board.as_ref() else {
+        if self.board.is_none() {
+            return UiCommand::None;
+        }
+        // The cursor, not the view's row: `ACTIVE` holds live agents that were never dispatched
+        // from a card, and there is nothing to put an agent on there because one is already on it.
+        let Some(id) = self.cursor_card() else {
+            self.error = Some("that is a running agent, not a card".into());
             return UiCommand::None;
         };
-        let Some(task) = board.view.selected() else {
-            self.error = Some("no task selected".into());
-            return UiCommand::None;
-        };
-        let key = task.id.to_string();
+        let key = id.to_string();
         self.board = None;
         self.task_dispatch_for(&key)
     }
@@ -4827,37 +5002,54 @@ impl SidebarRows {
 /// The task the daemon itself bound to a run, if it bound one. A blank reference means unbound
 /// rather than a task whose name happens to be empty, and the single lookup and the batch index
 /// have to agree about that or the roster and the pane title would disagree on screen.
+/// A card narrower than this cannot hold a whole liveness line, so it stops trying.
+///
+/// Five columns across a hundred-wide terminal leave about fourteen cells, where
+/// `claude · a · needs you · 0 queued` ellipsises into the middle of the one word worth reading.
+/// Below this the second line is the state word alone: the glyph is the glance, the word is the
+/// fact, and the fact is what survives.
+const NARROW_CARD: usize = 20;
+
+/// And narrower still than *this*, a card has no second line at all.
+///
+/// Sized to `  not running`, which is the longest of the short forms. Five columns across an
+/// eighty-wide terminal, with the sidebar taking its twenty-eight, leave nine cells — and a card
+/// reading `nee…` where it means "needs you" is worse than a card that says nothing and leaves
+/// the glyph and its colour to carry the state, which they are there to do.
+const ONE_LINE_CARD: usize = 13;
+
 /// The board's columns and the cards in them, over whatever rectangle it is handed.
 ///
 /// A free function rather than a method because it is the one thing the board overlay and the
-/// Board pane genuinely share: the overlay hands it the inside of a popup, the pane hands it the
-/// space under the runs lane, and neither has a second opinion about how a card looks. Two rows
-/// go to the heading and its rule; everything below is cards.
+/// Board pane genuinely share: the overlay hands it the inside of a popup, the pane hands it
+/// everything above its footer, and neither has a second opinion about how a card looks. Two
+/// rows go to the heading and its rule; everything below is cards.
 ///
 /// The columns come from the view rather than from `board::STATUSES`, which is what makes a
 /// `needs-input` card visible at all: the constant does not know that status, and every site that
 /// resolved columns through it drew the card into no column and let `<`/`>` walk straight past it.
 ///
-/// `badges` carries the live agent state of any card a run is bound to. That join is the whole
-/// reason a board shows what is actually happening without inventing a sixth column — and it is
-/// display-only: the glyph is derived and vanishes when the run does, whereas a status write is
-/// durable and would outlive whatever misread produced it.
+/// `live` is what is running, joined to the cards by the reference the daemon recorded when each
+/// was dispatched. That join is the whole reason a board shows what is actually happening without
+/// inventing a sixth column — and it is display-only: an entry is derived and vanishes when its
+/// run does, whereas a status write is durable and would outlive whatever misread produced it.
 fn render_board_columns(
     frame: &mut Frame,
     theme: &Theme,
     view: &BoardView,
     area: Rect,
-    badges: &HashMap<u64, AgentState>,
+    live: &BoardLive<'_>,
+    cursor: (usize, usize),
 ) {
     let statuses = view.statuses();
     if statuses.is_empty() || area.width < statuses.len() as u16 || area.height < 3 {
         return;
     }
     // A board with nothing on it drew five headings reading `· 0` above four dashes and filled
-    // the pane with them, which reads as broken rather than as empty — and prompts the question
-    // of why the agent in the lane above is not in one of the columns. Empty is a state worth
-    // saying out loud, with the key that changes it.
-    if view.tasks().is_empty() {
+    // the pane with them, which reads as broken rather than as empty. A board with an agent on it
+    // is not empty whatever its files say — that agent is an entry in `ACTIVE`, which is the
+    // whole point of this pass, so the grid is drawn for it.
+    if view.tasks().is_empty() && live.runs.is_empty() {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::styled("  no tasks on this board", Style::default().fg(theme.muted)),
@@ -4872,12 +5064,29 @@ fn render_board_columns(
         return;
     }
     let column_width = area.width / statuses.len() as u16;
-    let card_rows = area.height.saturating_sub(2);
+    let width = usize::from(column_width.saturating_sub(1));
+    let card_rows = usize::from(area.height.saturating_sub(2));
 
     for (index, status) in statuses.iter().enumerate() {
         let x = area.x + column_width * index as u16;
-        let cards = view.cards(status);
-        let active = index == view.column();
+        let active = index == cursor.0;
+        // A column taller than the space scrolls to keep the cursor visible, rather than hiding
+        // the selected card behind the bottom edge — so the selected row is passed down to
+        // whichever of the two card shapes this column draws.
+        let selected = active.then_some(cursor.1);
+        let (count, lines) = if status == ACTIVE_STATUS {
+            let entries = active_entries(view, live);
+            (
+                entries.len(),
+                active_lines(theme, &entries, width, card_rows, selected),
+            )
+        } else {
+            let cards = view.cards(status);
+            (
+                cards.len(),
+                card_lines(theme, &cards, live, width, card_rows, selected),
+            )
+        };
         // A rule under each heading gives the columns edges without spending a column of
         // width on borders, which at five columns would cost a fifth of the card text.
         frame.render_widget(
@@ -4887,82 +5096,23 @@ fn render_board_columns(
             )),
             Rect::new(x, area.y + 1, column_width.saturating_sub(1), 1),
         );
-        let heading = Style::default()
-            .fg(if active { theme.accent } else { theme.muted })
-            .add_modifier(if active {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            });
         frame.render_widget(
             Paragraph::new(Line::styled(
-                ellipsise(
-                    &format!("{} · {}", status.to_uppercase(), cards.len()),
-                    usize::from(column_width.saturating_sub(1)),
-                ),
-                heading,
+                ellipsise(&format!("{} · {count}", column_heading(status)), width),
+                Style::default()
+                    .fg(if active { theme.accent } else { theme.muted })
+                    .add_modifier(if active {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             )),
             Rect::new(x, area.y, column_width.saturating_sub(1), 1),
         );
-
-        // A column taller than the space scrolls to keep the cursor visible, rather than
-        // hiding the selected card behind the bottom edge.
-        let first = if active {
-            view.row()
-                .saturating_sub(usize::from(card_rows).saturating_sub(1))
-        } else {
-            0
-        };
-        let visible =
-            usize::from(card_rows).min(usize::from(area.bottom().saturating_sub(area.y + 2)));
         // One paragraph for the whole column rather than one per card. Each card used to be its
         // own widget over its own one-row rectangle, which put a ratatui render — and the dozen
         // allocations inside it — behind every card on the board, on a path that repaints at
-        // 60fps. The lines are identical and land on the same rows; only the widget count
-        // changes, from one per card to one per column.
-        let mut lines: Vec<Line> = Vec::with_capacity(visible.min(cards.len()));
-        for (row, task) in cards.iter().skip(first).take(visible).enumerate() {
-            let selected = active && first + row == view.row();
-            let style = if selected {
-                Style::default()
-                    .bg(theme.accent)
-                    .fg(theme.surface)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text)
-            };
-            let width = usize::from(column_width.saturating_sub(1));
-            let marker = if selected { "›" } else { " " };
-            // The badge is its own span so it keeps the state's colour against a selected card's
-            // inverted background, where a single styled line would have lost it.
-            lines.push(match badges.get(&task.id) {
-                Some(state) => Line::from(vec![
-                    Span::styled(format!("{marker} #{} ", task.id), style),
-                    Span::styled(
-                        state.glyph().to_string(),
-                        if selected {
-                            style
-                        } else {
-                            Style::default().fg(theme.agent(*state))
-                        },
-                    ),
-                    Span::styled(
-                        ellipsise(
-                            &format!(" {}", task.title),
-                            width.saturating_sub(marker.len() + 3 + task.id.to_string().len()),
-                        ),
-                        style,
-                    ),
-                ]),
-                None => Line::styled(
-                    ellipsise(&format!("{marker} #{} {}", task.id, task.title), width),
-                    style,
-                ),
-            });
-        }
-        if cards.is_empty() {
-            lines.push(Line::styled("  —", Style::default().fg(theme.border)));
-        }
+        // 60fps.
         frame.render_widget(
             Paragraph::new(lines),
             Rect::new(
@@ -4975,12 +5125,302 @@ fn render_board_columns(
     }
 }
 
-/// The same join, from a lane that has already been assembled. Building the lane is a pass over
-/// every run on the canvas, and the Board pane wants both answers from one pass.
-fn badges_from(rows: &[RunLaneRow<'_>]) -> HashMap<u64, AgentState> {
-    rows.iter()
-        .filter_map(|row| Some((row.task_id?, row.state)))
-        .collect()
+/// What a column is called on screen.
+///
+/// `in-progress` is what every task file says, what `board::STATUSES` holds and what `<` and `>`
+/// move a card between; none of that changes. `ACTIVE` is what the column *holds*, which is that
+/// plus every live agent with no card in it — and "in progress" is not what a hand-launched agent
+/// is.
+fn column_heading(status: &str) -> Cow<'_, str> {
+    if status == ACTIVE_STATUS {
+        Cow::Borrowed("ACTIVE")
+    } else {
+        Cow::Owned(status.to_uppercase())
+    }
+}
+
+/// Everything a column can put the cursor on, in the order it draws them.
+///
+/// The one place that decides what `j` and `k` walk through, so the cursor cannot disagree with
+/// the grid about how many things are in a column or what order they are in.
+fn column_targets(view: &BoardView, live: &BoardLive<'_>, column: usize) -> Vec<BoardTarget> {
+    let Some(status) = view.statuses().get(column) else {
+        return Vec::new();
+    };
+    if status == ACTIVE_STATUS {
+        active_entries(view, live)
+            .into_iter()
+            .map(ActiveEntry::target)
+            .collect()
+    } else {
+        view.cards(status)
+            .into_iter()
+            .map(|task| BoardTarget::Card(task.id))
+            .collect()
+    }
+}
+
+/// The one-line cards of every column that is not `ACTIVE`.
+///
+/// One line, not two. A backlog card has nothing to say on a second line, and vertical room is
+/// what limits how many cards a person can see at once — so the asymmetry is itself the
+/// information: a two-line card means this one is live.
+fn card_lines<'a>(
+    theme: &Theme,
+    cards: &[&'a BoardTask],
+    live: &BoardLive<'_>,
+    width: usize,
+    rows: usize,
+    selected: Option<usize>,
+) -> Vec<Line<'a>> {
+    if cards.is_empty() {
+        return vec![Line::styled("  —", Style::default().fg(theme.border))];
+    }
+    let first = scroll_to(selected, rows, 1);
+    let mut lines = Vec::with_capacity(rows.min(cards.len()));
+    for (row, task) in cards.iter().skip(first).take(rows).enumerate() {
+        let here = selected == Some(first + row);
+        let style = card_style(theme, here, true);
+        let marker = if here { "›" } else { " " };
+        // The badge is its own span so it keeps the state's colour against a selected card's
+        // inverted background, where a single styled line would have lost it.
+        lines.push(match live.by_task.get(&task.id) {
+            Some(run) => Line::from(vec![
+                Span::styled(format!("{marker} #{} ", task.id), style),
+                Span::styled(
+                    run.state.glyph().to_string(),
+                    if here {
+                        style
+                    } else {
+                        Style::default().fg(theme.agent(run.state))
+                    },
+                ),
+                Span::styled(
+                    ellipsise(
+                        &format!(" {}", task.title),
+                        width.saturating_sub(marker.len() + 3 + task.id.to_string().len()),
+                    ),
+                    style,
+                ),
+            ]),
+            None => Line::styled(
+                ellipsise(&format!("{marker} #{} {}", task.id, task.title), width),
+                style,
+            ),
+        });
+    }
+    lines
+}
+
+/// The two-line entries of the `ACTIVE` column: identity above, liveness below.
+///
+/// Two lines because there are two questions — what is this, and what is happening to it — and
+/// the second one only has an answer here. The glyph and the word both stay: a coloured dot says
+/// that something is true of this agent without saying what, and "needs you" is the one state
+/// worth crossing the room for. The same rule the sidebar roster follows.
+fn active_lines(
+    theme: &Theme,
+    entries: &[ActiveEntry<'_>],
+    width: usize,
+    rows: usize,
+    selected: Option<usize>,
+) -> Vec<Line<'static>> {
+    use std::fmt::Write as _;
+
+    if entries.is_empty() {
+        return vec![Line::styled("  —", Style::default().fg(theme.border))];
+    }
+    let per = if width < ONE_LINE_CARD { 1 } else { 2 };
+    let visible = (rows / per).max(1);
+    let first = scroll_to(selected, rows, per);
+    let mut lines = Vec::with_capacity(visible * per);
+    for (row, entry) in entries.iter().skip(first).take(visible).enumerate() {
+        let here = selected == Some(first + row);
+        let run = entry.run();
+        // A dispatched card whose agent has gone is dimmed rather than hidden. It is precisely
+        // the card a person has forgotten about, and hiding it would be the board agreeing.
+        let style = card_style(theme, here, run.is_some());
+        let live_style = match (here, run) {
+            (true, _) => style,
+            (false, Some(run)) => Style::default().fg(theme.agent(run.state)),
+            (false, None) => Style::default().fg(theme.muted),
+        };
+        let mut identity = String::with_capacity(width + 8);
+        match *entry {
+            ActiveEntry::Card(task, _) => {
+                let _ = write!(identity, " #{} {}", task.id, task.title);
+            }
+            // No card to name it by, so the agent names itself. What it is instead of a card is
+            // on the line below, where a card id would have been.
+            ActiveEntry::Loose(run) => {
+                identity.push(' ');
+                identity.push_str(run.agent.label());
+            }
+        }
+        ellipsise_in_place(&mut identity, width.saturating_sub(2));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "{}{}",
+                    if here { "›" } else { " " },
+                    run.map_or(' ', |run| run.state.glyph())
+                ),
+                live_style,
+            ),
+            Span::styled(identity, style),
+        ]));
+
+        if per == 1 {
+            continue;
+        }
+        let mut liveness = String::with_capacity(width + 8);
+        liveness.push_str("  ");
+        match run {
+            None => liveness.push_str("not running"),
+            Some(run) if width < NARROW_CARD => liveness.push_str(run.state.label()),
+            Some(run) => {
+                match *entry {
+                    ActiveEntry::Card(..) => liveness.push_str(run.agent.label()),
+                    ActiveEntry::Loose(run) => write_card_reference(&mut liveness, run),
+                }
+                liveness.push_str(" · ");
+                write_liveness(&mut liveness, run);
+            }
+        }
+        ellipsise_in_place(&mut liveness, width);
+        lines.push(Line::styled(liveness, live_style));
+    }
+    lines
+}
+
+/// Where a column starts drawing, so the cursor stays on screen in a column taller than the
+/// space. `per` is how many rows one entry costs, which is where the two card shapes differ.
+fn scroll_to(selected: Option<usize>, rows: usize, per: usize) -> usize {
+    let visible = (rows / per).max(1);
+    selected.map_or(0, |index| index.saturating_sub(visible.saturating_sub(1)))
+}
+
+/// How a card is painted: under the cursor, live, or dispatched and abandoned.
+fn card_style(theme: &Theme, selected: bool, live: bool) -> Style {
+    if selected {
+        Style::default()
+            .bg(theme.accent)
+            .fg(theme.surface)
+            .add_modifier(Modifier::BOLD)
+    } else if live {
+        Style::default().fg(theme.text)
+    } else {
+        Style::default().fg(theme.muted)
+    }
+}
+
+/// What a live agent with no entry of its own is called where a card id would go.
+fn write_card_reference(buffer: &mut String, run: &LiveRun<'_>) {
+    use std::fmt::Write as _;
+
+    match run.task_id {
+        Some(id) => {
+            let _ = write!(buffer, "#{id}");
+        }
+        // Said rather than punctuated. A bare dash here is correct and reads as "a value is
+        // missing", when what it means is that this agent was launched by hand rather than
+        // dispatched from a card, and so has no card to be linked to.
+        None => buffer.push_str("no card"),
+    }
+}
+
+/// What an agent is doing and what is waiting behind it: the tail of every liveness line,
+/// whichever identity that line opened with.
+fn write_liveness(buffer: &mut String, run: &LiveRun<'_>) {
+    use std::fmt::Write as _;
+
+    // The queue depth is always drawn, including zero. A board that mentions a queue only when
+    // it has something in it cannot be used to check that a queue is empty, which is the question
+    // somebody about to arm a pane is actually asking.
+    let _ = write!(
+        buffer,
+        "{} · {} · {} queued",
+        run.pane_id,
+        run.state.label(),
+        run.queued
+    );
+    if run.auto_feed {
+        buffer.push_str(" · armed");
+    }
+    if run.awaiting_ack {
+        buffer.push_str(" · fed · waiting for the agent to pick it up");
+    }
+    // Only with something to hold. `holding_because` is set whenever auto-feed declined, and on
+    // an empty queue it declines for the uninteresting reason that there was nothing to feed —
+    // printing that on every entry would bury the one that is stuck.
+    if run.queued > 0
+        && let Some(why) = run.holding_because
+    {
+        let _ = write!(buffer, " · holding: {why}");
+    }
+}
+
+/// What the board pane's footer says.
+///
+/// Three things, in the order they matter. The daemon-wide pause first, because an *armed* pane
+/// that feeds nothing looks broken until something says the whole daemon is held. Then whatever
+/// the cursor is on, in full — the card it sits under is thirty cells wide, and a stalled queue's
+/// own sentence is seventy. Then the keys, published only on the pane that is taking them.
+///
+/// A free function beside the renderer rather than a method, because it is drawing rather than
+/// state: everything it needs has already been resolved by the frame that calls it.
+fn board_pane_footer(
+    view: &BoardView,
+    live: &BoardLive<'_>,
+    (column, index): (usize, usize),
+    paused: bool,
+    focused: bool,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut footer = String::with_capacity(128);
+    if paused {
+        footer.push_str("PAUSED · every queue is held");
+    }
+    if view.statuses().get(column).map(String::as_str) == Some(ACTIVE_STATUS)
+        && let Some(entry) = active_entries(view, live).get(index).copied()
+    {
+        separate(&mut footer);
+        match entry {
+            ActiveEntry::Card(task, run) => {
+                let _ = write!(footer, "#{}", task.id);
+                match run {
+                    Some(run) => {
+                        // Named here even though the card above says it too: this line is read
+                        // on its own, as the answer to "what is `a` about to arm".
+                        let _ = write!(footer, " · {} · ", run.agent.label());
+                        write_liveness(&mut footer, run);
+                    }
+                    // The card a person has forgotten about: dispatched, and whatever was
+                    // working on it is gone. Said here as well as on the card, because this
+                    // is the line that says what the cursor is about to act on.
+                    None => footer.push_str(" · not running"),
+                }
+            }
+            ActiveEntry::Loose(run) => {
+                footer.push_str(run.agent.label());
+                footer.push_str(" · ");
+                write_liveness(&mut footer, run);
+            }
+        }
+    }
+    if focused {
+        separate(&mut footer);
+        footer.push_str("h/l column · j/k card · a arms auto-feed");
+    }
+    footer
+}
+
+/// Puts a separator between two things a line is joining, and nothing in front of the first.
+fn separate(buffer: &mut String) {
+    if !buffer.is_empty() {
+        buffer.push_str(" · ");
+    }
 }
 
 fn bound_task(run: &RuntimeSnapshot) -> Option<&str> {
@@ -6665,6 +7105,10 @@ mod tests {
         // agent running above it is not in one of the columns.
         let mut dashboard = dashboard_with_a_board_pane();
         dashboard.set_board_pane_tasks(Vec::new(), std::path::PathBuf::from("/tmp/none"));
+        // Nothing on the board and nothing running: the fixture's agent is cleared, because an
+        // agent *is* something to show and the grid is what shows it — see below.
+        dashboard.runs.clear();
+        dashboard.agents.clear();
         let frame = render_to_string(&mut dashboard, 160, 40);
 
         assert!(
@@ -6680,8 +7124,22 @@ mod tests {
             !frame.contains("BACKLOG"),
             "no column headings over an empty board: {frame:?}"
         );
-        // The runs lane above it is unaffected: an empty backlog says nothing about live agents.
-        assert!(frame.contains("RUNS"), "{frame:?}");
+    }
+
+    #[test]
+    fn a_board_with_no_cards_but_an_agent_running_draws_the_grid_rather_than_saying_it_is_empty() {
+        // The other half of the same judgement, and the half the runs lane used to cover. A
+        // board whose files are empty is not an empty board while an agent is working: that
+        // agent is an entry in `ACTIVE`, and the "no tasks" page would be the board hiding the
+        // one thing on it.
+        let mut dashboard = dashboard_with_a_board_pane();
+        dashboard.set_board_pane_tasks(Vec::new(), std::path::PathBuf::from("/tmp/none"));
+        let terminal = render_terminal(&mut dashboard, 400, 40);
+        let frame = rendered(&terminal);
+        assert!(!frame.contains("no tasks on this board"), "{frame:?}");
+        let active = board_column(&terminal, "ACTIVE");
+        assert!(active.contains("claude"), "{active:?}");
+        assert!(active.contains("needs you"), "{active:?}");
     }
 
     #[test]
@@ -6692,10 +7150,278 @@ mod tests {
         for run in &mut dashboard.runs {
             run.external_task_ref = String::new();
         }
-        let frame = render_to_string(&mut dashboard, 160, 40);
+        // Wide enough for a card to have room for its second line, which is where an entry with
+        // no card says so — see `a_narrow_active_card_gives_up_a_line_rather_than_cutting_the_
+        // state_word_in_half` for what a card does when it has not.
+        let frame = render_to_string(&mut dashboard, 400, 40);
         assert!(
             frame.contains("no card"),
             "a hand-launched agent should say why it has no task: {frame:?}"
+        );
+    }
+
+    /// Everything drawn in one board column, found by its heading rather than by counting cells.
+    ///
+    /// A test that hardcoded x coordinates would be asserting about how wide the fixture's split
+    /// happened to make the pane, which is not what any of them are about. The next heading on
+    /// the same row is this column's right edge.
+    ///
+    /// The topmost column with that heading wins, so a test with a board pane *and* the overlay
+    /// open reads a mixture of the two where the popup overwrites the pane. Open one or the
+    /// other.
+    fn board_column(terminal: &Terminal<TestBackend>, heading: &str) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        let symbol = |x: u16, y: u16| buffer[(x, y)].symbol().to_owned();
+        let wanted: Vec<String> = heading.chars().map(|c| c.to_string()).collect();
+        let width = wanted.len() as u16;
+        for row in 0..area.height {
+            for x in 0..area.width.saturating_sub(width) {
+                if (0..width).any(|offset| symbol(x + offset, row) != wanted[usize::from(offset)]) {
+                    continue;
+                }
+                let right = (x + width..area.width)
+                    .find(|probe| {
+                        symbol(*probe, row)
+                            .chars()
+                            .next()
+                            .is_some_and(|character| character.is_ascii_uppercase())
+                    })
+                    .unwrap_or(area.width);
+                return (row..area.height)
+                    .map(|y| {
+                        (x..right)
+                            .map(|column| symbol(column, y))
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<String>>()
+                    .join("\n");
+            }
+        }
+        String::new()
+    }
+
+    #[test]
+    fn a_live_agent_is_a_card_in_the_active_column_instead_of_a_lane_above_the_grid() {
+        // What the first real use of this pane asked out loud: the user's agent was running in a
+        // strip above the columns, and they asked why their work "was not in the table". One
+        // grid. `ACTIVE` is the `in-progress` column under the name of what it actually holds.
+        let mut dashboard = dashboard_with_a_board_pane();
+        let terminal = render_terminal(&mut dashboard, 400, 40);
+        let frame = rendered(&terminal);
+        assert!(!frame.contains("RUNS"), "the lane is gone: {frame:?}");
+        assert!(
+            !frame.contains("IN-PROGRESS"),
+            "and the column is called what it holds: {frame:?}"
+        );
+
+        let active = board_column(&terminal, "ACTIVE");
+        assert!(active.contains("#7"), "the card is in the grid: {active:?}");
+        assert!(
+            active.contains("wire the parser"),
+            "with what it is: {active:?}"
+        );
+        assert!(active.contains("claude"), "and the agent on it: {active:?}");
+        assert!(
+            active.contains("needs you"),
+            "and what that agent is doing, spelled out: {active:?}"
+        );
+    }
+
+    #[test]
+    fn an_agent_launched_by_hand_is_an_entry_in_active_rather_than_missing_from_the_grid() {
+        // The other half of the same complaint. A run nobody dispatched from a card has no card
+        // to be drawn as, and the old lane was the only place it appeared at all — so deleting
+        // the lane without this would have deleted the agent.
+        let mut dashboard = dashboard_with_a_board_pane();
+        for run in &mut dashboard.runs {
+            run.external_task_ref = String::new();
+        }
+        let terminal = render_terminal(&mut dashboard, 400, 40);
+        let active = board_column(&terminal, "ACTIVE");
+        assert!(
+            active.contains("claude"),
+            "the agent is in the grid: {active:?}"
+        );
+        assert!(
+            active.contains("no card"),
+            "said in words rather than punctuated with a dash: {active:?}"
+        );
+    }
+
+    #[test]
+    fn a_dispatched_card_whose_agent_has_gone_stays_in_active_and_says_it_is_not_running() {
+        // The card a person has forgotten about, which is exactly the one worth showing. A
+        // daemon restart or a closed pane takes the run away; the card is still in `in-progress`
+        // on disk and nothing about the missing run may move it.
+        let mut dashboard = dashboard_with_a_board_pane();
+        dashboard.runs.clear();
+        dashboard.agents.clear();
+        let terminal = render_terminal(&mut dashboard, 400, 40);
+        let active = board_column(&terminal, "ACTIVE");
+        assert!(active.contains("#7"), "the card stays: {active:?}");
+        assert!(
+            active.contains("not running"),
+            "and says what became of its agent: {active:?}"
+        );
+        assert_eq!(
+            dashboard.board_tasks[0].status, "in-progress",
+            "and the card is where its file says it is"
+        );
+    }
+
+    #[test]
+    fn active_puts_the_agent_that_needs_you_above_the_one_that_is_working() {
+        // The same order the sidebar roster sorts by, for the same reason: a blocked agent is
+        // the only one costing the user throughput while it waits.
+        let mut dashboard = dashboard_with_a_board_pane();
+        dashboard.set_board_pane_tasks(
+            vec![
+                board_task(7, "wire the parser", "in-progress"),
+                board_task(9, "write the docs", "in-progress"),
+            ],
+            "/repo/real/kanban/tasks".into(),
+        );
+        let mut second = snapshot();
+        second.run_id = "run_2".into();
+        second.workspace_id = "w".into();
+        second.pane_id = "d".into();
+        second.external_task_ref = "9".into();
+        dashboard.runs.push(second);
+        dashboard.agents.insert(
+            "run_2".into(),
+            (Some(AgentKind::Claude), AgentState::Working),
+        );
+
+        let terminal = render_terminal(&mut dashboard, 400, 40);
+        let active = board_column(&terminal, "ACTIVE");
+        let blocked = active.find("#7").expect("the blocked card is drawn");
+        let working = active.find("#9").expect("the working card is drawn");
+        assert!(
+            blocked < working,
+            "needs you sorts above working: {active:?}"
+        );
+
+        // And the order follows the agents rather than the file order: swap the states and the
+        // column swaps with them, on the next frame and with no keypress.
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_1".into(),
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+        });
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_2".into(),
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Blocked,
+        });
+        let terminal = render_terminal(&mut dashboard, 400, 40);
+        let active = board_column(&terminal, "ACTIVE");
+        assert!(
+            active.find("#9") < active.find("#7"),
+            "the column re-sorted itself: {active:?}"
+        );
+    }
+
+    #[test]
+    fn an_agent_bound_to_a_card_is_never_also_drawn_as_an_agent_with_no_card() {
+        // The one duplication this join can produce. A dispatched card is one entry carrying its
+        // run, not a card and a loose agent that happen to be the same work.
+        let mut dashboard = dashboard_with_a_board_pane();
+        let terminal = render_terminal(&mut dashboard, 400, 40);
+        let active = board_column(&terminal, "ACTIVE");
+        assert_eq!(
+            active.matches("claude").count(),
+            1,
+            "one entry for one agent: {active:?}"
+        );
+        assert!(
+            !active.contains("no card"),
+            "this agent has a card, and it is the entry it is drawn on: {active:?}"
+        );
+        assert!(
+            active.contains("ACTIVE \u{b7} 1"),
+            "and the column counts what it draws: {active:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_about_a_live_agent_ever_rewrites_a_status_line() {
+        // The rule the whole redesign rests on. `ACTIVE` membership is derived on every frame and
+        // written nowhere: the status detector calls a 1.8-second pause "finished", and a derived
+        // column shows a wrong card for one frame and corrects itself where a written one leaves
+        // a wrong file on disk for somebody to find tomorrow.
+        let root = std::env::temp_dir().join(format!("dock-derived-{}", std::process::id()));
+        let dir = root.join("tasks");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::board::create(&dir, "wire the parser").expect("seed a task");
+        let id = crate::board::load(&dir)[0].id;
+        crate::board::set_status(&dir, id, "in-progress").expect("dispatch puts it in progress");
+        let file = crate::board::load(&dir)[0].file.clone();
+        let before = std::fs::read_to_string(&file).unwrap();
+        assert!(before.contains("status: in-progress"), "{before:?}");
+
+        let mut dashboard = dashboard_with_a_board_pane();
+        dashboard.runs[0].external_task_ref = id.to_string();
+        dashboard.set_board_pane_tasks(crate::board::load(&dir), dir.clone());
+        for state in [
+            AgentState::Blocked,
+            AgentState::Working,
+            AgentState::Done,
+            AgentState::Idle,
+        ] {
+            dashboard
+                .agents
+                .insert("run_1".into(), (Some(AgentKind::Claude), state));
+            render_to_string(&mut dashboard, 400, 40);
+        }
+        // And the frame that would be most tempted to move the card back: its agent is gone.
+        dashboard.agents.clear();
+        dashboard.runs.clear();
+        render_to_string(&mut dashboard, 400, 40);
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            before,
+            "the board is files on disk, and nothing about a live agent may write one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_narrow_active_card_gives_up_a_line_rather_than_cutting_the_state_word_in_half() {
+        // The second line is what a two-line card is *for*, so it degrades in deliberate steps
+        // rather than being left to the ellipsis. Five columns across 105 cells, less the
+        // sidebar, leave fourteen: too narrow for `claude · a · needs you · 0 queued`, wide
+        // enough for the word that matters.
+        let mut dashboard = dashboard_with_a_board_pane();
+        dashboard.layout.workspaces[0].root = LayoutNode::Pane {
+            pane_id: "b".into(),
+        };
+        let terminal = render_terminal(&mut dashboard, 105, 24);
+        let active = board_column(&terminal, "ACTIVE");
+        assert!(
+            active.contains("needs you"),
+            "the state word survives whole: {active:?}"
+        );
+        assert!(
+            !active.contains("claude"),
+            "and everything that did not fit was dropped rather than cut: {active:?}"
+        );
+
+        // At 80 the same five columns leave nine cells, where even the word would be cut. The
+        // card gives up its second line entirely: `nee…` is worse than nothing, and the glyph
+        // and its colour are there to carry the state on their own.
+        let terminal = render_terminal(&mut dashboard, 80, 24);
+        let active = board_column(&terminal, "ACTIVE");
+        assert!(active.contains("#7"), "the card is still drawn: {active:?}");
+        assert!(
+            !active.contains("\u{2026}\n") || !active.contains("needs"),
+            "no half a state word anywhere: {active:?}"
+        );
+        assert!(
+            !active.contains("needs"),
+            "the second line is gone, not truncated: {active:?}"
         );
     }
 
@@ -6740,7 +7466,7 @@ mod tests {
     }
 
     #[test]
-    fn a_board_pane_draws_both_lanes_and_never_a_terminal_placeholder() {
+    fn a_board_pane_draws_the_whole_grid_and_never_a_terminal_placeholder() {
         // The Board pane is the whole point of giving panes a kind: it occupies a rectangle on
         // the canvas like any other pane and draws something that is not a terminal. Before this
         // it drew the "Ctrl+B R starts a shell" placeholder, which is an offer a board must never
@@ -6748,10 +7474,13 @@ mod tests {
         let mut dashboard = dashboard_with_a_board_pane();
         let frame = render_to_string(&mut dashboard, 160, 40);
 
-        assert!(frame.contains("RUNS"), "the runs lane is drawn: {frame:?}");
+        assert!(
+            frame.contains("ACTIVE"),
+            "the live column is drawn: {frame:?}"
+        );
         assert!(
             frame.contains("BACKLOG"),
-            "and the backlog lane under it: {frame:?}"
+            "and the rest of the one grid beside it: {frame:?}"
         );
         assert!(frame.contains("#9"), "with the cards in it: {frame:?}");
         assert!(
@@ -6767,7 +7496,7 @@ mod tests {
         // "nothing was detected here", not "the agent is resting" — and a lane that listed those
         // would list every pane on the canvas.
         let mut dashboard = dashboard_with_a_board_pane();
-        let rows = dashboard.run_lane_rows();
+        let rows = dashboard.live_runs();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].run_id, "run_1");
         assert_eq!(rows[0].state, AgentState::Blocked);
@@ -6837,6 +7566,22 @@ mod tests {
         assert!(!frame.contains("needs you"), "{frame:?}");
     }
 
+    /// Puts the board's cursor on the first entry in `ACTIVE`.
+    ///
+    /// The one cursor opens where the view opens — the leftmost column holding anything, which
+    /// in these fixtures is the backlog — so every claim about arming starts by moving into the
+    /// column arming happens in. This is what deleting the lane changed about these tests: the
+    /// target is the grid cursor now rather than a lane row.
+    fn cursor_into_active(dashboard: &mut Dashboard) {
+        for _ in 0..2 {
+            assert_eq!(
+                dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+                UiCommand::None,
+                "moving the cursor costs the daemon nothing"
+            );
+        }
+    }
+
     /// One pane's queue as the daemon would report it.
     fn pane_queue(pane_id: &str, entries: usize, auto_feed: bool) -> PaneQueueSnapshot {
         PaneQueueSnapshot {
@@ -6864,7 +7609,16 @@ mod tests {
     /// whichever pane happened to be first.
     fn board_pane_with_two_agents() -> Dashboard {
         let mut dashboard = dashboard_with_a_board_pane();
-        dashboard.layout.workspaces[0].focused_pane_id = "b".into();
+        // The board has the canvas to itself, which is how a board pane is actually used and
+        // what a card needs to have room for its second line: five columns across half a
+        // terminal leave twelve cells each, and a card that narrow says only what its glyph
+        // says. The runs stay — a run is a run whether or not its pane is on this canvas.
+        let workspace = &mut dashboard.layout.workspaces[0];
+        workspace.focused_pane_id = "b".into();
+        workspace.panes.remove("a");
+        workspace.root = LayoutNode::Pane {
+            pane_id: "b".into(),
+        };
         let mut second = snapshot();
         second.run_id = "run_2".into();
         second.workspace_id = "w".into();
@@ -6879,16 +7633,17 @@ mod tests {
     }
 
     #[test]
-    fn the_runs_lane_shows_each_panes_queue_depth_and_whether_it_is_armed() {
-        // The two placeholders the lane shipped with. Queue depth lives only in the daemon, so
-        // unlike agent state there is nothing on the client that could have implied it.
+    fn an_active_entry_shows_its_panes_queue_depth_and_whether_it_is_armed() {
+        // The two placeholders the lane shipped with, now on the card itself. Queue depth lives
+        // only in the daemon, so unlike agent state there is nothing on the client that could
+        // have implied it.
         let mut dashboard = board_pane_with_two_agents();
         dashboard.set_queues(
             vec![pane_queue("a", 3, true), pane_queue("d", 0, false)],
             false,
         );
 
-        let rows = dashboard.run_lane_rows();
+        let rows = dashboard.live_runs();
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(
             (rows[0].pane_id, rows[0].queued, rows[0].auto_feed),
@@ -6899,13 +7654,16 @@ mod tests {
             ("d", 0, false)
         );
 
-        let frame = render_to_string(&mut dashboard, 200, 40);
-        assert!(frame.contains("3 queued"), "{frame:?}");
+        // Both entries at once, which is what the column is for, so this is drawn wide enough
+        // for two full liveness lines rather than read out of the pane's footer.
+        let terminal = render_terminal(&mut dashboard, 400, 40);
+        let active = board_column(&terminal, "ACTIVE");
+        assert!(active.contains("3 queued"), "{active:?}");
         // Zero is drawn too. "Is anything waiting behind this agent" is the question somebody
-        // about to arm a pane is asking, and a lane that goes quiet on an empty queue cannot
+        // about to arm a pane is asking, and a board that goes quiet on an empty queue cannot
         // answer it.
-        assert!(frame.contains("0 queued"), "{frame:?}");
-        assert!(frame.contains("armed"), "{frame:?}");
+        assert!(active.contains("0 queued"), "{active:?}");
+        assert!(active.contains("armed"), "{active:?}");
     }
 
     #[test]
@@ -6917,6 +7675,11 @@ mod tests {
         let mut holding = pane_queue("a", 4, true);
         holding.holding_because = Some(crate::queue::DISARMED_BY_RESTART.into());
         dashboard.set_queues(vec![holding], false);
+        // Onto the entry that is stuck. The reason is seventy characters and a card is thirty,
+        // so the pane's footer is where it fits whole — which is also where the cursor is about
+        // to arm something, and therefore where a person is looking.
+        render_to_string(&mut dashboard, 400, 40);
+        cursor_into_active(&mut dashboard);
 
         let frame = render_to_string(&mut dashboard, 400, 40);
         assert!(
@@ -6938,7 +7701,7 @@ mod tests {
     }
 
     #[test]
-    fn a_queue_changed_event_repaints_the_lane_with_no_key_fed() {
+    fn a_queue_changed_event_repaints_the_board_with_no_key_fed() {
         // `dock queue add` from another terminal, and the acceptance criterion it has to satisfy:
         // it appears in the open board pane without a refresh. The client half is two halves —
         // the event marks the client dirty, and the render loop's own `refresh` re-reads the
@@ -6946,7 +7709,7 @@ mod tests {
         // without feeding one.
         let mut dashboard = board_pane_with_two_agents();
         dashboard.set_queues(vec![pane_queue("a", 0, false)], false);
-        assert!(render_to_string(&mut dashboard, 200, 40).contains("0 queued"));
+        assert!(render_to_string(&mut dashboard, 400, 40).contains("0 queued"));
 
         dashboard.apply_event(Event::QueueChanged {
             workspace_id: "w".into(),
@@ -6961,26 +7724,77 @@ mod tests {
         // What the render loop does with that flag: `refresh` asks for the listing and hands it
         // over. The frame after says the new depth, and no key was ever fed.
         dashboard.set_queues(vec![pane_queue("a", 2, false)], false);
-        let frame = render_to_string(&mut dashboard, 200, 40);
+        let frame = render_to_string(&mut dashboard, 400, 40);
         assert!(frame.contains("2 queued"), "{frame:?}");
     }
 
     #[test]
-    fn a_on_the_runs_lane_arms_the_selected_pane_and_only_that_pane() {
+    fn a_paused_daemon_says_so_on_the_board_even_when_a_pane_is_armed() {
+        // The daemon-wide kill switch is the one thing that makes an *armed* pane feed nothing,
+        // and without it a paused daemon looks like a broken one. It used to be on the runs
+        // lane's heading; with the lane gone it is the first thing in the pane's own footer,
+        // which is the one line wide enough to hold it.
+        let mut dashboard = board_pane_with_two_agents();
+        dashboard.set_queues(vec![pane_queue("a", 2, true)], true);
+        let frame = render_to_string(&mut dashboard, 400, 40);
+        assert!(frame.contains("PAUSED"), "{frame:?}");
+        assert!(frame.contains("every queue is held"), "{frame:?}");
+        // And the pane still says it is armed, because "armed, and paused anyway" is two facts.
+        assert!(frame.contains("armed"), "{frame:?}");
+    }
+
+    #[test]
+    fn the_board_overlay_is_tall_enough_for_an_active_column_of_live_agents() {
+        // The popup is sized to its tallest column. `ACTIVE` counts double and can hold more
+        // entries than it has cards, so measuring it in cards clipped the bottom off the one
+        // column that grew — which is the column this whole pass exists to fill.
+        // No board pane on this canvas, so the only `ACTIVE` column on screen is the overlay's.
+        let mut dashboard = bound_dashboard();
+        let mut agent = snapshot();
+        agent.run_id = "run_1".into();
+        agent.external_task_ref = "7".into();
+        dashboard.runs.push(agent);
+        dashboard.agents.insert(
+            "run_1".into(),
+            (Some(AgentKind::Claude), AgentState::Blocked),
+        );
+        dashboard.set_board_tasks(
+            vec![
+                board_task(7, "wire the parser", "in-progress"),
+                board_task(21, "audit the queue", "in-progress"),
+                board_task(22, "retry the fetch", "in-progress"),
+            ],
+            "/repo/real/kanban/tasks".into(),
+        );
+        // Three cards, one of them with an agent on it: three entries, six rows, over a popup
+        // that used to be sized for three *cards* and so had room for one and a half of them.
+        let terminal = render_terminal(&mut dashboard, 130, 40);
+        let active = board_column(&terminal, "ACTIVE");
+        assert!(active.contains("#7"), "{active:?}");
+        assert!(
+            active.contains("#22"),
+            "the last entry is drawn rather than clipped: {active:?}"
+        );
+    }
+
+    #[test]
+    fn a_on_an_active_entry_arms_that_entrys_pane_and_only_that_pane() {
         // Arming is the one deliberate act that lets Dock put words in front of an agent with
         // nobody watching, so the key names one pane explicitly and there is no key that arms
-        // the lane. `UiCommand::Request` carries exactly one request; `Requests` — the batch
-        // form — is deliberately not what this returns.
+        // the column. `UiCommand::Request` carries exactly one request; `Requests` — the batch
+        // form — is deliberately not what this returns. Only the way the target is chosen
+        // changed when the lane went: it is the grid's own cursor now.
         let mut dashboard = board_pane_with_two_agents();
         dashboard.set_queues(
             vec![pane_queue("a", 1, false), pane_queue("d", 1, false)],
             false,
         );
-        render_to_string(&mut dashboard, 200, 40);
+        render_to_string(&mut dashboard, 400, 40);
+        cursor_into_active(&mut dashboard);
 
         let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         let UiCommand::Request(request) = asked else {
-            panic!("`a` on the runs lane must ask the daemon to arm, got {asked:?}");
+            panic!("`a` on an ACTIVE entry must ask the daemon to arm, got {asked:?}");
         };
         assert_eq!(
             *request,
@@ -6989,25 +7803,52 @@ mod tests {
                 pane_id: "a".into(),
                 enabled: true,
             }),
-            "the selected row, which is the blocked agent at the top of the lane"
+            "the entry under the cursor, which is the blocked agent at the top of the column"
         );
 
         // The other pane is untouched: nothing local arms anything, and the listing only changes
         // when the daemon says it did.
-        assert!(!dashboard.run_lane_rows()[1].auto_feed);
+        assert!(!dashboard.live_runs()[1].auto_feed);
     }
 
     #[test]
-    fn the_lane_cursor_chooses_which_pane_a_arms() {
-        // The minimal selection model, and the reason it names a pane rather than an index: the
-        // lane sorts blocked agents to the top, so a position would quietly point somewhere else
-        // the moment an agent changed state.
+    fn a_outside_active_says_what_it_arms_rather_than_arming_whatever_is_nearest() {
+        // The cursor is one cursor over the whole grid, so it can be on a backlog card — and a
+        // backlog card has no agent. Falling back to "the first agent" would make the one
+        // deliberate act in Dock happen to a pane the user was not pointing at.
+        let mut dashboard = board_pane_with_two_agents();
+        dashboard.set_queues(vec![pane_queue("a", 1, false)], false);
+        render_to_string(&mut dashboard, 400, 40);
+
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            UiCommand::None,
+            "nothing is asked of the daemon"
+        );
+        assert!(
+            dashboard
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("ACTIVE")),
+            "{:?}",
+            dashboard.error
+        );
+        assert!(!dashboard.live_runs()[0].auto_feed);
+    }
+
+    #[test]
+    fn the_board_cursor_chooses_which_pane_a_arms_and_a_re_sort_never_slides_another_under_it() {
+        // The selection model, and the reason it names a pane rather than an index: `ACTIVE`
+        // sorts blocked agents to the top, so a position would quietly point somewhere else the
+        // moment an agent changed state. This is the property the deleted lane cursor existed
+        // for, and it is now the property of the one cursor over the whole grid.
         let mut dashboard = board_pane_with_two_agents();
         dashboard.set_queues(
             vec![pane_queue("a", 1, false), pane_queue("d", 1, false)],
             false,
         );
-        render_to_string(&mut dashboard, 200, 40);
+        render_to_string(&mut dashboard, 400, 40);
+        cursor_into_active(&mut dashboard);
 
         assert_eq!(
             dashboard.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
@@ -7027,8 +7868,8 @@ mod tests {
             })
         );
 
-        // The lane re-orders under the cursor when the agent it names starts working, and the
-        // cursor goes with the pane rather than staying over row two.
+        // The column re-orders under the cursor when the agent it names starts working, and the
+        // cursor goes with the pane rather than staying over the second entry.
         dashboard.apply_event(Event::AgentStateChanged {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Claude),
@@ -7050,7 +7891,7 @@ mod tests {
                 pane_id: "d".into(),
                 enabled: true,
             }),
-            "still the pane the user chose, which is now the top row rather than the second"
+            "still the pane the user chose, which is now the top entry rather than the second"
         );
     }
 
@@ -7060,7 +7901,8 @@ mod tests {
         // so a pane armed from `dock queue arm` in another terminal is disarmed by the same key.
         let mut dashboard = board_pane_with_two_agents();
         dashboard.set_queues(vec![pane_queue("a", 2, true)], false);
-        render_to_string(&mut dashboard, 200, 40);
+        render_to_string(&mut dashboard, 400, 40);
+        cursor_into_active(&mut dashboard);
 
         let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         let UiCommand::Request(request) = asked else {
@@ -7085,7 +7927,8 @@ mod tests {
         // that fixes it, and it has to arrive whole.
         let mut dashboard = board_pane_with_two_agents();
         dashboard.set_queues(vec![pane_queue("a", 1, false)], false);
-        render_to_string(&mut dashboard, 200, 40);
+        render_to_string(&mut dashboard, 400, 40);
+        cursor_into_active(&mut dashboard);
         assert!(matches!(
             dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
             UiCommand::Request(_)
@@ -7106,7 +7949,7 @@ mod tests {
         );
         // And the pane stayed unarmed. A refusal that left the lane claiming otherwise would be
         // the same failure as swallowing it.
-        assert!(!dashboard.run_lane_rows()[0].auto_feed);
+        assert!(!dashboard.live_runs()[0].auto_feed);
     }
 
     #[test]
@@ -7274,9 +8117,17 @@ mod tests {
         let frame = render_to_string(&mut dashboard, 130, 32);
         // The shape is the information: where work has piled up, what is in flight, what waits on
         // a person. A list sorted by status shows none of that at a glance.
-        for column in ["BACKLOG", "TODO", "IN-PROGRESS", "REVIEW", "DONE"] {
+        // `ACTIVE` rather than `IN-PROGRESS`: the heading is the one thing that changed, because
+        // the column holds live agents with no card as well as the cards that are in progress.
+        // The status on disk and in `board::STATUSES` is still `in-progress`.
+        for column in ["BACKLOG", "TODO", "ACTIVE", "REVIEW", "DONE"] {
             assert!(frame.contains(column), "missing column {column}: {frame:?}");
         }
+        assert!(!frame.contains("IN-PROGRESS"), "{frame:?}");
+        assert_eq!(
+            dashboard.board_tasks[1].status, "in-progress",
+            "and nothing about the heading touched the card"
+        );
         assert!(frame.contains("#11"), "{frame:?}");
         assert!(frame.contains("#12"), "{frame:?}");
         // It opens on the leftmost column holding anything, which here is backlog.
@@ -7284,6 +8135,76 @@ mod tests {
             dashboard.board.as_ref().unwrap().view.status(),
             Some("backlog")
         );
+    }
+
+    #[test]
+    fn moving_a_card_into_active_writes_in_progress_because_active_is_only_a_heading() {
+        // The one risk in renaming a column: a display name leaking into the write path. `<` and
+        // `>` walk `board.view.statuses()`, which is the board's own columns and still holds
+        // `in-progress` — so the heading changed and nothing else did. A file with
+        // `status: active` in it would be a file `kanban-md` has never heard of.
+        let root = std::env::temp_dir().join(format!("dock-heading-{}", std::process::id()));
+        let dir = root.join("tasks");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::board::create(&dir, "wire the parser").expect("seed a task");
+
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.board.as_mut().unwrap().writable = true;
+        let frame = render_to_string(&mut dashboard, 130, 32);
+        assert!(frame.contains("ACTIVE"), "{frame:?}");
+
+        // Backlog to todo to in-progress, which is two columns to the right of where it started.
+        dashboard.key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
+        assert_eq!(crate::board::load(&dir)[0].status, "in-progress");
+        assert_eq!(
+            dashboard.board.as_ref().unwrap().view.status(),
+            Some("in-progress"),
+            "and the cursor followed the card into the column it is actually in"
+        );
+        assert!(crate::board::STATUSES.contains(&"in-progress"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_active_entry_that_is_a_running_agent_has_nothing_for_the_move_keys_to_move() {
+        // `ACTIVE` holds two kinds of thing and only one of them is a card. `>` on a live agent
+        // used to be impossible because live agents were in a lane with no `>`; now that they
+        // share a column with cards, the move keys have to say so rather than moving whatever
+        // card the view's own row happened to be sitting over.
+        let root = std::env::temp_dir().join(format!("dock-loose-{}", std::process::id()));
+        let dir = root.join("tasks");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::board::create(&dir, "wire the parser").expect("seed a task");
+        let id = crate::board::load(&dir)[0].id;
+        crate::board::set_status(&dir, id, "in-progress").expect("dispatch it");
+
+        let mut dashboard = board_pane_with_two_agents();
+        dashboard.runs[0].external_task_ref = id.to_string();
+        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.board.as_mut().unwrap().writable = true;
+        render_to_string(&mut dashboard, 400, 40);
+
+        // The cursor opens on the only column holding a card, which is `ACTIVE`, and the second
+        // entry there is the agent that has no card at all.
+        dashboard.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert_eq!(
+            dashboard.error.as_deref(),
+            Some("that is a running agent, not a card")
+        );
+        assert_eq!(
+            crate::board::load(&dir)[0].status,
+            "in-progress",
+            "and the card the cursor was not on stayed exactly where it was"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

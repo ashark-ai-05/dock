@@ -22,6 +22,19 @@ thread_local! {
 pub const MAX_WORKSPACES: usize = 64;
 pub const MAX_PANES_PER_WORKSPACE: usize = 64;
 
+/// The `layout.json` schema this build writes, and the newest it can read.
+///
+/// Version 2 added [`PaneKind`]. Reading version 1 costs nothing — `deny_unknown_fields` rejects
+/// *extra* fields, not missing ones, so a v1 file simply has no `kind` and every pane defaults
+/// back to the terminal it already was. The first persist after any change writes 2.
+///
+/// The reverse does not work and deliberately is not made to: an older binary sees `kind` as an
+/// unknown field and refuses the whole file. Loosening `deny_unknown_fields` to buy that back was
+/// rejected — this file names the panes a daemon will spawn shells into, and the hardening on it
+/// is worth more than a downgrade convenience. What a downgrade loses is one split arrangement,
+/// which `layout.json` already half-discards on every load.
+const LAYOUT_SCHEMA_VERSION: u16 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitAxis {
@@ -38,6 +51,27 @@ pub enum PaneRuntime {
     Restored,
 }
 
+/// What a pane is for. A pane is a rectangle that takes focus, splits, resizes and closes; its
+/// kind decides only what gets drawn inside it and whether it owns a process.
+///
+/// Deliberately a field on [`PaneLayout`] rather than a third [`LayoutNode`] variant. A board
+/// occupies a rectangle, takes focus, resizes and closes exactly like a terminal does — topology
+/// is not where it differs — and a `LayoutNode::Widget` would have grown an arm saying "identical
+/// to `Pane`" onto every tree walker in this file, one of which ([`validate_node`]) is a security
+/// boundary. When the diff pane and the log pane arrive they add variants here, where the
+/// difference actually is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneKind {
+    /// A Dock-owned PTY. Every pane was this before board panes existed, which is why it is
+    /// the default a layout written by an older version deserialises into.
+    #[default]
+    Terminal,
+    /// The task board. No run, no PTY, no scrollback; drawn from the client's own board load
+    /// and its live agent roster.
+    Board,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PaneLayout {
@@ -45,6 +79,18 @@ pub struct PaneLayout {
     pub name: String,
     pub run_id: Option<String>,
     pub runtime: PaneRuntime,
+    /// What this pane is for. Durable topology rather than process state, so unlike `run_id` and
+    /// `runtime` it survives a restart: a board that came back as a terminal would come back with
+    /// a shell in it.
+    pub kind: PaneKind,
+}
+
+impl PaneLayout {
+    /// Whether this pane draws the board rather than a terminal. Named rather than compared
+    /// inline because the question is asked from three files and reads as a property of the pane.
+    pub fn is_board(&self) -> bool {
+        self.kind == PaneKind::Board
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +145,11 @@ struct DurableWorkspace {
 struct DurablePane {
     pane_id: String,
     name: String,
+    /// Defaulted, which is the whole migration: `deny_unknown_fields` refuses *extra* fields, not
+    /// missing ones, so a layout written before pane kinds existed reads back with every pane a
+    /// `Terminal` — exactly what each of them was.
+    #[serde(default)]
+    kind: PaneKind,
 }
 
 pub struct LayoutRegistry {
@@ -163,10 +214,23 @@ impl LayoutRegistry {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|e| format!("could not read layout metadata: {e}"))?;
-        let value = serde_json::from_slice::<DurableLayout>(&bytes)
+        let parsed = serde_json::from_slice::<DurableLayout>(&bytes);
+        // A layout from a newer Dock is intact, not mangled, and it is the only refusal here that
+        // a person can act on. Every other one ends in quarantine and an empty dashboard, which
+        // says nothing about which of the two happened; this one says so and leaves the file
+        // alone, because the build that wrote it will want it back.
+        if let Ok(value) = &parsed
+            && value.schema_version > LAYOUT_SCHEMA_VERSION
+        {
+            return Err(format!(
+                "layout metadata was written by a newer Dock (schema {}); this build understands up to {LAYOUT_SCHEMA_VERSION}",
+                value.schema_version
+            ));
+        }
+        let value = parsed
             .map_err(|e| format!("could not parse layout metadata: {e}"))
             .and_then(|value| {
-                if value.schema_version != 1 {
+                if value.schema_version == 0 {
                     return Err("unsupported layout metadata schema version".into());
                 }
                 validate_durable_workspaces(&value.workspaces)?;
@@ -229,6 +293,13 @@ impl LayoutRegistry {
             .run_id
             .clone()
     }
+    /// What a pane is for, or `None` when there is no such pane.
+    ///
+    /// The one question the PTY machinery has to ask before it does anything: a Board pane has no
+    /// run, and every path that would have given it one consults this first.
+    pub fn pane_kind(&self, workspace_id: &str, pane_id: &str) -> Option<PaneKind> {
+        Some(self.workspaces.get(workspace_id)?.panes.get(pane_id)?.kind)
+    }
     pub fn set_runtime(&mut self, run_id: &str, runtime: PaneRuntime) {
         for workspace in self.workspaces.values_mut() {
             for pane in workspace.panes.values_mut() {
@@ -269,6 +340,7 @@ impl LayoutRegistry {
             name: "terminal".into(),
             run_id: None,
             runtime: PaneRuntime::Empty,
+            kind: PaneKind::Terminal,
         };
         let workspace = WorkspaceLayout {
             workspace_id: id.clone(),
@@ -282,12 +354,18 @@ impl LayoutRegistry {
         self.commit(candidate)?;
         Ok(workspace)
     }
+    /// Divides a pane in two, giving the new half the kind the caller asked for.
+    ///
+    /// The kind belongs to the new pane and never to the one being split: splitting a board does
+    /// not make the half beside it a board, and splitting a terminal is how a board gets onto the
+    /// canvas in the first place.
     pub fn split(
         &mut self,
         workspace_id: &str,
         pane_id: &str,
         new_id: String,
         axis: SplitAxis,
+        kind: PaneKind,
     ) -> Result<WorkspaceLayout, String> {
         validate_id(&new_id)?;
         let mut candidate = self.workspaces.clone();
@@ -308,9 +386,13 @@ impl LayoutRegistry {
             new_id.clone(),
             PaneLayout {
                 pane_id: new_id.clone(),
-                name: "terminal".into(),
+                name: match kind {
+                    PaneKind::Terminal => "terminal".into(),
+                    PaneKind::Board => "board".into(),
+                },
                 run_id: None,
                 runtime: PaneRuntime::Empty,
+                kind,
             },
         );
         workspace.focused_pane_id = new_id;
@@ -410,6 +492,11 @@ impl LayoutRegistry {
             .panes
             .get_mut(pane_id)
             .ok_or("pane not found")?;
+        // The same refusal `ensure_bound_pane` makes, for the same reason: "a board pane has no
+        // run" is only an invariant if every way of giving one a run says no.
+        if p.is_board() {
+            return Err("that pane is a board; it cannot be bound to a run".into());
+        }
         p.run_id = Some(run_id);
         p.runtime = runtime;
         // Runtime bindings are process-local authority and are never durable.
@@ -436,6 +523,7 @@ impl LayoutRegistry {
                 name: "terminal".into(),
                 run_id: None,
                 runtime: PaneRuntime::Empty,
+                kind: PaneKind::Terminal,
             };
             candidate.insert(
                 workspace_id.clone(),
@@ -464,6 +552,7 @@ impl LayoutRegistry {
                     name: "terminal".into(),
                     run_id: None,
                     runtime: PaneRuntime::Empty,
+                    kind: PaneKind::Terminal,
                 },
             );
             workspace.focused_pane_id = pane_id.clone();
@@ -472,6 +561,14 @@ impl LayoutRegistry {
             .get_mut(&workspace_id)
             .and_then(|workspace| workspace.panes.get_mut(&pane_id))
             .ok_or("pane not found")?;
+        // The last place a run could be bound into a board. `check_launch_target` guards the
+        // dispatches that name a pane, but a dispatch with no launch target derives its pane id
+        // from its run id and binds whatever is already there — so a pane that happened to carry
+        // that name would have been quietly given a PTY it is not supposed to have. Cheap to
+        // close, and the alternative is a rule that holds everywhere except one route.
+        if pane.is_board() {
+            return Err("that pane is a board; it cannot be bound to a run".into());
+        }
         pane.run_id = Some(run_id);
         pane.runtime = PaneRuntime::Running;
         self.commit(candidate)?;
@@ -564,6 +661,13 @@ impl LayoutRegistry {
             .panes
             .get(pane_id)
             .ok_or("pane not found")?;
+        // Refused by kind before it is refused by binding, and with its own words. A board pane's
+        // `run_id` is permanently `None`, so the binding check below would have passed it
+        // straight through to a launch; and if it ever did report "pane already has a run", that
+        // would be a sentence about a pane that will never have one.
+        if pane.kind == PaneKind::Board {
+            return Err("that pane is a board; split a terminal pane to launch here".into());
+        }
         if pane.run_id.is_some() {
             return Err("pane already has a run; close it before launching another".into());
         }
@@ -585,7 +689,7 @@ impl LayoutRegistry {
             return Err("injected layout persistence failure".into());
         }
         let value = DurableLayout {
-            schema_version: 1,
+            schema_version: LAYOUT_SCHEMA_VERSION,
             workspaces: workspaces.values().map(DurableWorkspace::from).collect(),
         };
         validate_durable_workspaces(&value.workspaces)?;
@@ -875,6 +979,11 @@ impl DurableWorkspace {
                             name: pane.name,
                             run_id: None,
                             runtime: PaneRuntime::Restored,
+                            // Carried through rather than dropped. `run_id` and `runtime` are
+                            // process state and a restart genuinely invalidates them; the kind
+                            // is topology, and a board restored as a terminal would be handed a
+                            // shell by `revive_restored_panes` the moment it came back.
+                            kind: pane.kind,
                         },
                     )
                 })
@@ -899,6 +1008,7 @@ impl From<&WorkspaceLayout> for DurableWorkspace {
                         DurablePane {
                             pane_id: pane.pane_id.clone(),
                             name: pane.name.clone(),
+                            kind: pane.kind,
                         },
                     )
                 })
@@ -1082,7 +1192,13 @@ mod tests {
             .create_workspace("work_1".into(), "daily".into(), "pane_1".into())
             .unwrap();
         layout
-            .split("work_1", "pane_1", "pane_2".into(), SplitAxis::Vertical)
+            .split(
+                "work_1",
+                "pane_1",
+                "pane_2".into(),
+                SplitAxis::Vertical,
+                PaneKind::Terminal,
+            )
             .unwrap();
         // Apply each mutation once, so the file already holds the state the loop below re-asserts.
         layout.resize("work_1", "pane_2", 700).unwrap();
@@ -1122,7 +1238,13 @@ mod tests {
             .create_workspace("work_1".into(), "daily".into(), "pane_1".into())
             .unwrap();
         layout
-            .split("work_1", "pane_1", "pane_2".into(), SplitAxis::Vertical)
+            .split(
+                "work_1",
+                "pane_1",
+                "pane_2".into(),
+                SplitAxis::Vertical,
+                PaneKind::Terminal,
+            )
             .unwrap();
         settle();
         let before = written_at(&dir);
@@ -1169,7 +1291,13 @@ mod tests {
             .create_workspace("work_1".into(), "daily".into(), "pane_1".into())
             .unwrap();
         layout
-            .split("work_1", "pane_1", "pane_2".into(), SplitAxis::Vertical)
+            .split(
+                "work_1",
+                "pane_1",
+                "pane_2".into(),
+                SplitAxis::Vertical,
+                PaneKind::Terminal,
+            )
             .unwrap();
         layout.resize("work_1", "pane_2", 700).unwrap();
         layout.focus("work_1", "pane_1").unwrap();
@@ -1191,10 +1319,22 @@ mod tests {
             .create_workspace("w".into(), "nested".into(), "p1".into())
             .unwrap();
         layout
-            .split("w", "p1", "p2".into(), SplitAxis::Vertical)
+            .split(
+                "w",
+                "p1",
+                "p2".into(),
+                SplitAxis::Vertical,
+                PaneKind::Terminal,
+            )
             .unwrap();
         layout
-            .split("w", "p2", "p3".into(), SplitAxis::Horizontal)
+            .split(
+                "w",
+                "p2",
+                "p3".into(),
+                SplitAxis::Horizontal,
+                PaneKind::Terminal,
+            )
             .unwrap();
         layout.resize("w", "p3", 700).unwrap();
         let workspace = &layout.snapshot().workspaces[0];
@@ -1287,10 +1427,12 @@ mod tests {
             0o600
         );
 
+        // Schema 0 is the only version below the supported range, and it is a mangling rather
+        // than a downgrade: nothing ever wrote it.
         let dir = directory("unsupported");
         fs::write(
             dir.join("layout.json"),
-            br#"{"schema_version":2,"workspaces":[]}"#,
+            br#"{"schema_version":0,"workspaces":[]}"#,
         )
         .unwrap();
         assert!(
@@ -1312,6 +1454,191 @@ mod tests {
                 .create_workspace("work_1".into(), "x".repeat(129), "pane_1".into())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_layout_written_before_pane_kinds_existed_loads_with_every_pane_a_terminal() {
+        // The whole migration, in one direction. A v1 file has no `kind` at all, and every pane
+        // in it was a terminal by construction — so the default has to be `Terminal` and the load
+        // has to be silent. Quarantining here would take a working layout away from anyone who
+        // upgraded.
+        let dir = directory("v1-file");
+        fs::write(
+            dir.join("layout.json"),
+            br#"{"schema_version":1,"workspaces":[{"workspace_id":"w","name":"daily","focused_pane_id":"p","panes":{"p":{"pane_id":"p","name":"editor"},"q":{"pane_id":"q","name":"agent"}},"root":{"kind":"split","axis":"vertical","ratio_milli":500,"first":{"kind":"pane","pane_id":"p"},"second":{"kind":"pane","pane_id":"q"}}}]}"#,
+        )
+        .unwrap();
+        let mut layout = LayoutRegistry::load(&dir).unwrap();
+        let workspace = &layout.snapshot().workspaces[0];
+        assert_eq!(workspace.panes.len(), 2);
+        for pane in workspace.panes.values() {
+            assert_eq!(
+                pane.kind,
+                PaneKind::Terminal,
+                "a pane written before kinds existed was a terminal and must come back as one"
+            );
+        }
+        assert!(
+            !dir.join("layout-quarantine").exists(),
+            "an older layout is readable, not corrupt"
+        );
+
+        // And the other direction: the first durable change writes the current schema, so the
+        // upgrade needs no rewrite-on-load and no shim.
+        assert!(
+            fs::read_to_string(dir.join("layout.json"))
+                .unwrap()
+                .contains(r#""schema_version": 1"#)
+                || fs::read_to_string(dir.join("layout.json"))
+                    .unwrap()
+                    .contains(r#""schema_version":1"#)
+        );
+        layout.rename("w", Some("p"), "renamed".into()).unwrap();
+        let written = fs::read_to_string(dir.join("layout.json")).unwrap();
+        assert!(
+            written.contains(r#""schema_version": 2"#),
+            "the first persist upgrades the file: {written}"
+        );
+        assert!(written.contains(r#""kind": "terminal""#), "{written}");
+    }
+
+    #[test]
+    fn a_board_pane_survives_a_restart_and_is_still_a_board() {
+        // Durable topology, not process state. `run_id` and `runtime` are deliberately discarded
+        // on every load; the kind must not be, because a board restored as a terminal is a board
+        // that comes back with a shell in it.
+        let dir = directory("board-restart");
+        {
+            let mut layout = LayoutRegistry::load(&dir).unwrap();
+            layout
+                .create_workspace("w".into(), "daily".into(), "p".into())
+                .unwrap();
+            layout
+                .split("w", "p", "q".into(), SplitAxis::Vertical, PaneKind::Board)
+                .unwrap();
+            let workspace = &layout.snapshot().workspaces[0];
+            assert_eq!(workspace.panes["p"].kind, PaneKind::Terminal);
+            assert_eq!(
+                workspace.panes["q"].kind,
+                PaneKind::Board,
+                "the kind belongs to the new half, not to the pane that was split"
+            );
+        }
+        let layout = LayoutRegistry::load(&dir).unwrap();
+        let workspace = &layout.snapshot().workspaces[0];
+        assert_eq!(workspace.panes["q"].kind, PaneKind::Board);
+        assert_eq!(workspace.panes["q"].runtime, PaneRuntime::Restored);
+        assert_eq!(workspace.panes["q"].run_id, None);
+        assert_eq!(layout.pane_kind("w", "q"), Some(PaneKind::Board));
+        assert_eq!(layout.pane_kind("w", "gone"), None);
+    }
+
+    #[test]
+    fn a_board_pane_counts_against_the_workspace_pane_limit() {
+        // A board occupies a rectangle like anything else. Exempting it would be a way to put
+        // more panes on a canvas than the cap allows by asking for the other kind.
+        let dir = directory("board-capacity");
+        let mut layout = LayoutRegistry::load(&dir).unwrap();
+        layout
+            .create_workspace("w".into(), "daily".into(), "p0".into())
+            .unwrap();
+        for index in 1..MAX_PANES_PER_WORKSPACE {
+            layout
+                .split(
+                    "w",
+                    "p0",
+                    format!("p{index}"),
+                    SplitAxis::Vertical,
+                    PaneKind::Board,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            layout.split(
+                "w",
+                "p0",
+                "one_too_many".into(),
+                SplitAxis::Vertical,
+                PaneKind::Board
+            ),
+            Err("pane limit reached".into())
+        );
+        assert!(layout.check_bind_capacity("w", "another").is_err());
+    }
+
+    #[test]
+    fn launching_into_a_board_pane_is_refused_with_a_message_about_splitting_a_terminal() {
+        // A board pane's `run_id` is permanently `None`, so the binding check would have waved a
+        // launch straight through — and had it refused, "pane already has a run" would have been
+        // a sentence about a pane that will never have one.
+        let dir = directory("board-launch-target");
+        let mut layout = LayoutRegistry::load(&dir).unwrap();
+        layout
+            .create_workspace("w".into(), "daily".into(), "p".into())
+            .unwrap();
+        layout
+            .split("w", "p", "q".into(), SplitAxis::Vertical, PaneKind::Board)
+            .unwrap();
+        assert_eq!(layout.check_launch_target("w", "p"), Ok(()));
+        assert_eq!(
+            layout.check_launch_target("w", "q"),
+            Err("that pane is a board; split a terminal pane to launch here".into())
+        );
+    }
+
+    #[test]
+    fn a_run_can_never_be_bound_into_a_board_however_it_arrives() {
+        // `check_launch_target` covers the dispatches that name a pane. This covers the one that
+        // does not: a dispatch with no launch target derives `pane_{run_id}` and binds whatever
+        // is already sitting under that name, which would have handed a board a PTY through the
+        // one route that never asks what the pane is for.
+        let dir = directory("board-bind");
+        let mut layout = LayoutRegistry::load(&dir).unwrap();
+        layout
+            .create_workspace("w".into(), "daily".into(), "p".into())
+            .unwrap();
+        layout
+            .split("w", "p", "q".into(), SplitAxis::Vertical, PaneKind::Board)
+            .unwrap();
+        assert_eq!(
+            layout
+                .ensure_bound_pane("w".into(), "q".into(), "dock_run".into())
+                .err(),
+            Some("that pane is a board; it cannot be bound to a run".into())
+        );
+        assert_eq!(layout.snapshot().workspaces[0].panes["q"].run_id, None);
+        assert!(
+            layout
+                .bind_run("w", "q", "dock_run".into(), PaneRuntime::Running)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_layout_written_by_a_newer_schema_is_refused_with_a_message_that_says_so() {
+        // A file from a newer Dock is intact, not mangled — but every refusal used to end in the
+        // same quarantine, so a downgrade and a corruption were indistinguishable from the log
+        // and from the empty dashboard they both produced. Refusing outright, by name, is what
+        // lets a person tell "you downgraded" from "your file was mangled", and it leaves the
+        // file where the newer build will still find it rather than renaming it away.
+        let dir = directory("from-the-future");
+        fs::write(
+            dir.join("layout.json"),
+            br#"{"schema_version":3,"workspaces":[]}"#,
+        )
+        .unwrap();
+        let Err(refusal) = LayoutRegistry::load(&dir) else {
+            panic!("a newer schema must be refused rather than loaded");
+        };
+        assert!(
+            refusal.contains("newer Dock") && refusal.contains('3'),
+            "the refusal must name the version that wrote it: {refusal}"
+        );
+        assert!(
+            dir.join("layout.json").exists(),
+            "a layout Dock merely does not understand must not be quarantined"
+        );
+        assert!(!dir.join("layout-quarantine").exists());
     }
 
     #[test]
@@ -1549,7 +1876,13 @@ mod tests {
             .create_workspace("w".into(), "workspace".into(), "p".into())
             .unwrap();
         layout
-            .split("w", "p", "q".into(), SplitAxis::Vertical)
+            .split(
+                "w",
+                "p",
+                "q".into(),
+                SplitAxis::Vertical,
+                PaneKind::Terminal,
+            )
             .unwrap();
         let baseline = layout.snapshot();
         let durable = fs::read(dir.join("layout.json")).unwrap();
@@ -1559,7 +1892,13 @@ mod tests {
         assert!(layout.resize("w", "p", 600).is_err());
         assert!(
             layout
-                .split("w", "p", "r".into(), SplitAxis::Vertical)
+                .split(
+                    "w",
+                    "p",
+                    "r".into(),
+                    SplitAxis::Vertical,
+                    PaneKind::Terminal
+                )
                 .is_err()
         );
         assert!(layout.close("w", "p").is_err());

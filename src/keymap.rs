@@ -35,6 +35,12 @@ pub enum PaneCommand {
     Review,
     /// Show the task board and dispatch an agent onto one of its tasks.
     Board,
+    /// Split the focused pane and make the new half a board on the canvas.
+    ///
+    /// Distinct from [`Board`](Self::Board), which opens the same board as a popup over the
+    /// canvas. Both are kept: the overlay is what you want when the board is a thing you glance
+    /// at, and a pane is what you want when it is a thing you work from.
+    SplitBoard,
     /// Show what has changed in the focused pane's worktree.
     Git,
     /// Jump straight to the workspace in this 1-based position, if it exists.
@@ -114,7 +120,9 @@ impl Keymap {
             ("f", "file"),
             ("a", "resume"),
             ("i", "review"),
-            ("k", "board"),
+            // Paired like `h/v`: the same board, as a popup or as a pane on the canvas. A
+            // separate entry for the second one pushed the last binding out of the two-row bar.
+            ("k/B", "board ▤"),
             ("g", "git"),
             ("[", "copy mode"),
             ("+/-", "resize"),
@@ -170,6 +178,9 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Char('i') => PaneCommand::Review,
         // `k` for kanban.
         KeyCode::Char('k') => PaneCommand::Board,
+        // Shifted, for the same reason `R` and `X` are: this one changes the canvas, and `b` is
+        // the prefix key itself — pressing it twice already means "send a literal Ctrl+B".
+        KeyCode::Char('B') => PaneCommand::SplitBoard,
         KeyCode::Char('g') => PaneCommand::Git,
         // Cycling is fine for two workspaces and miserable for eight. A digit is the only way to
         // reach a distant workspace in constant time. `0` is deliberately unbound: the positions
@@ -323,7 +334,9 @@ mod tests {
             "f",
             "a",
             "i",
-            "k",
+            // The board's two surfaces share one entry, as `h/v` does: same board, once as a
+            // popup over the canvas and once as a pane on it.
+            "k/B",
             "g",
             "[",
             // The three ways to reach a workspace share one entry: the footer is two rows, and
@@ -332,6 +345,33 @@ mod tests {
         ] {
             assert!(keys.contains(&expected), "missing hint for {expected}");
         }
+    }
+
+    #[test]
+    fn the_board_pane_key_is_the_shifted_form_of_the_board_overlay_key() {
+        // Requirement 4 keeps the overlay, so the two surfaces must not share a key. `b` itself
+        // is unavailable — it is the prefix, and pressing it twice already means "send a literal
+        // Ctrl+B" — which is why the pane is on the shifted `B` beside the overlay's `k`.
+        let mut keymap = Keymap::new();
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(plain('k'), KeyEncoding::default()),
+            KeyOutcome::Command(PaneCommand::Board)
+        );
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(
+                KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT),
+                KeyEncoding::default()
+            ),
+            KeyOutcome::Command(PaneCommand::SplitBoard)
+        );
+        // And an unshifted `b` after the prefix is still the literal Ctrl+B it always was.
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(prefix(), KeyEncoding::default()),
+            KeyOutcome::Passthrough(vec![0x02])
+        );
     }
 
     #[test]

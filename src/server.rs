@@ -270,14 +270,7 @@ fn handle_connection_with_timeout(
                 Ok(snapshot) => write_response(stream, &Response::Dispatched { snapshot })?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
-            Ok(Request::TerminalLaunch(request)) => match runtime.terminal_launch(
-                request.workspace_id,
-                request.pane_id,
-                request.run_id,
-                request.profile,
-                request.runtime_directory,
-                request.arguments,
-            ) {
+            Ok(Request::TerminalLaunch(request)) => match runtime.terminal_launch(request) {
                 Ok(snapshot) => write_response(stream, &Response::Dispatched { snapshot })?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
@@ -2417,6 +2410,7 @@ mod tests {
                     pane_id: pane_ids[index - 1].clone(),
                     new_pane_id: pane_id.clone(),
                     axis: crate::layout::SplitAxis::Vertical,
+                    kind: crate::layout::PaneKind::Terminal,
                 })
                 .expect("split a bench pane");
             pane_ids.push(pane_id);

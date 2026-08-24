@@ -14,14 +14,16 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::{
     adapter::{AdapterId, AdapterSelection},
-    board::{BoardTask, BoardView, STATUSES},
+    board::{BoardTask, BoardView},
     clipboard::{self, ClipboardRoute},
     copy::{CopySession, find_matches},
     detect::{AgentKind, AgentState},
     files,
     git::GitFacts,
     keymap::{FocusDirection, KeyOutcome, Keymap, PaneCommand},
-    layout::{LayoutNode, LayoutSnapshot, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout},
+    layout::{
+        LayoutNode, LayoutSnapshot, PaneKind, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout,
+    },
     model::{HandoffRecord, ReviewDecision, ReviewRoute},
     picker::{Picker, PickerItem},
     protocol::{
@@ -135,6 +137,11 @@ pub struct Dashboard {
     /// Dock only ever writes tasks to its own.
     board_dir: Option<std::path::PathBuf>,
     board_is_personal: bool,
+    /// The columns a Board *pane* draws, kept apart from `board` because a pane is not an
+    /// overlay: nothing opens or closes it, Esc means nothing to it, and it must survive the
+    /// overlay being opened and closed over the top of it. It renders the same `BoardView` the
+    /// overlay does, which is the whole reason keeping the overlay costs nothing.
+    board_pane_view: Option<BoardView>,
     #[cfg(test)]
     /// Stands in for what is installed on this machine. Tests must not ask the machine, or they
     /// assert something about the laptop they ran on rather than about Dock.
@@ -145,7 +152,6 @@ pub struct Dashboard {
     /// is only needed for unbound ones: `TerminalLaunchRequest` has no task field, so nothing
     /// durable records the pairing. Client-local, and lost with the dashboard — which is honest,
     /// because it is a note about what this dashboard did rather than a fact about the run.
-    dispatched_tasks: HashMap<String, u64>,
     /// The Git overlay, if open.
     git: Option<GitOverlay>,
     /// The board, if open.
@@ -209,6 +215,27 @@ pub enum PaneControl {
 pub enum RenameTarget {
     Pane,
     Workspace,
+}
+
+/// A row in the runs lane: one live agent pane, as it is right now.
+///
+/// Assembled per frame from the run list and the agent roster, and stored nowhere — because a
+/// run that ends must leave the lane the moment its run does, and anything cached would keep a
+/// finished agent on screen until something thought to evict it. Borrowed from the dashboard's
+/// own state rather than owned, because this is built on a path that runs at 60fps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunLaneRow<'a> {
+    pub run_id: &'a str,
+    pub workspace_id: &'a str,
+    pub pane_id: &'a str,
+    pub agent: AgentKind,
+    pub state: AgentState,
+    /// The board card this run is bound to, when the daemon's binding says so.
+    pub task_id: Option<u64>,
+    /// How many prompts are waiting for this pane. Always zero until the per-agent queue exists;
+    /// carried now so the lane does not change shape when it arrives.
+    pub queued: usize,
+    pub auto_feed: bool,
 }
 
 /// The board, laid out as columns of cards.
@@ -1336,37 +1363,172 @@ impl Dashboard {
     /// The task each run is on, in one pass, giving the same answer for every run that
     /// [`task_of`](Self::task_of) gives for one.
     ///
-    /// The daemon's own binding wins over this dashboard's note of what it dispatched, which is
-    /// why the bindings are written second. Borrowed where the text already exists; only a
-    /// dispatched task has to be built, because it is held as a number.
+    /// The daemon's binding is the only source now: a dispatch records the card on the run
+    /// itself, so this no longer needs a client-local note that a quit would take with it.
     fn tasks_by_run(&self) -> HashMap<&str, Cow<'_, str>> {
-        let mut index: HashMap<&str, Cow<'_, str>> = self
-            .dispatched_tasks
+        self.runs
             .iter()
-            .map(|(run_id, task)| (run_id.as_str(), Cow::Owned(task.to_string())))
-            .collect();
-        for run in &self.runs {
-            if let Some(task) = bound_task(run) {
-                index.insert(run.run_id.as_str(), Cow::Borrowed(task));
-            }
-        }
-        index
+            .filter_map(|run| Some((run.run_id.as_str(), Cow::Borrowed(bound_task(run)?))))
+            .collect()
     }
 
-    /// The task a run is working on, if anything knows: the daemon's own binding first, then this
-    /// dashboard's note of what it dispatched.
+    /// The task a run is working on, according to the daemon that owns the run.
+    ///
+    /// There used to be a client-local fallback here, because an unbound launch had nowhere
+    /// durable to record which card it was for. It went with the dashboard when it quit, and a
+    /// second dashboard never had it at all; the request carries the reference now.
     fn task_of(&self, run_id: &str) -> Option<String> {
-        let bound = self
-            .runs
+        self.runs
             .iter()
             .find(|run| run.run_id == run_id)
             .and_then(bound_task)
-            .map(str::to_owned);
-        bound.or_else(|| {
-            self.dispatched_tasks
-                .get(run_id)
-                .map(|task| task.to_string())
-        })
+            .map(str::to_owned)
+    }
+
+    /// The runs lane: one row per live agent pane, in the order a person should look at them.
+    ///
+    /// Derived from data this client already holds and pushed to it — `self.runs` for where each
+    /// run lives and what task it was bound to, `self.agents` for what it is doing — so the lane
+    /// is live the moment it renders and requires nothing new on the wire.
+    ///
+    /// A pane with no agent in it is not a row. `AgentState::Idle` does not mean "the agent is
+    /// resting", it means no agent was detected in this pane at all, so a lane that admitted them
+    /// would list every shell on the canvas under a state none of them is in.
+    fn run_lane_rows(&self) -> Vec<RunLaneRow<'_>> {
+        let mut rows: Vec<RunLaneRow<'_>> = self
+            .runs
+            .iter()
+            .filter_map(|run| {
+                let (agent, state) = self.agents.get(run.run_id.as_str())?;
+                Some(RunLaneRow {
+                    run_id: run.run_id.as_str(),
+                    workspace_id: run.workspace_id.as_str(),
+                    pane_id: run.pane_id.as_str(),
+                    agent: (*agent)?,
+                    state: *state,
+                    task_id: bound_task(run).and_then(|task| task.parse().ok()),
+                    queued: 0,
+                    auto_feed: false,
+                })
+            })
+            .collect();
+        // Blocked agents first, for the reason the sidebar sorts that way: they are the only ones
+        // costing the user throughput while they wait.
+        rows.sort_by(|left, right| {
+            left.state
+                .attention_rank()
+                .cmp(&right.state.attention_rank())
+                .then_with(|| left.agent.label().cmp(right.agent.label()))
+                .then_with(|| left.pane_id.cmp(right.pane_id))
+        });
+        rows
+    }
+
+    /// The agent state to badge each board card with, keyed by card id.
+    ///
+    /// Display-only, and that is a rule rather than an implementation detail. `needs-input` on the
+    /// board means what `AgentState::Blocked` means, so it is tempting to move the card when its
+    /// agent blocks — but Dock measures and the agent reports, and a badge vanishes with the run
+    /// that produced it while a status write outlives whatever misread produced it.
+    fn board_badges(&self) -> HashMap<u64, AgentState> {
+        badges_from(&self.run_lane_rows())
+    }
+
+    /// A Board pane: the runs lane across the top, the backlog columns below.
+    ///
+    /// Two stacked regions rather than two column sets, because a run is not a status — appending
+    /// a "runs" pseudo-column would put the same card in two columns at once.
+    fn render_board_pane(&self, frame: &mut Frame, inner: Rect) {
+        if inner.height < 4 || inner.width < 12 {
+            return;
+        }
+        let rows = self.run_lane_rows();
+        // The lane is given what it needs and no more, so a board with two agents on it does not
+        // spend half the pane on empty rows. It never takes more than half: the backlog is the
+        // half a person curates, and a busy runtime must not squeeze it off the screen.
+        // Heading, rule, the rows themselves, and one blank so the backlog's own headings do not
+        // read as a fourth line of the lane.
+        let wanted = u16::try_from(rows.len().max(1))
+            .unwrap_or(u16::MAX)
+            .saturating_add(3);
+        let lane_height = wanted.min(inner.height / 2).max(3);
+        let lane = Rect::new(inner.x, inner.y, inner.width, lane_height);
+
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!("RUNS · {}", rows.len()),
+                Style::default()
+                    .fg(self.theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(lane.x, lane.y, lane.width, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(usize::from(lane.width)),
+                Style::default().fg(self.theme.border),
+            )),
+            Rect::new(lane.x, lane.y + 1, lane.width, 1),
+        );
+        if rows.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "no agents running",
+                    Style::default().fg(self.theme.border),
+                )),
+                Rect::new(lane.x, lane.y + 2, lane.width, 1),
+            );
+        }
+        for (index, row) in rows
+            .iter()
+            .take(usize::from(lane_height.saturating_sub(2)))
+            .enumerate()
+        {
+            let task = match row.task_id {
+                Some(task) => format!("#{task}"),
+                None => "—".into(),
+            };
+            // The state is spelled out, not left to the glyph. A coloured dot says that something
+            // is true of this agent without saying what, and "needs you" is the one state worth
+            // crossing the room for.
+            let text = format!(
+                "{} {} · {} · {} · {}",
+                row.state.glyph(),
+                row.agent.label(),
+                task,
+                row.state.label(),
+                row.pane_id
+            );
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    ellipsise(&text, usize::from(lane.width)),
+                    Style::default().fg(self.theme.agent(row.state)),
+                )),
+                Rect::new(lane.x, lane.y + 2 + index as u16, lane.width, 1),
+            );
+        }
+
+        let backlog = Rect::new(
+            inner.x,
+            inner.y + lane_height,
+            inner.width,
+            inner.height.saturating_sub(lane_height),
+        );
+        match self.board_pane_view.as_ref() {
+            // Derived from the rows already in hand rather than asked for again: assembling the
+            // lane is a pass over every run on the canvas, and this pane was doing it twice per
+            // frame to answer two questions about the same list.
+            Some(view) => {
+                render_board_columns(frame, &self.theme, view, backlog, &badges_from(&rows))
+            }
+            None => frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "reading the board…",
+                    Style::default().fg(self.theme.muted),
+                )),
+                backlog,
+            ),
+        }
     }
 
     fn render_node(
@@ -1393,7 +1555,12 @@ impl Dashboard {
                 // this the only difference between a live shell and a dead one is that typing
                 // stops working, so the title has to carry the news and the recovery key.
                 let exited = pane.runtime == PaneRuntime::Exited;
-                let title = if exited {
+                let title = if pane.is_board() {
+                    // No run, so no state glyph and no location: a board is not somewhere a
+                    // process is, and a title that said "unbound" would be answering a question
+                    // nobody asked about a pane that will never have a run.
+                    " ▤ board ".to_owned()
+                } else if exited {
                     format!(" ✗ {label} · exited · Ctrl+B R restarts ")
                 } else {
                     format!(
@@ -1507,6 +1674,14 @@ impl Dashboard {
                             .push((*control, Rect::new(x, row, 3, 1)));
                         x = x.saturating_add(3);
                     }
+                }
+                // Where a pane's kind actually decides something. Everything above — the
+                // rectangle, the focus, the border, the controls — is identical for both kinds,
+                // which is exactly why the kind is a field on the pane rather than a variant in
+                // the layout tree.
+                if pane.is_board() {
+                    self.render_board_pane(frame, inner);
+                    return;
                 }
                 // A frozen pane is painted from its own clone of the screen, which is what
                 // makes copy mode a freeze rather than a claim: the live parser keeps
@@ -1716,6 +1891,7 @@ impl Dashboard {
             Line::from("a resume the agent that last ran here, continuing its own session"),
             Line::from("i review handoffs agents are waiting on: a accept · c request changes"),
             Line::from("k board: ←/→ column · ↑/↓ card · </> move · n new · Enter dispatch"),
+            Line::from("B splits the same board into the canvas as a pane, with its runs lane"),
             Line::from("g what changed in this pane's worktree · j/k scroll · g/G ends"),
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
@@ -1848,7 +2024,7 @@ impl Dashboard {
                     pane_id,
                 })))
             }
-            PaneCommand::Split(axis) => self.split(axis),
+            PaneCommand::Split(axis) => self.split(axis, PaneKind::Terminal),
             // Focus is still ordinal rather than geometric, so the two backwards directions
             // and the two forwards ones collapse onto the existing cycle.
             PaneCommand::Focus(direction) => self.focus_next(matches!(
@@ -1867,6 +2043,9 @@ impl Dashboard {
                 self.error = None;
                 UiCommand::LoadBoard
             }
+            // Horizontal, which divides by height here: a board is five columns wide before it is
+            // anything else, and half the width of a split screen is not enough for five of them.
+            PaneCommand::SplitBoard => self.split(SplitAxis::Horizontal, PaneKind::Board),
             PaneCommand::Git => {
                 self.error = None;
                 UiCommand::LoadGit
@@ -1963,7 +2142,9 @@ impl Dashboard {
         };
         // Sized to the tallest column rather than filling the screen: a board with four cards on
         // it should look like a board with four cards on it, not like one that has lost the rest.
-        let tallest = STATUSES
+        let tallest = board
+            .view
+            .statuses()
             .iter()
             .map(|status| board.view.cards(status).len())
             .max()
@@ -2001,101 +2182,22 @@ impl Dashboard {
             return;
         }
 
-        // Columns share the width evenly. Five is few enough that an even split stays readable at
-        // any terminal width Dock already refuses to draw below.
-        let columns = STATUSES.len() as u16;
-        let column_width = inner.width / columns;
-        let card_rows = inner.height.saturating_sub(4);
-
-        for (index, status) in STATUSES.iter().enumerate() {
-            let x = inner.x + column_width * index as u16;
-            let cards = board.view.cards(status);
-            let active = index == board.view.column();
-            // A rule under each heading gives the columns edges without spending a column of
-            // width on borders, which at five columns would cost a fifth of the card text.
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    "─".repeat(usize::from(column_width.saturating_sub(2))),
-                    Style::default().fg(if active {
-                        self.theme.accent
-                    } else {
-                        self.theme.border
-                    }),
-                )),
-                Rect::new(x, inner.y + 1, column_width.saturating_sub(1), 1),
-            );
-            let heading = Style::default()
-                .fg(if active {
-                    self.theme.accent
-                } else {
-                    self.theme.muted
-                })
-                .add_modifier(if active {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                });
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    ellipsise(
-                        &format!("{} · {}", status.to_uppercase(), cards.len()),
-                        usize::from(column_width.saturating_sub(1)),
-                    ),
-                    heading,
-                )),
-                Rect::new(x, inner.y, column_width.saturating_sub(1), 1),
-            );
-
-            // A column taller than the space scrolls to keep the cursor visible, rather than
-            // hiding the selected card behind the bottom edge.
-            let first = if active {
-                board
-                    .view
-                    .row()
-                    .saturating_sub(usize::from(card_rows).saturating_sub(1))
-            } else {
-                0
-            };
-            for (row, task) in cards
-                .iter()
-                .skip(first)
-                .take(usize::from(card_rows))
-                .enumerate()
-            {
-                let y = inner.y + 2 + row as u16;
-                if y >= inner.bottom() {
-                    break;
-                }
-                let selected = active && first + row == board.view.row();
-                let style = if selected {
-                    Style::default()
-                        .bg(self.theme.accent)
-                        .fg(self.theme.surface)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(self.theme.text)
-                };
-                let label = format!(
-                    "{} #{} {}",
-                    if selected { "›" } else { " " },
-                    task.id,
-                    task.title
-                );
-                frame.render_widget(
-                    Paragraph::new(Line::styled(
-                        ellipsise(&label, usize::from(column_width.saturating_sub(1))),
-                        style,
-                    )),
-                    Rect::new(x, y, column_width.saturating_sub(1), 1),
-                );
-            }
-            if cards.is_empty() {
-                frame.render_widget(
-                    Paragraph::new(Line::styled("  —", Style::default().fg(self.theme.border))),
-                    Rect::new(x, inner.y + 2, column_width.saturating_sub(1), 1),
-                );
-            }
-        }
+        // The cards are drawn by the same function the Board pane uses, over the rectangle the
+        // footer below does not want. There is no second renderer and no second data path: a
+        // pane and an overlay differ in the rectangle they are handed and in whether Esc closes
+        // them, which is the whole reason keeping the overlay costs nothing.
+        render_board_columns(
+            frame,
+            &self.theme,
+            &board.view,
+            Rect::new(
+                inner.x,
+                inner.y,
+                inner.width,
+                inner.height.saturating_sub(2),
+            ),
+            &self.board_badges(),
+        );
 
         // The footer carries the board's identity and its controls, which is where a person looks
         // when they do not already know what a key does.
@@ -2268,10 +2370,8 @@ impl Dashboard {
 
     /// Receives the board and opens it as columns of cards.
     pub fn set_board_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
-        let writable = crate::board::is_personal(&directory);
-        self.board_is_personal = writable;
-        self.board_tasks = tasks.clone();
-        self.board_dir = Some(directory.clone());
+        self.set_board_pane_tasks(tasks.clone(), directory.clone());
+        let writable = self.board_is_personal;
         self.board = Some(BoardOverlay {
             view: BoardView::new(tasks),
             directory,
@@ -2279,6 +2379,34 @@ impl Dashboard {
             composing: None,
         });
         self.error = None;
+    }
+
+    /// Receives the board without opening anything over the canvas.
+    ///
+    /// A Board pane is already on screen, so reading its files must not also pop a modal in front
+    /// of it — which is what made this a second entry point rather than a flag. It is also the
+    /// path a board pane takes on start-up, because a pane is not opened by a keystroke and
+    /// nothing else in the loop would ever read the board for it.
+    pub fn set_board_pane_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
+        self.board_is_personal = crate::board::is_personal(&directory);
+        self.board_pane_view = Some(BoardView::new(tasks.clone()));
+        self.board_tasks = tasks;
+        self.board_dir = Some(directory);
+    }
+
+    /// Whether a Board pane is on the canvas with no board read for it yet.
+    ///
+    /// The board is files on disk that only the client can see, and the overlay is the only thing
+    /// that ever asked for them — so a board pane restored from a previous session would have come
+    /// back as an empty grid until somebody pressed `Ctrl+B k`. Answered from a field first, so
+    /// the common case costs one `Option` check rather than a walk over every pane on every frame.
+    pub fn board_pane_needs_load(&self) -> bool {
+        self.board_dir.is_none()
+            && self
+                .layout
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.panes.values().any(|pane| pane.is_board()))
     }
 
     fn board_key(&mut self, key: KeyEvent) -> UiCommand {
@@ -2344,21 +2472,32 @@ impl Dashboard {
             return UiCommand::None;
         };
         let (id, status) = (task.id, task.status.clone());
-        let Some(current) = STATUSES.iter().position(|known| *known == status) else {
+        // The board's own columns, not the constant's. A card sitting in a status Dock has never
+        // heard of is exactly the card a person most wants to move, and resolving its position
+        // through `STATUSES` made that the one card `<` and `>` refused to touch.
+        let columns: Vec<String> = board.view.statuses().to_vec();
+        let Some(current) = columns.iter().position(|known| *known == status) else {
             self.error = Some(format!("task {id} is in an unknown column: {status}"));
             return UiCommand::None;
         };
-        let next = current.saturating_add_signed(delta).min(STATUSES.len() - 1);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(columns.len().saturating_sub(1));
         if next == current {
             return UiCommand::None;
         }
         let directory = board.directory.clone();
-        match crate::board::set_status(&directory, id, STATUSES[next]) {
+        match crate::board::set_status(&directory, id, &columns[next]) {
             Ok(_) => {
                 // Re-read rather than editing the copy in hand: the board is files on disk and
                 // anything else may have written to it since it was opened.
                 let tasks = crate::board::load(&directory);
-                self.board_tasks = tasks.clone();
+                // Both views, because a Board pane may be on the canvas underneath this overlay
+                // and a card that moved in one and not the other is two answers to one question.
+                self.set_board_pane_tasks(tasks.clone(), directory.clone());
+                if let Some(view) = self.board_pane_view.as_mut() {
+                    view.follow(id);
+                }
                 if let Some(board) = self.board.as_mut() {
                     board.view = BoardView::new(tasks);
                     board.view.follow(id);
@@ -2420,7 +2559,6 @@ impl Dashboard {
         };
         self.error = None;
         let run_id = self.next_unique_id("dock_task");
-        self.dispatched_tasks.insert(run_id.clone(), task_id);
         UiCommand::DispatchTask(TaskDispatch {
             workspace_id,
             pane_id,
@@ -2707,6 +2845,9 @@ impl Dashboard {
                     profile,
                     runtime_directory: run.worktree.clone(),
                     arguments,
+                    // A resume re-enters the run's own pane, and the daemon already knows what
+                    // that run was dispatched for.
+                    external_task_ref: String::new(),
                 })))
             }
         }
@@ -3566,6 +3707,8 @@ impl Dashboard {
                 profile,
                 runtime_directory: self.runtime_directory.clone(),
                 arguments: Vec::new(),
+                // Launched by hand rather than off a card, so there is no task to record.
+                external_task_ref: String::new(),
             })));
         }
         let Some(option) = self.repository_launches.first() else {
@@ -3720,7 +3863,12 @@ impl Dashboard {
         })))
     }
 
-    fn split(&mut self, axis: SplitAxis) -> UiCommand {
+    /// Divides the focused pane, giving the new half the kind asked for.
+    ///
+    /// The local layout is updated before the request goes out, for the reason every other
+    /// command here does it: the split is visible in the frame painted before the daemon is
+    /// asked, and `refresh` is what the dashboard actually believes afterwards.
+    fn split(&mut self, axis: SplitAxis, kind: PaneKind) -> UiCommand {
         let Some((workspace_id, pane_id)) = self.workspace().map(|workspace| {
             (
                 workspace.workspace_id.clone(),
@@ -3737,9 +3885,13 @@ impl Dashboard {
             new_pane_id.clone(),
             PaneLayout {
                 pane_id: new_pane_id.clone(),
-                name: new_pane_id.replace('_', " "),
+                name: match kind {
+                    PaneKind::Terminal => new_pane_id.replace('_', " "),
+                    PaneKind::Board => "board".into(),
+                },
                 run_id: None,
                 runtime: PaneRuntime::Empty,
+                kind,
             },
         );
         workspace.focused_pane_id = new_pane_id.clone();
@@ -3748,6 +3900,7 @@ impl Dashboard {
             pane_id,
             new_pane_id,
             axis,
+            kind,
         })))
     }
 
@@ -4452,6 +4605,144 @@ impl SidebarRows {
 /// The task the daemon itself bound to a run, if it bound one. A blank reference means unbound
 /// rather than a task whose name happens to be empty, and the single lookup and the batch index
 /// have to agree about that or the roster and the pane title would disagree on screen.
+/// The board's columns and the cards in them, over whatever rectangle it is handed.
+///
+/// A free function rather than a method because it is the one thing the board overlay and the
+/// Board pane genuinely share: the overlay hands it the inside of a popup, the pane hands it the
+/// space under the runs lane, and neither has a second opinion about how a card looks. Two rows
+/// go to the heading and its rule; everything below is cards.
+///
+/// The columns come from the view rather than from `board::STATUSES`, which is what makes a
+/// `needs-input` card visible at all: the constant does not know that status, and every site that
+/// resolved columns through it drew the card into no column and let `<`/`>` walk straight past it.
+///
+/// `badges` carries the live agent state of any card a run is bound to. That join is the whole
+/// reason a board shows what is actually happening without inventing a sixth column — and it is
+/// display-only: the glyph is derived and vanishes when the run does, whereas a status write is
+/// durable and would outlive whatever misread produced it.
+fn render_board_columns(
+    frame: &mut Frame,
+    theme: &Theme,
+    view: &BoardView,
+    area: Rect,
+    badges: &HashMap<u64, AgentState>,
+) {
+    let statuses = view.statuses();
+    if statuses.is_empty() || area.width < statuses.len() as u16 || area.height < 3 {
+        return;
+    }
+    let column_width = area.width / statuses.len() as u16;
+    let card_rows = area.height.saturating_sub(2);
+
+    for (index, status) in statuses.iter().enumerate() {
+        let x = area.x + column_width * index as u16;
+        let cards = view.cards(status);
+        let active = index == view.column();
+        // A rule under each heading gives the columns edges without spending a column of
+        // width on borders, which at five columns would cost a fifth of the card text.
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(usize::from(column_width.saturating_sub(2))),
+                Style::default().fg(if active { theme.accent } else { theme.border }),
+            )),
+            Rect::new(x, area.y + 1, column_width.saturating_sub(1), 1),
+        );
+        let heading = Style::default()
+            .fg(if active { theme.accent } else { theme.muted })
+            .add_modifier(if active {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                ellipsise(
+                    &format!("{} · {}", status.to_uppercase(), cards.len()),
+                    usize::from(column_width.saturating_sub(1)),
+                ),
+                heading,
+            )),
+            Rect::new(x, area.y, column_width.saturating_sub(1), 1),
+        );
+
+        // A column taller than the space scrolls to keep the cursor visible, rather than
+        // hiding the selected card behind the bottom edge.
+        let first = if active {
+            view.row()
+                .saturating_sub(usize::from(card_rows).saturating_sub(1))
+        } else {
+            0
+        };
+        let visible =
+            usize::from(card_rows).min(usize::from(area.bottom().saturating_sub(area.y + 2)));
+        // One paragraph for the whole column rather than one per card. Each card used to be its
+        // own widget over its own one-row rectangle, which put a ratatui render — and the dozen
+        // allocations inside it — behind every card on the board, on a path that repaints at
+        // 60fps. The lines are identical and land on the same rows; only the widget count
+        // changes, from one per card to one per column.
+        let mut lines: Vec<Line> = Vec::with_capacity(visible.min(cards.len()));
+        for (row, task) in cards.iter().skip(first).take(visible).enumerate() {
+            let selected = active && first + row == view.row();
+            let style = if selected {
+                Style::default()
+                    .bg(theme.accent)
+                    .fg(theme.surface)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            let width = usize::from(column_width.saturating_sub(1));
+            let marker = if selected { "›" } else { " " };
+            // The badge is its own span so it keeps the state's colour against a selected card's
+            // inverted background, where a single styled line would have lost it.
+            lines.push(match badges.get(&task.id) {
+                Some(state) => Line::from(vec![
+                    Span::styled(format!("{marker} #{} ", task.id), style),
+                    Span::styled(
+                        state.glyph().to_string(),
+                        if selected {
+                            style
+                        } else {
+                            Style::default().fg(theme.agent(*state))
+                        },
+                    ),
+                    Span::styled(
+                        ellipsise(
+                            &format!(" {}", task.title),
+                            width.saturating_sub(marker.len() + 3 + task.id.to_string().len()),
+                        ),
+                        style,
+                    ),
+                ]),
+                None => Line::styled(
+                    ellipsise(&format!("{marker} #{} {}", task.id, task.title), width),
+                    style,
+                ),
+            });
+        }
+        if cards.is_empty() {
+            lines.push(Line::styled("  —", Style::default().fg(theme.border)));
+        }
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect::new(
+                x,
+                area.y + 2,
+                column_width.saturating_sub(1),
+                area.bottom().saturating_sub(area.y + 2),
+            ),
+        );
+    }
+}
+
+/// The same join, from a lane that has already been assembled. Building the lane is a pass over
+/// every run on the canvas, and the Board pane wants both answers from one pass.
+fn badges_from(rows: &[RunLaneRow<'_>]) -> HashMap<u64, AgentState> {
+    rows.iter()
+        .filter_map(|row| Some((row.task_id?, row.state)))
+        .collect()
+}
+
 fn bound_task(run: &RuntimeSnapshot) -> Option<&str> {
     Some(run.external_task_ref.trim()).filter(|task| !task.is_empty())
 }
@@ -4628,6 +4919,7 @@ mod tests {
                     name: "editor".into(),
                     run_id: None,
                     runtime: PaneRuntime::Running,
+                    kind: PaneKind::Terminal,
                 },
             ),
             (
@@ -4637,6 +4929,7 @@ mod tests {
                     name: "agent".into(),
                     run_id: None,
                     runtime: PaneRuntime::Restored,
+                    kind: PaneKind::Terminal,
                 },
             ),
         ]);
@@ -4786,6 +5079,7 @@ mod tests {
                     name: "deploy".into(),
                     run_id: Some("run_2".into()),
                     runtime: PaneRuntime::Running,
+                    kind: PaneKind::Terminal,
                 },
             )]),
             root: LayoutNode::Pane {
@@ -5098,6 +5392,7 @@ mod tests {
                 name: "collision".into(),
                 run_id: None,
                 runtime: PaneRuntime::Restored,
+                kind: PaneKind::Terminal,
             },
         );
         dashboard.layout.workspaces[0].panes.insert(
@@ -5107,6 +5402,7 @@ mod tests {
                 name: "persisted".into(),
                 run_id: None,
                 runtime: PaneRuntime::Restored,
+                kind: PaneKind::Terminal,
             },
         );
         let create = command(&mut dashboard, KeyCode::Char('n'));
@@ -6079,8 +6375,8 @@ mod tests {
         dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
         dashboard.board.as_mut().unwrap().writable = true;
         assert_eq!(
-            STATUSES[dashboard.board.as_ref().unwrap().view.column()],
-            "backlog"
+            dashboard.board.as_ref().unwrap().view.status(),
+            Some("backlog")
         );
 
         // `>` is the one thing a board does that a list cannot do at all.
@@ -6088,14 +6384,274 @@ mod tests {
         assert_eq!(crate::board::load(&dir)[0].status, "todo", "the file moved");
         let board = dashboard.board.as_ref().unwrap();
         assert_eq!(
-            STATUSES[board.view.column()],
-            "todo",
+            board.view.status(),
+            Some("todo"),
             "the cursor follows the card rather than staying over a column position"
         );
         assert_eq!(board.view.selected().map(|task| task.id), Some(1));
 
         dashboard.key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
         assert_eq!(crate::board::load(&dir)[0].status, "backlog");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A dashboard whose visible workspace holds one terminal pane and one board pane, with a
+    /// live agent in a second workspace so the runs lane has something to show.
+    fn dashboard_with_a_board_pane() -> Dashboard {
+        let mut dashboard = bound_dashboard();
+        let workspace = &mut dashboard.layout.workspaces[0];
+        workspace.panes.get_mut("b").unwrap().kind = PaneKind::Board;
+        workspace.panes.get_mut("b").unwrap().name = "board".into();
+        workspace.panes.get_mut("b").unwrap().runtime = PaneRuntime::Empty;
+
+        // One agent pane and one plain shell, so "one row per live agent and none for a shell"
+        // has both halves to distinguish.
+        let mut agent = snapshot();
+        agent.run_id = "run_1".into();
+        agent.workspace_id = "w".into();
+        agent.pane_id = "a".into();
+        agent.external_task_ref = "7".into();
+        dashboard.runs.push(agent);
+        let mut shell = snapshot();
+        shell.run_id = "dock_sh_w_c".into();
+        shell.workspace_id = "w".into();
+        shell.pane_id = "c".into();
+        shell.external_task_ref = String::new();
+        dashboard.runs.push(shell);
+        dashboard.agents.insert(
+            "run_1".into(),
+            (Some(AgentKind::Claude), AgentState::Blocked),
+        );
+        // A shell has no agent kind, which is precisely what `AgentState::Idle` means here: not
+        // "the agent is idle" but "no agent was detected in this pane".
+        dashboard
+            .agents
+            .insert("dock_sh_w_c".into(), (None, AgentState::Idle));
+        dashboard.set_board_pane_tasks(
+            vec![
+                board_task(7, "wire the parser", "in-progress"),
+                board_task(9, "write the docs", "backlog"),
+            ],
+            "/repo/real/kanban/tasks".into(),
+        );
+        dashboard
+    }
+
+    #[test]
+    fn a_board_pane_draws_both_lanes_and_never_a_terminal_placeholder() {
+        // The Board pane is the whole point of giving panes a kind: it occupies a rectangle on
+        // the canvas like any other pane and draws something that is not a terminal. Before this
+        // it drew the "Ctrl+B R starts a shell" placeholder, which is an offer a board must never
+        // make — it has no run and is never going to get one.
+        let mut dashboard = dashboard_with_a_board_pane();
+        let frame = render_to_string(&mut dashboard, 160, 40);
+
+        assert!(frame.contains("RUNS"), "the runs lane is drawn: {frame:?}");
+        assert!(
+            frame.contains("BACKLOG"),
+            "and the backlog lane under it: {frame:?}"
+        );
+        assert!(frame.contains("#9"), "with the cards in it: {frame:?}");
+        assert!(
+            !frame.contains("Ctrl+B R starts a shell"),
+            "a board must never offer to become a terminal: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn the_runs_lane_shows_one_row_per_live_agent_and_none_for_a_shell() {
+        // Derived, never stored: one row per live agent pane, assembled from the run list and the
+        // agent roster on each frame. A plain shell is a pane with no agent in it — `Idle` means
+        // "nothing was detected here", not "the agent is resting" — and a lane that listed those
+        // would list every pane on the canvas.
+        let mut dashboard = dashboard_with_a_board_pane();
+        let rows = dashboard.run_lane_rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].run_id, "run_1");
+        assert_eq!(rows[0].state, AgentState::Blocked);
+        assert_eq!(rows[0].task_id, Some(7));
+        assert_eq!(rows[0].queued, 0, "there are no queues yet");
+        assert!(!rows[0].auto_feed);
+
+        let frame = render_to_string(&mut dashboard, 160, 40);
+        assert!(
+            frame.contains("needs you"),
+            "the lane says what the state means, because a coloured glyph says only that \
+             something changed: {frame:?}"
+        );
+        assert!(!frame.contains("dock_sh_w_c"), "{frame:?}");
+    }
+
+    #[test]
+    fn a_backlog_card_bound_to_a_live_run_is_badged_with_that_runs_state() {
+        // The one join between the lanes, and it is display-only. Dock measures; the agent
+        // reports. A badge is derived and vanishes with the run that produced it; a status write
+        // is durable and outlives whatever misread produced it, which is why nothing here moves
+        // the card to `needs-input` however blocked its agent is.
+        let mut dashboard = dashboard_with_a_board_pane();
+        let terminal = render_terminal(&mut dashboard, 160, 40);
+        let blocked = dashboard.theme.agent(AgentState::Blocked);
+        let buffer = terminal.backend().buffer();
+
+        let badged = buffer
+            .content
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.symbol() == "●" && cell.fg == blocked)
+            .count();
+        assert!(
+            badged >= 2,
+            "the blocked run is badged in the runs lane and again on the card it is bound to"
+        );
+        // And the card file is untouched: the board is the durable record of what happened.
+        assert_eq!(dashboard.board_tasks[0].status, "in-progress");
+    }
+
+    #[test]
+    fn an_agent_state_change_reaches_the_board_pane_on_the_next_frame_with_no_keypress() {
+        // Requirement 3, and it costs nothing on the wire. `Event::AgentStateChanged` already
+        // lands in `self.agents`, and the runs lane is assembled from `self.agents` per frame —
+        // so the frame after the event already says the new thing. Deliberately asserted without
+        // a keypress and without `needs_refresh`: a state transition does not invalidate the run
+        // list, and marking it dirty would put a daemon round trip behind every flicker of a busy
+        // agent's classifier.
+        let mut dashboard = dashboard_with_a_board_pane();
+        assert!(render_to_string(&mut dashboard, 160, 40).contains("needs you"));
+
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_1".into(),
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+        });
+        assert!(
+            !dashboard.needs_refresh,
+            "a state transition must not ask the daemon for the run list again"
+        );
+        let frame = render_to_string(&mut dashboard, 160, 40);
+        assert!(frame.contains("working"), "{frame:?}");
+        assert!(!frame.contains("needs you"), "{frame:?}");
+    }
+
+    #[test]
+    fn ctrl_b_shift_b_asks_for_a_split_whose_new_half_is_a_board() {
+        // The board overlay keeps `Ctrl+B k`, so requirement 4 costs nothing: the shifted key is
+        // free and the two surfaces are one keystroke apart.
+        let mut dashboard = bound_dashboard();
+        render_to_string(&mut dashboard, 100, 30);
+        let asked = command(&mut dashboard, KeyCode::Char('B'));
+        let UiCommand::Request(request) = asked else {
+            panic!("Ctrl+B B must ask for a split, got {asked:?}");
+        };
+        let Request::Workspace(WorkspaceRequest::Split { kind, axis, .. }) = *request else {
+            panic!("expected a split request");
+        };
+        assert_eq!(kind, PaneKind::Board);
+        // Full width: a board is five columns wide before it is anything else.
+        assert_eq!(axis, SplitAxis::Horizontal);
+        // And the local layout already says so, so the frame painted before the daemon answers
+        // shows a board rather than an empty terminal.
+        let workspace = &dashboard.layout.workspaces[0];
+        assert_eq!(
+            workspace.panes[&workspace.focused_pane_id].kind,
+            PaneKind::Board
+        );
+    }
+
+    #[test]
+    fn a_board_pane_comes_back_a_board_when_the_dashboard_reopens_and_reads_the_board_itself() {
+        // Quitting the TUI and reopening it means a fresh `Dashboard` filled from the daemon's
+        // layout, so the kind has to survive that snapshot as well as the file on disk.
+        let dashboard = dashboard_with_a_board_pane();
+        let wire = serde_json::to_string(&dashboard.layout).expect("layouts go over the socket");
+        let reopened: LayoutSnapshot = serde_json::from_str(&wire).expect("and come back");
+        assert!(reopened.workspaces[0].panes["b"].is_board());
+
+        // And then it has to fill itself in. The board is files only the client can see, and
+        // until now the only thing that ever read them was the overlay's key — so a board pane
+        // restored from a previous session would have sat there empty until somebody pressed it.
+        let mut fresh = Dashboard {
+            layout: reopened,
+            ..Dashboard::default()
+        };
+        assert!(fresh.board_pane_needs_load());
+        fresh.set_board_pane_tasks(
+            vec![board_task(9, "write the docs", "backlog")],
+            "/repo/real/kanban/tasks".into(),
+        );
+        assert!(
+            !fresh.board_pane_needs_load(),
+            "and asks exactly once, not once per frame"
+        );
+        assert!(render_to_string(&mut fresh, 160, 40).contains("#9"));
+
+        // A canvas with no board on it never reads the board at all.
+        assert!(!bound_dashboard().board_pane_needs_load());
+    }
+
+    #[test]
+    fn a_board_pane_announces_no_geometry_and_takes_no_keystrokes() {
+        // Two of the four sites this design claims need no change at all. `queue_resize` returns
+        // early on `run_id: None` and a board's is permanently `None`, so nothing is announced;
+        // `send_to_pane` drops input for a pane with no run, so a focused board swallows keys
+        // rather than earning one daemon error per character straight into the footer.
+        let mut dashboard = dashboard_with_a_board_pane();
+        dashboard.layout.workspaces[0].focused_pane_id = "b".into();
+        render_to_string(&mut dashboard, 160, 40);
+        assert!(
+            dashboard
+                .take_pending_resizes()
+                .iter()
+                .all(|(_, pane_id, _, _)| pane_id != "b"),
+            "a pane with no PTY has no geometry to announce"
+        );
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            UiCommand::None
+        );
+    }
+
+    #[test]
+    fn a_needs_input_card_is_drawn_and_reachable_with_the_arrows() {
+        // `needs-input` is declared by this repository's own `kanban/config.yml` and has never
+        // been in `board::STATUSES`. `BoardView` learned to take the union of the two, but the
+        // dashboard still resolved its columns and its `<`/`>` through the constant — so the
+        // column was not drawn, the card was in no column at all, and the one thing a person
+        // could do about a blocked card was the one thing the board refused to do.
+        let root = std::env::temp_dir().join(format!("dock-needs-input-{}", std::process::id()));
+        let dir = root.join("tasks");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("007-blocked.md"),
+            "---\nid: 7\ntitle: 'waiting on a person'\nstatus: needs-input\npriority: high\n---\n\n# Outcome\n\nsay something\n",
+        )
+        .unwrap();
+
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.board.as_mut().unwrap().writable = true;
+
+        let frame = render_to_string(&mut dashboard, 130, 32);
+        assert!(
+            frame.contains("NEEDS-INPUT"),
+            "the column a card is actually in must be drawn: {frame:?}"
+        );
+        assert!(frame.contains("#7"), "and the card in it: {frame:?}");
+
+        // The only card on the board, so the cursor opens on it.
+        assert_eq!(
+            dashboard.board.as_ref().unwrap().view.status(),
+            Some("needs-input")
+        );
+        // `<` moves it back into a column the constant does know, which is the half that was
+        // impossible: the card could be put here by hand and never taken out again.
+        dashboard.key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
+        assert_eq!(crate::board::load(&dir)[0].status, "done");
+        assert_eq!(
+            dashboard.board.as_ref().unwrap().view.status(),
+            Some("done"),
+            "the cursor follows the card it just moved"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6120,8 +6676,8 @@ mod tests {
         assert!(frame.contains("#12"), "{frame:?}");
         // It opens on the leftmost column holding anything, which here is backlog.
         assert_eq!(
-            STATUSES[dashboard.board.as_ref().unwrap().view.column()],
-            "backlog"
+            dashboard.board.as_ref().unwrap().view.status(),
+            Some("backlog")
         );
     }
 
@@ -6392,11 +6948,13 @@ mod tests {
         else {
             panic!("Enter dispatches the selected card");
         };
-        // TerminalLaunchRequest carries no task field, so nothing durable records the pairing for
-        // an unbound run. The dashboard notes what it dispatched so the roster can still say.
+        // The launch request carries the task now, so the daemon records the pairing on the run
+        // itself. It used to carry no task field at all, and the dashboard kept a note of what it
+        // had dispatched — a note that went with it when it quit, and that a second dashboard
+        // never had. What the roster reads here is the daemon's answer, not its own memory.
         let mut run = snapshot();
         run.run_id = task.run_id.clone();
-        run.external_task_ref = String::new();
+        run.external_task_ref = task.task_id.to_string();
         dashboard.runs = vec![run];
         dashboard.agents.insert(
             task.run_id.clone(),
@@ -7071,19 +7629,8 @@ mod tests {
         both.run_id = "both".into();
         both.external_task_ref = "TASK-2".into();
         dashboard.runs = vec![bound, blank, both];
-        dashboard.dispatched_tasks.insert("blank".into(), 7);
-        dashboard.dispatched_tasks.insert("both".into(), 9);
-        dashboard
-            .dispatched_tasks
-            .insert("only_dispatched".into(), 11);
         let index = dashboard.tasks_by_run();
-        for run_id in [
-            "bound",
-            "blank",
-            "both",
-            "only_dispatched",
-            "never_heard_of",
-        ] {
+        for run_id in ["bound", "blank", "both", "never_heard_of"] {
             assert_eq!(
                 dashboard.task_of(run_id).as_deref(),
                 index.get(run_id).map(AsRef::as_ref),
@@ -7092,7 +7639,9 @@ mod tests {
         }
         // And the answers themselves, so agreement on a wrong answer cannot pass.
         assert_eq!(dashboard.task_of("bound").as_deref(), Some("TASK-1"));
-        assert_eq!(dashboard.task_of("blank").as_deref(), Some("7"));
+        // A whitespace binding means unbound, and there is no client-local note to fall back to
+        // any more, so the honest answer is that nothing knows rather than a remembered guess.
+        assert_eq!(dashboard.task_of("blank"), None);
         assert_eq!(dashboard.task_of("both").as_deref(), Some("TASK-2"));
     }
 
@@ -8648,6 +9197,7 @@ mod tests {
                         name: format!("pane {index} of workspace {workspace}"),
                         run_id: Some(run_id.clone()),
                         runtime: PaneRuntime::Running,
+                        kind: PaneKind::Terminal,
                     },
                 );
                 let mut screen = PaneScreen::new(100, 220, 2000);
@@ -8730,6 +9280,50 @@ mod tests {
         for (width, height, frames) in [(80u16, 24u16, 400u32), (200, 50, 200), (400, 100, 100)] {
             let (milliseconds, allocations, bytes) =
                 measure_frame(&mut dashboard, width, height, frames);
+            println!(
+                "{:>10}  {milliseconds:>10.3}  {allocations:>12}  {bytes:>12}",
+                format!("{width}x{height}")
+            );
+        }
+
+        // What the Board pane itself costs, against the identical layout with that pane still a
+        // terminal. A board pane is a new render surface that participates in every frame, and
+        // "it is only one pane" is exactly the kind of claim that turns out to be a scan of the
+        // run list per card. Measured on the same dashboard so the only difference is one kind.
+        let mut with_board = benchmark_dashboard(4, 12);
+        let board_pane = with_board.layout.workspaces[0]
+            .panes
+            .values()
+            .next()
+            .map(|pane| pane.pane_id.clone())
+            .expect("a pane to turn into a board");
+        let pane = with_board.layout.workspaces[0]
+            .panes
+            .get_mut(&board_pane)
+            .unwrap();
+        pane.kind = PaneKind::Board;
+        pane.run_id = None;
+        with_board.set_board_pane_tasks(
+            (1..=24)
+                .map(|id| {
+                    board_task(
+                        id,
+                        "a card with a title long enough to need ellipsising",
+                        crate::board::STATUSES[(id as usize) % crate::board::STATUSES.len()],
+                    )
+                })
+                .collect(),
+            "/repo/real/kanban/tasks".into(),
+        );
+        println!();
+        println!("the same layout with one pane turned into a board (24 cards, 48 agents)");
+        println!(
+            "{:>10}  {:>10}  {:>12}  {:>12}",
+            "size", "ms/frame", "allocs/frame", "bytes/frame"
+        );
+        for (width, height, frames) in [(80u16, 24u16, 400u32), (200, 50, 200), (400, 100, 100)] {
+            let (milliseconds, allocations, bytes) =
+                measure_frame(&mut with_board, width, height, frames);
             println!(
                 "{:>10}  {milliseconds:>10.3}  {allocations:>12}  {bytes:>12}",
                 format!("{width}x{height}")

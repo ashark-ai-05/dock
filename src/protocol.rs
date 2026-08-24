@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     adapter::{AdapterCapabilities, AdapterId, AdapterSelection, ProcessCapabilities},
     detect::{AgentKind, AgentState},
-    layout::{LayoutSnapshot, SplitAxis, WorkspaceLayout},
+    layout::{LayoutSnapshot, PaneKind, SplitAxis, WorkspaceLayout},
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,8 +33,11 @@ pub enum Request {
     Subscribe(SubscribeRequest),
 }
 
-/// Dashboard-safe launch authority.  Its closed shape deliberately cannot carry repository,
-/// task, worktree, executable, argument, environment, or shell data.
+/// Dashboard-safe launch authority.
+///
+/// Its closed shape deliberately cannot carry repository, worktree, executable, argument,
+/// environment, or shell data. The task reference it does carry is an opaque bounded label —
+/// recorded in the binding and exported as `DOCK_TASK`, never resolved, never a path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TerminalLaunchRequest {
@@ -48,6 +51,36 @@ pub struct TerminalLaunchRequest {
     /// every existing caller and stored request stays valid.
     #[serde(default)]
     pub arguments: Vec<String>,
+    /// Which task on the board this run is for, so the pairing outlives the client that made it.
+    ///
+    /// Recorded here rather than remembered client-side because a dashboard that quits used to
+    /// take the answer with it, and a second dashboard never had it at all. It selects nothing:
+    /// the repository and worktree are still derived from `runtime_directory`, and this is echoed
+    /// back and exported, never resolved. [`validate_external_task_ref`] is what keeps it that
+    /// way.
+    #[serde(default)]
+    pub external_task_ref: String,
+}
+
+/// Refuses a task reference that could be anything but a label.
+///
+/// The shape above is a security boundary, so widening it comes with a bound: at most 64 bytes of
+/// ASCII letters, digits, underscore and hyphen. No dot, no slash, no separator of any kind, so a
+/// value that arrives here can never be walked into a path by anything downstream that forgets
+/// what it was promised.
+pub fn validate_external_task_ref(reference: &str) -> Result<(), String> {
+    if reference.len() > 64 {
+        return Err("external task reference must be at most 64 bytes".into());
+    }
+    if !reference
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(
+            "external task reference must be letters, digits, underscore or hyphen only".into(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +316,11 @@ pub enum WorkspaceRequest {
         pane_id: String,
         new_pane_id: String,
         axis: SplitAxis,
+        /// What the new half is for. Defaulted so a client built before board panes existed asks
+        /// for exactly what it always asked for, and so this is one field on an existing request
+        /// rather than a second request that means "split, but".
+        #[serde(default)]
+        kind: PaneKind,
     },
     Focus {
         workspace_id: String,
@@ -541,8 +579,52 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_eight() {
-        assert_eq!(PROTOCOL_VERSION, 10);
+    fn a_task_reference_can_never_be_walked_into_a_path() {
+        // The launch request's shape is a security boundary — it exists so a dashboard cannot ask
+        // the daemon to run something of its choosing. Letting it carry a task reference widens
+        // that shape, and this bound is the whole reason widening it is safe: the value is a
+        // label, is recorded and echoed, and has no character in it that any downstream reader
+        // could mistake for a path.
+        for allowed in ["7", "TASK-61", "dock_task_9", "", &"a".repeat(64)] {
+            assert!(validate_external_task_ref(allowed).is_ok(), "{allowed:?}");
+        }
+        for refused in [
+            "../../etc/passwd",
+            "/etc/passwd",
+            "task/7",
+            "task.7",
+            "task 7",
+            "task;rm -rf /",
+            "task\n7",
+            "täsk",
+            &"a".repeat(65),
+        ] {
+            assert!(
+                validate_external_task_ref(refused).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_version_is_eleven() {
+        assert_eq!(PROTOCOL_VERSION, 11);
+    }
+
+    #[test]
+    fn a_split_request_written_before_pane_kinds_existed_still_asks_for_a_terminal() {
+        // What makes `kind` one field on an existing request rather than a second request: every
+        // split ever sent, and every one an older client will send, means the same thing it
+        // always meant. The version bump is what tells such a client it is behind; the default is
+        // what makes the wire safe until it notices.
+        let request: Request = serde_json::from_str(
+            r#"{"type":"workspace","operation":"split","workspace_id":"w","pane_id":"p","new_pane_id":"q","axis":"vertical"}"#,
+        )
+        .expect("a split with no kind is still a split");
+        let Request::Workspace(WorkspaceRequest::Split { kind, .. }) = request else {
+            panic!("expected a split");
+        };
+        assert_eq!(kind, PaneKind::Terminal);
     }
 
     #[test]
@@ -706,12 +788,12 @@ mod tests {
             serde_json::from_str::<Request>(json).unwrap(),
             Request::TerminalLaunch(_)
         ));
+        // Nothing that selects what runs, or where. These are the fields whose absence is what
+        // makes it safe to hand this request to a dashboard.
         for forbidden in [
             "repository_root",
-            "external_task_ref",
             "worktree",
             "executable",
-            "arguments",
             "environment",
             "shell",
         ] {
@@ -722,6 +804,29 @@ mod tests {
                 "accepted {forbidden}"
             );
         }
+        // `external_task_ref` is carried, and was on the list above until a run needed to
+        // remember which card it was for across the death of the client that dispatched it. It
+        // selects nothing — the repository and worktree are still derived from
+        // `runtime_directory` — and `validate_external_task_ref` is what holds it to a label.
+        let with_task =
+            json.strip_suffix('}').unwrap().to_owned() + r#", "external_task_ref":"61"}"#;
+        let Request::TerminalLaunch(request) =
+            serde_json::from_str::<Request>(&with_task).expect("a task reference is carried")
+        else {
+            panic!("expected a terminal launch");
+        };
+        assert_eq!(request.external_task_ref, "61");
+        // Accepted by serde and refused by the validation, which is the layer that matters: a
+        // path arriving in this field must not reach a binding.
+        assert!(validate_external_task_ref("../../etc/passwd").is_err());
+
+        // `arguments` is carried too, and the old spelling of this test only appeared to refuse
+        // it: it sent a string where a list belongs, so serde rejected the type rather than the
+        // field, and the assertion would have passed even if the field had been forbidden.
+        let with_arguments =
+            json.strip_suffix('}').unwrap().to_owned() + r#", "arguments":["--continue"]}"#;
+        assert!(serde_json::from_str::<Request>(&with_arguments).is_ok());
+
         assert!(serde_json::from_str::<Request>(&json.replace("fixture", "generic")).is_err());
     }
 }

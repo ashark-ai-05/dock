@@ -1,5 +1,5 @@
 use dock::{
-    layout::SplitAxis,
+    layout::{PaneKind, SplitAxis},
     paths,
     protocol::{HelloRequest, PROTOCOL_VERSION, Request, Response, WorkspaceRequest},
 };
@@ -49,7 +49,7 @@ fn main() -> Result<(), String> {
 }
 
 fn parse(a: &[String]) -> Result<WorkspaceRequest, String> {
-    let usage = "usage: dock-workspace [--socket=PATH] inspect | create ID NAME PANE | split WORKSPACE PANE NEW_PANE horizontal|vertical | focus WORKSPACE PANE | resize WORKSPACE PANE RATIO_MILLI | rename-workspace WORKSPACE NAME | rename-pane WORKSPACE PANE NAME | close WORKSPACE PANE | respawn WORKSPACE PANE";
+    let usage = "usage: dock-workspace [--socket=PATH] inspect | create ID NAME PANE | split WORKSPACE PANE NEW_PANE horizontal|vertical [terminal|board] | focus WORKSPACE PANE | resize WORKSPACE PANE RATIO_MILLI | rename-workspace WORKSPACE NAME | rename-pane WORKSPACE PANE NAME | close WORKSPACE PANE | respawn WORKSPACE PANE";
     match a.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["inspect"] => Ok(WorkspaceRequest::Inspect),
         ["create", w, n, p] => Ok(WorkspaceRequest::Create {
@@ -57,7 +57,9 @@ fn parse(a: &[String]) -> Result<WorkspaceRequest, String> {
             name: (*n).into(),
             pane_id: (*p).into(),
         }),
-        ["split", w, p, n, axis] => Ok(WorkspaceRequest::Split {
+        // The kind is optional and trailing, so every existing invocation still means what it
+        // meant: a split with no kind is the terminal split it always was.
+        ["split", w, p, n, axis] | ["split", w, p, n, axis, _] => Ok(WorkspaceRequest::Split {
             workspace_id: (*w).into(),
             pane_id: (*p).into(),
             new_pane_id: (*n).into(),
@@ -65,6 +67,11 @@ fn parse(a: &[String]) -> Result<WorkspaceRequest, String> {
                 "horizontal" => SplitAxis::Horizontal,
                 "vertical" => SplitAxis::Vertical,
                 _ => return Err(usage.into()),
+            },
+            kind: match a.get(5).map(String::as_str) {
+                None | Some("terminal") => PaneKind::Terminal,
+                Some("board") => PaneKind::Board,
+                Some(_) => return Err(usage.into()),
             },
         }),
         ["focus", w, p] => Ok(WorkspaceRequest::Focus {

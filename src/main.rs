@@ -558,6 +558,20 @@ fn run_dashboard(
         if dashboard.take_refresh() {
             refresh(client, &mut dashboard)?;
         }
+        // A Board pane draws from the client's own board load, and until now the only thing that
+        // ever read the board was the overlay's key. A board pane restored from a previous
+        // session would therefore have come back as an empty grid until somebody pressed
+        // `Ctrl+B k`. Read once, when a board pane first exists and nothing has been read yet;
+        // the check short-circuits on a field the moment it has.
+        if dashboard.board_pane_needs_load()
+            && let Some(directory) = dock::board::tasks_dir(
+                &dashboard.repository_root,
+                dashboard.workspace_id().unwrap_or_default(),
+            )
+        {
+            let tasks = dock::board::load(&directory);
+            dashboard.set_board_pane_tasks(tasks, directory);
+        }
         terminal
             .draw(|frame| dashboard.render(frame))
             .map_err(|e| e.to_string())?;
@@ -1037,6 +1051,9 @@ fn dispatch_task(
             profile,
             runtime_directory: dashboard.runtime_directory.clone(),
             arguments: adapter.prompt_arguments(&dispatch_prompt(*task_id, title, &body)),
+            // Recorded on the run itself, so which card this pane is working stays known after
+            // the dashboard that dispatched it has gone.
+            external_task_ref: task_id.to_string(),
         });
         if let Response::Error { message, .. } = client.request(&request)? {
             return Err(message);

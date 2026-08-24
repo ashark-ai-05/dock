@@ -22,12 +22,12 @@ use crate::{
     adapter::AdapterSelection,
     detect::{AgentKind, AgentState, classify_screen, process::ProcessTree},
     git::GitAdapter,
-    layout::{LayoutRegistry, LayoutSnapshot, PaneRuntime, WorkspaceLayout},
+    layout::{LayoutRegistry, LayoutSnapshot, PaneKind, PaneRuntime, WorkspaceLayout},
     model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
     protocol::{
-        BindingKind, DashboardProfile, DependencyGateSnapshot, DispatchRequest,
-        DurableProgrammeGate, ErrorCode, GateState, LifecycleOperation, ProgrammeSnapshot,
-        RepositoryPortfolioSnapshot, RuntimeSnapshot, WorkspaceRequest,
+        BindingKind, DependencyGateSnapshot, DispatchRequest, DurableProgrammeGate, ErrorCode,
+        GateState, LifecycleOperation, ProgrammeSnapshot, RepositoryPortfolioSnapshot,
+        RuntimeSnapshot, WorkspaceRequest,
     },
     runtime::{OwnedRuntime, PtySize, RunBinding, RunPulse},
     storage::LocalStore,
@@ -577,16 +577,27 @@ impl RuntimeRegistry {
         self.dispatch_with_gate_authorization(request, false, Some((workspace_id, pane_id)))
     }
 
+    /// Takes the request whole rather than seven loose strings, so the closed shape the protocol
+    /// defines is the shape this reasons about, and a field added there does not reshuffle a
+    /// positional argument list here.
     pub fn terminal_launch(
         &self,
-        workspace_id: String,
-        pane_id: String,
-        run_id: String,
-        profile: DashboardProfile,
-        runtime_directory: String,
-        supplied_arguments: Vec<String>,
+        launch: crate::protocol::TerminalLaunchRequest,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
+        let crate::protocol::TerminalLaunchRequest {
+            workspace_id,
+            pane_id,
+            run_id,
+            profile,
+            runtime_directory,
+            arguments: supplied_arguments,
+            external_task_ref,
+        } = launch;
         validate_external_run_id(&run_id).map_err(|m| (ErrorCode::InvalidBinding, m))?;
+        // Bounded before it reaches the binding, so the one field this deliberately closed shape
+        // gained can never be walked into a path by anything downstream.
+        crate::protocol::validate_external_task_ref(&external_task_ref)
+            .map_err(|m| (ErrorCode::InvalidBinding, m))?;
         let directory = canonical_terminal_directory(Path::new(&runtime_directory))
             .map_err(|m| (ErrorCode::InvalidBinding, m))?;
         let adapter_id = crate::adapter::AdapterId::from(profile);
@@ -604,7 +615,7 @@ impl RuntimeRegistry {
         };
         let request = DispatchRequest {
             repository_root: directory.display().to_string(),
-            external_task_ref: String::new(),
+            external_task_ref: external_task_ref.clone(),
             run_id,
             worktree: directory.display().to_string(),
             adapter: AdapterSelection {
@@ -633,10 +644,27 @@ impl RuntimeRegistry {
         )
     }
 
-    /// Every Dock pane is a working terminal from the moment it exists. This is a Dock-created
-    /// PTY in a Dock-created process group like any other owned run, so the no-adoption
-    /// invariant is untouched.
+    /// Every Dock *terminal* pane is a working terminal from the moment it exists. This is a
+    /// Dock-created PTY in a Dock-created process group like any other owned run, so the
+    /// no-adoption invariant is untouched.
+    ///
+    /// A Board pane gets nothing. Not a PTY that is ignored — no run at all, which is why the
+    /// refusal is here rather than at the three places that call this. Pane create, pane split
+    /// and `revive_restored_panes` each reach this line, and a guard written three times is a
+    /// guard the fourth caller forgets; the property being protected is the absence of a
+    /// process, which is exactly the kind of thing nobody notices has stopped being true.
     fn launch_pane_shell(&self, workspace_id: &str, pane_id: &str) {
+        // Bound rather than tested inline so the layout lock is released on this line: every
+        // launch path below takes `runs` and then `layout`, and holding it across the dispatch
+        // would invert that order.
+        let kind = self
+            .layout
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pane_kind(workspace_id, pane_id);
+        if kind == Some(PaneKind::Board) {
+            return;
+        }
         #[cfg(test)]
         if *self
             .suppress_pane_shells
@@ -979,6 +1007,15 @@ impl RuntimeRegistry {
                         "respawn target pane does not exist".into(),
                     ));
                 }
+                // Refused rather than quietly doing nothing. `launch_pane_shell` would walk past
+                // a board and this request would answer with an unchanged layout, which reads as
+                // Dock having failed at something it in fact declined to do.
+                if layout.pane_kind(workspace_id, pane_id) == Some(PaneKind::Board) {
+                    return Err((
+                        ErrorCode::UnsupportedOperation,
+                        "that pane is a board; there is no process in it to restart".into(),
+                    ));
+                }
                 layout.pane_run(workspace_id, pane_id)
             };
             // Respawn is a recovery path, never a way to displace something that is alive: a
@@ -1141,8 +1178,12 @@ impl RuntimeRegistry {
                 pane_id,
                 new_pane_id,
                 axis,
+                kind,
             } => layout
-                .split(&workspace_id, &pane_id, new_pane_id.clone(), axis)
+                .split(&workspace_id, &pane_id, new_pane_id.clone(), axis, kind)
+                // Pushed whatever the kind is, because the decision about a shell belongs inside
+                // `launch_pane_shell` rather than at each of its callers. A caller that filtered
+                // here would be a caller that could forget to.
                 .inspect(|_| new_panes.push((workspace_id, new_pane_id)))
                 .map(Some),
             WorkspaceRequest::Focus {
@@ -3579,6 +3620,9 @@ fn repository_id(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::model::Check;
+    // Only the tests build launch requests by hand now; the runtime destructures the one the
+    // protocol already typed.
+    use crate::protocol::DashboardProfile;
     use std::{
         os::unix::fs::symlink,
         sync::atomic::{AtomicU64, Ordering},
@@ -3671,6 +3715,7 @@ mod tests {
                 pane_id: "p1".into(),
                 new_pane_id: "p2".into(),
                 axis: crate::layout::SplitAxis::Vertical,
+                kind: PaneKind::Terminal,
             })
             .expect("split pane");
         let layout = registry.layout();
@@ -3730,6 +3775,115 @@ mod tests {
             "the shell identity belongs to the pane, not to one launch"
         );
         assert!(restored.pane_input("w1", "p1", b"echo revived\n").is_ok());
+    }
+
+    /// The one property that makes a Board pane a board rather than a terminal with a picture in
+    /// it, asserted where it is hardest to assert: as the absence of a process.
+    ///
+    /// Every one of the three paths that gives a pane a shell is exercised here, because the
+    /// guard lives inside `launch_pane_shell` rather than at its callers — and a guard at the
+    /// callers is a guard the fourth caller forgets.
+    #[test]
+    fn a_board_pane_is_never_given_a_shell_on_create_split_or_revive() {
+        let state = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "dock-board-pane-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let shell_run_id = pane_shell_run_id("w1", "board");
+
+        {
+            // A plain registry rather than a `TestRegistry`: this one has to leave the state
+            // directory behind for the restart below, and only its own shells are stopped.
+            let first = RuntimeRegistry::new(&state, 2000).unwrap();
+            first
+                .workspace(WorkspaceRequest::Create {
+                    workspace_id: "w1".into(),
+                    name: "Daily".into(),
+                    pane_id: "p1".into(),
+                })
+                .expect("create workspace");
+            first
+                .workspace(WorkspaceRequest::Split {
+                    workspace_id: "w1".into(),
+                    pane_id: "p1".into(),
+                    new_pane_id: "board".into(),
+                    axis: crate::layout::SplitAxis::Vertical,
+                    kind: PaneKind::Board,
+                })
+                .expect("split a board onto the canvas");
+
+            let layout = first.layout();
+            assert!(
+                layout.workspaces[0].panes["p1"].run_id.is_some(),
+                "splitting a board must not cost the other half its shell"
+            );
+            assert_eq!(layout.workspaces[0].panes["board"].run_id, None);
+            let runs = first.inspect(None).expect("inspect");
+            assert!(
+                !runs.iter().any(|run| run.pane_id == "board"),
+                "no run may exist for a board pane, not even a stopped one"
+            );
+            assert!(
+                first.inspect(Some(&shell_run_id)).is_err(),
+                "the pane shell identity a board would have had was never reserved"
+            );
+            // No PTY, so no input path either — and this is the daemon refusing rather than the
+            // client declining to ask.
+            assert!(first.pane_input("w1", "board", b"x").is_err());
+
+            let terminal_shell = first.layout().workspaces[0].panes["p1"]
+                .run_id
+                .clone()
+                .expect("the terminal half has a shell");
+            first
+                .lifecycle(&terminal_shell, LifecycleOperation::Stop)
+                .expect("stop the terminal half's shell");
+        }
+
+        // A restart is the other half of the claim: the kind is durable, so the pane comes back
+        // a board, and reviving restored panes must walk straight past it.
+        let restored = TestRegistry {
+            registry: RuntimeRegistry::new(&state, 2000).unwrap(),
+            state: state.clone(),
+        };
+        assert_eq!(
+            restored.layout().workspaces[0].panes["board"].kind,
+            PaneKind::Board
+        );
+        restored.revive_restored_panes();
+        assert_eq!(
+            restored.layout().workspaces[0].panes["board"].run_id,
+            None,
+            "a restored board must not be handed a shell by the revive sweep"
+        );
+        assert!(
+            restored.layout().workspaces[0].panes["p1"].run_id.is_some(),
+            "and the terminal beside it must still be revived"
+        );
+        assert!(
+            !restored
+                .inspect(None)
+                .expect("inspect")
+                .iter()
+                .any(|run| run.pane_id == "board")
+        );
+
+        // Respawn is the third path, and it is refused by name rather than silently doing
+        // nothing: `Ctrl+B R` on a board should say why, not look broken.
+        let (_, message) = restored
+            .workspace(WorkspaceRequest::Respawn {
+                workspace_id: "w1".into(),
+                pane_id: "board".into(),
+            })
+            .expect_err("respawning a board must be refused");
+        assert!(message.contains("board"), "{message}");
+        assert_eq!(restored.layout().workspaces[0].panes["board"].run_id, None);
     }
 
     /// Typing `exit` leaves a pane with a dead shell. Recovery is a keyboard command, so the
@@ -3831,28 +3985,31 @@ mod tests {
                 pane_id: "p1".into(),
                 new_pane_id: "p2".into(),
                 axis: crate::layout::SplitAxis::Vertical,
+                kind: PaneKind::Terminal,
             })
             .expect("split pane");
         let directory = registry.state.display().to_string();
         registry
-            .terminal_launch(
-                "w1".into(),
-                "p2".into(),
-                "dock_taken".into(),
-                DashboardProfile::Fixture,
-                directory.clone(),
-                Vec::new(),
-            )
+            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+                workspace_id: "w1".into(),
+                pane_id: "p2".into(),
+                run_id: "dock_taken".into(),
+                profile: DashboardProfile::Fixture,
+                runtime_directory: directory.clone(),
+                arguments: Vec::new(),
+                external_task_ref: String::new(),
+            })
             .expect("first launch claims the run id");
 
-        let refused = registry.terminal_launch(
-            "w1".into(),
-            "p1".into(),
-            "dock_taken".into(),
-            DashboardProfile::Fixture,
-            directory,
-            Vec::new(),
-        );
+        let refused = registry.terminal_launch(crate::protocol::TerminalLaunchRequest {
+            workspace_id: "w1".into(),
+            pane_id: "p1".into(),
+            run_id: "dock_taken".into(),
+            profile: DashboardProfile::Fixture,
+            runtime_directory: directory,
+            arguments: Vec::new(),
+            external_task_ref: String::new(),
+        });
         assert!(matches!(refused, Err((ErrorCode::DuplicateRunId, _))));
 
         let shell_run_id = pane_shell_run_id("w1", "p1");
@@ -3881,14 +4038,15 @@ mod tests {
         // This is the shape a resume takes on the unbound path: the same profile, launched with
         // the agent's own "continue where you left off" arguments.
         let snapshot = registry
-            .terminal_launch(
-                "w1".into(),
-                "p1".into(),
-                "dock_resumed".into(),
-                DashboardProfile::Fixture,
-                registry.state.display().to_string(),
-                vec!["-c".into(), "printf resumed".into()],
-            )
+            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+                run_id: "dock_resumed".into(),
+                profile: DashboardProfile::Fixture,
+                runtime_directory: registry.state.display().to_string(),
+                arguments: vec!["-c".into(), "printf resumed".into()],
+                external_task_ref: String::new(),
+            })
             .expect("launch with supplied arguments");
         assert!(
             snapshot.command.contains(&"printf resumed".to_owned()),
@@ -4251,6 +4409,7 @@ mod tests {
                     pane_id: from.into(),
                     new_pane_id: new.into(),
                     axis: crate::layout::SplitAxis::Vertical,
+                    kind: PaneKind::Terminal,
                 })
                 .expect("split pane");
         }
@@ -4269,14 +4428,15 @@ mod tests {
             "pane shells are infrastructure and must not be counted as agent runs"
         );
         registry
-            .terminal_launch(
-                "w1".into(),
-                "p1".into(),
-                "dock_agent_run".into(),
-                DashboardProfile::Fixture,
-                registry.state.display().to_string(),
-                Vec::new(),
-            )
+            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+                run_id: "dock_agent_run".into(),
+                profile: DashboardProfile::Fixture,
+                runtime_directory: registry.state.display().to_string(),
+                arguments: Vec::new(),
+                external_task_ref: String::new(),
+            })
             .expect("agent dispatch must still be admitted with three panes open");
         assert_eq!(registry.inspect_programme().global_active, 1);
     }
@@ -4292,14 +4452,15 @@ mod tests {
             })
             .expect("create workspace");
         let error = registry
-            .terminal_launch(
-                "w1".into(),
-                "p1".into(),
-                pane_shell_run_id("w1", "p1"),
-                DashboardProfile::Fixture,
-                registry.state.display().to_string(),
-                Vec::new(),
-            )
+            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+                run_id: pane_shell_run_id("w1", "p1"),
+                profile: DashboardProfile::Fixture,
+                runtime_directory: registry.state.display().to_string(),
+                arguments: Vec::new(),
+                external_task_ref: String::new(),
+            })
             .expect_err("a caller must not mint a pane-shell identity");
         assert_eq!(error.0, ErrorCode::InvalidBinding);
         assert!(error.1.contains("reserved"), "{}", error.1);
@@ -4364,14 +4525,15 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some("injected retirement stop failure".into());
         registry
-            .terminal_launch(
-                "w1".into(),
-                "p1".into(),
-                "dock_replacement".into(),
-                DashboardProfile::Fixture,
-                registry.state.display().to_string(),
-                Vec::new(),
-            )
+            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+                run_id: "dock_replacement".into(),
+                profile: DashboardProfile::Fixture,
+                runtime_directory: registry.state.display().to_string(),
+                arguments: Vec::new(),
+                external_task_ref: String::new(),
+            })
             .expect("launch replaces the pane shell");
         assert!(
             registry
@@ -4495,14 +4657,15 @@ mod tests {
             })
             .unwrap();
         let snapshot = registry
-            .terminal_launch(
-                "w".into(),
-                "p".into(),
-                "dock_terminal_1".into(),
-                DashboardProfile::Fixture,
-                runtime_dir.display().to_string(),
-                Vec::new(),
-            )
+            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+                workspace_id: "w".into(),
+                pane_id: "p".into(),
+                run_id: "dock_terminal_1".into(),
+                profile: DashboardProfile::Fixture,
+                runtime_directory: runtime_dir.display().to_string(),
+                arguments: Vec::new(),
+                external_task_ref: String::new(),
+            })
             .unwrap();
         assert_eq!(snapshot.binding_kind, BindingKind::Terminal);
         assert_eq!(snapshot.external_task_ref, "");
@@ -4713,6 +4876,7 @@ mod tests {
                 pane_id: "selected_pane".into(),
                 new_pane_id: "launch_target".into(),
                 axis: crate::layout::SplitAxis::Vertical,
+                kind: PaneKind::Terminal,
             })
             .unwrap();
         registry
@@ -4974,9 +5138,12 @@ mod tests {
     fn invalid_layout_does_not_block_dispatch_or_programme_inspection() {
         for (label, bytes) in [
             ("corrupt-layout", b"{not-json}".as_slice()),
+            // Schema 0 rather than a version from the future: nothing ever wrote 0, so it is a
+            // mangling and quarantine is the right answer. A *newer* schema is a different
+            // thing entirely and is asserted separately, below.
             (
                 "unsupported-layout",
-                br#"{"schema_version":99,"workspaces":[]}"#.as_slice(),
+                br#"{"schema_version":0,"workspaces":[]}"#.as_slice(),
             ),
         ] {
             let repo = Repo::new(label);
@@ -4997,6 +5164,31 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn a_layout_from_a_newer_dock_stops_the_daemon_rather_than_overwriting_it() {
+        // The one refusal that must not start the daemon anyway. Starting empty would be
+        // starting with a *wrong* answer — every workspace missing — and the first layout change
+        // after that would persist the empty topology straight over the newer file. A downgrade
+        // should cost the user nothing but the downgrade, so the daemon declines to start and
+        // says which version wrote the file it will not touch.
+        let repo = Repo::new("layout-from-the-future");
+        fs::create_dir_all(&repo.state).unwrap();
+        fs::set_permissions(&repo.state, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = repo.state.join("layout.json");
+        fs::write(&path, br#"{"schema_version":99,"workspaces":[]}"#).unwrap();
+
+        let Err(refusal) = RuntimeRegistry::new(&repo.state, 64) else {
+            panic!("a layout from a newer Dock must not be loaded");
+        };
+        assert!(refusal.contains("newer Dock"), "{refusal}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            br#"{"schema_version":99,"workspaces":[]}"#,
+            "the file the newer build still needs must be left exactly as it was"
+        );
+        assert!(!repo.state.join("layout-quarantine").exists());
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod model;
 pub mod paths;
 pub mod picker;
 pub mod protocol;
+pub mod queue;
 pub mod runtime;
 pub mod server;
 pub mod storage;

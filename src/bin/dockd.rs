@@ -2,7 +2,9 @@ use std::{path::PathBuf, sync::Arc};
 
 use dock::{
     dispatch::{CapacityPolicy, RuntimeRegistry},
-    paths, server,
+    paths,
+    queue::AutoFeedTrust,
+    server,
 };
 
 fn main() -> Result<(), String> {
@@ -13,6 +15,9 @@ fn main() -> Result<(), String> {
     let mut global_run_capacity = usize::MAX;
     let mut repository_run_capacity = usize::MAX;
     let mut human_review_reserved = 0;
+    // Which "the agent finished" signal an *already-armed* pane believes. It arms nothing: there
+    // is deliberately no option here, or anywhere else, that turns auto-feed on by itself.
+    let mut auto_feed_trust = AutoFeedTrust::Reported;
     for argument in args {
         if let Some(value) = argument.strip_prefix("--socket=") {
             socket = Some(value.into());
@@ -37,9 +42,15 @@ fn main() -> Result<(), String> {
             human_review_reserved = value
                 .parse()
                 .map_err(|_| "--human-review-reserved must be a non-negative integer")?;
+        } else if let Some(value) = argument.strip_prefix("--auto-feed-trust=") {
+            auto_feed_trust = match value {
+                "reported" => AutoFeedTrust::Reported,
+                "screen" => AutoFeedTrust::Screen,
+                _ => return Err("--auto-feed-trust must be reported or screen".into()),
+            };
         } else {
             return Err(format!(
-                "unknown option {argument:?}; usage: dockd [--socket=PATH] [--state-dir=PATH] [--scrollback-rows=N] [--global-run-capacity=N] [--repository-run-capacity=N] [--human-review-reserved=N]"
+                "unknown option {argument:?}; usage: dockd [--socket=PATH] [--state-dir=PATH] [--scrollback-rows=N] [--global-run-capacity=N] [--repository-run-capacity=N] [--human-review-reserved=N] [--auto-feed-trust=reported|screen]"
             ));
         }
     }
@@ -61,6 +72,7 @@ fn main() -> Result<(), String> {
             human_review_reserved,
         },
     )?);
+    runtime.set_auto_feed_trust(auto_feed_trust);
     // A pane restored from durable layout comes back with no run at all. `dock` auto-starts
     // `dockd`, so without this every pane is inert after a reboot.
     runtime.revive_restored_panes();

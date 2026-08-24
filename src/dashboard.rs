@@ -28,8 +28,8 @@ use crate::{
     picker::{Picker, PickerItem},
     protocol::{
         BindingKind, DashboardProfile, DecideRequest, DispatchRequest, Event,
-        LaunchIntoPaneRequest, PROTOCOL_VERSION, Request, RuntimeSnapshot, TerminalLaunchRequest,
-        WorkspaceRequest,
+        LaunchIntoPaneRequest, PROTOCOL_VERSION, PaneQueueSnapshot, QueueRequest, Request,
+        Response, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
     },
     terminal::{KeyEncoding, PaneScreen, PaneSnapshot, encode_paste},
     theme::Theme,
@@ -142,6 +142,25 @@ pub struct Dashboard {
     /// overlay being opened and closed over the top of it. It renders the same `BoardView` the
     /// overlay does, which is the whole reason keeping the overlay costs nothing.
     board_pane_view: Option<BoardView>,
+    /// Every pane queue the daemon holds, as of the last refresh.
+    ///
+    /// Queue depth lives only in the daemon — nothing the client can see implies it — so this is
+    /// replicated state like `agents` is, refilled by `refresh` and invalidated by
+    /// `Event::QueueChanged`. Held as the wire listing rather than indexed by pane: it is capped
+    /// at `MAX_QUEUED_TOTAL` entries across a handful of panes, and a map rebuilt per frame would
+    /// cost more than the scan it saves.
+    queues: Vec<PaneQueueSnapshot>,
+    /// The daemon-wide kill switch, as the daemon last reported it. Independent of every pane's
+    /// own arming, so the lane must be able to say "armed, and paused anyway".
+    queues_paused: bool,
+    /// The runs-lane row a board pane's keys act on, named by the pane it points at rather than
+    /// by its position in the lane.
+    ///
+    /// An index would be the smaller field and the wrong one: the lane sorts blocked agents to
+    /// the top, so an agent two rows down going `Blocked` silently slides a different pane under
+    /// the cursor — and the key on this cursor is the one that lets Dock type into an agent
+    /// unattended. Naming the pane means a reordered lane moves the highlight, never the target.
+    board_lane_selection: Option<(String, String)>,
     #[cfg(test)]
     /// Stands in for what is installed on this machine. Tests must not ask the machine, or they
     /// assert something about the laptop they ran on rather than about Dock.
@@ -232,10 +251,15 @@ pub struct RunLaneRow<'a> {
     pub state: AgentState,
     /// The board card this run is bound to, when the daemon's binding says so.
     pub task_id: Option<u64>,
-    /// How many prompts are waiting for this pane. Always zero until the per-agent queue exists;
-    /// carried now so the lane does not change shape when it arrives.
+    /// How many prompts are waiting for this pane.
     pub queued: usize,
     pub auto_feed: bool,
+    /// A prompt has been fed that the agent has not been seen working on yet. The queue is armed
+    /// and will still not fire, which is a different thing from being idle and worth saying.
+    pub awaiting_ack: bool,
+    /// Why auto-feed last declined to fire, in the daemon's own words. Borrowed, because it is
+    /// the daemon's sentence and rewording it here would give a stalled queue two explanations.
+    pub holding_because: Option<&'a str>,
 }
 
 /// The board, laid out as columns of cards.
@@ -568,7 +592,11 @@ impl Dashboard {
                 }
                 self.agents.insert(run_id, (agent, state));
             }
-            Event::PaneState { .. } | Event::LayoutChanged => self.needs_refresh = true,
+            // Queue depth lives only in the daemon, so unlike agent state nothing else a
+            // subscriber receives would tell the client a queue drained.
+            Event::PaneState { .. } | Event::LayoutChanged | Event::QueueChanged { .. } => {
+                self.needs_refresh = true
+            }
         }
     }
 
@@ -1388,8 +1416,9 @@ impl Dashboard {
     /// The runs lane: one row per live agent pane, in the order a person should look at them.
     ///
     /// Derived from data this client already holds and pushed to it — `self.runs` for where each
-    /// run lives and what task it was bound to, `self.agents` for what it is doing — so the lane
-    /// is live the moment it renders and requires nothing new on the wire.
+    /// run lives and what task it was bound to, `self.agents` for what it is doing, `self.queues`
+    /// for what is waiting behind it — so the lane is live the moment it renders and asks the
+    /// daemon for nothing of its own.
     ///
     /// A pane with no agent in it is not a row. `AgentState::Idle` does not mean "the agent is
     /// resting", it means no agent was detected in this pane at all, so a lane that admitted them
@@ -1400,6 +1429,10 @@ impl Dashboard {
             .iter()
             .filter_map(|run| {
                 let (agent, state) = self.agents.get(run.run_id.as_str())?;
+                // Keyed by the pane rather than the run, because that is how the daemon keys a
+                // queue: a queue outlives the run it was filled for, and a pane that is
+                // relaunched must not come back with somebody else's queue behind it.
+                let queue = self.queue_for(run.workspace_id.as_str(), run.pane_id.as_str());
                 Some(RunLaneRow {
                     run_id: run.run_id.as_str(),
                     workspace_id: run.workspace_id.as_str(),
@@ -1407,8 +1440,10 @@ impl Dashboard {
                     agent: (*agent)?,
                     state: *state,
                     task_id: bound_task(run).and_then(|task| task.parse().ok()),
-                    queued: 0,
-                    auto_feed: false,
+                    queued: queue.map_or(0, |queue| queue.entries.len()),
+                    auto_feed: queue.is_some_and(|queue| queue.auto_feed),
+                    awaiting_ack: queue.is_some_and(|queue| queue.awaiting_ack),
+                    holding_because: queue.and_then(|queue| queue.holding_because.as_deref()),
                 })
             })
             .collect();
@@ -1422,6 +1457,126 @@ impl Dashboard {
                 .then_with(|| left.pane_id.cmp(right.pane_id))
         });
         rows
+    }
+
+    /// The daemon's queue for one pane, if it holds one.
+    ///
+    /// A linear scan on purpose. The daemon caps itself at `MAX_QUEUED_TOTAL` entries spread over
+    /// a handful of panes, and the lane has one row per *agent*, so this is a few comparisons
+    /// against a few strings — where a map keyed by the pair would allocate a `String` key per
+    /// pane per frame to look itself up.
+    fn queue_for(&self, workspace_id: &str, pane_id: &str) -> Option<&PaneQueueSnapshot> {
+        self.queues
+            .iter()
+            .find(|queue| queue.workspace_id == workspace_id && queue.pane_id == pane_id)
+    }
+
+    /// Replaces the replicated queue listing with the daemon's.
+    ///
+    /// Deliberately does not touch `self.error`: this arrives on the back of every refresh,
+    /// including the one that follows a refusal, and a listing that cleared the footer would
+    /// erase the refusal before it had been read.
+    pub fn set_queues(&mut self, queues: Vec<PaneQueueSnapshot>, paused: bool) {
+        self.queues = queues;
+        self.queues_paused = paused;
+    }
+
+    /// Takes the daemon's answer to a queue request.
+    ///
+    /// The refusal is the product here, so it is surfaced in the daemon's own words rather than
+    /// being folded into a house message: arming a pane whose agent has never reported a state
+    /// is answered with the sentence naming `dock hooks --install`, and a person who never sees
+    /// that sentence is left with a queue that is silently never going to fire. The success case
+    /// carries the whole listing, so the lane is already right when the frame after this paints.
+    pub fn apply_queue_response(&mut self, response: Response) {
+        match response {
+            Response::Queues { queues, paused } => {
+                self.set_queues(queues, paused);
+                self.error = None;
+            }
+            Response::Error { message, .. } => self.error = Some(message),
+            other => self.error = Some(format!("unexpected queue response: {other:?}")),
+        }
+    }
+
+    /// Which row of the runs lane the board pane's keys act on.
+    ///
+    /// Resolved against the rows as they are now rather than remembered as a position, and falls
+    /// back to the first row when the pane it named has left the lane — a lane that kept pointing
+    /// at a departed pane would answer `a` by arming nothing and saying nothing.
+    fn selected_lane_index(&self, rows: &[RunLaneRow<'_>]) -> Option<usize> {
+        if rows.is_empty() {
+            return None;
+        }
+        let Some((workspace_id, pane_id)) = self.board_lane_selection.as_ref() else {
+            return Some(0);
+        };
+        Some(
+            rows.iter()
+                .position(|row| row.workspace_id == workspace_id && row.pane_id == pane_id)
+                .unwrap_or(0),
+        )
+    }
+
+    /// The runs lane's cursor, moved by rows and clamped rather than wrapped.
+    ///
+    /// Clamped because the one key this cursor carries arms an agent: wrapping from the last row
+    /// to the first would put a held `j` on a pane the user was moving *away* from.
+    fn move_lane_selection(&mut self, delta: isize) -> UiCommand {
+        let rows = self.run_lane_rows();
+        let Some(current) = self.selected_lane_index(&rows) else {
+            return UiCommand::None;
+        };
+        let next = current
+            .saturating_add_signed(delta)
+            .min(rows.len().saturating_sub(1));
+        let row = &rows[next];
+        let selection = (row.workspace_id.to_owned(), row.pane_id.to_owned());
+        self.board_lane_selection = Some(selection);
+        UiCommand::None
+    }
+
+    /// Arms or disarms auto-feed for the selected pane, and nothing else.
+    ///
+    /// One pane per press, named explicitly, and the toggle reads the pane's current state from
+    /// the daemon's own listing rather than from anything this client decided — so `a` on an
+    /// armed pane disarms it and `a` on a pane the daemon never armed asks for arming. There is
+    /// deliberately no key that arms the lane: arming is the one act that lets Dock type into an
+    /// agent while nobody is watching, and "arm all" would make one keystroke's worth of
+    /// deliberateness stand in for a whole canvas of it.
+    fn toggle_lane_auto_feed(&mut self) -> UiCommand {
+        let rows = self.run_lane_rows();
+        let Some(index) = self.selected_lane_index(&rows) else {
+            self.error = Some("no agent to arm: the runs lane is empty".into());
+            return UiCommand::None;
+        };
+        let row = &rows[index];
+        let request = Request::Queue(QueueRequest::SetAuto {
+            workspace_id: row.workspace_id.to_owned(),
+            pane_id: row.pane_id.to_owned(),
+            enabled: !row.auto_feed,
+        });
+        // The cursor follows the pane that was acted on, so the answer lands on the row the user
+        // was looking at even if the lane reorders around it before the frame after.
+        self.board_lane_selection = Some((row.workspace_id.to_owned(), row.pane_id.to_owned()));
+        self.error = None;
+        UiCommand::Request(Box::new(request))
+    }
+
+    /// The keys a Board pane takes, which is the runs lane's cursor and its one verb.
+    ///
+    /// This exists because a Board pane has no PTY and must never be given one. Ordinary panes
+    /// reach the daemon through `send_to_pane`, which is unchanged and still drops input for a
+    /// pane with no run; a board is intercepted before that, so nothing here can turn into
+    /// `PaneInput` however the key is encoded. Anything unrecognised is ignored rather than
+    /// guessed at — a board is not a keyboard surface, it has a cursor and a switch.
+    fn board_pane_key(&mut self, key: KeyEvent) -> UiCommand {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.move_lane_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_lane_selection(-1),
+            KeyCode::Char('a') => self.toggle_lane_auto_feed(),
+            _ => UiCommand::None,
+        }
     }
 
     /// The agent state to badge each board card with, keyed by card id.
@@ -1438,11 +1593,16 @@ impl Dashboard {
     ///
     /// Two stacked regions rather than two column sets, because a run is not a status — appending
     /// a "runs" pseudo-column would put the same card in two columns at once.
-    fn render_board_pane(&self, frame: &mut Frame, inner: Rect) {
+    fn render_board_pane(&self, frame: &mut Frame, inner: Rect, focused: bool) {
+        use std::fmt::Write as _;
+
         if inner.height < 4 || inner.width < 12 {
             return;
         }
         let rows = self.run_lane_rows();
+        // Only drawn on the focused board. A cursor on a pane that is not taking keys points at a
+        // row nothing is about to happen to, and the row it points at is the one `a` would arm.
+        let selected = focused.then(|| self.selected_lane_index(&rows)).flatten();
         // The lane is given what it needs and no more, so a board with two agents on it does not
         // spend half the pane on empty rows. It never takes more than half: the backlog is the
         // half a person curates, and a busy runtime must not squeeze it off the screen.
@@ -1454,11 +1614,25 @@ impl Dashboard {
         let lane_height = wanted.min(inner.height / 2).max(3);
         let lane = Rect::new(inner.x, inner.y, inner.width, lane_height);
 
+        // The heading carries the daemon-wide kill switch, because it is the one thing that makes
+        // an *armed* pane feed nothing: without it a paused daemon looks like a broken one.
+        let mut heading = format!("RUNS · {}", rows.len());
+        if self.queues_paused {
+            heading.push_str(" · PAUSED · every queue is held");
+        }
+        if focused && !rows.is_empty() {
+            heading.push_str(" · j/k choose · a arms auto-feed");
+        }
+        ellipsise_in_place(&mut heading, usize::from(lane.width));
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!("RUNS · {}", rows.len()),
+                heading,
                 Style::default()
-                    .fg(self.theme.muted)
+                    .fg(if self.queues_paused {
+                        self.theme.blocked
+                    } else {
+                        self.theme.muted
+                    })
                     .add_modifier(Modifier::BOLD),
             )),
             Rect::new(lane.x, lane.y, lane.width, 1),
@@ -1484,25 +1658,58 @@ impl Dashboard {
             .take(usize::from(lane_height.saturating_sub(2)))
             .enumerate()
         {
-            let task = match row.task_id {
-                Some(task) => format!("#{task}"),
-                None => "—".into(),
-            };
+            let here = selected == Some(index);
             // The state is spelled out, not left to the glyph. A coloured dot says that something
             // is true of this agent without saying what, and "needs you" is the one state worth
-            // crossing the room for.
-            let text = format!(
-                "{} {} · {} · {} · {}",
-                row.state.glyph(),
-                row.agent.label(),
-                task,
+            // crossing the room for. Built into one buffer rather than assembled from formatted
+            // pieces: this is a line per agent per frame on a path that runs at 60fps.
+            //
+            // Sized for a row without a hold reason on it, which is almost all of them. The lane
+            // is as wide as the pane and a row is a fraction of that, so asking for the pane's
+            // width would reserve four hundred bytes to hold fifty.
+            let mut text = String::with_capacity(64);
+            text.push_str(if here { "▸ " } else { "  " });
+            let _ = write!(text, "{} {} · ", row.state.glyph(), row.agent.label());
+            match row.task_id {
+                Some(task) => {
+                    let _ = write!(text, "#{task}");
+                }
+                None => text.push('—'),
+            }
+            let _ = write!(
+                text,
+                " · {} · {} · {} queued",
                 row.state.label(),
-                row.pane_id
+                row.pane_id,
+                // Always, including zero. A lane that mentions a queue only when it has something
+                // in it cannot be used to check that a queue is empty, which is the question
+                // somebody about to arm a pane is actually asking.
+                row.queued
             );
+            if row.auto_feed {
+                text.push_str(" · armed");
+            }
+            if row.awaiting_ack {
+                text.push_str(" · fed · waiting for the agent to pick it up");
+            }
+            // Only with something to hold. `holding_because` is set whenever auto-feed declined,
+            // and on an empty queue it declines for the uninteresting reason that there was
+            // nothing to feed — printing that on every row would bury the one row that is stuck.
+            if row.queued > 0
+                && let Some(why) = row.holding_because
+            {
+                let _ = write!(text, " · holding: {why}");
+            }
+            ellipsise_in_place(&mut text, usize::from(lane.width));
+            let style = Style::default().fg(self.theme.agent(row.state));
             frame.render_widget(
                 Paragraph::new(Line::styled(
-                    ellipsise(&text, usize::from(lane.width)),
-                    Style::default().fg(self.theme.agent(row.state)),
+                    text,
+                    if here {
+                        style.add_modifier(Modifier::BOLD)
+                    } else {
+                        style
+                    },
                 )),
                 Rect::new(lane.x, lane.y + 2 + index as u16, lane.width, 1),
             );
@@ -1680,7 +1887,7 @@ impl Dashboard {
                 // which is exactly why the kind is a field on the pane rather than a variant in
                 // the layout tree.
                 if pane.is_board() {
-                    self.render_board_pane(frame, inner);
+                    self.render_board_pane(frame, inner, focused);
                     return;
                 }
                 // A frozen pane is painted from its own clone of the screen, which is what
@@ -2007,7 +2214,19 @@ impl Dashboard {
             // through the request arm would put two daemon round trips in front of the echo.
             // Dropped outright when the pane has no run: there is no PTY to receive it, and
             // sending anyway earns one daemon error per character straight into the footer.
-            KeyOutcome::Passthrough(bytes) => self.send_to_pane(bytes),
+            //
+            // A focused Board pane takes the key here instead, ahead of `send_to_pane` and with
+            // the encoded bytes thrown away. It is the one pane kind with a cursor of its own and
+            // no process to type into, and routing it this way is what keeps `send_to_pane` and
+            // `pane_input` untouched: a board never reaches either, so neither has to learn what
+            // a board is. The prefix is already spent by `keymap.handle`, so `Ctrl+B` still
+            // commands the dashboard from inside a board exactly as it does from a terminal.
+            KeyOutcome::Passthrough(bytes) => {
+                if self.focused_pane().is_some_and(PaneLayout::is_board) {
+                    return self.board_pane_key(key);
+                }
+                self.send_to_pane(bytes)
+            }
             KeyOutcome::Command(command) => self.run_command(command),
             KeyOutcome::PendingPrefix | KeyOutcome::Ignored => UiCommand::None,
         }
@@ -4861,6 +5080,26 @@ fn drag_ratio(divider: &Divider, x: u16, y: u16) -> u16 {
         ((u32::from(bounded) * 1000) / u32::from(length)) as u16
     }
 }
+/// [`ellipsise`] for a string that was just built, cutting it in place rather than copying it.
+///
+/// The runs lane assembles a line per agent per frame and then has to fit it to the pane, and
+/// doing that with `ellipsise` means every row is allocated twice — once to build and once to
+/// trim. This trims the buffer that is already in hand, which is one allocation per row instead
+/// of two, on a path that runs at 60fps with a row for every agent on the canvas.
+fn ellipsise_in_place(value: &mut String, width: usize) {
+    if value.chars().count() <= width {
+        return;
+    }
+    // The byte offset of the character after the last one kept, so a multi-byte glyph is never
+    // cut down the middle — `String::truncate` panics on a boundary that is not one.
+    let cut = value
+        .char_indices()
+        .nth(width.saturating_sub(1))
+        .map_or(value.len(), |(offset, _)| offset);
+    value.truncate(cut);
+    value.push('…');
+}
+
 fn ellipsise(value: &str, width: usize) -> String {
     if value.chars().count() <= width {
         return value.to_owned();
@@ -6470,7 +6709,10 @@ mod tests {
         assert_eq!(rows[0].run_id, "run_1");
         assert_eq!(rows[0].state, AgentState::Blocked);
         assert_eq!(rows[0].task_id, Some(7));
-        assert_eq!(rows[0].queued, 0, "there are no queues yet");
+        assert_eq!(
+            rows[0].queued, 0,
+            "the daemon reported no queue for this pane"
+        );
         assert!(!rows[0].auto_feed);
 
         let frame = render_to_string(&mut dashboard, 160, 40);
@@ -6530,6 +6772,306 @@ mod tests {
         let frame = render_to_string(&mut dashboard, 160, 40);
         assert!(frame.contains("working"), "{frame:?}");
         assert!(!frame.contains("needs you"), "{frame:?}");
+    }
+
+    /// One pane's queue as the daemon would report it.
+    fn pane_queue(pane_id: &str, entries: usize, auto_feed: bool) -> PaneQueueSnapshot {
+        PaneQueueSnapshot {
+            workspace_id: "w".into(),
+            pane_id: pane_id.into(),
+            run_id: None,
+            auto_feed,
+            awaiting_ack: false,
+            holding_because: None,
+            entries: (1..=entries)
+                .map(|entry_id| crate::protocol::QueueEntrySnapshot {
+                    entry_id: entry_id as u64,
+                    label: format!("task {entry_id}"),
+                    preview: "rewrite the parser".into(),
+                    bytes: 18,
+                })
+                .collect(),
+        }
+    }
+
+    /// A board pane holding the focus, with two agents in the lane.
+    ///
+    /// Two rather than one because every claim worth making about arming is about *which* pane it
+    /// reached: a lane with a single row cannot tell arming the selected pane apart from arming
+    /// whichever pane happened to be first.
+    fn board_pane_with_two_agents() -> Dashboard {
+        let mut dashboard = dashboard_with_a_board_pane();
+        dashboard.layout.workspaces[0].focused_pane_id = "b".into();
+        let mut second = snapshot();
+        second.run_id = "run_2".into();
+        second.workspace_id = "w".into();
+        second.pane_id = "d".into();
+        second.external_task_ref = "9".into();
+        dashboard.runs.push(second);
+        dashboard.agents.insert(
+            "run_2".into(),
+            (Some(AgentKind::Claude), AgentState::Working),
+        );
+        dashboard
+    }
+
+    #[test]
+    fn the_runs_lane_shows_each_panes_queue_depth_and_whether_it_is_armed() {
+        // The two placeholders the lane shipped with. Queue depth lives only in the daemon, so
+        // unlike agent state there is nothing on the client that could have implied it.
+        let mut dashboard = board_pane_with_two_agents();
+        dashboard.set_queues(
+            vec![pane_queue("a", 3, true), pane_queue("d", 0, false)],
+            false,
+        );
+
+        let rows = dashboard.run_lane_rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(
+            (rows[0].pane_id, rows[0].queued, rows[0].auto_feed),
+            ("a", 3, true)
+        );
+        assert_eq!(
+            (rows[1].pane_id, rows[1].queued, rows[1].auto_feed),
+            ("d", 0, false)
+        );
+
+        let frame = render_to_string(&mut dashboard, 200, 40);
+        assert!(frame.contains("3 queued"), "{frame:?}");
+        // Zero is drawn too. "Is anything waiting behind this agent" is the question somebody
+        // about to arm a pane is asking, and a lane that goes quiet on an empty queue cannot
+        // answer it.
+        assert!(frame.contains("0 queued"), "{frame:?}");
+        assert!(frame.contains("armed"), "{frame:?}");
+    }
+
+    #[test]
+    fn a_queue_that_is_holding_says_why_it_is_holding() {
+        // Why `holding_because` exists at all. An armed pane with four prompts behind it that
+        // feeds nothing is indistinguishable from a broken one until it says which guard it is
+        // sitting behind, and the daemon's own sentence is the only one that knows.
+        let mut dashboard = board_pane_with_two_agents();
+        let mut holding = pane_queue("a", 4, true);
+        holding.holding_because = Some(crate::queue::DISARMED_BY_RESTART.into());
+        dashboard.set_queues(vec![holding], false);
+
+        let frame = render_to_string(&mut dashboard, 400, 40);
+        assert!(
+            frame.contains(crate::queue::DISARMED_BY_RESTART),
+            "the daemon's own words, not a house paraphrase: {frame:?}"
+        );
+
+        // And not on a pane with nothing to hold: auto-feed declines on an empty queue for the
+        // uninteresting reason that there was nothing to feed, and printing that on every idle
+        // row would bury the one row that is actually stuck.
+        let mut empty = pane_queue("a", 0, true);
+        empty.holding_because = Some(crate::queue::DISARMED_BY_RESTART.into());
+        dashboard.set_queues(vec![empty], false);
+        let frame = render_to_string(&mut dashboard, 400, 40);
+        assert!(
+            !frame.contains(crate::queue::DISARMED_BY_RESTART),
+            "{frame:?}"
+        );
+    }
+
+    #[test]
+    fn a_queue_changed_event_repaints_the_lane_with_no_key_fed() {
+        // `dock queue add` from another terminal, and the acceptance criterion it has to satisfy:
+        // it appears in the open board pane without a refresh. The client half is two halves —
+        // the event marks the client dirty, and the render loop's own `refresh` re-reads the
+        // listing on the way to the next frame. Neither is a keypress, and this asserts both
+        // without feeding one.
+        let mut dashboard = board_pane_with_two_agents();
+        dashboard.set_queues(vec![pane_queue("a", 0, false)], false);
+        assert!(render_to_string(&mut dashboard, 200, 40).contains("0 queued"));
+
+        dashboard.apply_event(Event::QueueChanged {
+            workspace_id: "w".into(),
+            pane_id: "a".into(),
+        });
+        assert!(
+            dashboard.take_refresh(),
+            "queue depth lives only in the daemon, so nothing but going back to it would tell \
+             this client the queue grew"
+        );
+
+        // What the render loop does with that flag: `refresh` asks for the listing and hands it
+        // over. The frame after says the new depth, and no key was ever fed.
+        dashboard.set_queues(vec![pane_queue("a", 2, false)], false);
+        let frame = render_to_string(&mut dashboard, 200, 40);
+        assert!(frame.contains("2 queued"), "{frame:?}");
+    }
+
+    #[test]
+    fn a_on_the_runs_lane_arms_the_selected_pane_and_only_that_pane() {
+        // Arming is the one deliberate act that lets Dock put words in front of an agent with
+        // nobody watching, so the key names one pane explicitly and there is no key that arms
+        // the lane. `UiCommand::Request` carries exactly one request; `Requests` — the batch
+        // form — is deliberately not what this returns.
+        let mut dashboard = board_pane_with_two_agents();
+        dashboard.set_queues(
+            vec![pane_queue("a", 1, false), pane_queue("d", 1, false)],
+            false,
+        );
+        render_to_string(&mut dashboard, 200, 40);
+
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let UiCommand::Request(request) = asked else {
+            panic!("`a` on the runs lane must ask the daemon to arm, got {asked:?}");
+        };
+        assert_eq!(
+            *request,
+            Request::Queue(QueueRequest::SetAuto {
+                workspace_id: "w".into(),
+                pane_id: "a".into(),
+                enabled: true,
+            }),
+            "the selected row, which is the blocked agent at the top of the lane"
+        );
+
+        // The other pane is untouched: nothing local arms anything, and the listing only changes
+        // when the daemon says it did.
+        assert!(!dashboard.run_lane_rows()[1].auto_feed);
+    }
+
+    #[test]
+    fn the_lane_cursor_chooses_which_pane_a_arms() {
+        // The minimal selection model, and the reason it names a pane rather than an index: the
+        // lane sorts blocked agents to the top, so a position would quietly point somewhere else
+        // the moment an agent changed state.
+        let mut dashboard = board_pane_with_two_agents();
+        dashboard.set_queues(
+            vec![pane_queue("a", 1, false), pane_queue("d", 1, false)],
+            false,
+        );
+        render_to_string(&mut dashboard, 200, 40);
+
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            UiCommand::None,
+            "moving the cursor costs the daemon nothing"
+        );
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let UiCommand::Request(request) = asked else {
+            panic!("expected an arming request, got {asked:?}");
+        };
+        assert_eq!(
+            *request,
+            Request::Queue(QueueRequest::SetAuto {
+                workspace_id: "w".into(),
+                pane_id: "d".into(),
+                enabled: true,
+            })
+        );
+
+        // The lane re-orders under the cursor when the agent it names starts working, and the
+        // cursor goes with the pane rather than staying over row two.
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_1".into(),
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+        });
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_2".into(),
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Blocked,
+        });
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let UiCommand::Request(request) = asked else {
+            panic!("expected an arming request, got {asked:?}");
+        };
+        assert_eq!(
+            *request,
+            Request::Queue(QueueRequest::SetAuto {
+                workspace_id: "w".into(),
+                pane_id: "d".into(),
+                enabled: true,
+            }),
+            "still the pane the user chose, which is now the top row rather than the second"
+        );
+    }
+
+    #[test]
+    fn a_on_an_armed_pane_disarms_it() {
+        // A toggle read from the daemon's listing rather than from anything this client decided,
+        // so a pane armed from `dock queue arm` in another terminal is disarmed by the same key.
+        let mut dashboard = board_pane_with_two_agents();
+        dashboard.set_queues(vec![pane_queue("a", 2, true)], false);
+        render_to_string(&mut dashboard, 200, 40);
+
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let UiCommand::Request(request) = asked else {
+            panic!("expected a disarming request, got {asked:?}");
+        };
+        assert_eq!(
+            *request,
+            Request::Queue(QueueRequest::SetAuto {
+                workspace_id: "w".into(),
+                pane_id: "a".into(),
+                enabled: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_refused_arming_reaches_the_user_in_the_daemons_own_words() {
+        // The refusal is the product. A pane whose agent has never reported a state can be armed
+        // as often as you like and will never feed anything, so a refusal that got swallowed
+        // would leave a person watching a queue that was silently never going to fire — which is
+        // strictly worse than the pane refusing to be armed at all. The message names the command
+        // that fixes it, and it has to arrive whole.
+        let mut dashboard = board_pane_with_two_agents();
+        dashboard.set_queues(vec![pane_queue("a", 1, false)], false);
+        render_to_string(&mut dashboard, 200, 40);
+        assert!(matches!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            UiCommand::Request(_)
+        ));
+
+        dashboard.apply_queue_response(Response::Error {
+            code: crate::protocol::ErrorCode::QueueRefused,
+            message: crate::queue::ARM_WITHOUT_REPORTED_STATE.into(),
+        });
+        let frame = render_to_string(&mut dashboard, 240, 40);
+        assert!(
+            frame.contains(crate::queue::ARM_WITHOUT_REPORTED_STATE),
+            "verbatim, not paraphrased and not truncated to a house message: {frame:?}"
+        );
+        assert!(
+            frame.contains("dock hooks --install"),
+            "the refusal names the command that makes arming possible: {frame:?}"
+        );
+        // And the pane stayed unarmed. A refusal that left the lane claiming otherwise would be
+        // the same failure as swallowing it.
+        assert!(!dashboard.run_lane_rows()[0].auto_feed);
+    }
+
+    #[test]
+    fn a_board_pane_takes_the_lanes_keys_without_any_of_them_reaching_a_pty() {
+        // §2.3: `pane_input` and `send_to_pane` stay unchanged for a board pane. A board has no
+        // run and is never going to get one, so the keys are intercepted ahead of `send_to_pane`
+        // and nothing a board takes can become `PaneInput` however it is encoded.
+        let mut dashboard = board_pane_with_two_agents();
+        dashboard.set_queues(vec![pane_queue("a", 1, false)], false);
+        render_to_string(&mut dashboard, 200, 40);
+
+        for code in [
+            KeyCode::Char('x'),
+            KeyCode::Char('j'),
+            KeyCode::Enter,
+            KeyCode::Char('a'),
+        ] {
+            let outcome = dashboard.key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(
+                !matches!(outcome, UiCommand::PaneInput(_)),
+                "{code:?} reached a PTY from a board pane: {outcome:?}"
+            );
+        }
+
+        // And the prefix still commands the dashboard from inside a board, because the keymap
+        // spends it before any of this is reached.
+        let asked = command(&mut dashboard, KeyCode::Char('k'));
+        assert_eq!(asked, UiCommand::LoadBoard);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     model::{HandoffPacket, HandoffRecord, ReviewDecision},
-    protocol::DurableProgrammeGate,
+    protocol::{DurablePaneQueue, DurableProgrammeGate},
 };
 use serde::Serialize;
 
@@ -16,6 +16,20 @@ pub struct ProgrammeRecord {
     pub run_id: String,
     pub gate: Result<DurableProgrammeGate, String>,
 }
+
+/// One file found in the queue directory.
+///
+/// `identity` is the file's own name without its suffix, kept beside the parse result for the
+/// same reason `ProgrammeRecord` keeps `run_id`: a record that failed to parse has no identity
+/// except its filename, and quarantining it needs one.
+pub struct PaneQueueRecord {
+    pub identity: String,
+    pub queue: Result<DurablePaneQueue, String>,
+}
+
+/// Where the queues live, and where a queue file that cannot be parsed goes instead.
+const QUEUES: &str = "queues";
+const QUEUE_QUARANTINE: &str = "queues-quarantine";
 
 #[derive(Debug, Clone)]
 pub struct LocalStore {
@@ -275,6 +289,207 @@ impl LocalStore {
         sync_directory(directory)
     }
 
+    /// Writes one pane's queue, replacing whatever was there.
+    ///
+    /// Deliberately not [`Self::atomic_save`], which links its temporary into place and therefore
+    /// *refuses* to overwrite — exactly right for a handoff, which is a record of something that
+    /// happened once, and exactly wrong for a queue, which is the current state of a thing and is
+    /// rewritten on every add, remove and feed. The durability is the same: a temporary written
+    /// and fsynced at `0600`, renamed over the destination, and the directory fsynced after, so a
+    /// crash leaves either the old file or the new one and never half of either.
+    pub fn save_pane_queue(&self, queue: &DurablePaneQueue) -> Result<PathBuf, String> {
+        let filename = queue_filename(&queue.workspace_id, &queue.pane_id)?;
+        let directory = self.root.join(QUEUES);
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("could not create queue storage: {error}"))?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("could not secure queue storage: {error}"))?;
+        let destination = directory.join(&filename);
+        let temporary = directory.join(format!(
+            ".{filename}.{}.tmp",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| format!("system time is before Unix epoch: {error}"))?
+                .as_nanos()
+        ));
+        let bytes = serde_json::to_vec_pretty(queue)
+            .map_err(|error| format!("could not serialize queue: {error}"))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("could not create temporary queue file: {error}"))?;
+        if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("could not persist queue: {error}"));
+        }
+        if let Err(error) = fs::rename(&temporary, &destination) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("could not atomically save queue: {error}"));
+        }
+        sync_directory(&directory)?;
+        Ok(destination)
+    }
+
+    /// Every queue file, each with its own parse result.
+    ///
+    /// A `Result` per record rather than one for the listing, exactly as
+    /// [`Self::list_programme_gates`] does: one unreadable file must not cost the operator every
+    /// other queue on the machine.
+    pub fn list_pane_queues(&self) -> Result<Vec<PaneQueueRecord>, String> {
+        let directory = self.root.join(QUEUES);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("could not read queue storage: {error}")),
+        };
+        let mut queues = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("could not read queue storage: {error}"))?;
+            let Some(identity) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let source = directory.join(format!("{identity}.json"));
+            let queue = fs::read(&source)
+                .map_err(|error| format!("could not read {}: {error}", source.display()))
+                .and_then(|bytes| {
+                    serde_json::from_slice(&bytes)
+                        .map_err(|error| format!("could not parse {}: {error}", source.display()))
+                })
+                .and_then(|queue: DurablePaneQueue| {
+                    // A file whose contents name a different pane than its own name does is not a
+                    // queue this daemon can key anything by, whatever else is in it.
+                    if queue_filename(&queue.workspace_id, &queue.pane_id)?
+                        != format!("{identity}.json")
+                    {
+                        Err("stored queue does not match its filename".to_string())
+                    } else if queue.schema_version != QUEUE_SCHEMA_VERSION {
+                        Err(format!(
+                            "stored queue is schema version {}; this daemon writes {QUEUE_SCHEMA_VERSION}",
+                            queue.schema_version
+                        ))
+                    } else {
+                        Ok(queue)
+                    }
+                });
+            queues.push(PaneQueueRecord { identity, queue });
+        }
+        queues.sort_by(|a, b| a.identity.cmp(&b.identity));
+        Ok(queues)
+    }
+
+    /// Moves a queue file that could not be parsed out of the way and leaves it there.
+    ///
+    /// Quarantine rather than deletion, and rather than refusing to start: the file is the only
+    /// copy of work somebody queued, and a daemon that will not boot because one of them is
+    /// unreadable is worse than one that boots without it and leaves the evidence on disk.
+    pub fn quarantine_pane_queue(&self, identity: &str) -> Result<(), String> {
+        if identity.is_empty() || identity.contains('/') || identity.contains('\\') {
+            return Err("invalid queue quarantine identity".into());
+        }
+        let source_directory = self.root.join(QUEUES);
+        let destination_directory = self.root.join(QUEUE_QUARANTINE);
+        fs::create_dir_all(&destination_directory)
+            .map_err(|error| format!("could not create queue quarantine: {error}"))?;
+        fs::set_permissions(&destination_directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("could not secure queue quarantine: {error}"))?;
+        let filename = format!("{identity}.json");
+        let source = source_directory.join(&filename);
+        let destination = destination_directory.join(filename);
+        if destination.exists() {
+            fs::remove_file(&source)
+                .map_err(|error| format!("could not discard a duplicate invalid queue: {error}"))?;
+        } else {
+            fs::rename(&source, &destination)
+                .map_err(|error| format!("could not quarantine an invalid queue: {error}"))?;
+        }
+        sync_directory(&source_directory)?;
+        sync_directory(&destination_directory)
+    }
+
+    pub fn list_quarantined_pane_queue_ids(&self) -> Result<Vec<String>, String> {
+        let directory = self.root.join(QUEUE_QUARANTINE);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("could not read queue quarantine: {error}")),
+        };
+        let mut identities = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("could not read queue quarantine: {error}"))?;
+            if let Some(identity) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+            {
+                identities.push(identity.to_owned());
+            }
+        }
+        identities.sort();
+        Ok(identities)
+    }
+
+    /// Forgets one pane's queue. Missing is success: a pane closed twice, or closed before it ever
+    /// held an entry, is not a failure anybody can act on.
+    pub fn remove_pane_queue(&self, workspace_id: &str, pane_id: &str) -> Result<(), String> {
+        let directory = self.root.join(QUEUES);
+        let destination = directory.join(queue_filename(workspace_id, pane_id)?);
+        match fs::remove_file(&destination) {
+            Ok(()) => sync_directory(&directory),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("could not remove queue: {error}")),
+        }
+    }
+
+    /// Records the daemon-wide kill switch.
+    ///
+    /// **Existence is the signal**, and the text inside is for whoever finds the file. Storing a
+    /// parsed boolean would mean a truncated or half-written file has to be interpreted, and the
+    /// only safe interpretation of "something is wrong with the pause flag" is *paused* — which is
+    /// what a file that is merely present already says, with no parser to get it wrong.
+    pub fn set_queue_pause(&self, paused: bool) -> Result<(), String> {
+        let directory = self.root.join(QUEUES);
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("could not create queue storage: {error}"))?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("could not secure queue storage: {error}"))?;
+        let marker = directory.join("paused");
+        if paused {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&marker)
+                .map_err(|error| format!("could not persist the queue pause: {error}"))?;
+            file.write_all(
+                b"auto-feed is paused for the whole daemon; `dock queue resume` starts it again\n",
+            )
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("could not persist the queue pause: {error}"))?;
+        } else if let Err(error) = fs::remove_file(&marker)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!("could not lift the queue pause: {error}"));
+        }
+        sync_directory(&directory)
+    }
+
+    /// Whether auto-feed was paused when the daemon last stopped.
+    ///
+    /// Persisted, unlike arming, and in the opposite direction: pausing before you walk away is a
+    /// decision that must survive a restart, where arming is a decision that must not.
+    pub fn queue_paused(&self) -> bool {
+        self.root.join(QUEUES).join("paused").exists()
+    }
+
     fn load<T: serde::de::DeserializeOwned>(
         &self,
         directory: &str,
@@ -363,6 +578,31 @@ impl CreateKind {
     }
 }
 
+/// The schema this daemon writes, and the only one it will load.
+pub const QUEUE_SCHEMA_VERSION: u16 = 1;
+
+/// One queue's filename.
+///
+/// Both halves are validated to the same alphabet `packet_filename` uses, which is what makes the
+/// `_` join safe to write and safe to check: the pair round-trips because the loaded file names
+/// its own workspace and pane and the two are re-joined and compared, so an ambiguous split is
+/// never attempted in the first place.
+fn queue_filename(workspace_id: &str, pane_id: &str) -> Result<String, String> {
+    for part in [workspace_id, pane_id] {
+        if part.is_empty()
+            || !part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(
+                "queue identities must contain only letters, numbers, hyphens, or underscores"
+                    .into(),
+            );
+        }
+    }
+    Ok(format!("{workspace_id}_{pane_id}.json"))
+}
+
 fn packet_filename(run_id: &str) -> Result<String, String> {
     if run_id.is_empty()
         || !run_id
@@ -432,6 +672,96 @@ mod tests {
         fs::create_dir_all(&directory).expect("create store");
         fs::write(directory.join("dock_01J9.json"), b"not json").expect("write corrupt packet");
         assert!(store.load_handoff("dock_01J9").is_err());
+    }
+
+    fn queue(pane_id: &str, entries: u64) -> DurablePaneQueue {
+        DurablePaneQueue {
+            schema_version: QUEUE_SCHEMA_VERSION,
+            workspace_id: "dock".into(),
+            pane_id: pane_id.into(),
+            next_entry_id: entries + 1,
+            entries: (1..=entries)
+                .map(|entry_id| crate::protocol::DurableQueueEntry {
+                    entry_id,
+                    label: format!("card {entry_id}"),
+                    prompt: "keep going".into(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The one place a queue must behave *unlike* a handoff. A handoff is a record of something
+    /// that happened once and a second write of it is a bug; a queue is the current state of a
+    /// thing and is rewritten on every add, remove and feed, so it renames over itself rather
+    /// than linking into place.
+    #[test]
+    fn a_queue_is_rewritten_in_place_where_a_handoff_would_refuse() {
+        let store = temporary_store("queue-rewrite");
+        store
+            .save_pane_queue(&queue("ledger", 2))
+            .expect("first write");
+        store
+            .save_pane_queue(&queue("ledger", 1))
+            .expect("second write");
+        let records = store.list_pane_queues().expect("list queues");
+        assert_eq!(
+            records.len(),
+            1,
+            "a rewrite replaces rather than accumulates"
+        );
+        assert_eq!(
+            records[0].queue.as_ref().expect("parses").entries.len(),
+            1,
+            "and the second write is what is there"
+        );
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// A file whose contents name a different pane than its own name does is not a queue anything
+    /// can be keyed by, whatever else is in it — so the ambiguity of splitting `workspace_pane` on
+    /// an underscore is never attempted. The pair is re-joined and compared instead.
+    #[test]
+    fn a_queue_that_does_not_name_its_own_filename_is_refused() {
+        let store = temporary_store("queue-mismatch");
+        store.save_pane_queue(&queue("ledger", 1)).expect("write");
+        let directory = store.root.join(QUEUES);
+        let moved = serde_json::to_vec(&queue("elsewhere", 1)).unwrap();
+        fs::write(directory.join("dock_ledger.json"), moved).expect("overwrite in place");
+        let records = store.list_pane_queues().expect("list queues");
+        assert!(
+            records[0]
+                .queue
+                .as_ref()
+                .expect_err("a mismatched queue must not load")
+                .contains("filename")
+        );
+        store
+            .quarantine_pane_queue(&records[0].identity)
+            .expect("quarantine it");
+        assert_eq!(
+            store.list_quarantined_pane_queue_ids().unwrap(),
+            vec!["dock_ledger".to_string()]
+        );
+        assert!(store.list_pane_queues().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    /// The kill switch is a file that either exists or does not, so there is no content for a
+    /// truncated write to make ambiguous. Lifting a pause that was never taken is not an error:
+    /// `dock queue resume` on a running daemon is a reasonable thing for a person to type.
+    #[test]
+    fn the_pause_marker_is_its_own_existence_and_lifting_an_absent_one_is_not_an_error() {
+        let store = temporary_store("queue-pause");
+        assert!(!store.queue_paused());
+        store.set_queue_pause(false).expect("lift an absent pause");
+        assert!(!store.queue_paused());
+        store.set_queue_pause(true).expect("pause");
+        assert!(store.queue_paused());
+        store.set_queue_pause(true).expect("pause again");
+        assert!(store.queue_paused());
+        store.set_queue_pause(false).expect("resume");
+        assert!(!store.queue_paused());
+        let _ = fs::remove_dir_all(&store.root);
     }
 
     #[test]

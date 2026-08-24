@@ -101,7 +101,8 @@ use crate::{
     detect::{AgentKind, AgentState},
     dispatch::RuntimeRegistry,
     protocol::{
-        ErrorCode, Event, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProcessState, Request, Response,
+        ErrorCode, Event, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProcessState, QueueRequest, Request,
+        Response,
     },
     terminal::{PaneOutput, ScreenSync},
 };
@@ -138,6 +139,11 @@ impl Server {
     }
 
     pub fn serve(self, runtime: Arc<RuntimeRegistry>) -> Result<(), String> {
+        // The queue's own thread, started here rather than folded into the loop below, because
+        // auto-feed must advance whether or not anybody is connected and must advance exactly
+        // once per tick however many clients are.
+        crate::dispatch::spawn_queue_tick(Arc::clone(&runtime))
+            .map_err(|error| format!("could not start the queue thread: {error}"))?;
         self.serve_connections(runtime, None)
     }
 
@@ -384,6 +390,69 @@ fn handle_connection_with_timeout(
                 Ok(()) => write_response(stream, &Response::Ack)?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
+            Ok(Request::Queue(request)) => {
+                let response = match request {
+                    QueueRequest::Inspect => Response::Queues {
+                        queues: runtime.queue_snapshots(),
+                        paused: runtime.queue_paused(),
+                    },
+                    QueueRequest::Add {
+                        workspace_id,
+                        pane_id,
+                        prompt,
+                        label,
+                    } => match runtime.queue_add(&workspace_id, &pane_id, label, prompt) {
+                        // The whole listing rather than the one entry: the caller almost always
+                        // wants to see where its prompt landed in the order, and a second round
+                        // trip to find out is the shape of a race.
+                        Ok(_) => Response::Queues {
+                            queues: runtime.queue_snapshots(),
+                            paused: runtime.queue_paused(),
+                        },
+                        Err((code, message)) => Response::Error { code, message },
+                    },
+                    QueueRequest::Remove {
+                        workspace_id,
+                        pane_id,
+                        entry_id,
+                    } => match runtime.queue_remove(&workspace_id, &pane_id, entry_id) {
+                        Ok(()) => Response::Queues {
+                            queues: runtime.queue_snapshots(),
+                            paused: runtime.queue_paused(),
+                        },
+                        Err((code, message)) => Response::Error { code, message },
+                    },
+                    QueueRequest::Clear {
+                        workspace_id,
+                        pane_id,
+                    } => match runtime.queue_clear(&workspace_id, &pane_id) {
+                        Ok(_) => Response::Queues {
+                            queues: runtime.queue_snapshots(),
+                            paused: runtime.queue_paused(),
+                        },
+                        Err((code, message)) => Response::Error { code, message },
+                    },
+                    QueueRequest::SetAuto {
+                        workspace_id,
+                        pane_id,
+                        enabled,
+                    } => match runtime.queue_set_auto(&workspace_id, &pane_id, enabled) {
+                        Ok(()) => Response::Queues {
+                            queues: runtime.queue_snapshots(),
+                            paused: runtime.queue_paused(),
+                        },
+                        Err((code, message)) => Response::Error { code, message },
+                    },
+                    QueueRequest::SetPaused { paused } => match runtime.queue_set_paused(paused) {
+                        Ok(()) => Response::Queues {
+                            queues: runtime.queue_snapshots(),
+                            paused: runtime.queue_paused(),
+                        },
+                        Err((code, message)) => Response::Error { code, message },
+                    },
+                };
+                write_response(stream, &response)?;
+            }
             // Subscribing converts the connection into a one-way push channel: the client
             // sends nothing more on it, so this handler never returns to the request loop.
             Ok(Request::Subscribe(_)) => return stream_events(stream, runtime, stream_deadline),
@@ -433,6 +502,12 @@ fn stream_events(
     // so no delta carries the news either. Without this the pane renders its dead last frame
     // and reports Running until something else happens to issue a request.
     let mut process_states: HashMap<String, ProcessState> = HashMap::new();
+    // Queue depth is the one thing on the runs lane that lives only in the daemon, so it is the
+    // one thing a subscriber cannot infer from anything else it is already sent. The generation
+    // is a single atomic: on the overwhelming majority of passes, where no queue moved, that load
+    // is the entire cost of asking.
+    let mut queue_generation = 0;
+    let mut queue_revisions: HashMap<(String, String), u64> = HashMap::new();
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(());
@@ -541,6 +616,27 @@ fn stream_events(
                 )?;
                 states.insert(snapshot.run_id, current);
             }
+        }
+        let generation = runtime.queue_generation();
+        if generation != queue_generation {
+            for (key, revision) in runtime.queue_revisions() {
+                if queue_revisions.get(&key) == Some(&revision) {
+                    continue;
+                }
+                write_response(
+                    stream,
+                    &Response::Stream {
+                        event: Event::QueueChanged {
+                            workspace_id: key.0.clone(),
+                            pane_id: key.1.clone(),
+                        },
+                    },
+                )?;
+                // Recorded only once the frame is on the wire, exactly as every other change
+                // above is, so a failed write cannot convince this loop the client already knows.
+                queue_revisions.insert(key, revision);
+            }
+            queue_generation = generation;
         }
         thread::sleep(STREAM_POLL_INTERVAL);
     }
@@ -2251,6 +2347,88 @@ mod tests {
         assert_eq!((snapshot.rows, snapshot.cols), (40, 120));
     }
 
+    /// The whole queue surface across the socket in one exchange, because this is the shape a
+    /// client is being wired to: every operation answers with the *complete* listing rather than
+    /// with an acknowledgement, so a board never has to make a second round trip to find out where
+    /// its prompt landed in the order.
+    #[test]
+    fn every_queue_operation_answers_with_the_whole_listing() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let responses = exchange(
+            &[
+                &hello(),
+                &serde_json::to_string(&Request::Queue(QueueRequest::Add {
+                    workspace_id: "w1".into(),
+                    pane_id: "p1".into(),
+                    prompt: "keep going".into(),
+                    label: "card 7".into(),
+                }))
+                .unwrap(),
+                &serde_json::to_string(&Request::Queue(QueueRequest::SetPaused { paused: true }))
+                    .unwrap(),
+                &serde_json::to_string(&Request::Queue(QueueRequest::Inspect)).unwrap(),
+                &serde_json::to_string(&Request::Queue(QueueRequest::Clear {
+                    workspace_id: "w1".into(),
+                    pane_id: "p1".into(),
+                }))
+                .unwrap(),
+            ],
+            &runtime,
+        );
+        let Response::Queues { queues, paused } = &responses[1] else {
+            panic!("an add answers with the listing: {:?}", responses[1]);
+        };
+        assert_eq!(queues.len(), 1);
+        assert_eq!(queues[0].entries[0].label, "card 7");
+        assert_eq!(queues[0].entries[0].preview, "keep going");
+        assert_eq!(queues[0].entries[0].bytes, "keep going".len());
+        assert!(
+            !queues[0].auto_feed,
+            "nothing that crosses this socket arms a pane but `set_auto`"
+        );
+        assert!(!paused);
+        let Response::Queues { paused, .. } = &responses[3] else {
+            panic!("inspect answers with the listing: {:?}", responses[3]);
+        };
+        assert!(
+            paused,
+            "the pause is daemon-wide and reported with the queues"
+        );
+        let Response::Queues { queues, .. } = &responses[4] else {
+            panic!("a clear answers with the listing: {:?}", responses[4]);
+        };
+        assert!(queues[0].entries.is_empty());
+    }
+
+    /// The refusals reach the client as refusals, with their own code. `GateBlocked` already
+    /// carries five distinct meanings and a sixth would make it useless for diagnosis.
+    #[test]
+    fn a_refused_queue_request_crosses_the_socket_as_a_queue_refusal() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let responses = exchange(
+            &[
+                &hello(),
+                &serde_json::to_string(&Request::Queue(QueueRequest::SetAuto {
+                    workspace_id: "w1".into(),
+                    pane_id: "p1".into(),
+                    enabled: true,
+                }))
+                .unwrap(),
+            ],
+            &runtime,
+        );
+        let Response::Error { code, message } = &responses[1] else {
+            panic!(
+                "arming an unhooked agent must be refused: {:?}",
+                responses[1]
+            );
+        };
+        assert_eq!(*code, ErrorCode::QueueRefused);
+        assert!(message.contains("dock hooks --install"));
+    }
+
     #[test]
     fn an_unresizable_pane_is_refused_rather_than_acknowledged() {
         let runtime = registry();
@@ -2487,6 +2665,14 @@ mod tests {
         let panes = bench_panes();
         let runtime = registry_with_scrollback(2_000);
         let pane_ids = bench_workspace(&runtime, panes);
+        // The queue thread, started exactly as `serve` starts it, so what this measures is the
+        // daemon a user actually runs. No queues are created: that is the state every daemon is in
+        // until somebody queues something, and it is the state this harness has to keep measuring
+        // if its numbers are to stay comparable across releases. What a *populated* queue costs is
+        // its own measurement — `measure_what_the_queue_tick_costs_over_every_run` — because it is
+        // a different question with a different answer.
+        let _queue_thread =
+            crate::dispatch::spawn_queue_tick(runtime.shared()).expect("start the queue thread");
         // Long enough for every shell to have execed, painted its prompt and gone quiet, so the
         // idle phase below measures an idle daemon rather than sixteen starting ones.
         thread::sleep(Duration::from_millis(2_500));
@@ -2569,6 +2755,59 @@ mod tests {
                 Self::Streaming => "streaming",
             }
         }
+    }
+
+    /// What the queue's 250ms tick actually costs, in the two states that matter.
+    ///
+    /// The hot-path measurement above runs the tick alongside everything else, which answers "did
+    /// the daemon get slower". This answers the narrower question the design turns on: a tick is
+    /// recurring work over every run, and the claim is that it costs nothing at all until somebody
+    /// queues something and very little afterwards. Both halves are printed as a duty cycle —
+    /// what fraction of each 250ms period the tick is actually running — because that, not the
+    /// millisecond figure, is what the daemon pays.
+    #[test]
+    #[ignore = "a measurement, not an assertion: cargo test --release --lib -- --ignored --nocapture"]
+    fn measure_what_the_queue_tick_costs_over_every_run() {
+        let panes = bench_panes();
+        let runtime = registry_with_scrollback(2_000);
+        let pane_ids = bench_workspace(&runtime, panes);
+        thread::sleep(Duration::from_millis(2_500));
+        println!("\n--- {panes} panes, one queue tick every 250ms ---");
+
+        let sample = |label: &str| {
+            let mut ticks = Vec::new();
+            let (self_before, children_before) = cpu_seconds();
+            let started = Instant::now();
+            for _ in 0..40 {
+                let tick = Instant::now();
+                runtime.queue_tick();
+                ticks.push(tick.elapsed());
+                thread::sleep(crate::dispatch::QUEUE_TICK_INTERVAL);
+            }
+            let window = started.elapsed().as_secs_f64();
+            let (self_after, children_after) = cpu_seconds();
+            let busy: f64 = ticks.iter().map(|tick| tick.as_secs_f64()).sum();
+            report_durations(&format!("queue_tick [{label}]"), panes, ticks);
+            println!(
+                "queue_tick [{label:<12}]                  duty={:6.3}%  daemon={:5.2}%  spawned \
+                 `ps` and pane shells={:5.2}%",
+                busy / window * 100.0,
+                (self_after - self_before) / window * 100.0,
+                (children_after - children_before) / window * 100.0,
+            );
+        };
+
+        // Every daemon, until somebody queues something: one lock and one length comparison.
+        sample("no queues");
+        for pane_id in &pane_ids {
+            runtime
+                .queue_add("bench", pane_id, "bench".into(), "keep going".into())
+                .expect("queue a prompt for the bench pane");
+        }
+        // The worst case the caps allow at this pane count: every pane holding a queue, so every
+        // tick pulses, maps and polls all of them. Left unarmed, because an unarmed queue is
+        // polled in full and typing into sixteen shells would measure the shells.
+        sample("every pane");
     }
 
     #[test]

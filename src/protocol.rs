@@ -8,7 +8,7 @@ use crate::{
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +31,7 @@ pub enum Request {
     PaneInput(PaneInputRequest),
     PaneResize(PaneResizeRequest),
     Subscribe(SubscribeRequest),
+    Queue(QueueRequest),
 }
 
 /// Dashboard-safe launch authority.
@@ -169,6 +170,94 @@ pub struct PaneResizeRequest {
 #[serde(deny_unknown_fields)]
 pub struct SubscribeRequest {}
 
+/// Everything a client may ask of the per-pane prompt queues.
+///
+/// An inner tagged enum in the shape `WorkspaceRequest` already uses, because these are one
+/// subsystem's operations rather than seven unrelated requests, and grouping them keeps the outer
+/// `Request` readable as a list of subsystems.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum QueueRequest {
+    /// Every queue the daemon holds, not one, so a board fills its runs lane in one round trip.
+    Inspect,
+    /// `prompt` is the literal text fed to the agent. The daemon never resolves a task id: it has
+    /// never read a board file and this does not change that.
+    Add {
+        workspace_id: String,
+        pane_id: String,
+        prompt: String,
+        label: String,
+    },
+    Remove {
+        workspace_id: String,
+        pane_id: String,
+        entry_id: u64,
+    },
+    Clear {
+        workspace_id: String,
+        pane_id: String,
+    },
+    /// Arm or disarm auto-feed for one pane. `enabled: true` is refused when the pane's agent has
+    /// never reported a state and the daemon is on the default trust setting.
+    SetAuto {
+        workspace_id: String,
+        pane_id: String,
+        enabled: bool,
+    },
+    /// The kill switch. Daemon-wide, persisted, and independent of every pane's own arming.
+    SetPaused { paused: bool },
+}
+
+/// One pane's queue as a listing sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaneQueueSnapshot {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub run_id: Option<String>,
+    pub auto_feed: bool,
+    pub awaiting_ack: bool,
+    /// Why auto-feed last declined to fire, so a stalled queue explains itself instead of looking
+    /// broken.
+    pub holding_because: Option<String>,
+    pub entries: Vec<QueueEntrySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueEntrySnapshot {
+    pub entry_id: u64,
+    pub label: String,
+    /// First `QUEUE_PREVIEW_BYTES` of the prompt, never the whole thing: a full listing of sixteen
+    /// 8 KiB prompts across several panes would exceed `MAX_MESSAGE_BYTES`.
+    pub preview: String,
+    pub bytes: usize,
+}
+
+/// One pane's queue on disk.
+///
+/// What is **not** here is the point of it: `auto_feed`, `awaiting_ack`, the last observed state,
+/// the settle clock and the last feed time are all deliberately absent. Every one of them
+/// describes the last few seconds of a process that no longer exists, and restoring them would
+/// let a pre-restart observation authorise a post-restart feed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurablePaneQueue {
+    pub schema_version: u16,
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub next_entry_id: u64,
+    pub entries: Vec<DurableQueueEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableQueueEntry {
+    pub entry_id: u64,
+    pub label: String,
+    pub prompt: String,
+}
+
 /// Pushed by the daemon to subscribed clients. Replaces polling entirely: an unchanged
 /// pane produces no event at all, where the previous protocol re-sent full scrollback
 /// for every run five times a second regardless of activity.
@@ -211,6 +300,15 @@ pub enum Event {
         state: AgentState,
     },
     LayoutChanged,
+    /// One pane's queue changed — an entry added, removed, or fed to its agent.
+    ///
+    /// Pushed rather than polled because, unlike agent state, queue depth lives only in the daemon:
+    /// nothing else a subscriber already receives would tell it that a drain happened, so an open
+    /// board would show a stale depth until the next unrelated keystroke.
+    QueueChanged {
+        workspace_id: String,
+        pane_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,6 +513,10 @@ pub enum Response {
     Stream {
         event: Event,
     },
+    Queues {
+        queues: Vec<PaneQueueSnapshot>,
+        paused: bool,
+    },
     /// Acknowledges a request that has no payload of its own to report, such as a resize.
     Ack,
     Error {
@@ -444,6 +546,10 @@ pub enum ErrorCode {
     CapacityExceeded,
     GateNotFound,
     GateBlocked,
+    /// A queue operation the daemon declined: a depth cap, an over-long prompt, or an arming
+    /// request that cannot be honoured. Its own code rather than `GateBlocked`, which already
+    /// carries five distinct meanings and would stop being useful for diagnosis at a sixth.
+    QueueRefused,
     DuplicateGate,
     InvalidLayout,
     WorkspaceNotFound,
@@ -490,6 +596,9 @@ pub struct ProgrammeSnapshot {
     pub human_review_reserved: usize,
     pub repositories: Vec<RepositoryPortfolioSnapshot>,
     pub gates: Vec<DependencyGateSnapshot>,
+    /// Every pane queue, beside the gates, so `dock-programme` shows both rather than making an
+    /// operator hold two mental models of "queued work".
+    pub queues: Vec<PaneQueueSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -606,9 +715,58 @@ mod tests {
         }
     }
 
+    /// The v12 wire shapes, written out, because a client is being wired to them in a separate
+    /// change and a rename here would otherwise be discovered at runtime.
     #[test]
-    fn protocol_version_is_eleven() {
-        assert_eq!(PROTOCOL_VERSION, 11);
+    fn a_queue_request_is_an_inner_tagged_operation_like_a_workspace_request() {
+        let json = serde_json::to_string(&Request::Queue(QueueRequest::Add {
+            workspace_id: "w1".into(),
+            pane_id: "p1".into(),
+            prompt: "keep going".into(),
+            label: "card 7".into(),
+        }))
+        .expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"queue","operation":"add","workspace_id":"w1","pane_id":"p1","prompt":"keep going","label":"card 7"}"#
+        );
+        let paused =
+            serde_json::to_string(&Request::Queue(QueueRequest::SetPaused { paused: true }))
+                .expect("serialize");
+        assert_eq!(
+            paused,
+            r#"{"type":"queue","operation":"set_paused","paused":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(&json).expect("round trips"),
+            Request::Queue(QueueRequest::Add {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+                prompt: "keep going".into(),
+                label: "card 7".into(),
+            })
+        );
+    }
+
+    /// `QueueChanged` names a pane rather than a run, for the same reason the queue is keyed by
+    /// one: a run dies and is replaced, and a client that had to follow the substitution to find
+    /// out its queue moved would miss exactly the changes a restart caused.
+    #[test]
+    fn a_queue_changed_event_names_the_pane_rather_than_the_run() {
+        let json = serde_json::to_string(&Event::QueueChanged {
+            workspace_id: "w1".into(),
+            pane_id: "p1".into(),
+        })
+        .expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"event":"queue_changed","workspace_id":"w1","pane_id":"p1"}"#
+        );
+    }
+
+    #[test]
+    fn protocol_version_is_twelve() {
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 
     #[test]

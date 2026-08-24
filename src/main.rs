@@ -35,7 +35,7 @@ use dock::{
     paths,
     protocol::{
         DashboardProfile, DispatchRequest, InspectRequest, LaunchIntoPaneRequest, PROTOCOL_VERSION,
-        PaneInputRequest, PaneResizeRequest, ProcessState, Request, Response,
+        PaneInputRequest, PaneResizeRequest, ProcessState, QueueRequest, Request, Response,
         TerminalLaunchRequest, WorkspaceRequest,
     },
     storage::LocalStore,
@@ -117,6 +117,19 @@ fn run_noninteractive_legacy(args: &[String]) -> Result<bool, Box<dyn Error>> {
     }
     if args.first().is_some_and(|first| first == "task") {
         task_command(&args[1..])?;
+        return Ok(true);
+    }
+    // Unlike every other arm here, `dock queue` talks to the daemon rather than to files —
+    // `dock task` writes the board, the queue lives in dockd. Parsing is pure and tested
+    // (`parse_queue_command`); the socket call is a separate change and is not here yet.
+    if args.first().is_some_and(|first| first == "queue") {
+        // Printed and exited rather than returned: `main` renders an error with `{:?}`, and a
+        // command whose whole job is to tell somebody what their queues are doing should not
+        // sign off in Debug format. `dock hooks --check` does the same for the same reason.
+        if let Err(error) = queue_command(&args[1..]) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
         return Ok(true);
     }
     if let Some(run_id) = args.iter().find_map(|a| a.strip_prefix("--load-handoff=")) {
@@ -650,9 +663,19 @@ fn run_dashboard(
                 terminal
                     .draw(|frame| dashboard.render(frame))
                     .map_err(|e| e.to_string())?;
-                match client.request(&request)? {
-                    Response::Error { message, .. } => dashboard.error = Some(message),
-                    _ => dashboard.error = None,
+                let response = client.request(&request)?;
+                // A queue answer goes to the dashboard whole rather than being reduced to
+                // "did the daemon object". Both halves matter: the success carries the full
+                // listing, so an arming lands on the lane in the same round trip, and the
+                // refusal is the product — the sentence naming `dock hooks --install` has to
+                // reach the person who pressed the key, in the daemon's own words.
+                if matches!(request.as_ref(), Request::Queue(_)) {
+                    dashboard.apply_queue_response(response);
+                } else {
+                    match response {
+                        Response::Error { message, .. } => dashboard.error = Some(message),
+                        _ => dashboard.error = None,
+                    }
                 }
                 refresh(client, &mut dashboard)?;
                 if test_launch {
@@ -1793,6 +1816,784 @@ fn task_command(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+/// What `dock queue add` was asked to enqueue.
+///
+/// The parser records the *intent* and stops there: a card's title and body are read off the
+/// board with `board::load`, which is I/O, and the whole point of splitting this out from the
+/// socket call is that no usage error needs a daemon, a board or a filesystem to reproduce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueuePrompt {
+    /// Text typed on the command line, fed to the agent verbatim.
+    Literal(String),
+    /// A card id. The caller resolves it to the card's title plus body (§8.7) before sending.
+    Task(u64),
+}
+
+/// One parsed `dock queue` invocation. Every variant is what crosses the socket, not how it was
+/// typed, so the wiring never re-reads argv.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueueCommand {
+    /// `None` means unfiltered: every queue the daemon holds.
+    List {
+        pane: Option<String>,
+        workspace: Option<String>,
+    },
+    Add {
+        pane: String,
+        prompt: QueuePrompt,
+    },
+    Remove {
+        pane: String,
+        entry_id: u64,
+    },
+    Clear {
+        pane: String,
+    },
+    /// Turn auto-feed on for one pane. Deliberately its own verb rather than a flag on `add`,
+    /// because it is the act that lets Dock speak to an agent with nobody watching, and because
+    /// the daemon can refuse it (§8.4 guard 4) where `add` cannot.
+    Arm {
+        pane: String,
+    },
+    Disarm {
+        pane: String,
+    },
+    /// Daemon-wide kill switch, independent of which panes are armed.
+    Pause,
+    Resume,
+}
+
+/// Options belonging to other parts of the CLI that may legitimately appear after `queue`:
+/// `--board=` is how `--task=<id>` is resolved, and the rest are read by `main` when it decides
+/// which daemon to talk to. They are skipped here rather than rejected as unknown.
+const QUEUE_FOREIGN_OPTIONS: [&str; 4] = ["--board=", "--socket=", "--state-dir=", "--dock-dir="];
+
+const QUEUE_VERBS: &str = "expected list, add, remove, clear, arm, disarm, pause or resume";
+
+/// Parse `dock queue`'s arguments and nothing else — no socket, no board, no clock.
+///
+/// Split out from the sending half on purpose: `task_command` parses and performs I/O in one
+/// function, so not one of its usage errors has a test, and this command is not repeating that.
+///
+/// Flag handling follows the hand-parsed house convention: `--flag=value`, positionals are the
+/// arguments that do not start with `--`. That convention cannot express a prompt beginning with
+/// `--`, so a bare `--` ends the options and everything after it is a positional. Without that,
+/// `dock queue add p1 "--task=7 is not a flag here"` would quietly enqueue somebody's card
+/// instead of their sentence; with it, that spelling is refused with the escape named, and
+/// `dock queue add p1 -- "--task=7 is not a flag here"` says what was meant. Unknown options are
+/// refused rather than ignored, for the same reason: silently dropping an argument that looks
+/// like a flag is how a prompt goes missing.
+fn parse_queue_command(args: &[String]) -> Result<QueueCommand, String> {
+    let (head, tail) = match args.iter().position(|argument| argument == "--") {
+        Some(index) => (&args[..index], &args[index + 1..]),
+        None => (args, &args[args.len()..]),
+    };
+    let mut pane_flag: Option<&str> = None;
+    let mut workspace_flag: Option<&str> = None;
+    let mut task_flag: Option<&str> = None;
+    let mut positional: Vec<&str> = Vec::new();
+    for argument in head {
+        if !argument.starts_with("--") {
+            positional.push(argument);
+            continue;
+        }
+        if argument == "--all" || argument.starts_with("--all=") {
+            // Refused rather than ignored: §9 has no --all, and a person who typed one believes
+            // they armed everything.
+            return Err(
+                "there is no --all: arm and disarm are per pane, so four agents is four commands"
+                    .to_owned(),
+            );
+        }
+        if let Some(value) = argument.strip_prefix("--pane=") {
+            pane_flag = Some(value);
+        } else if let Some(value) = argument.strip_prefix("--workspace=") {
+            workspace_flag = Some(value);
+        } else if let Some(value) = argument.strip_prefix("--task=") {
+            task_flag = Some(value);
+        } else if !QUEUE_FOREIGN_OPTIONS
+            .iter()
+            .any(|known| argument.starts_with(known))
+        {
+            return Err(format!(
+                "unknown queue option {argument:?}; expected --pane=, --workspace= or --task= \
+                 (a prompt that starts with -- goes after a bare --)"
+            ));
+        }
+    }
+    positional.extend(tail.iter().map(String::as_str));
+
+    // Same default as `dock task`: the verb that only reads is the one you get for typing nothing.
+    let verb = positional.first().copied().unwrap_or("list");
+    let rest = &positional[positional.len().min(1)..];
+    if !matches!(
+        verb,
+        "list" | "add" | "remove" | "clear" | "arm" | "disarm" | "pause" | "resume"
+    ) {
+        return Err(format!("unknown queue command {verb:?}; {QUEUE_VERBS}"));
+    }
+    if verb != "list" && (pane_flag.is_some() || workspace_flag.is_some()) {
+        return Err(match verb {
+            "pause" | "resume" => format!(
+                "dock queue {verb} is daemon-wide and takes no pane; stop one pane with \
+                 dock queue disarm <pane>"
+            ),
+            _ => format!("dock queue {verb} takes its pane positionally: dock queue {verb} <pane>"),
+        });
+    }
+    if verb != "add" && task_flag.is_some() {
+        return Err(format!(
+            "--task=<id> is only for dock queue add; dock queue {verb} works on a pane"
+        ));
+    }
+    match verb {
+        "list" => {
+            if let Some(extra) = rest.first() {
+                return Err(format!(
+                    "dock queue list filters with --pane=<id> and --workspace=<id>, so {extra:?} \
+                     would have been silently ignored"
+                ));
+            }
+            Ok(QueueCommand::List {
+                pane: queue_filter("--pane", pane_flag)?,
+                workspace: queue_filter("--workspace", workspace_flag)?,
+            })
+        }
+        "add" => {
+            let usage = "dock queue add <pane> \"<prompt>\", or dock queue add <pane> --task=<id>";
+            let pane = queue_pane_id(rest.first().copied(), usage)?;
+            if rest.len() > 2 {
+                return Err(format!(
+                    "{usage} — a prompt is one argument, so quote it; got {} instead",
+                    rest.len() - 1
+                ));
+            }
+            let prompt = match (rest.get(1), task_flag) {
+                (Some(_), Some(_)) => {
+                    return Err(
+                        "dock queue add takes either a prompt or --task=<id>, not both".to_owned(),
+                    );
+                }
+                (None, None) => return Err(usage.to_owned()),
+                (Some(text), None) => {
+                    if text.trim().is_empty() {
+                        return Err(
+                            "that prompt is empty; an agent fed a bare newline learns nothing"
+                                .to_owned(),
+                        );
+                    }
+                    QueuePrompt::Literal((*text).to_owned())
+                }
+                (None, Some(id)) => QueuePrompt::Task(id.parse().map_err(|_| {
+                    "the task id must be a number; a prompt that starts with -- goes after a \
+                     bare --"
+                        .to_owned()
+                })?),
+            };
+            Ok(QueueCommand::Add { pane, prompt })
+        }
+        "remove" => {
+            let usage = "dock queue remove <pane> <entry-id>";
+            let pane = queue_pane_id(rest.first().copied(), usage)?;
+            let entry_id: u64 = rest
+                .get(1)
+                .ok_or_else(|| usage.to_owned())?
+                .parse()
+                .map_err(|_| {
+                    "the entry id must be a number; dock queue list prints it".to_owned()
+                })?;
+            if rest.len() > 2 {
+                return Err(format!("{usage} removes one entry at a time"));
+            }
+            Ok(QueueCommand::Remove { pane, entry_id })
+        }
+        "clear" => Ok(QueueCommand::Clear {
+            pane: queue_one_pane("clear", rest)?,
+        }),
+        "arm" => Ok(QueueCommand::Arm {
+            pane: queue_one_pane("arm", rest)?,
+        }),
+        "disarm" => Ok(QueueCommand::Disarm {
+            pane: queue_one_pane("disarm", rest)?,
+        }),
+        _ => {
+            if let Some(extra) = rest.first() {
+                return Err(format!(
+                    "dock queue {verb} is daemon-wide and takes no pane; {extra:?} would have \
+                     suggested otherwise — stop one pane with dock queue disarm <pane>"
+                ));
+            }
+            Ok(if verb == "pause" {
+                QueueCommand::Pause
+            } else {
+                QueueCommand::Resume
+            })
+        }
+    }
+}
+
+/// A verb whose whole argument list is one pane.
+fn queue_one_pane(verb: &str, rest: &[&str]) -> Result<String, String> {
+    let usage = format!("dock queue {verb} <pane>");
+    let pane = queue_pane_id(rest.first().copied(), &usage)?;
+    if rest.len() > 1 {
+        return Err(format!(
+            "{usage} takes one pane; quote the id if it has a space in it"
+        ));
+    }
+    Ok(pane)
+}
+
+/// An absent pane and a blank one are different mistakes and get different sentences; both are
+/// caught here so no verb can send an empty pane id to the daemon and be told "no such pane".
+fn queue_pane_id(pane: Option<&str>, usage: &str) -> Result<String, String> {
+    let pane = pane.ok_or_else(|| usage.to_owned())?;
+    if pane.trim().is_empty() {
+        return Err(format!("a pane id cannot be empty: {usage}"));
+    }
+    Ok(pane.to_owned())
+}
+
+/// `--pane=` with nothing after it is a filter that matches nothing; refusing beats listing
+/// everything as though no filter had been asked for.
+fn queue_filter(flag: &str, value: Option<&str>) -> Result<Option<String>, String> {
+    match value {
+        Some(value) if value.trim().is_empty() => Err(format!(
+            "{flag}= needs an id after it, or leave it off to list every queue"
+        )),
+        other => Ok(other.map(str::to_owned)),
+    }
+}
+
+/// PROVISIONAL. Parsing is done and tested; the socket call is a separate change, so this
+/// reports what it understood and exits non-zero rather than pretending a prompt was queued.
+fn queue_command(args: &[String]) -> io::Result<()> {
+    let command = parse_queue_command(args).map_err(io::Error::other)?;
+    // The first arm of `run_noninteractive_legacy` that talks to the daemon. Every other one
+    // reads or writes files; a queue lives in the daemon because the daemon is what feeds it, so
+    // this opens a client the way `dock-dispatch` does rather than touching the state directory.
+    let runtime_directory = std::env::current_dir()?;
+    let (default_socket, _) =
+        paths::runtime_paths_for(&runtime_directory).map_err(io::Error::other)?;
+    let socket = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--socket=").map(PathBuf::from))
+        .unwrap_or(default_socket);
+    let mut client = Client::connect(&socket).map_err(|error| {
+        io::Error::other(format!(
+            "{error}; a queue lives in the daemon, so Dock has to be running to hold one"
+        ))
+    })?;
+
+    let request = match command {
+        QueueCommand::Pause => Request::Queue(QueueRequest::SetPaused { paused: true }),
+        QueueCommand::Resume => Request::Queue(QueueRequest::SetPaused { paused: false }),
+        QueueCommand::List { pane, workspace } => {
+            return print_queues(&mut client, pane.as_deref(), workspace.as_deref());
+        }
+        QueueCommand::Add { pane, prompt } => {
+            // Resolved here rather than in the daemon: the board is a directory this client was
+            // given and the daemon has never been told about, and only the resulting text needs
+            // to cross the socket.
+            let (label, prompt) = match prompt {
+                QueuePrompt::Literal(text) => (queue_label(&text), text),
+                QueuePrompt::Task(id) => {
+                    let board = queue_board(args)?;
+                    let task = dock::board::load(&board)
+                        .into_iter()
+                        .find(|task| task.id == id)
+                        .ok_or_else(|| io::Error::other(format!("no task {id} on this board")))?;
+                    (
+                        format!("#{id} {}", task.title),
+                        dispatch_prompt(id, &task.title, &task.body),
+                    )
+                }
+            };
+            let (workspace_id, pane_id) = resolve_pane(&mut client, &pane)?;
+            Request::Queue(QueueRequest::Add {
+                workspace_id,
+                pane_id,
+                prompt,
+                label,
+            })
+        }
+        QueueCommand::Remove { pane, entry_id } => {
+            let (workspace_id, pane_id) = resolve_pane(&mut client, &pane)?;
+            Request::Queue(QueueRequest::Remove {
+                workspace_id,
+                pane_id,
+                entry_id,
+            })
+        }
+        QueueCommand::Clear { pane } => {
+            let (workspace_id, pane_id) = resolve_pane(&mut client, &pane)?;
+            Request::Queue(QueueRequest::Clear {
+                workspace_id,
+                pane_id,
+            })
+        }
+        QueueCommand::Arm { pane } => {
+            let (workspace_id, pane_id) = resolve_pane(&mut client, &pane)?;
+            Request::Queue(QueueRequest::SetAuto {
+                workspace_id,
+                pane_id,
+                enabled: true,
+            })
+        }
+        QueueCommand::Disarm { pane } => {
+            let (workspace_id, pane_id) = resolve_pane(&mut client, &pane)?;
+            Request::Queue(QueueRequest::SetAuto {
+                workspace_id,
+                pane_id,
+                enabled: false,
+            })
+        }
+    };
+    match client.request(&request).map_err(io::Error::other)? {
+        Response::Queues { queues, paused } => {
+            render_queues(&queues, paused, None, None);
+            Ok(())
+        }
+        Response::Error { message, .. } => Err(io::Error::other(message)),
+        other => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+    }
+}
+
+/// The board a `--task=` is read from, on the same terms `dock task` uses.
+fn queue_board(args: &[String]) -> io::Result<PathBuf> {
+    args.iter()
+        .find_map(|argument| argument.strip_prefix("--board="))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("DOCK_BOARD").map(PathBuf::from))
+        .ok_or_else(|| {
+            io::Error::other(
+                "no board: pass --board=<dir>, or run this inside a pane Dock launched, where \
+                 DOCK_BOARD is already set",
+            )
+        })
+}
+
+/// A short name for a literal prompt, so a listing says something other than its first line.
+fn queue_label(prompt: &str) -> String {
+    let first = prompt.lines().next().unwrap_or("").trim();
+    ellipsised_label(first)
+}
+
+fn ellipsised_label(text: &str) -> String {
+    const WIDTH: usize = 48;
+    if text.chars().count() <= WIDTH {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(WIDTH.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
+}
+
+/// Which workspace holds this pane.
+///
+/// The command names one pane because that is what a person knows; the daemon keys queues by the
+/// pair, because a pane id is only unique inside its workspace. Asked of the layout rather than
+/// guessed, and an id in two workspaces is refused by name rather than resolved to whichever came
+/// first — feeding the wrong pane is the whole class of mistake this feature has to avoid.
+fn resolve_pane(client: &mut Client, pane: &str) -> io::Result<(String, String)> {
+    let layout = match client
+        .request(&Request::Workspace(WorkspaceRequest::Inspect))
+        .map_err(io::Error::other)?
+    {
+        Response::Layout { layout } => layout,
+        Response::Error { message, .. } => return Err(io::Error::other(message)),
+        other => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+    };
+    let found: Vec<&str> = layout
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.panes.contains_key(pane))
+        .map(|workspace| workspace.workspace_id.as_str())
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(((*one).to_owned(), pane.to_owned())),
+        [] => Err(io::Error::other(format!(
+            "no pane {pane:?}; `dock queue list` names the panes that have queues"
+        ))),
+        many => Err(io::Error::other(format!(
+            "pane {pane:?} is in {} workspaces ({}); name one with --workspace=",
+            many.len(),
+            many.join(", ")
+        ))),
+    }
+}
+
+fn print_queues(
+    client: &mut Client,
+    pane: Option<&str>,
+    workspace: Option<&str>,
+) -> io::Result<()> {
+    match client
+        .request(&Request::Queue(QueueRequest::Inspect))
+        .map_err(io::Error::other)?
+    {
+        Response::Queues { queues, paused } => {
+            render_queues(&queues, paused, pane, workspace);
+            Ok(())
+        }
+        Response::Error { message, .. } => Err(io::Error::other(message)),
+        other => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+    }
+}
+
+/// Prints the queues, narrowed to what was asked for.
+fn render_queues(
+    queues: &[dock::protocol::PaneQueueSnapshot],
+    paused: bool,
+    pane: Option<&str>,
+    workspace: Option<&str>,
+) {
+    if paused {
+        println!("every queue is paused — `dock queue resume` starts them again");
+    }
+    let shown: Vec<_> = queues
+        .iter()
+        .filter(|queue| pane.is_none_or(|wanted| queue.pane_id == wanted))
+        .filter(|queue| workspace.is_none_or(|wanted| queue.workspace_id == wanted))
+        .collect();
+    if shown.is_empty() {
+        println!("no queues");
+        return;
+    }
+    for queue in shown {
+        let armed = if queue.auto_feed {
+            "armed"
+        } else {
+            "not armed"
+        };
+        let count = queue.entries.len();
+        let entries = if count == 1 { "entry" } else { "entries" };
+        println!(
+            "{}/{}  {count} {entries}  {armed}",
+            queue.workspace_id, queue.pane_id
+        );
+        if let Some(reason) = &queue.holding_because {
+            println!("    holding: {reason}");
+        }
+        for entry in &queue.entries {
+            println!("    {:>4}  {}", entry.entry_id, entry.label);
+        }
+    }
+}
+
+#[cfg(test)]
+mod queue_parse_tests {
+    use super::{QueueCommand, QueuePrompt, parse_queue_command};
+
+    fn parse(args: &[&str]) -> Result<QueueCommand, String> {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        parse_queue_command(&owned)
+    }
+
+    fn refusal(args: &[&str]) -> String {
+        parse(args).expect_err("this spelling has to be refused")
+    }
+
+    #[test]
+    fn every_verb_the_command_offers_parses_into_the_thing_it_names() {
+        // The whole surface in one place, because a verb that parses as a neighbouring verb is
+        // the failure this enum exists to make impossible: `disarm` read as `arm` would arm a
+        // pane somebody was explicitly turning off.
+        assert_eq!(
+            parse(&["add", "p1", "look at the retry path"]),
+            Ok(QueueCommand::Add {
+                pane: "p1".to_owned(),
+                prompt: QueuePrompt::Literal("look at the retry path".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(&["remove", "p1", "3"]),
+            Ok(QueueCommand::Remove {
+                pane: "p1".to_owned(),
+                entry_id: 3
+            })
+        );
+        assert_eq!(
+            parse(&["clear", "p1"]),
+            Ok(QueueCommand::Clear {
+                pane: "p1".to_owned()
+            })
+        );
+        assert_eq!(
+            parse(&["arm", "p1"]),
+            Ok(QueueCommand::Arm {
+                pane: "p1".to_owned()
+            })
+        );
+        assert_eq!(
+            parse(&["disarm", "p1"]),
+            Ok(QueueCommand::Disarm {
+                pane: "p1".to_owned()
+            })
+        );
+        assert_eq!(parse(&["pause"]), Ok(QueueCommand::Pause));
+        assert_eq!(parse(&["resume"]), Ok(QueueCommand::Resume));
+    }
+
+    #[test]
+    fn a_bare_queue_lists_every_queue_rather_than_complaining() {
+        // `dock task` with no verb lists, and the verb you get for typing nothing should be the
+        // one that only reads.
+        assert_eq!(
+            parse(&[]),
+            Ok(QueueCommand::List {
+                pane: None,
+                workspace: None
+            })
+        );
+    }
+
+    #[test]
+    fn a_list_narrows_to_the_pane_or_workspace_it_was_given_and_to_everything_when_it_was_not() {
+        assert_eq!(
+            parse(&["list", "--pane=p1"]),
+            Ok(QueueCommand::List {
+                pane: Some("p1".to_owned()),
+                workspace: None
+            })
+        );
+        assert_eq!(
+            parse(&["list", "--workspace=w1", "--pane=p1"]),
+            Ok(QueueCommand::List {
+                pane: Some("p1".to_owned()),
+                workspace: Some("w1".to_owned())
+            })
+        );
+        assert_eq!(
+            parse(&["list"]),
+            Ok(QueueCommand::List {
+                pane: None,
+                workspace: None
+            })
+        );
+    }
+
+    #[test]
+    fn a_card_is_queued_by_id_and_left_for_the_caller_to_read_off_the_board() {
+        // The parser must not try to resolve the card: title and body come from `board::load`
+        // against --board= / $DOCK_BOARD, which is I/O, and dragging it in here is exactly what
+        // makes `task_command` untestable.
+        assert_eq!(
+            parse(&["add", "p1", "--task=7"]),
+            Ok(QueueCommand::Add {
+                pane: "p1".to_owned(),
+                prompt: QueuePrompt::Task(7),
+            })
+        );
+    }
+
+    #[test]
+    fn a_verb_the_queue_does_not_have_is_named_back_with_the_ones_it_does() {
+        // Including `dispatch`, which §9 cut deliberately and which is the first thing anybody
+        // will try, so the message has to list what exists rather than only say no.
+        let message = refusal(&["dispatch", "p1"]);
+        assert!(message.contains("\"dispatch\""), "{message}");
+        assert!(message.contains("arm"), "{message}");
+        assert!(message.contains("pause"), "{message}");
+    }
+
+    #[test]
+    fn a_verb_that_needs_a_pane_and_was_given_none_prints_the_shape_of_the_command() {
+        // Every one of these, because the pane argument is positional and a person who forgets
+        // it gets the same silence from all five otherwise.
+        assert_eq!(refusal(&["clear"]), "dock queue clear <pane>");
+        assert_eq!(refusal(&["arm"]), "dock queue arm <pane>");
+        assert_eq!(refusal(&["disarm"]), "dock queue disarm <pane>");
+        assert_eq!(refusal(&["remove"]), "dock queue remove <pane> <entry-id>");
+        assert!(refusal(&["add"]).starts_with("dock queue add <pane>"));
+    }
+
+    #[test]
+    fn dock_queue_add_without_a_prompt_explains_the_shape_of_the_command() {
+        // A pane and nothing else is the commonest mistake — the prompt was left off, or the
+        // shell ate it — and the answer has to name both spellings, since --task= is the one
+        // that is not obvious from the failure.
+        let message = refusal(&["add", "p1"]);
+        assert!(message.contains("\"<prompt>\""), "{message}");
+        assert!(message.contains("--task=<id>"), "{message}");
+    }
+
+    #[test]
+    fn a_prompt_and_a_card_id_together_are_refused_rather_than_one_quietly_winning() {
+        // Whichever won, half the invocations would feed an agent something the person did not
+        // type, and they would not find out until they read the pane.
+        let message = refusal(&["add", "p1", "look here", "--task=7"]);
+        assert!(message.contains("not both"), "{message}");
+    }
+
+    #[test]
+    fn there_is_no_way_to_arm_every_pane_at_once_and_asking_for_one_says_so() {
+        // §9: arming is the act that lets Dock speak with nobody watching, and it is per pane.
+        // Ignoring --all would leave somebody believing they had armed four agents.
+        let message = refusal(&["arm", "p1", "--all"]);
+        assert!(message.contains("no --all"), "{message}");
+        assert!(message.contains("per pane"), "{message}");
+        // Anywhere it appears, not only on arm, since --all means the same wrong thing on each.
+        assert!(refusal(&["disarm", "--all"]).contains("no --all"));
+        assert!(refusal(&["clear", "--all"]).contains("no --all"));
+    }
+
+    #[test]
+    fn an_entry_id_that_is_not_a_number_is_refused_here_rather_than_by_the_daemon() {
+        // And the message says where entry ids come from, because they are the daemon's
+        // invention and there is nowhere else to learn them.
+        let message = refusal(&["remove", "p1", "second"]);
+        assert!(message.contains("must be a number"), "{message}");
+        assert!(message.contains("dock queue list"), "{message}");
+        assert_eq!(
+            refusal(&["remove", "p1"]),
+            "dock queue remove <pane> <entry-id>"
+        );
+    }
+
+    #[test]
+    fn a_card_id_that_is_not_a_number_is_refused_and_names_the_way_to_mean_it_literally() {
+        // This is where `dock queue add p1 "--task=7 is not a flag here"` lands: the house
+        // convention has already claimed the argument as a flag, so the only honest outcome is
+        // a refusal that says how to spell the prompt instead.
+        let message = refusal(&["add", "p1", "--task=7 is not a flag here"]);
+        assert!(message.contains("must be a number"), "{message}");
+        assert!(message.contains("bare --"), "{message}");
+        assert!(refusal(&["add", "p1", "--task=seven"]).contains("must be a number"));
+    }
+
+    #[test]
+    fn pause_is_daemon_wide_and_a_pane_given_to_it_is_a_misunderstanding_worth_naming() {
+        // Accepting and ignoring the pane would leave every other agent stopped too, which is
+        // the opposite of what the person meant; the message points at the per-pane verb.
+        let message = refusal(&["pause", "p1"]);
+        assert!(message.contains("daemon-wide"), "{message}");
+        assert!(message.contains("dock queue disarm <pane>"), "{message}");
+        assert!(refusal(&["resume", "p1"]).contains("daemon-wide"));
+        assert!(refusal(&["pause", "--pane=p1"]).contains("daemon-wide"));
+    }
+
+    #[test]
+    fn a_prompt_keeps_its_spaces_its_newlines_and_its_punctuation_exactly_as_typed() {
+        // The prompt is fed to an agent verbatim (§8.7), so anything this function does to it —
+        // trimming, splitting, collapsing whitespace — is damage nobody asked for.
+        let prompt = "first line\n\n  second, indented — with an em dash\n";
+        assert_eq!(
+            parse(&["add", "p1", prompt]),
+            Ok(QueueCommand::Add {
+                pane: "p1".to_owned(),
+                prompt: QueuePrompt::Literal(prompt.to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_looks_like_a_flag_is_a_prompt_when_it_is_given_after_a_bare_dash_dash() {
+        // The escape hatch the refusal above advertises has to actually work, and it has to
+        // work for text that would otherwise be read as any flag, not only as --task=.
+        assert_eq!(
+            parse(&["add", "p1", "--", "--task=7 is not a flag here"]),
+            Ok(QueueCommand::Add {
+                pane: "p1".to_owned(),
+                prompt: QueuePrompt::Literal("--task=7 is not a flag here".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(&["add", "p1", "--", "--all of the above"]),
+            Ok(QueueCommand::Add {
+                pane: "p1".to_owned(),
+                prompt: QueuePrompt::Literal("--all of the above".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_prompt_is_refused_rather_than_feeding_an_agent_a_bare_newline() {
+        // `dock queue add p1 "$PROMPT"` with an unset variable is the way this arrives, and the
+        // queue entry it would make is one an agent cannot act on and a person cannot read.
+        assert!(refusal(&["add", "p1", ""]).contains("empty"));
+        assert!(refusal(&["add", "p1", "   \n "]).contains("empty"));
+    }
+
+    #[test]
+    fn an_unquoted_prompt_that_arrived_as_several_words_is_refused_rather_than_joined() {
+        // Joining would work often enough to be trusted and would silently normalise the
+        // whitespace the shell had already eaten; naming the quoting is the honest answer.
+        let message = refusal(&["add", "p1", "look", "at", "the", "retry", "path"]);
+        assert!(message.contains("quote it"), "{message}");
+    }
+
+    #[test]
+    fn a_filter_flag_on_a_verb_that_takes_its_pane_positionally_is_refused() {
+        // --pane= belongs to `list`. On `arm` it would parse as a pane-less arm, so accepting
+        // it as a synonym is one more way to arm the wrong thing.
+        let message = refusal(&["arm", "--pane=p1"]);
+        assert!(message.contains("positionally"), "{message}");
+        assert!(message.contains("dock queue arm <pane>"), "{message}");
+        assert!(refusal(&["clear", "--workspace=w1"]).contains("positionally"));
+    }
+
+    #[test]
+    fn a_list_does_not_take_its_pane_positionally_either() {
+        // The mirror of the rule above: `dock queue list p1` would otherwise list every queue
+        // on the daemon and look like it had filtered.
+        let message = refusal(&["list", "p1"]);
+        assert!(message.contains("--pane=<id>"), "{message}");
+        assert!(message.contains("silently ignored"), "{message}");
+    }
+
+    #[test]
+    fn a_card_id_on_a_verb_that_cannot_use_one_is_refused() {
+        // `dock queue arm --task=7` is somebody expecting arm to enqueue as well as arm, which
+        // §9 split apart on purpose.
+        let message = refusal(&["arm", "p1", "--task=7"]);
+        assert!(message.contains("only for dock queue add"), "{message}");
+    }
+
+    #[test]
+    fn an_option_the_queue_does_not_know_is_named_back_rather_than_dropped() {
+        // The convention filters positionals by a leading --, so an unknown option vanishes
+        // silently; for a command that carries a prompt, a vanished argument is a lost prompt.
+        let message = refusal(&["add", "p1", "--tasks=7"]);
+        assert!(message.contains("\"--tasks=7\""), "{message}");
+        assert!(message.contains("bare --"), "{message}");
+    }
+
+    #[test]
+    fn the_options_the_rest_of_the_cli_owns_are_not_mistaken_for_queue_options() {
+        // --board= is how --task= gets resolved and --socket= chooses the daemon, so both reach
+        // this parser on perfectly ordinary invocations and must pass straight through.
+        assert_eq!(
+            parse(&["--board=/tmp/board", "add", "p1", "--task=7"]),
+            Ok(QueueCommand::Add {
+                pane: "p1".to_owned(),
+                prompt: QueuePrompt::Task(7),
+            })
+        );
+        assert_eq!(
+            parse(&["--socket=/tmp/dock.sock", "--state-dir=/tmp/state", "pause"]),
+            Ok(QueueCommand::Pause)
+        );
+    }
+
+    #[test]
+    fn an_empty_pane_id_is_refused_wherever_a_pane_is_required() {
+        // `dock queue arm "$PANE"` with nothing in the variable, again. The daemon would answer
+        // "no such pane", which describes the pane rather than the mistake.
+        assert!(refusal(&["arm", ""]).contains("cannot be empty"));
+        assert!(refusal(&["add", "  ", "look here"]).contains("cannot be empty"));
+        assert!(refusal(&["list", "--pane="]).contains("needs an id after it"));
+    }
+
+    #[test]
+    fn a_verb_that_wants_one_pane_is_not_quietly_given_two() {
+        // Two panes means either an unquoted id or a person expecting one command to arm both,
+        // and both deserve to hear about it rather than have the second argument dropped.
+        assert!(refusal(&["arm", "p1", "p2"]).contains("takes one pane"));
+        assert!(refusal(&["clear", "p1", "p2"]).contains("takes one pane"));
+        assert!(refusal(&["remove", "p1", "3", "4"]).contains("one entry at a time"));
+    }
+}
+
 fn repository_catalog(directory: &Path) -> (String, Vec<dock::dashboard::RepositoryLaunchOption>) {
     let marker = directory
         .ancestors()
@@ -1981,6 +2782,15 @@ fn refresh(client: &mut Client, dashboard: &mut Dashboard) -> Result<(), String>
             response => return Err(format!("unexpected runtime response: {response:?}")),
         },
     );
+    // On the same refresh as the layout and the runs, not on a timer of its own. Queue depth is
+    // the third thing the runs lane is assembled from, and `Event::QueueChanged` already marks
+    // the client dirty — so a `dock queue add` from another terminal lands in the open board pane
+    // through exactly the path an agent state change does, with no keypress and no second poll.
+    match client.request(&Request::Queue(QueueRequest::Inspect))? {
+        Response::Queues { queues, paused } => dashboard.set_queues(queues, paused),
+        Response::Error { message, .. } => return Err(message),
+        response => return Err(format!("unexpected queue response: {response:?}")),
+    }
     if dashboard.workspace_index >= dashboard.layout.workspaces.len() {
         dashboard.workspace_index = dashboard.layout.workspaces.len().saturating_sub(1);
     }

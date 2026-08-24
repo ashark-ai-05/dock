@@ -10,7 +10,10 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -25,10 +28,12 @@ use crate::{
     layout::{LayoutRegistry, LayoutSnapshot, PaneKind, PaneRuntime, WorkspaceLayout},
     model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
     protocol::{
-        BindingKind, DependencyGateSnapshot, DispatchRequest, DurableProgrammeGate, ErrorCode,
-        GateState, LifecycleOperation, ProgrammeSnapshot, RepositoryPortfolioSnapshot,
+        BindingKind, DependencyGateSnapshot, DispatchRequest, DurablePaneQueue,
+        DurableProgrammeGate, DurableQueueEntry, ErrorCode, GateState, LifecycleOperation,
+        PaneQueueSnapshot, ProgrammeSnapshot, QueueEntrySnapshot, RepositoryPortfolioSnapshot,
         RuntimeSnapshot, WorkspaceRequest,
     },
+    queue::{AutoFeedTrust, MAX_PROMPT_BYTES, MAX_QUEUED_TOTAL, PaneQueue, QueueEntry},
     runtime::{OwnedRuntime, PtySize, RunBinding, RunPulse},
     storage::LocalStore,
     terminal::{PaneOutput, PaneScreen},
@@ -264,6 +269,32 @@ pub struct RuntimeRegistry {
     /// When each run's output last grew. Not memoisable the way classification is: the answer it
     /// feeds changes with the passage of time rather than with new bytes, so it is read afresh.
     output_marks: Mutex<HashMap<String, StateTracker>>,
+    /// Every pane's queue of prompts, keyed by `(workspace_id, pane_id)`.
+    ///
+    /// The pane, not the run: a run dies and is replaced by a resume, a respawn or a restart,
+    /// while the pane is the identity `layout.json` persists and the one the user thinks in. A
+    /// queue keyed by run would be lost every time the thing it was queued for was restarted.
+    ///
+    /// A leaf lock. Nothing else is taken while it is held — in particular not `layout` or `runs`,
+    /// which is why `queue_tick` resolves every pane *before* it touches this map.
+    queues: Mutex<HashMap<(String, String), PaneQueue>>,
+    /// The daemon-wide kill switch, suppressing every feed regardless of any pane's own arming.
+    ///
+    /// An atomic rather than a field on the map because the 250ms tick reads it on every pass and
+    /// the answer must not depend on the queue lock being free.
+    queue_paused: AtomicBool,
+    /// Which "the agent finished" signal an *already-armed* pane is willing to act on.
+    ///
+    /// Chooses a signal; it arms nothing. There is no setting anywhere that makes arming the
+    /// default, and this is not a back door into one.
+    auto_feed_trust: Mutex<AutoFeedTrust>,
+    /// Bumped on every queue change, and the only thing the 16ms subscriber loop reads on a pass
+    /// where nothing happened. Without it that loop would have to lock and walk the revision map
+    /// sixty times a second to discover, almost always, that no queue had moved.
+    queue_generation: AtomicU64,
+    /// The generation at which each pane's queue last changed, so a subscriber can work out which
+    /// panes to tell its client about rather than being told to refresh all of them.
+    queue_revisions: Mutex<HashMap<(String, String), u64>>,
     #[cfg(test)]
     /// Auto-launched pane shells put a live run in every pane, which is exactly what the
     /// dispatch-authority tests below assert cannot happen. Those tests suppress the shell so
@@ -515,6 +546,11 @@ impl RuntimeRegistry {
         }
         programme.terminal_gates = terminal_gates;
         let layout = LayoutRegistry::load(&state_dir)?;
+        let queues = restore_pane_queues(&store, &layout);
+        // Read once, here, rather than consulted on disk from the tick: the flag changes only
+        // when somebody asks it to, and the tick must not do file I/O sixty times a minute to
+        // learn something that almost never moves.
+        let paused = store.queue_paused();
         Ok(Self {
             runs: Mutex::new(HashMap::new()),
             receipts,
@@ -528,6 +564,11 @@ impl RuntimeRegistry {
             agent_states: Mutex::new(HashMap::new()),
             output_marks: Mutex::new(HashMap::new()),
             reported_states: Mutex::new(HashMap::new()),
+            queues: Mutex::new(queues),
+            queue_paused: AtomicBool::new(paused),
+            auto_feed_trust: Mutex::new(AutoFeedTrust::default()),
+            queue_generation: AtomicU64::new(0),
+            queue_revisions: Mutex::new(HashMap::new()),
             #[cfg(test)]
             suppress_pane_shells: Mutex::new(false),
             #[cfg(test)]
@@ -1078,6 +1119,7 @@ impl RuntimeRegistry {
                 }
                 _ => None,
             };
+            let mut closed_pane_queue: Option<QueueKey> = None;
             if run_id.is_some() && slot.is_some() && entry.is_none() {
                 return Err((
                     ErrorCode::Internal,
@@ -1143,6 +1185,11 @@ impl RuntimeRegistry {
                 }
             }
             let result = layout.close(workspace_id, pane_id);
+            if result.is_ok() {
+                // Queued for a pane that no longer exists, so the entries have nowhere to go and
+                // the file would otherwise outlive the pane forever.
+                closed_pane_queue = Some((workspace_id.clone(), pane_id.clone()));
+            }
             if let Some(run_id) = &run_id {
                 // Stop irrevocably retired this capability. A persistence failure retains an
                 // Exited pane marker for a safe Close retry, but never dead Active authority.
@@ -1150,6 +1197,11 @@ impl RuntimeRegistry {
                 if result.is_err() {
                     layout.set_runtime(run_id, PaneRuntime::Exited);
                 }
+            }
+            drop(layout);
+            drop(runs);
+            if let Some((workspace_id, pane_id)) = closed_pane_queue {
+                self.forget_pane_queue(&workspace_id, &pane_id);
             }
             return result.map_err(layout_error);
         }
@@ -1818,6 +1870,10 @@ impl RuntimeRegistry {
             .map(|g| self.gate_snapshot(g))
             .collect();
         gates.sort_by(|a, b| a.downstream_run_id.cmp(&b.downstream_run_id));
+        // `runs` is still held here, and `queue_snapshots` takes `layout` and then `queues`.
+        // That is the order every binding mutation uses — runs, then layout — so this adds no new
+        // edge to the lock graph.
+        let queues = self.queue_snapshots();
         ProgrammeSnapshot {
             global_active: capacity_snapshots
                 .iter()
@@ -1827,6 +1883,7 @@ impl RuntimeRegistry {
             human_review_reserved: self.capacity.human_review_reserved,
             repositories,
             gates,
+            queues,
         }
     }
 
@@ -2628,6 +2685,494 @@ impl RuntimeRegistry {
             .input(input)
             .map_err(|message| (ErrorCode::UnsupportedOperation, message))?;
         Ok(input.len())
+    }
+
+    /// Which "the agent finished" signal an already-armed pane believes.
+    ///
+    /// Set once at startup from `--auto-feed-trust`. It chooses a *signal*; there is deliberately
+    /// no setting here or anywhere else that arms a pane, because arming is the one deliberate act
+    /// that lets Dock work while nobody is watching.
+    pub fn set_auto_feed_trust(&self, trust: AutoFeedTrust) {
+        *self
+            .auto_feed_trust
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = trust;
+    }
+
+    pub fn auto_feed_trust(&self) -> AutoFeedTrust {
+        *self
+            .auto_feed_trust
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn queue_paused(&self) -> bool {
+        self.queue_paused.load(Ordering::Acquire)
+    }
+
+    /// How many times any queue has changed since this daemon started.
+    ///
+    /// One atomic load is the whole cost of "did anything happen" on the 16ms subscriber loop,
+    /// which is why it exists: the alternative is walking a map sixty times a second to find out
+    /// that nothing did.
+    pub fn queue_generation(&self) -> u64 {
+        self.queue_generation.load(Ordering::Acquire)
+    }
+
+    /// The generation at which each pane's queue last changed. Read only when
+    /// [`Self::queue_generation`] says something moved.
+    pub fn queue_revisions(&self) -> HashMap<(String, String), u64> {
+        self.queue_revisions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Adds one prompt to a pane's queue.
+    ///
+    /// Two caps are checked here rather than in `PaneQueue`, for the same reason: a queue cannot
+    /// see anything but itself. `MAX_QUEUED_TOTAL` is a property of the daemon, and the byte limit
+    /// is checked before the entry is built so an over-long prompt is refused in the words §11
+    /// gives rather than in the queue's own.
+    pub fn queue_add(
+        &self,
+        workspace_id: &str,
+        pane_id: &str,
+        label: String,
+        prompt: String,
+    ) -> Result<u64, (ErrorCode, String)> {
+        self.require_pane(workspace_id, pane_id)?;
+        if prompt.len() > MAX_PROMPT_BYTES {
+            return Err((
+                ErrorCode::QueueRefused,
+                format!(
+                    "that prompt is {} bytes; the limit is {MAX_PROMPT_BYTES}",
+                    prompt.len()
+                ),
+            ));
+        }
+        let key = (workspace_id.to_owned(), pane_id.to_owned());
+        let (entry_id, durable) = {
+            let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+            let total: usize = queues.values().map(PaneQueue::len).sum();
+            if total >= MAX_QUEUED_TOTAL {
+                return Err((
+                    ErrorCode::QueueRefused,
+                    format!(
+                        "this daemon already holds {MAX_QUEUED_TOTAL} queued prompts across every pane; remove one before adding another"
+                    ),
+                ));
+            }
+            let queue = queues.entry(key.clone()).or_default();
+            let entry_id = queue
+                .add(label, prompt)
+                .map_err(|message| (ErrorCode::QueueRefused, message))?;
+            (entry_id, durable_queue(&key, queue))
+        };
+        self.commit_queue_change(&key, &durable);
+        Ok(entry_id)
+    }
+
+    pub fn queue_remove(
+        &self,
+        workspace_id: &str,
+        pane_id: &str,
+        entry_id: u64,
+    ) -> Result<(), (ErrorCode, String)> {
+        self.require_pane(workspace_id, pane_id)?;
+        let key = (workspace_id.to_owned(), pane_id.to_owned());
+        let durable = {
+            let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+            let queue = queues.get_mut(&key).ok_or_else(|| {
+                (
+                    ErrorCode::QueueRefused,
+                    format!("this pane has no queued entry {entry_id}"),
+                )
+            })?;
+            queue
+                .remove(entry_id)
+                .map_err(|message| (ErrorCode::QueueRefused, message))?;
+            durable_queue(&key, queue)
+        };
+        self.commit_queue_change(&key, &durable);
+        Ok(())
+    }
+
+    pub fn queue_clear(
+        &self,
+        workspace_id: &str,
+        pane_id: &str,
+    ) -> Result<usize, (ErrorCode, String)> {
+        self.require_pane(workspace_id, pane_id)?;
+        let key = (workspace_id.to_owned(), pane_id.to_owned());
+        let (removed, durable) = {
+            let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(queue) = queues.get_mut(&key) else {
+                return Ok(0);
+            };
+            (queue.clear(), durable_queue(&key, queue))
+        };
+        self.commit_queue_change(&key, &durable);
+        Ok(removed)
+    }
+
+    /// Arms or disarms auto-feed for one pane.
+    ///
+    /// The refusals are the point. Under the default trust a pane whose agent has never reported a
+    /// state can never satisfy the feed rule, so arming it would produce a queue that sits there
+    /// forever looking broken — `PaneQueue::arm` refuses it in words that name `dock hooks
+    /// --install`. Under `--auto-feed-trust=screen` there is no report to check, so the question
+    /// becomes whether there is an agent there at all: feeding a shell would type a sentence at a
+    /// `$` prompt and press return, and that refusal is worth making before the queue is armed as
+    /// well as at every feed.
+    ///
+    /// Nothing about arming is persisted. See [`restore_pane_queues`].
+    pub fn queue_set_auto(
+        &self,
+        workspace_id: &str,
+        pane_id: &str,
+        enabled: bool,
+    ) -> Result<(), (ErrorCode, String)> {
+        self.require_pane(workspace_id, pane_id)?;
+        let key = (workspace_id.to_owned(), pane_id.to_owned());
+        if !enabled {
+            let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+            queues.entry(key.clone()).or_default().disarm();
+            drop(queues);
+            self.note_queue_change(&key);
+            return Ok(());
+        }
+        let trust = self.auto_feed_trust();
+        let run_id = self
+            .layout
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pane_run(workspace_id, pane_id);
+        if trust == AutoFeedTrust::Screen {
+            // One pulse, on a human action, so the answer is this moment's rather than whatever a
+            // subscriber last happened to leave in the classification cache. Under the default
+            // trust this is skipped entirely: a reported state already proves an agent.
+            let _ = self.pulse();
+            let agent = run_id.as_deref().and_then(|run_id| {
+                self.agent_states
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(run_id)
+                    .and_then(|classified| classified.agent)
+            });
+            if agent.is_none() {
+                return Err((
+                    ErrorCode::QueueRefused,
+                    "nothing in that pane looks like an agent; auto-feed would type into a shell"
+                        .to_string(),
+                ));
+            }
+        }
+        let has_reported = run_id.as_deref().is_some_and(|run_id| {
+            self.reported_states
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(run_id)
+        });
+        let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+        queues
+            .entry(key.clone())
+            .or_default()
+            .arm(has_reported, trust)
+            .map_err(|message| (ErrorCode::QueueRefused, message))?;
+        drop(queues);
+        self.note_queue_change(&key);
+        Ok(())
+    }
+
+    /// The daemon-wide kill switch.
+    ///
+    /// Persisted, and a persistence failure is an error rather than a line on stderr: pausing
+    /// before you walk away is a decision that has to survive a restart, so a pause the daemon
+    /// could not write down is a pause the caller must be told it does not have.
+    pub fn queue_set_paused(&self, paused: bool) -> Result<(), (ErrorCode, String)> {
+        self.store
+            .set_queue_pause(paused)
+            .map_err(|message| (ErrorCode::Internal, message))?;
+        self.queue_paused.store(paused, Ordering::Release);
+        // Every queue changed, because the pause is what each of them is now doing. Saying so per
+        // pane rather than daemon-wide is what lets `Event::QueueChanged` carry a pane at all: a
+        // client that hears about the pause hears about it the same way it hears about a drain.
+        let keys: Vec<QueueKey> = self
+            .queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        for key in &keys {
+            self.note_queue_change(key);
+        }
+        if keys.is_empty() {
+            self.queue_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
+    /// Every queue the daemon holds, in one listing, so a board fills its runs lane in one round
+    /// trip rather than one request per pane.
+    pub fn queue_snapshots(&self) -> Vec<PaneQueueSnapshot> {
+        let runs: HashMap<(String, String), String> = {
+            let layout = self.layout.lock().unwrap_or_else(|p| p.into_inner());
+            layout
+                .snapshot()
+                .workspaces
+                .into_iter()
+                .flat_map(|workspace| {
+                    workspace
+                        .panes
+                        .into_iter()
+                        .filter_map(move |(pane_id, pane)| {
+                            pane.run_id
+                                .map(|run_id| ((workspace.workspace_id.clone(), pane_id), run_id))
+                        })
+                })
+                .collect()
+        };
+        let queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+        let mut snapshots: Vec<PaneQueueSnapshot> = queues
+            .iter()
+            .map(|((workspace_id, pane_id), queue)| PaneQueueSnapshot {
+                workspace_id: workspace_id.clone(),
+                pane_id: pane_id.clone(),
+                run_id: runs.get(&(workspace_id.clone(), pane_id.clone())).cloned(),
+                auto_feed: queue.auto_feed(),
+                awaiting_ack: queue.awaiting_ack(),
+                holding_because: queue.holding_because().map(str::to_owned),
+                entries: queue
+                    .entries()
+                    .iter()
+                    .map(|entry| QueueEntrySnapshot {
+                        entry_id: entry.entry_id,
+                        label: entry.label.clone(),
+                        // A preview, never the prompt: sixteen 8 KiB prompts across a handful of
+                        // panes would not fit in one protocol message.
+                        preview: entry.preview(),
+                        bytes: entry.bytes(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        snapshots.sort_by(|a, b| (&a.workspace_id, &a.pane_id).cmp(&(&b.workspace_id, &b.pane_id)));
+        snapshots
+    }
+
+    /// Forgets one pane's queue, in memory and on disk.
+    ///
+    /// Called when a pane closes. Without it a queue file outlives the pane it was keyed to
+    /// forever, and the entries in it would reappear the day somebody created a pane with the same
+    /// name.
+    pub fn forget_pane_queue(&self, workspace_id: &str, pane_id: &str) {
+        let key = (workspace_id.to_owned(), pane_id.to_owned());
+        let existed = self
+            .queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key)
+            .is_some();
+        self.queue_revisions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+        if let Err(message) = self.store.remove_pane_queue(workspace_id, pane_id) {
+            eprintln!("dockd: could not remove the queue for a closed pane: {message}");
+        }
+        if existed {
+            self.queue_generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// One pass of the auto-feed machinery.
+    ///
+    /// Driven by a dedicated 250ms daemon thread rather than by the 16ms loop in `stream_events`,
+    /// and that is not a tuning choice. That loop is a *subscriber* loop: a queue driven from it
+    /// would only advance while a TUI happened to be attached, and would advance N times over with
+    /// N clients connected. Both are wrong in ways a user would experience as the daemon being
+    /// haunted.
+    ///
+    /// The early return matters as much as the rest. A daemon with no queues at all — which is
+    /// every daemon until somebody queues something — does one lock and one length comparison four
+    /// times a second and never touches `pulse`, so the whole subsystem costs nothing until it is
+    /// used.
+    pub fn queue_tick(&self) {
+        if self
+            .queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+        {
+            return;
+        }
+        let reported = self
+            .reported_states
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let observations: Vec<QueueObservation> = self
+            .pulse()
+            .into_iter()
+            .map(|pulse| QueueObservation {
+                // Not "has this agent ever reported", but "is *this* answer the agent's own".
+                // A report that has been superseded by the screen is an inference again, and
+                // guard (4) is about the provenance of the `Done` in hand.
+                reported: reported.get(&pulse.run_id) == Some(&pulse.agent_state),
+                run_id: pulse.run_id,
+                agent: pulse.agent,
+                state: pulse.agent_state,
+            })
+            .collect();
+        self.queue_tick_from(&observations, Instant::now());
+    }
+
+    /// The tick with its two impure inputs — what every run is doing, and what time it is — handed
+    /// in.
+    ///
+    /// Split out so the wiring is testable without a real agent in a real process table. `pulse`
+    /// can only report an agent it can actually detect, so a test driven through [`Self::queue_tick`]
+    /// could never reach a feed at all: every pane would classify as a shell and refuse, and the
+    /// test would pass by never testing anything.
+    fn queue_tick_from(&self, observations: &[QueueObservation], now: Instant) {
+        // Only the panes that actually have a queue are looked up, and they are looked up one at a
+        // time. Walking the layout instead would clone every workspace and every pane four times a
+        // second to discover, on a machine with one queue, fifteen panes it has nothing to say
+        // about. `queues` is a leaf lock, so the keys are taken and the lock dropped before
+        // `layout` is touched at all — a feed calls `pane_input`, which takes `layout` and `runs`
+        // itself.
+        let keys: Vec<QueueKey> = self
+            .queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let by_run: HashMap<String, QueueKey> = {
+            let layout = self.layout.lock().unwrap_or_else(|p| p.into_inner());
+            keys.into_iter()
+                .filter_map(|key| layout.pane_run(&key.0, &key.1).map(|run_id| (run_id, key)))
+                .collect()
+        };
+        let panes: Vec<(QueueKey, &QueueObservation)> = observations
+            .iter()
+            .filter_map(|observation| {
+                by_run
+                    .get(&observation.run_id)
+                    .cloned()
+                    .map(|key| (key, observation))
+            })
+            .collect();
+        let paused = self.queue_paused();
+        let trust = self.auto_feed_trust();
+        let mut feeds: Vec<(QueueKey, String, DurablePaneQueue)> = Vec::new();
+        let mut held: Vec<QueueKey> = Vec::new();
+        {
+            let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+            for (key, observation) in panes {
+                // `get_mut`, never `entry`: a pane nobody has queued anything for has no queue,
+                // and the tick must not conjure one for every pane on the machine.
+                let Some(queue) = queues.get_mut(&key) else {
+                    continue;
+                };
+                let before = queue.holding_because().map(str::to_owned);
+                match queue.poll(
+                    observation.agent,
+                    observation.state,
+                    observation.reported,
+                    trust,
+                    paused,
+                    now,
+                ) {
+                    Some(prompt) => {
+                        let durable = durable_queue(&key, queue);
+                        feeds.push((key, prompt, durable));
+                    }
+                    None => {
+                        if before.as_deref() != queue.holding_because() {
+                            held.push(key);
+                        }
+                    }
+                }
+            }
+        }
+        // A held queue changed nothing but its explanation, which the runs lane still shows, so a
+        // client is told — and nothing is written to disk, because the sentence is about the last
+        // few seconds of this process and would be a lie after a restart.
+        for key in held {
+            self.note_queue_change(&key);
+        }
+        for (key, prompt, durable) in feeds {
+            let (workspace_id, pane_id) = key.clone();
+            // The same call the client's keystrokes go through, with all four of its binding
+            // re-validations intact. Auto-feed gets no privileged path into a pane, which is what
+            // makes "an auto-feeding queue of depth sixteen creates zero worktrees" structural
+            // rather than a promise: there is no other verb here to reach for.
+            match self.pane_input(&workspace_id, &pane_id, prompt.as_bytes()) {
+                Ok(_) => self.commit_queue_change(&key, &durable),
+                Err((_, message)) => {
+                    // The entry goes back and the pane is disarmed. Retrying into a pane whose
+                    // binding just changed is how one wrong feed becomes many.
+                    let durable = {
+                        let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+                        let Some(queue) = queues.get_mut(&key) else {
+                            continue;
+                        };
+                        queue.feed_failed(&message);
+                        durable_queue(&key, queue)
+                    };
+                    self.commit_queue_change(&key, &durable);
+                }
+            }
+        }
+    }
+
+    /// Refuses an operation against a pane that is not there, before anything is allocated for it.
+    fn require_pane(&self, workspace_id: &str, pane_id: &str) -> Result<(), (ErrorCode, String)> {
+        if self
+            .layout
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pane_exists(workspace_id, pane_id)
+        {
+            Ok(())
+        } else {
+            Err((
+                ErrorCode::PaneNotFound,
+                format!("no pane {pane_id} in workspace {workspace_id}"),
+            ))
+        }
+    }
+
+    /// Records that a queue moved and writes it down.
+    ///
+    /// A write failure is one line on stderr rather than an error to the caller, and the asymmetry
+    /// with [`Self::queue_set_paused`] is deliberate: an entry that fails to persist is still
+    /// queued and still feeds correctly for the life of this daemon, and refusing work that has
+    /// already been accepted would be a stranger answer than losing it at the next restart. A
+    /// pause that fails to persist is a safety promise the daemon cannot keep, so that one is
+    /// refused.
+    fn commit_queue_change(&self, key: &QueueKey, durable: &DurablePaneQueue) {
+        if let Err(message) = self.store.save_pane_queue(durable) {
+            eprintln!(
+                "dockd: could not persist the queue for {}/{}: {message}",
+                key.0, key.1
+            );
+        }
+        self.note_queue_change(key);
+    }
+
+    fn note_queue_change(&self, key: &QueueKey) {
+        let generation = self.queue_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.queue_revisions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.clone(), generation);
     }
 
     /// Resizes the PTY behind one Dock-owned pane and records the geometry, so a run launched
@@ -3469,6 +4014,130 @@ fn pane_size_key(workspace_id: &str, pane_id: &str) -> String {
 
 /// A pane's shell is identified by the pane it serves, not by the launch that created it, so the
 /// same pane always reclaims the same identity across relaunches.
+/// How a queue is keyed: `(workspace_id, pane_id)`.
+///
+/// Named because it is written out a dozen times and because the *pane* half is the decision. A
+/// run dies and is replaced by a resume, a respawn or a daemon restart; the pane is the identity
+/// `layout.json` persists and the one the user thinks in.
+type QueueKey = (String, String);
+
+/// What one tick knows about one run.
+///
+/// Gathered from `pulse` in production and by hand in tests, which is the whole reason it is a
+/// struct: the wiring around `PaneQueue` has to be reachable without a real agent process.
+struct QueueObservation {
+    run_id: String,
+    agent: Option<AgentKind>,
+    state: AgentState,
+    /// Whether this exact state is what the agent said about itself, rather than what its screen
+    /// was read to mean. Guard (4) is about the provenance of the `Done` in hand.
+    reported: bool,
+}
+
+/// One queue in the form that goes to disk. Entries and the id counter; nothing else, by design.
+fn durable_queue(key: &QueueKey, queue: &PaneQueue) -> DurablePaneQueue {
+    DurablePaneQueue {
+        schema_version: crate::storage::QUEUE_SCHEMA_VERSION,
+        workspace_id: key.0.clone(),
+        pane_id: key.1.clone(),
+        next_entry_id: queue.next_entry_id(),
+        entries: queue
+            .entries()
+            .iter()
+            .map(|entry| DurableQueueEntry {
+                entry_id: entry.entry_id,
+                label: entry.label.clone(),
+                prompt: entry.prompt.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Reads every stored queue back, and refuses to bring three things back with it.
+///
+/// **Arming.** `PaneQueue::restored` forces `auto_feed` off and says so, and nothing here can
+/// override that — the file does not carry the flag in the first place. A daemon that comes back
+/// from a crash and immediately starts typing at agents is precisely the unattended behaviour the
+/// whole design guards against, so a restart is a disarm, whatever the pane was before.
+///
+/// **A queue whose pane is gone.** Dropped, and its file with it, so a pane closed while the
+/// daemon was down does not leave an entry to be inherited by the next pane to wear its name.
+///
+/// **A file that will not parse.** Quarantined and stepped over, exactly as an unreadable
+/// programme gate is: the file is the only copy of work somebody queued, and a daemon that refuses
+/// to boot because one of them is corrupt is worse than one that boots without it.
+fn restore_pane_queues(
+    store: &LocalStore,
+    layout: &LayoutRegistry,
+) -> HashMap<QueueKey, PaneQueue> {
+    let records = match store.list_pane_queues() {
+        Ok(records) => records,
+        Err(message) => {
+            eprintln!("dockd: could not read stored queues: {message}");
+            return HashMap::new();
+        }
+    };
+    let mut queues = HashMap::new();
+    for record in records {
+        let stored = match record.queue {
+            Ok(stored) => stored,
+            Err(message) => {
+                eprintln!(
+                    "dockd: quarantining an unreadable queue {}: {message}",
+                    record.identity
+                );
+                if let Err(message) = store.quarantine_pane_queue(&record.identity) {
+                    eprintln!("dockd: could not quarantine that queue: {message}");
+                }
+                continue;
+            }
+        };
+        if !layout.pane_exists(&stored.workspace_id, &stored.pane_id) {
+            if let Err(message) = store.remove_pane_queue(&stored.workspace_id, &stored.pane_id) {
+                eprintln!("dockd: could not drop the queue of a departed pane: {message}");
+            }
+            continue;
+        }
+        let entries = stored
+            .entries
+            .into_iter()
+            .map(|entry| QueueEntry {
+                entry_id: entry.entry_id,
+                label: entry.label,
+                prompt: entry.prompt,
+            })
+            .collect();
+        queues.insert(
+            (stored.workspace_id, stored.pane_id),
+            PaneQueue::restored(entries, stored.next_entry_id),
+        );
+    }
+    queues
+}
+
+/// How often the queue thread looks at the world.
+///
+/// Auto-feed is not latency-critical — a quarter second after an agent finishes is invisible — and
+/// 250ms keeps the cost of the process-table walk, already time-limited at 500ms, in the noise.
+pub const QUEUE_TICK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Starts the daemon's queue thread.
+///
+/// A thread of its own rather than a step in the subscriber loop. That loop is per-connection, so
+/// a queue driven from it would advance only while a TUI was attached and would advance N times
+/// over with N clients — a queue that drains four entries because four dashboards are open is not
+/// a queue anybody can reason about.
+pub fn spawn_queue_tick(runtime: Arc<RuntimeRegistry>) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("dock-queue".into())
+        .spawn(move || {
+            loop {
+                runtime.queue_tick();
+                thread::sleep(QUEUE_TICK_INTERVAL);
+            }
+        })
+}
+
 fn pane_shell_run_id(workspace_id: &str, pane_id: &str) -> String {
     format!("{PANE_SHELL_RUN_ID_PREFIX}{workspace_id}_{pane_id}")
 }
@@ -4690,6 +5359,670 @@ mod tests {
             unsafe { nix::libc::kill(-process_group_id, 0) },
             0,
             "retired Dock-owned group {process_group_id} survived lifecycle completion"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The queue's wiring.
+    //
+    // `queue.rs` proves the *decision* — every guard in §8.4, with no process in it. What is
+    // below proves the *wiring*: that the decision is asked the right questions, that the answer
+    // reaches a pane through the same door a keystroke does, and that the three things a restart
+    // must and must not carry over actually behave that way. None of it depends on a real agent
+    // existing, because `pulse` can only report an agent it can genuinely detect and a test that
+    // waited for one would pass by never reaching a feed at all.
+    // ---------------------------------------------------------------------------------------
+
+    /// A state directory that outlives one registry, for the restart tests.
+    fn queue_state_dir(label: &str) -> PathBuf {
+        let state = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "dock-queue-{label}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+        let _ = fs::remove_dir_all(&state);
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        state
+    }
+
+    /// A workspace with one pane, and the id of the shell that pane auto-launched.
+    fn queue_pane(registry: &RuntimeRegistry) -> String {
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Daily".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+        registry.layout().workspaces[0].panes["p1"]
+            .run_id
+            .clone()
+            .expect("a new pane auto-launches a shell")
+    }
+
+    /// One tick's worth of "what this run is doing", built by hand.
+    fn observation(run_id: &str, state: AgentState, reported: bool) -> QueueObservation {
+        QueueObservation {
+            run_id: run_id.to_owned(),
+            agent: Some(AgentKind::Claude),
+            state,
+            reported,
+        }
+    }
+
+    /// The one queue a test made, or nothing.
+    fn only_queue(registry: &RuntimeRegistry) -> Option<crate::protocol::PaneQueueSnapshot> {
+        registry.queue_snapshots().into_iter().next()
+    }
+
+    /// Drives a pane from working to a settled, reported `Done` — the full shape of one auto-feed
+    /// cycle, with the clock supplied rather than waited on.
+    fn feed_cycle(registry: &RuntimeRegistry, run_id: &str, base: Instant) {
+        registry.queue_tick_from(&[observation(run_id, AgentState::Working, true)], base);
+        registry.queue_tick_from(
+            &[observation(run_id, AgentState::Done, true)],
+            base + Duration::from_millis(250),
+        );
+        // Past QUEUE_SETTLE, so guard (5) is satisfied by the clock the test chose rather than by
+        // a sleep that could flake on a loaded machine.
+        registry.queue_tick_from(
+            &[observation(run_id, AgentState::Done, true)],
+            base + Duration::from_secs(4),
+        );
+    }
+
+    /// Every worktree Git knows about, as a set that can be compared before and after.
+    fn worktrees(root: &Path) -> Vec<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("list worktrees");
+        let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    fn bound_run_ids(registry: &RuntimeRegistry) -> Vec<String> {
+        let mut ids: Vec<String> = registry
+            .runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn receipt_count(state: &Path) -> usize {
+        fs::read_dir(state.join("dispatches"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    /// The acceptance criterion in one test: *after a daemon restart every pane is unarmed,
+    /// whatever it was before, and says so.*
+    ///
+    /// The entries come back — they are work somebody queued and nothing has happened to it. The
+    /// arming does not, and cannot: the file has no field for it. A daemon that came back from a
+    /// crash and immediately started typing at agents is exactly the unattended behaviour the
+    /// standing safety decision guards against.
+    #[test]
+    fn a_daemon_restart_disarms_every_pane_and_says_so() {
+        let state = queue_state_dir("restart-disarms");
+        {
+            let first = RuntimeRegistry::new(&state, 2000).unwrap();
+            let run_id = queue_pane(&first);
+            first
+                .report_agent_state(&run_id, AgentState::Done)
+                .expect("a hooked agent reports its state");
+            first
+                .queue_add("w1", "p1", "card 7".into(), "keep going".into())
+                .expect("queue a prompt");
+            first
+                .queue_set_auto("w1", "p1", true)
+                .expect("a hooked agent can be armed");
+            assert!(
+                only_queue(&first).expect("one queue").auto_feed,
+                "the pane must actually be armed, or the restart proves nothing"
+            );
+            let _ = first.lifecycle(&run_id, LifecycleOperation::Stop);
+        }
+
+        let restored = TestRegistry {
+            registry: RuntimeRegistry::new(&state, 2000).unwrap(),
+            state,
+        };
+        let queue = only_queue(&restored).expect("the queue came back");
+        assert_eq!(
+            queue.entries.len(),
+            1,
+            "queued work survives a restart; it is work somebody asked for"
+        );
+        assert!(
+            !queue.auto_feed,
+            "arming must not survive a restart, whatever the pane was before"
+        );
+        assert_eq!(
+            queue.holding_because.as_deref(),
+            Some(crate::queue::DISARMED_BY_RESTART),
+            "and the pane must say why, or a queue that stopped feeding looks broken"
+        );
+    }
+
+    /// The other half of the restart story, and it goes the opposite way on purpose: *`dock queue
+    /// pause` stops every feed daemon-wide, and survives a restart.*
+    ///
+    /// Pausing before you walk away is a decision that has to hold while you are away, including
+    /// across the crash you were not there for. Arming is a decision that must not. The two are
+    /// persisted differently because they fail safe in opposite directions.
+    #[test]
+    fn a_pause_survives_a_restart_and_overrides_an_armed_pane() {
+        let state = queue_state_dir("pause-survives");
+        {
+            let first = RuntimeRegistry::new(&state, 2000).unwrap();
+            first.queue_set_paused(true).expect("pause the daemon");
+        }
+        let restored = TestRegistry {
+            registry: RuntimeRegistry::new(&state, 2000).unwrap(),
+            state,
+        };
+        assert!(
+            restored.queue_paused(),
+            "a pause taken before a restart must still hold after it"
+        );
+        let run_id = queue_pane(&restored);
+        restored
+            .report_agent_state(&run_id, AgentState::Done)
+            .expect("report a state");
+        restored
+            .queue_add("w1", "p1", "card 7".into(), "keep going".into())
+            .expect("queue a prompt");
+        restored
+            .queue_set_auto("w1", "p1", true)
+            .expect("arm the pane");
+
+        feed_cycle(&restored, &run_id, Instant::now());
+
+        let queue = only_queue(&restored).expect("one queue");
+        assert_eq!(
+            queue.entries.len(),
+            1,
+            "a paused daemon feeds nothing however armed a pane is"
+        );
+        assert!(
+            queue
+                .holding_because
+                .as_deref()
+                .is_some_and(|held| held.contains("paused")),
+            "and the pause explains itself: {:?}",
+            queue.holding_because
+        );
+    }
+
+    /// `MAX_QUEUED_TOTAL` is the one cap a `PaneQueue` structurally cannot enforce — it can see
+    /// itself and nothing else — so it is enforced here, and refused rather than dropped. A queue
+    /// that discards work is worse than one that says no.
+    #[test]
+    fn the_daemon_refuses_a_prompt_past_its_total_cap_rather_than_dropping_one() {
+        let registry = registry();
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w1".into(),
+                name: "Daily".into(),
+                pane_id: "p0".into(),
+            })
+            .expect("create workspace");
+        let panes = crate::queue::MAX_QUEUED_TOTAL / crate::queue::MAX_QUEUE_DEPTH;
+        for index in 1..panes {
+            registry
+                .workspace(WorkspaceRequest::Split {
+                    workspace_id: "w1".into(),
+                    pane_id: format!("p{}", index - 1),
+                    new_pane_id: format!("p{index}"),
+                    axis: crate::layout::SplitAxis::Vertical,
+                    kind: PaneKind::Terminal,
+                })
+                .expect("split a pane");
+        }
+        for index in 0..panes {
+            for entry in 0..crate::queue::MAX_QUEUE_DEPTH {
+                registry
+                    .queue_add(
+                        "w1",
+                        &format!("p{index}"),
+                        format!("card {entry}"),
+                        "keep going".into(),
+                    )
+                    .expect("every entry up to the total cap fits");
+            }
+        }
+        let (code, message) = registry
+            .queue_add("w1", "p0", "one too many".into(), "keep going".into())
+            .expect_err("the total cap must refuse");
+        assert_eq!(code, ErrorCode::QueueRefused);
+        assert!(
+            message.contains(&crate::queue::MAX_QUEUED_TOTAL.to_string())
+                && message.contains("every pane"),
+            "the refusal must name the daemon-wide cap: {message}"
+        );
+        let total: usize = registry
+            .queue_snapshots()
+            .iter()
+            .map(|queue| queue.entries.len())
+            .sum();
+        assert_eq!(
+            total,
+            crate::queue::MAX_QUEUED_TOTAL,
+            "nothing may be dropped to make room"
+        );
+    }
+
+    /// Refused at the daemon's edge, in the daemon's words, before an entry is built for it.
+    /// Truncating would put half a prompt in front of an agent, which is worse than no prompt.
+    #[test]
+    fn a_prompt_over_the_byte_limit_is_refused_rather_than_truncated() {
+        let registry = registry();
+        queue_pane(&registry);
+        let oversized = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let (code, message) = registry
+            .queue_add("w1", "p1", "card 7".into(), oversized)
+            .expect_err("an over-long prompt must be refused");
+        assert_eq!(code, ErrorCode::QueueRefused);
+        assert_eq!(
+            message,
+            format!(
+                "that prompt is {} bytes; the limit is {MAX_PROMPT_BYTES}",
+                MAX_PROMPT_BYTES + 1
+            )
+        );
+        assert!(
+            registry.queue_snapshots().is_empty(),
+            "a refused prompt must not leave a queue behind it"
+        );
+    }
+
+    /// A prompt the daemon could not deliver is work that was never done, so it goes back — and
+    /// the pane is disarmed, because retrying into a pane whose binding just changed is how one
+    /// wrong feed becomes many.
+    #[test]
+    fn a_feed_the_pane_refuses_goes_back_on_the_queue_and_disarms_it() {
+        let registry = registry();
+        let run_id = queue_pane(&registry);
+        registry
+            .report_agent_state(&run_id, AgentState::Done)
+            .expect("report a state");
+        registry
+            .queue_add("w1", "p1", "card 7".into(), "keep going".into())
+            .expect("queue a prompt");
+        registry
+            .queue_set_auto("w1", "p1", true)
+            .expect("arm the pane");
+        // The binding moves to a run this daemon has no authority over, which is what `pane_input`
+        // exists to refuse. Nothing about the queue is special-cased: it goes through the same
+        // four re-validations a keystroke does and is turned away by the same one.
+        registry
+            .layout
+            .lock()
+            .unwrap()
+            .bind_run("w1", "p1", "replacement_run".into(), PaneRuntime::Running)
+            .expect("rebind the pane");
+
+        feed_cycle(&registry, "replacement_run", Instant::now());
+
+        let queue = only_queue(&registry).expect("one queue");
+        assert_eq!(
+            queue.entries.len(),
+            1,
+            "an undelivered prompt must come back rather than being lost"
+        );
+        assert_eq!(queue.entries[0].label, "card 7");
+        assert!(
+            !queue.auto_feed,
+            "a failed feed disarms the pane and asks for a human"
+        );
+        assert!(
+            queue
+                .holding_because
+                .as_deref()
+                .is_some_and(|held| held.contains("authority")),
+            "the daemon's own refusal is what the pane shows: {:?}",
+            queue.holding_because
+        );
+    }
+
+    /// The safety claim of §8.5, proved rather than asserted: **an auto-feeding queue of depth
+    /// sixteen creates zero worktrees.**
+    ///
+    /// A queue entry is text put in front of an agent that is already running in a worktree that
+    /// already exists. Auto-feed never constructs a `DispatchRequest`, never calls
+    /// `git::ensure_worktree`, never creates a branch, never binds a run and never creates a pane
+    /// — and the reason it cannot is structural, because the only verb the tick has is
+    /// `pane_input`. This measures all three of the observable consequences before and after a
+    /// complete feed.
+    #[test]
+    fn a_full_auto_feed_cycle_creates_no_worktree_and_binds_no_run() {
+        let repo = Repo::new("queue-no-worktree");
+        let registry = TestRegistry {
+            registry: RuntimeRegistry::new(&repo.state, 2000).unwrap(),
+            state: repo.state.clone(),
+        };
+        let run_id = queue_pane(&registry);
+        registry
+            .report_agent_state(&run_id, AgentState::Done)
+            .expect("report a state");
+        registry
+            .queue_add("w1", "p1", "card 7".into(), "keep going".into())
+            .expect("queue a prompt");
+        registry
+            .queue_set_auto("w1", "p1", true)
+            .expect("arm the pane");
+
+        let worktrees_before = worktrees(&repo.root);
+        let runs_before = bound_run_ids(&registry);
+        let receipts_before = receipt_count(&repo.state);
+        let panes_before = registry.layout().workspaces[0].panes.len();
+
+        feed_cycle(&registry, &run_id, Instant::now());
+
+        let queue = only_queue(&registry).expect("one queue");
+        assert!(
+            queue.entries.is_empty() && queue.awaiting_ack,
+            "the point of the test is a feed that actually happened: {queue:?}"
+        );
+        assert_eq!(
+            worktrees(&repo.root),
+            worktrees_before,
+            "auto-feed must not create a worktree"
+        );
+        assert_eq!(
+            bound_run_ids(&registry),
+            runs_before,
+            "auto-feed must not bind a run"
+        );
+        assert_eq!(
+            receipt_count(&repo.state),
+            receipts_before,
+            "auto-feed must not dispatch"
+        );
+        assert_eq!(
+            registry.layout().workspaces[0].panes.len(),
+            panes_before,
+            "auto-feed must not create a pane"
+        );
+    }
+
+    /// The refusal §8.4's guard (4) makes at arm time, in the exact words that name the command
+    /// which fixes it. A queue that is silently never going to fire is worse than one that refuses
+    /// to be armed.
+    #[test]
+    fn arming_a_pane_whose_agent_has_never_reported_names_the_hooks_command() {
+        let registry = registry();
+        queue_pane(&registry);
+        let (code, message) = registry
+            .queue_set_auto("w1", "p1", true)
+            .expect_err("arming without a reported state must be refused");
+        assert_eq!(code, ErrorCode::QueueRefused);
+        assert_eq!(message, crate::queue::ARM_WITHOUT_REPORTED_STATE);
+        assert!(
+            message.contains("dock hooks --install"),
+            "the refusal has to say what to do about it"
+        );
+    }
+
+    /// The sharpest hazard in the design, refused before the queue is armed as well as at every
+    /// feed. Under `--auto-feed-trust=screen` there is no hook report to stand in for "there is an
+    /// agent here", so the question has to be asked directly: feeding a shell would type a
+    /// sentence at a `$` prompt and press return.
+    #[test]
+    fn arming_a_shell_pane_under_screen_trust_is_refused_before_anything_is_armed() {
+        let registry = registry();
+        queue_pane(&registry);
+        registry.set_auto_feed_trust(AutoFeedTrust::Screen);
+        let (code, message) = registry
+            .queue_set_auto("w1", "p1", true)
+            .expect_err("a pane running a shell must not be armable");
+        assert_eq!(code, ErrorCode::QueueRefused);
+        assert_eq!(
+            message,
+            "nothing in that pane looks like an agent; auto-feed would type into a shell"
+        );
+        assert!(
+            registry
+                .queue_snapshots()
+                .first()
+                .is_none_or(|queue| !queue.auto_feed),
+            "a refused arm must leave the pane disarmed"
+        );
+    }
+
+    /// Guard (3) again, at the other end: even armed, even settled, even reported, a pane with no
+    /// agent in it is never fed. This is the one that would type a sentence into a shell.
+    #[test]
+    fn a_pane_with_no_agent_is_never_fed_and_says_why() {
+        let registry = registry();
+        let run_id = queue_pane(&registry);
+        registry
+            .report_agent_state(&run_id, AgentState::Done)
+            .expect("report a state");
+        registry
+            .queue_add("w1", "p1", "card 7".into(), "keep going".into())
+            .expect("queue a prompt");
+        registry
+            .queue_set_auto("w1", "p1", true)
+            .expect("arm the pane");
+
+        let base = Instant::now();
+        for (offset, state) in [
+            (0, AgentState::Working),
+            (250, AgentState::Idle),
+            (4_000, AgentState::Idle),
+        ] {
+            registry.queue_tick_from(
+                &[QueueObservation {
+                    run_id: run_id.clone(),
+                    agent: None,
+                    state,
+                    reported: true,
+                }],
+                base + Duration::from_millis(offset),
+            );
+        }
+
+        let queue = only_queue(&registry).expect("one queue");
+        assert_eq!(queue.entries.len(), 1, "a shell is never fed");
+        assert!(
+            queue
+                .holding_because
+                .as_deref()
+                .is_some_and(|held| held.contains("shell")),
+            "and it is an explicit refusal, not a silent skip: {:?}",
+            queue.holding_because
+        );
+    }
+
+    /// A queue is keyed by the pane, so when the pane goes the queue goes with it — in memory and
+    /// on disk. Otherwise the file outlives the pane forever and its entries reappear the day
+    /// somebody creates a pane with the same name.
+    #[test]
+    fn closing_a_pane_takes_its_queue_with_it() {
+        let registry = registry();
+        queue_pane(&registry);
+        registry
+            .workspace(WorkspaceRequest::Split {
+                workspace_id: "w1".into(),
+                pane_id: "p1".into(),
+                new_pane_id: "p2".into(),
+                axis: crate::layout::SplitAxis::Vertical,
+                kind: PaneKind::Terminal,
+            })
+            .expect("split a second pane");
+        registry
+            .queue_add("w1", "p2", "card 7".into(), "keep going".into())
+            .expect("queue a prompt");
+        assert_eq!(registry.queue_snapshots().len(), 1);
+        registry
+            .workspace(WorkspaceRequest::Close {
+                workspace_id: "w1".into(),
+                pane_id: "p2".into(),
+            })
+            .expect("close the pane");
+        assert!(
+            registry.queue_snapshots().is_empty(),
+            "a closed pane leaves no queue behind"
+        );
+        assert!(
+            !registry.state.join("queues").join("w1_p2.json").exists(),
+            "nor a file"
+        );
+    }
+
+    /// A queue whose pane is gone by the time the daemon comes back is dropped, so a pane closed
+    /// while the daemon was down does not leave work to be inherited by the next pane to wear its
+    /// name.
+    #[test]
+    fn a_queue_whose_pane_is_gone_is_dropped_on_load() {
+        let state = queue_state_dir("orphan-queue");
+        {
+            let first = RuntimeRegistry::new(&state, 2000).unwrap();
+            let run_id = queue_pane(&first);
+            first
+                .queue_add("w1", "p1", "card 7".into(), "keep going".into())
+                .expect("queue a prompt");
+            // Written for a pane that will not be in the layout the next daemon loads.
+            first
+                .store
+                .save_pane_queue(&DurablePaneQueue {
+                    schema_version: crate::storage::QUEUE_SCHEMA_VERSION,
+                    workspace_id: "w1".into(),
+                    pane_id: "gone".into(),
+                    next_entry_id: 2,
+                    entries: vec![DurableQueueEntry {
+                        entry_id: 1,
+                        label: "card 9".into(),
+                        prompt: "orphaned".into(),
+                    }],
+                })
+                .expect("write an orphan queue");
+            let _ = first.lifecycle(&run_id, LifecycleOperation::Stop);
+        }
+        let restored = TestRegistry {
+            registry: RuntimeRegistry::new(&state, 2000).unwrap(),
+            state,
+        };
+        let queues = restored.queue_snapshots();
+        assert_eq!(
+            queues.len(),
+            1,
+            "only the queue whose pane still exists comes back: {queues:?}"
+        );
+        assert_eq!(queues[0].pane_id, "p1");
+        assert!(
+            !restored.state.join("queues").join("w1_gone.json").exists(),
+            "and the orphan's file is removed rather than left forever"
+        );
+    }
+
+    /// A file the daemon cannot read is moved aside and stepped over, exactly as an unreadable
+    /// programme gate is. The alternative — refusing to start — would make one corrupt queue cost
+    /// the operator every pane on the machine.
+    #[test]
+    fn a_queue_file_the_daemon_cannot_parse_is_quarantined_rather_than_obeyed() {
+        let state = queue_state_dir("quarantine-queue");
+        {
+            let first = RuntimeRegistry::new(&state, 2000).unwrap();
+            let run_id = queue_pane(&first);
+            let _ = first.lifecycle(&run_id, LifecycleOperation::Stop);
+        }
+        let queues = state.join("queues");
+        fs::create_dir_all(&queues).unwrap();
+        fs::write(
+            queues.join("w1_p1.json"),
+            br#"{"schema_version":99,"workspace_id":"w1","pane_id":"p1","next_entry_id":1,"entries":[]}"#,
+        )
+        .unwrap();
+
+        let restored = TestRegistry {
+            registry: RuntimeRegistry::new(&state, 2000).unwrap(),
+            state,
+        };
+        assert!(
+            restored.queue_snapshots().is_empty(),
+            "a queue from a schema this daemon does not know is not loaded"
+        );
+        assert_eq!(
+            restored
+                .store
+                .list_quarantined_pane_queue_ids()
+                .expect("read the quarantine"),
+            vec!["w1_p1".to_string()],
+            "but it is kept, because it is the only copy of what somebody queued"
+        );
+    }
+
+    /// Nothing but a human arms a queue. Entries alone feed nothing, however finished the agent
+    /// looks and however long it has been finished for.
+    #[test]
+    fn a_queue_with_entries_feeds_nothing_until_a_human_arms_its_pane() {
+        let registry = registry();
+        let run_id = queue_pane(&registry);
+        registry
+            .report_agent_state(&run_id, AgentState::Done)
+            .expect("report a state");
+        registry
+            .queue_add("w1", "p1", "card 7".into(), "keep going".into())
+            .expect("queue a prompt");
+
+        feed_cycle(&registry, &run_id, Instant::now());
+
+        let queue = only_queue(&registry).expect("one queue");
+        assert!(!queue.auto_feed, "a fresh queue is never armed");
+        assert_eq!(queue.entries.len(), 1, "and an unarmed queue feeds nothing");
+        assert!(
+            queue
+                .holding_because
+                .as_deref()
+                .is_some_and(|held| held.contains("not armed")),
+            "which it says out loud: {:?}",
+            queue.holding_because
+        );
+    }
+
+    /// The subscriber's side of §7.2: a change to any queue bumps a generation the 16ms loop can
+    /// read with one atomic load, and names the pane that moved so a client refreshes rather than
+    /// polls. Without it queue depth would be the one thing on the runs lane that went stale.
+    #[test]
+    fn every_queue_change_names_the_pane_that_moved() {
+        let registry = registry();
+        assert_eq!(registry.queue_generation(), 0);
+        queue_pane(&registry);
+        let entry_id = registry
+            .queue_add("w1", "p1", "card 7".into(), "keep going".into())
+            .expect("queue a prompt");
+        let after_add = registry.queue_generation();
+        assert!(after_add > 0, "an add is a change");
+        assert!(
+            registry
+                .queue_revisions()
+                .contains_key(&("w1".to_string(), "p1".to_string())),
+            "and it is attributed to the pane it happened to"
+        );
+        registry
+            .queue_remove("w1", "p1", entry_id)
+            .expect("remove the prompt");
+        assert!(
+            registry.queue_generation() > after_add,
+            "so is a remove, or an open board would show a stale depth"
         );
     }
 

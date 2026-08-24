@@ -173,7 +173,14 @@ impl Server {
                         .name("dock-client".into())
                         .spawn(move || {
                             let _permit = permit;
-                            let _ = handle_connection(stream, &runtime);
+                            // Said out loud rather than dropped. A connection that ends badly
+                            // ends for a reason the client cannot see: it learns only that the
+                            // socket went away, and on the wrong request at that, because the
+                            // daemon answers a message it refuses and *then* hangs up. Without
+                            // this, the only account of why was the victim's error message.
+                            if let Err(reason) = handle_connection(stream, &runtime) {
+                                eprintln!("dockd: client {accepted} disconnected: {reason}");
+                            }
                         })
                         .map_err(|error| format!("could not start client handler: {error}"))?;
                     if connection_limit == Some(accepted) {
@@ -764,9 +771,23 @@ fn read_request(
 fn write_response(stream: &mut UnixStream, response: &Response) -> Result<(), String> {
     let mut message = serde_json::to_vec(response).map_err(|error| error.to_string())?;
     message.push(b'\n');
-    stream
-        .write_all(&message)
-        .map_err(|error| error.to_string())
+    stream.write_all(&message).map_err(|error| {
+        // A client that stops reading is worth naming, because the shape of the failure hides
+        // it: replies it never collects fill the socket, this write blocks, the write timeout
+        // ends it, and the connection closes. The client then fails on whatever it sent next,
+        // which is never the thing at fault. "Broken pipe" told nobody any of that.
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            return format!(
+                "client stopped reading its replies, so a {}s write timed out and the \
+                 connection was closed; it will see this as a broken pipe on its next request",
+                CLIENT_WRITE_TIMEOUT.as_secs()
+            );
+        }
+        error.to_string()
+    })
 }
 
 #[cfg(test)]
@@ -1215,6 +1236,40 @@ mod tests {
     /// has gone and one that has merely shut down the write half it was never going to use again
     /// read identically — this suite's own `exchange` does the second — so EOF would have ended
     /// live subscriptions.
+    #[test]
+    fn a_client_that_stops_reading_is_named_rather_than_left_to_guess() {
+        // The failure this exists for is silent on the daemon's side and misattributed on the
+        // client's: replies nobody collects fill the socket, the daemon's own write blocks, the
+        // write timeout closes the connection, and the client then fails on whatever request it
+        // sent next. A person reading the daemon's output saw nothing at all.
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        // A write deadline short enough to reach, and a peer that never reads.
+        server
+            .set_write_timeout(Some(Duration::from_millis(50)))
+            .expect("write timeout");
+        let big = Response::Error {
+            code: ErrorCode::RunNotFound,
+            message: "x".repeat(4096),
+        };
+        let mut reason = None;
+        for _ in 0..64 {
+            if let Err(error) = write_response(&mut server, &big) {
+                reason = Some(error);
+                break;
+            }
+        }
+        let reason = reason.expect("a peer that never reads must eventually stall the write");
+        assert!(
+            reason.contains("stopped reading"),
+            "the daemon must name the cause, got {reason:?}"
+        );
+        assert!(
+            reason.contains("broken pipe"),
+            "and say what the client will see, got {reason:?}"
+        );
+        drop(client.take_error());
+    }
+
     #[test]
     fn a_subscriber_whose_client_has_gone_stops_being_polled() {
         let runtime = registry();

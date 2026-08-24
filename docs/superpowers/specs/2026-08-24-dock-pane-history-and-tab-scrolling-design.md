@@ -112,11 +112,14 @@ description that is no longer true.
 
 Two readers join `since()`:
 
-- **`tail(max: usize) -> (u64, &[u8])`** — the newest `≤max` bytes and the sequence they begin at, snapped
+- **`tail(max: usize) -> (u64, Vec<u8>)`** — the newest `≤max` bytes and the sequence they begin at, snapped
   **to a chunk boundary**. Chunks are whole writes, so a boundary is the closest thing to a safe parser
   entry point the log has.
-- **`range_from(seq: u64) -> (u64, Vec<u8>, bool)`** — clamping where `since()` refuses, returning the
-  sequence actually served and whether it reached the oldest retained byte.
+- **`before(before: u64, max: usize) -> (u64, Vec<u8>, bool)`** — the `max` bytes *ending at* `before`,
+  clamping where `since()` refuses, returning the sequence actually served and whether it reached the oldest
+  retained byte. Backwards rather than forwards: a client extending its history needs the bytes that abut
+  what it already holds, and a `before` falling inside a write is truncated to it rather than skipped, so
+  the answer never leaves a gap.
 
 `since()` keeps its `None` contract untouched: it serves the delta path, where a gap is a correctness bug.
 The clamping reader serves the history path, where a short answer is the honest one.
@@ -183,10 +186,14 @@ rebuild. The alternative — asking the daemon for `from`-to-`end` and re-sendin
 The client's log is capped at the **same byte budget the daemon announces**, so the two never disagree about
 how much history exists and the client cannot accumulate more than the daemon can re-serve.
 
-Per-run state: `{ epoch, from, complete, pending }`. When a scroll leaves the viewport **within one screen
-height of the top** of what the parser holds, and neither `complete` nor `pending` is set, the client
-requests the next **2 MB**. `pending` makes it fire once per round trip rather than once per scroll event. An
+Per-run state: `{ epoch, from, complete }`. When a scroll leaves the viewport **within one screen height of
+the top** of what the parser holds, and `complete` is not set, the client requests the next **2 MB**. An
 `epoch` mismatch in the response discards it.
+
+**No in-flight guard is needed.** `run_dashboard` (`main.rs:654`) sends a `UiCommand::Request` with a
+blocking `client.request(&request)` and handles the response before reading the next input event, so a
+second scroll cannot arrive while a history request is outstanding. A failed request therefore leaves
+`from` unmoved and the next scroll simply retries, which is the behaviour we want.
 
 **The viewport survives the rebuild for free.** Because `scrollback_offset` is measured from the bottom
 (`grid.rs:198`), adding rows above leaves the same offset pointing at the same content. Nothing needs to be
@@ -246,7 +253,7 @@ Digits and `Ctrl+B w` are untouched. Tab numbers stay positional, as `:1130` say
 ## 6. Testing
 
 **`OutputLog`** — eviction at the new cap; `tail` snapping to a chunk boundary; `tail` when one write exceeds
-the whole budget; `range_from` clamping below the oldest byte; `complete` true only at the oldest retained
+the whole budget; `before` clamping below the oldest byte, and truncating to a cursor that falls inside a write; `complete` true only at the oldest retained
 byte; `since()`'s `None` contract unchanged.
 
 **Seed** — the seed contains history, not just the grid; `ScreenSync` correction still lands the visible
@@ -274,7 +281,7 @@ must hold 60fps. The 16 MB × pane-count memory cost is measured and reported, n
 
 Each step ends green and shippable.
 
-1. **`OutputLog` capacity and readers** — `tail`, `range_from`, the `--pane-history-bytes` flag, the doc
+1. **`OutputLog` capacity and readers** — `tail`, `before`, the `--pane-history-bytes` flag, the doc
    comment correction. Daemon-only, no protocol change, nothing observable yet.
 2. **Seed carries history** — `seeded` replays the tail; alternate-screen normalisation and its two-direction
    tests. Client parser capacity derived from the byte budget. **Deep scrollback works from this step on**,

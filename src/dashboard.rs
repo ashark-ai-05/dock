@@ -235,6 +235,29 @@ pub struct Dashboard {
     picker_row_areas: Vec<Rect>,
     /// Where each workspace's tab landed, so the strip is clickable like every other chrome.
     tab_areas: Vec<(String, Rect)>,
+    /// The index of the first workspace the strip is currently showing.
+    ///
+    /// Bounds-clamped on every render so a resize or a closed workspace cannot strand it past
+    /// the end, but *not* re-anchored to the active tab every render — see `tab_scroll_last_active`
+    /// and `render_tabs`. A wheel scroll is the one thing allowed to leave the active tab
+    /// scrolled out of view, and it does that by changing only this field.
+    tab_scroll: usize,
+    /// The workspace that was active the last time the strip was rendered.
+    ///
+    /// Exists to tell a jump from a plain re-render: `render_tabs` scrolls the active tab back
+    /// into view only when `workspace_index` differs from this, then updates it to match. A
+    /// wheel scroll never touches `workspace_index`, so it never triggers the correction — which
+    /// is the point, and why this clamp does not simply run every frame like the bounds one
+    /// above it. Do not "fix" it into an unconditional clamp; that regresses the wheel to a
+    /// no-op, which is the exact bug this field exists to avoid.
+    tab_scroll_last_active: usize,
+    /// The whole tab-strip row, recorded so the wheel arm can tell a scroll over the strip from
+    /// a scroll over a pane without duplicating the layout the strip's own render already did.
+    tab_strip_area: Option<Rect>,
+    /// `‹`/`›`, drawn in the strip's reserved edge columns only when tabs are hidden on that
+    /// side, and clickable like every other tab-strip control.
+    tab_scroll_left_area: Option<Rect>,
+    tab_scroll_right_area: Option<Rect>,
     /// The `+` at the end of the tab strip, and the rename and close affordances on the
     /// active tab.
     new_workspace_area: Option<Rect>,
@@ -1107,6 +1130,9 @@ impl Dashboard {
         self.launch_mode_area = None;
         self.picker_row_areas.clear();
         self.tab_areas.clear();
+        self.tab_strip_area = None;
+        self.tab_scroll_left_area = None;
+        self.tab_scroll_right_area = None;
         self.new_workspace_area = None;
         self.rename_workspace_area = None;
         self.close_workspace_area = None;
@@ -1327,19 +1353,92 @@ impl Dashboard {
 
     /// The workspace strip: one tab per workspace, numbered by the digit that jumps to it.
     ///
-    /// Tabs are laid out left to right and simply stop when the row runs out, rather than
-    /// scrolling. The numbers stay meaningful because they are positions, not labels, and a
-    /// workspace pushed off the end is still reachable by name through `Ctrl+B w`.
+    /// The strip scrolls rather than truncating, and follows the active tab: a workspace you
+    /// have jumped to is always visible, together with its own rename and close affordances,
+    /// which are the last thing that should fall off an edge. `‹` and `›` mark tabs hidden on
+    /// each side and are clickable. The numbers stay meaningful because they are positions,
+    /// not labels.
     fn render_tabs(&mut self, frame: &mut Frame, area: Rect) {
-        let mut x = area.x.saturating_add(1);
-        for (index, workspace) in self.layout.workspaces.iter().enumerate() {
+        self.tab_strip_area = Some(area);
+        let workspace_count = self.layout.workspaces.len();
+        if workspace_count == 0 {
+            return;
+        }
+
+        // Every tab's rendered width, measured once so the clamp below and the layout further
+        // down agree on what "fits" means. Only the active tab carries rename and close
+        // affordances, which is why it alone gets the extra width; the trailing `+ 1` on every
+        // tab is the one-column gap this loop always left between tabs.
+        let armed = self.close_workspace_armed.clone();
+        let labels: Vec<String> = self
+            .layout
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| format!(" {} {} ", index + 1, workspace.name))
+            .collect();
+        let widths: Vec<u16> = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                let mut width = label.chars().count() as u16 + 1;
+                if index == self.workspace_index {
+                    width += 3; // ✎
+                    width += 3; // ✘ (or the armed cancel)
+                    if armed.as_deref() == Some(self.layout.workspaces[index].workspace_id.as_str())
+                    {
+                        width += 3; // ✓ confirm, once armed
+                    }
+                }
+                width
+            })
+            .collect();
+
+        // Reserved so `‹`/`›` never shift the strip by a column as they appear or disappear —
+        // tabs are laid out between these two columns whether or not the markers are drawn.
+        let available = area.width.saturating_sub(2);
+
+        // Bounds clamp: runs every frame, and only ever keeps `tab_scroll` inside range so a
+        // resize or a closed workspace cannot strand it past the end. It never chases the active
+        // tab — that would undo a wheel scroll on the very next frame. See
+        // `tab_scroll_last_active` for the correction that does chase it, and why it is kept
+        // separate from this one.
+        self.tab_scroll = self.tab_scroll.min(workspace_count - 1);
+
+        // Bring-into-view correction: fires only when the active workspace differs from the one
+        // shown last render, i.e. only on a jump (digit, `Ctrl+B w`, a click, `,`/`.`). A wheel
+        // scroll never changes `workspace_index`, so it never reaches this branch, which is what
+        // lets a strip the user positioned by hand stay exactly where they left it.
+        //
+        // Accepted consequence: narrowing the terminal can carry the active tab out of view
+        // without a jump to bring it back — re-snapping on every width change would mean
+        // tracking the previous width for a case the next jump already resolves for free.
+        if self.tab_scroll_last_active != self.workspace_index {
+            if self.tab_scroll > self.workspace_index {
+                self.tab_scroll = self.workspace_index;
+            }
+            while self.tab_scroll < self.workspace_index {
+                let span: u16 = widths[self.tab_scroll..=self.workspace_index].iter().sum();
+                if span <= available {
+                    break;
+                }
+                self.tab_scroll += 1;
+            }
+            self.tab_scroll_last_active = self.workspace_index;
+        }
+
+        let left_edge = area.x.saturating_add(1);
+        let right_edge = area.right().saturating_sub(1);
+        let mut x = left_edge;
+        let mut last_drawn = None;
+        for (index, label) in labels.iter().enumerate().skip(self.tab_scroll) {
             let active = index == self.workspace_index;
-            let label = format!(" {} {} ", index + 1, workspace.name);
-            let width = label.chars().count() as u16;
-            if x.saturating_add(width) > area.right() {
+            let label_width = label.chars().count() as u16;
+            if x.saturating_add(label_width) > right_edge {
                 break;
             }
-            let tab = Rect::new(x, area.y, width, 1);
+            let workspace = &self.layout.workspaces[index];
+            let tab = Rect::new(x, area.y, label_width, 1);
             let style = if active {
                 Style::default()
                     .bg(self.theme.accent)
@@ -1348,12 +1447,12 @@ impl Dashboard {
             } else {
                 Style::default().fg(self.theme.muted)
             };
-            frame.render_widget(Paragraph::new(Line::styled(label, style)), tab);
+            frame.render_widget(Paragraph::new(Line::styled(label.clone(), style)), tab);
             self.tab_areas.push((workspace.workspace_id.clone(), tab));
-            x = x.saturating_add(width);
+            x = x.saturating_add(label_width);
             // The rename affordance rides only on the active tab. On every tab it would be
             // clutter, and on none of them renaming would stay keyboard-only.
-            if active && x.saturating_add(3) <= area.right() {
+            if active && x.saturating_add(3) <= right_edge {
                 let pencil = Rect::new(x, area.y, 3, 1);
                 frame.render_widget(Paragraph::new(Line::styled(" ✎ ", style)), pencil);
                 self.rename_workspace_area = Some(pencil);
@@ -1364,15 +1463,14 @@ impl Dashboard {
             // to hang off one stray click on a three-cell target; the armed tab says so in
             // words rather than opening a ninth modal overlay.
             if active {
-                let armed =
-                    self.close_workspace_armed.as_deref() == Some(workspace.workspace_id.as_str());
+                let tab_armed = armed.as_deref() == Some(workspace.workspace_id.as_str());
                 // Cancel keeps the cell the close control had, and confirm is the new target to
                 // its right. Putting confirm first read better and was a trap: the second press
                 // of a double-click would land on it and destroy the workspace the first press
                 // had only asked about.
-                if x.saturating_add(3) <= area.right() {
+                if x.saturating_add(3) <= right_edge {
                     let cancel = Rect::new(x, area.y, 3, 1);
-                    let cancel_style = if armed {
+                    let cancel_style = if tab_armed {
                         Style::default()
                             .bg(self.theme.blocked)
                             .fg(self.theme.surface)
@@ -1384,7 +1482,7 @@ impl Dashboard {
                     self.close_workspace_area = Some(cancel);
                     x = x.saturating_add(3);
                 }
-                if armed && x.saturating_add(3) <= area.right() {
+                if tab_armed && x.saturating_add(3) <= right_edge {
                     let confirm = Rect::new(x, area.y, 3, 1);
                     frame.render_widget(
                         Paragraph::new(Line::styled(
@@ -1401,14 +1499,36 @@ impl Dashboard {
                 }
             }
             x = x.saturating_add(1);
+            last_drawn = Some(index);
         }
-        if x.saturating_add(3) <= area.right() {
+        if x.saturating_add(3) <= right_edge {
             let plus = Rect::new(x, area.y, 3, 1);
             frame.render_widget(
                 Paragraph::new(Line::styled(" + ", Style::default().fg(self.theme.accent))),
                 plus,
             );
             self.new_workspace_area = Some(plus);
+        }
+
+        if self.tab_scroll > 0 {
+            let marker = Rect::new(area.x, area.y, 1, 1);
+            frame.render_widget(
+                Paragraph::new(Line::styled("‹", Style::default().fg(self.theme.accent))),
+                marker,
+            );
+            self.tab_scroll_left_area = Some(marker);
+        }
+        let hides_tabs_on_the_right = match last_drawn {
+            Some(last) => last + 1 < workspace_count,
+            None => self.tab_scroll < workspace_count,
+        };
+        if hides_tabs_on_the_right {
+            let marker = Rect::new(right_edge, area.y, 1, 1);
+            frame.render_widget(
+                Paragraph::new(Line::styled("›", Style::default().fg(self.theme.accent))),
+                marker,
+            );
+            self.tab_scroll_right_area = Some(marker);
         }
     }
 
@@ -4885,6 +5005,22 @@ impl Dashboard {
                 {
                     return self.rename_workspace();
                 }
+                // The scroll markers sit on the same row as the tabs, so testing tabs first
+                // would swallow a click meant for one of them.
+                if self
+                    .tab_scroll_left_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    self.tab_scroll = self.tab_scroll.saturating_sub(1);
+                    return UiCommand::None;
+                }
+                if self
+                    .tab_scroll_right_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    self.tab_scroll = self.tab_scroll.saturating_add(1);
+                    return UiCommand::None;
+                }
                 if let Some(workspace_id) = self
                     .tab_areas
                     .iter()
@@ -5048,6 +5184,20 @@ impl Dashboard {
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                // The strip is tested first and returns early: it shares this arm with pane
+                // scrolling below, and a notch over the tabs must move the strip rather than
+                // whatever pane happens to sit under the same column further down the canvas.
+                if self
+                    .tab_strip_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    if event.kind == MouseEventKind::ScrollDown {
+                        self.tab_scroll = self.tab_scroll.saturating_add(1);
+                    } else {
+                        self.tab_scroll = self.tab_scroll.saturating_sub(1);
+                    }
+                    return UiCommand::None;
+                }
                 // Three rows per notch matches what terminals send for a single wheel click.
                 let delta = if event.kind == MouseEventKind::ScrollUp {
                     3
@@ -5863,7 +6013,7 @@ fn ellipsise(value: &str, width: usize) -> String {
 /// following its own output is the exact failure this marker exists to catch, and a divider can
 /// be dragged to widths well under `MIN_TITLE_WIDTH` routinely — a pane that narrow already has
 /// no readable title of its own to protect. So the glyph rung asks only that the glyph and its
-/// one-column separator fit inside the border; the title gets whatever is left, down to nothing.
+/// one-column separator fit inside the border; the title gets whatever is left, down to one column.
 /// Only below that — not even two columns for the glyph itself — is there no marker at all, and
 /// the title is left exactly as it was.
 fn fit_scroll_marker(title: &str, budget: usize, offset: usize) -> (String, Option<String>) {
@@ -5891,7 +6041,8 @@ fn fit_scroll_marker(title: &str, budget: usize, offset: usize) -> (String, Opti
     // this marker exists to catch, and on the narrowest panes — the ones a divider drag reaches
     // routinely, well below `MIN_TITLE_WIDTH` — the title is already unreadable on its own. So
     // this rung asks only that the glyph and its separator fit inside the border, and the title
-    // takes whatever is left, even if that is nothing.
+    // takes whatever is left, even if that is only one column — `ellipsise(_, 0)` still returns
+    // the "…" itself, so the title never actually disappears.
     // "▲" is one `char` (a single Unicode scalar value), so this is a literal rather than
     // `"▲".chars().count()`: the latter is not a `const fn` on stable, and the former is
     // exactly as informative for exactly one character of literal text.
@@ -6137,6 +6288,36 @@ mod tests {
                 pane_id: "c".into(),
             },
         });
+        dashboard
+    }
+
+    /// A dashboard with `count` workspaces, each named `ws{n}` — short on purpose. Mirrors
+    /// `benchmark_dashboard`'s construction, but that helper names workspaces with a string long
+    /// enough to be ellipsised, deliberately, so its render benchmark exercises ellipsising. With
+    /// names that long barely one tab fits a narrow strip at all, which makes it useless for
+    /// telling scrolling apart from truncation — these names are short so several tabs fit and
+    /// the strip's own scrolling, rather than the ellipsiser, is what these tests exercise.
+    fn scrollable_tab_dashboard(count: usize) -> Dashboard {
+        let mut dashboard = Dashboard::default();
+        for index in 0..count {
+            let pane_id = format!("p{index}");
+            dashboard.layout.workspaces.push(WorkspaceLayout {
+                workspace_id: format!("w{index}"),
+                name: format!("ws{}", index + 1),
+                focused_pane_id: pane_id.clone(),
+                panes: BTreeMap::from([(
+                    pane_id.clone(),
+                    PaneLayout {
+                        pane_id: pane_id.clone(),
+                        name: "pane".into(),
+                        run_id: None,
+                        runtime: PaneRuntime::Empty,
+                        kind: PaneKind::Terminal,
+                    },
+                )]),
+                root: LayoutNode::Pane { pane_id },
+            });
+        }
         dashboard
     }
 
@@ -7058,6 +7239,164 @@ mod tests {
             UiCommand::None
         );
         assert_eq!(dashboard.workspace_index, 1);
+    }
+
+    #[test]
+    fn the_active_tab_stays_fully_visible_however_many_workspaces_there_are() {
+        let mut dashboard = scrollable_tab_dashboard(12);
+        for index in 0..12 {
+            dashboard.jump_to_workspace((index + 1) as u8);
+            let rendered = render_to_string(&mut dashboard, 60, 24);
+            let name = format!("{} ws{}", index + 1, index + 1);
+            assert!(
+                rendered.contains(&name),
+                "workspace {} must be visible when it is active: {rendered}",
+                index + 1
+            );
+            assert!(
+                rendered.contains('✎') && rendered.contains('✘'),
+                "the active tab's own affordances must not be what falls off the edge: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn jumping_to_an_offscreen_workspace_scrolls_it_fully_into_view() {
+        // A jump is the one thing allowed to re-anchor the strip: this dedicated test exists
+        // because that correction is now conditional on a jump having happened, rather than
+        // running unconditionally every frame, and a conditional correction is one that can
+        // silently stop firing.
+        let mut dashboard = scrollable_tab_dashboard(12);
+        render_to_string(&mut dashboard, 60, 24);
+        assert_eq!(dashboard.jump_to_workspace(11), UiCommand::None);
+        let rendered = render_to_string(&mut dashboard, 60, 24);
+        assert!(
+            rendered.contains("11 ws11"),
+            "the jumped-to workspace must be scrolled into view: {rendered}"
+        );
+        assert!(
+            rendered.contains('✎') && rendered.contains('✘'),
+            "its own affordances must come along, not be clipped: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_strip_marks_the_tabs_it_is_hiding_on_each_side() {
+        // The whole-frame string is the wrong thing to search here: the sidebar's own "current
+        // workspace" marker in its WORKSPACES list is the same '›' glyph, present for any active
+        // workspace whether or not the tab strip itself is scrolled. Reading just the tab-strip
+        // row is what actually tells the two apart.
+        let mut dashboard = scrollable_tab_dashboard(12);
+        dashboard.jump_to_workspace(7);
+        let terminal = render_terminal(&mut dashboard, 60, 24);
+        let strip = row_text(&terminal, Rect::new(0, 2, 60, 1), 2);
+        assert!(strip.contains('‹') && strip.contains('›'), "{strip:?}");
+    }
+
+    #[test]
+    fn a_strip_that_fits_shows_no_markers() {
+        // Same reasoning as above: the sidebar's own '›' for the active workspace would make a
+        // whole-frame search for the glyph pass or fail for the wrong reason. Scope the read to
+        // the tab-strip row alone.
+        let mut dashboard = scrollable_tab_dashboard(2);
+        let terminal = render_terminal(&mut dashboard, 120, 24);
+        let strip = row_text(&terminal, Rect::new(0, 2, 120, 1), 2);
+        assert!(!strip.contains('‹') && !strip.contains('›'), "{strip:?}");
+    }
+
+    #[test]
+    fn the_wheel_over_the_strip_scrolls_it_without_switching_workspace() {
+        let mut dashboard = scrollable_tab_dashboard(12);
+        let active = dashboard.workspace_index;
+        let before = render_to_string(&mut dashboard, 60, 24);
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 2, // the tab strip row
+            modifiers: KeyModifiers::NONE,
+        });
+        let after = render_to_string(&mut dashboard, 60, 24);
+        assert_ne!(before, after, "the strip must move");
+        assert_eq!(
+            dashboard.workspace_index, active,
+            "scrolling the strip must not switch workspace"
+        );
+    }
+
+    #[test]
+    fn scrolling_the_strip_by_wheel_is_not_reverted_by_the_next_render() {
+        // The bounds clamp runs every frame; the bring-into-view correction must not. If it did,
+        // a second render after the wheel event would silently undo the scroll — exactly the
+        // contradiction that made the previous test unsatisfiable until this distinction was
+        // drawn between the two clamps.
+        let mut dashboard = scrollable_tab_dashboard(12);
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        let once = render_to_string(&mut dashboard, 60, 24);
+        let twice = render_to_string(&mut dashboard, 60, 24);
+        assert_eq!(
+            once, twice,
+            "re-rendering with no new input must not move the strip back"
+        );
+        assert_eq!(dashboard.workspace_index, 0);
+    }
+
+    #[test]
+    fn clicking_the_right_marker_scrolls_the_strip_without_switching_workspace() {
+        let mut dashboard = scrollable_tab_dashboard(12);
+        let before = render_to_string(&mut dashboard, 60, 24);
+        let marker = dashboard
+            .tab_scroll_right_area
+            .expect("a strip this full must show a right marker");
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: marker.x,
+                row: marker.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None
+        );
+        let after = render_to_string(&mut dashboard, 60, 24);
+        assert_ne!(before, after, "the strip must move");
+        assert_eq!(dashboard.workspace_index, 0);
+    }
+
+    #[test]
+    fn clicking_the_left_marker_scrolls_the_strip_back() {
+        let mut dashboard = scrollable_tab_dashboard(12);
+        dashboard.jump_to_workspace(12);
+        render_to_string(&mut dashboard, 60, 24);
+        let scrolled = dashboard.tab_scroll;
+        assert!(
+            scrolled > 0,
+            "jumping to the last workspace must have scrolled the strip"
+        );
+        let marker = dashboard
+            .tab_scroll_left_area
+            .expect("a strip scrolled away from the start must show a left marker");
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: marker.x,
+                row: marker.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None
+        );
+        render_to_string(&mut dashboard, 60, 24);
+        assert!(
+            dashboard.tab_scroll < scrolled,
+            "the left marker must scroll back toward the start"
+        );
+        assert_eq!(
+            dashboard.workspace_index, 11,
+            "clicking a marker must not switch workspace"
+        );
     }
 
     #[test]

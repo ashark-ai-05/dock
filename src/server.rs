@@ -1242,7 +1242,7 @@ mod tests {
         // client's: replies nobody collects fill the socket, the daemon's own write blocks, the
         // write timeout closes the connection, and the client then fails on whatever request it
         // sent next. A person reading the daemon's output saw nothing at all.
-        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        let (client, mut server) = UnixStream::pair().expect("socket pair");
         // A write deadline short enough to reach, and a peer that never reads.
         server
             .set_write_timeout(Some(Duration::from_millis(50)))

@@ -677,6 +677,10 @@ impl Dashboard {
                 rows,
                 cols,
                 scrollback_rows,
+                // Not yet consumed here: paging back through history is Task 5's client
+                // behaviour. This task only carries the fields on the wire.
+                history_from: _,
+                epoch: _,
                 screen,
             } => {
                 // The daemon's own retention, so this replica holds exactly the history the
@@ -5731,6 +5735,12 @@ mod tests {
     /// A full-screen seed for `run_id`, sized to the inner geometry a 100x30 dashboard gives
     /// the left pane, so nothing this feeds is clipped for a reason other than pane size.
     fn attach_event(run_id: &str, bytes: &[u8]) -> Event {
+        attach_event_at(run_id, bytes, 0, 1)
+    }
+
+    /// An attach frame with a chosen paging cursor and epoch, for the tests that care where a
+    /// replica's own history starts and which byte stream it belongs to.
+    fn attach_event_at(run_id: &str, bytes: &[u8], history_from: u64, epoch: u64) -> Event {
         let mut source = crate::terminal::VtTerminal::new(PANE_ROWS, PANE_COLS, 0);
         source.feed(bytes);
         Event::PaneAttached {
@@ -5739,7 +5749,22 @@ mod tests {
             rows: PANE_ROWS,
             cols: PANE_COLS,
             scrollback_rows: 2000,
+            history_from,
+            epoch,
             screen: STANDARD.encode(source.state_bytes()),
+        }
+    }
+
+    /// One delta of raw child output. Revisions must be contiguous or `apply_event` drops the
+    /// screen rather than advancing it into a corrupted grid, so this counts for the caller.
+    ///
+    /// Not yet called from this file: it exists for the paging tests the next task adds.
+    #[allow(dead_code)]
+    fn delta_event(run_id: &str, revision: u64, bytes: &[u8]) -> Event {
+        Event::PaneDelta {
+            run_id: run_id.into(),
+            revision,
+            bytes: STANDARD.encode(bytes),
         }
     }
 
@@ -8977,6 +9002,8 @@ mod tests {
             rows: 24,
             cols: 80,
             scrollback_rows: 2000,
+            history_from: 0,
+            epoch: 1,
             screen: STANDARD.encode(source.state_bytes()),
         });
         let mut sync = crate::terminal::ScreenSync::new(24, 80);
@@ -9002,6 +9029,8 @@ mod tests {
             rows: 24,
             cols: 80,
             scrollback_rows: 2000,
+            history_from: 0,
+            epoch: 1,
             screen: String::new(),
         });
         dashboard.apply_event(Event::PaneDelta {
@@ -9021,6 +9050,8 @@ mod tests {
             rows: 24,
             cols: 80,
             scrollback_rows: 2000,
+            history_from: 0,
+            epoch: 1,
             screen: String::new(),
         });
         let mut source = crate::terminal::VtTerminal::new(10, 40, 0);
@@ -9031,6 +9062,8 @@ mod tests {
             rows: 10,
             cols: 40,
             scrollback_rows: 2000,
+            history_from: 0,
+            epoch: 1,
             screen: STANDARD.encode(source.state_bytes()),
         });
         assert_eq!(dashboard.screens["run_1"].size(), (10, 40));
@@ -9388,6 +9421,8 @@ mod tests {
             rows: 5,
             cols: 20,
             scrollback_rows: 3,
+            history_from: 0,
+            epoch: 1,
             screen: String::new(),
         });
         let mut written = Vec::new();
@@ -9728,6 +9763,8 @@ mod tests {
                 rows: 12,
                 cols: 20,
                 scrollback_rows: 2000,
+                history_from: 0,
+                epoch: 1,
                 screen: String::new(),
             },
             // The other re-seed trigger: a revision gap means this client missed bytes, so

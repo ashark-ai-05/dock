@@ -505,6 +505,8 @@ mod tests {
                         rows: 10,
                         cols: 40,
                         scrollback_rows: 2000,
+                        history_from: 0,
+                        epoch: 1,
                         screen: String::new(),
                     },
                 },
@@ -600,6 +602,8 @@ mod tests {
             rows: 10,
             cols: 40,
             scrollback_rows: 2000,
+            history_from: 0,
+            epoch: 1,
             screen: String::new(),
         }
     }

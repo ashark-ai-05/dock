@@ -390,6 +390,35 @@ fn handle_connection_with_timeout(
                 Ok(()) => write_response(stream, &Response::Ack)?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
+            Ok(Request::PaneHistory(request)) => {
+                // Clamped to what the log can hold: a request for more than that is not an
+                // error, it is a caller that does not know the budget, and the honest answer
+                // is everything there is.
+                let max = (request.max_bytes as usize).min(runtime.pane_history_bytes());
+                let served = runtime.with_run_output(&request.run_id, |output| {
+                    let (from, bytes, complete) = output.log().before(request.before, max);
+                    (output.log().epoch(), from, bytes, complete)
+                });
+                match served {
+                    Some((epoch, from, bytes, complete)) => write_response(
+                        stream,
+                        &Response::PaneHistory {
+                            run_id: request.run_id,
+                            epoch,
+                            from,
+                            bytes: STANDARD.encode(&bytes),
+                            complete,
+                        },
+                    )?,
+                    None => write_response(
+                        stream,
+                        &Response::Error {
+                            code: ErrorCode::RunNotFound,
+                            message: format!("no live pane {}", request.run_id),
+                        },
+                    )?,
+                }
+            }
             Ok(Request::Queue(request)) => {
                 let response = match request {
                     QueueRequest::Inspect => Response::Queues {
@@ -567,8 +596,9 @@ fn stream_events(
                     revisions.insert(snapshot.run_id.clone(), revision);
                 }
                 StreamFrame::Seed(seed) => {
-                    let (view, _history_from, bytes) = *seed;
+                    let (view, history_from, bytes) = *seed;
                     let revision = revisions.get(&snapshot.run_id).copied().unwrap_or(0) + 1;
+                    let epoch = view.epoch;
                     write_response(
                         stream,
                         &Response::Stream {
@@ -577,6 +607,8 @@ fn stream_events(
                                 revision,
                                 rows: snapshot.rows,
                                 cols: snapshot.cols,
+                                history_from,
+                                epoch,
                                 // Rows the replica must retain to hold everything it can be
                                 // sent, derived from the byte budget at a pessimistic 8 bytes
                                 // a row so under-sizing (which would silently discard replayed
@@ -932,7 +964,9 @@ fn write_response(stream: &mut UnixStream, response: &Response) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{HelloRequest, PaneInputRequest, PaneResizeRequest, SubscribeRequest};
+    use crate::protocol::{
+        HelloRequest, PaneHistoryRequest, PaneInputRequest, PaneResizeRequest, SubscribeRequest,
+    };
     use crate::terminal::PaneScreen;
     use std::{
         net::Shutdown,
@@ -2130,6 +2164,108 @@ mod tests {
             live_view,
             "returning to the bottom must resume following live output"
         );
+    }
+
+    /// A pane that has written more than a seed replays retains a cursor to page back from
+    /// (Task 3), and `PaneHistory` is what lets a client actually use it: asked for the bytes
+    /// behind that cursor, the daemon must answer from the same byte stream the attach frame
+    /// named (`epoch`), never run its answer past the caller's own cursor, and say so when the
+    /// answer reaches everything still retained.
+    #[test]
+    fn a_pane_history_request_answers_from_the_cursor_an_attach_frame_reported() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let run_id = runtime
+            .inspect(None)
+            .expect("inspect")
+            .into_iter()
+            .find(|run| run.pane_id == "p1")
+            .expect("bound run")
+            .run_id;
+
+        // More than a seed ever replays, so the attach frame below truncates its cursor away
+        // from the very start of the log and leaves genuine history behind it to page back
+        // into. Comfortably short of the daemon's own retention budget, so every one of these
+        // bytes is still there to be served back in full.
+        runtime
+            .pane_input("w1", "p1", b"yes | head -c 300000; echo DONEMARK\n")
+            .expect("type into the pane");
+        let deadline = Instant::now() + convergence_backstop();
+        while runtime
+            .with_run_output(&run_id, |output| output.log().end())
+            .expect("live output")
+            < (SEED_HISTORY_BYTES as u64 + 4096)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the shell never produced enough output to truncate the seed"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let responses = exchange(&[&hello(), &subscribe_line()], &runtime);
+        let (attached_history_from, attached_epoch) = collect_events(&responses)
+            .into_iter()
+            .find_map(|event| match event {
+                Event::PaneAttached {
+                    history_from,
+                    epoch,
+                    ..
+                } => Some((history_from, epoch)),
+                _ => None,
+            })
+            .expect("an attach frame");
+
+        let request = Request::PaneHistory(PaneHistoryRequest {
+            run_id: run_id.clone(),
+            before: attached_history_from,
+            max_bytes: 2 << 20,
+        });
+        let responses = exchange(
+            &[&hello(), &serde_json::to_string(&request).unwrap()],
+            &runtime,
+        );
+        match &responses[1] {
+            Response::PaneHistory {
+                epoch,
+                from,
+                complete,
+                bytes,
+                ..
+            } => {
+                assert_eq!(*epoch, attached_epoch, "the same byte stream");
+                assert!(*from <= attached_history_from);
+                assert!(
+                    *complete,
+                    "a fixture well inside the daemon's retention budget keeps everything it \
+                     wrote"
+                );
+                assert!(!STANDARD.decode(bytes).expect("base64").is_empty());
+            }
+            other => panic!("expected history, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_for_a_run_the_daemon_does_not_have_is_refused_rather_than_answered_empty() {
+        let runtime = registry();
+        let request = Request::PaneHistory(PaneHistoryRequest {
+            run_id: "no-such-run".into(),
+            before: 0,
+            max_bytes: 1 << 20,
+        });
+        let responses = exchange(
+            &[&hello(), &serde_json::to_string(&request).unwrap()],
+            &runtime,
+        );
+        match &responses[1] {
+            Response::Error { code, .. } => assert_eq!(
+                *code,
+                ErrorCode::RunNotFound,
+                "an empty answer and a missing pane must not look the same to a client"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[test]

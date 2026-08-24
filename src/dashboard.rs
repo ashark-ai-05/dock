@@ -12300,6 +12300,62 @@ mod tests {
         }
     }
 
+    /// What entering copy mode costs, which is what a row of retained scrollback costs.
+    ///
+    /// Copy mode freezes a pane by cloning the grid *and* the scrollback (`terminal/vt.rs`),
+    /// so this one gesture pays for every row `PANE_HISTORY_MAX_ROWS` allows, at whatever the
+    /// pane is wide. It is therefore both the latency measurement for the gesture — it is
+    /// keyboard-driven, so it is felt — and the price list for the constant: the bytes column
+    /// divided by the rows column is what one retained row costs, which is the figure the
+    /// constant's doc comment quotes.
+    ///
+    /// The pre-history depth of 2000 rows is measured alongside the current cap so the
+    /// difference is the number rather than the argument. **Run with `--test-threads=1`:** the
+    /// byte counter is a process-global, and a benchmark sharing the process with another one
+    /// reports the other one's allocations as its own.
+    #[test]
+    #[ignore = "a measurement, not an assertion; cargo test --release measure_what_freezing -- --ignored --nocapture --test-threads=1"]
+    fn measure_what_freezing_a_pane_for_copy_mode_costs() {
+        println!();
+        println!("cloning a replica's grid and scrollback, which is all entering copy mode does");
+        println!(
+            "{:>10}  {:>10}  {:>10}  {:>14}  {:>12}",
+            "replica", "capacity", "ms/entry", "bytes/entry", "bytes/row"
+        );
+        for (rows, cols) in [(24u16, 80u16), (40, 160)] {
+            // 2000 is the depth a replica held before pane history; 50,000 is the cap this
+            // branch first shipped and then withdrew. Both are here so the row that matters —
+            // the current constant, in the middle — is read against what it replaced.
+            for capacity in [2_000usize, crate::terminal::PANE_HISTORY_MAX_ROWS, 50_000] {
+                let mut screen = PaneScreen::new(rows, cols, capacity);
+                // Enough lines to fill the scrollback to its capacity and then some, so the
+                // clone is of a full replica rather than of a half-empty one.
+                let log: Vec<u8> = (0..capacity + usize::from(rows) + 100)
+                    .map(|line| format!("line {line} of a long build log\r\n"))
+                    .collect::<String>()
+                    .into_bytes();
+                screen.feed(&log);
+                let held = screen.history_rows();
+                let mut fastest = f64::MAX;
+                let mut bytes = u64::MAX;
+                for _ in 0..7 {
+                    let before = ALLOCATED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+                    let start = std::time::Instant::now();
+                    let frozen = screen.snapshot();
+                    fastest = fastest.min(start.elapsed().as_secs_f64() * 1000.0);
+                    bytes = bytes
+                        .min(ALLOCATED_BYTES.load(std::sync::atomic::Ordering::Relaxed) - before);
+                    std::hint::black_box(&frozen);
+                }
+                println!(
+                    "{:>10}  {capacity:>10}  {fastest:>10.2}  {bytes:>14}  {:>12}",
+                    format!("{rows}x{cols}"),
+                    bytes / held.max(1) as u64
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "a measurement, not an assertion; cargo test --release render_measurement -- --ignored --nocapture"]
     fn render_measurement_of_a_busy_dashboard_at_three_terminal_sizes() {

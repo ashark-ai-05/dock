@@ -2122,6 +2122,12 @@ mod tests {
             "the attach frame must carry a capacity derived from the daemon's real history \
              retention, not a client-side guess"
         );
+        assert_eq!(
+            attached as usize,
+            crate::terminal::PANE_HISTORY_MAX_ROWS,
+            "and at the default budget it is the row cap that binds, not the byte budget: a \
+             replica's rows are parsed cells, so the cap is what actually bounds client memory"
+        );
 
         let mut replayed = replay(&events, &run_id);
         assert_eq!(

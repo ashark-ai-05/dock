@@ -82,15 +82,25 @@ pub const PANE_HISTORY_BYTES: usize = 16 << 20;
 ///
 /// A second budget is needed because the two sides pay in different currencies. The daemon
 /// keeps raw bytes, which are cheap; a replica keeps parsed cells, and `vt100` allocates a
-/// full row of them per scrollback row — `cols × 32` bytes, whatever the row actually
-/// contains. Deriving rows from the byte budget alone therefore prices history at roughly a
-/// thousandth of what it costs, and at 160 columns the 16 MiB budget would authorise about
-/// ten gigabytes of cells per pane.
+/// full row of them per scrollback row: `Row::new(cols)` eagerly allocates `cols` cells and a
+/// `Cell` is exactly 32 bytes, whatever the row actually holds. Deriving rows from the byte
+/// budget alone therefore prices history at roughly a thousandth of what it costs, and at 160
+/// columns the 16 MiB budget would authorise about ten gigabytes of cells per pane.
 ///
-/// This cap, not the byte budget, is what bounds a client's memory: a replica is fed the live
-/// delta stream indefinitely, not merely the bytes the daemon can re-serve. Fifty thousand
-/// rows is twenty-five times the old retention and further back than anyone scrolls.
-pub const PANE_HISTORY_MAX_ROWS: usize = 50_000;
+/// **What a row costs, measured with an instrumented allocator:** about **2.6 KB at 80
+/// columns** (2,602 bytes) and **5.2 KB at 160** (5,162 bytes) — `cols × 32` plus the row's
+/// own header. Multiply by this constant before raising it. Ten thousand rows is therefore
+/// roughly **26 MB per pane at 80 columns and 52 MB at 160**, per attached run. Fifty
+/// thousand, which is what this was, came to 124 MiB and 246 MiB: several times the 16 MiB
+/// byte log the same pane keeps, and by a wide margin the largest thing the client allocates.
+/// Ten thousand is still five times the 2000 rows a replica held before pane history existed,
+/// and further back than anyone scrolls to read.
+///
+/// The cap exists for a reason separate from that price, and the two should not be confused:
+/// it is this, not the byte budget, that bounds a client's memory at all. A replica is fed the
+/// live delta stream indefinitely, not merely the bytes the daemon can re-serve, so a
+/// long-lived pane would grow without limit however small the daemon's retention were set.
+pub const PANE_HISTORY_MAX_ROWS: usize = 10_000;
 
 /// A bounded, in-memory record of the raw bytes a pane's child has written, addressed by a
 /// monotonic byte sequence.
@@ -286,6 +296,41 @@ impl PaneOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `PANE_HISTORY_MAX_ROWS` is a memory budget written as a row count, and the conversion
+    /// is what makes it reviewable: `vt100` allocates `cols` cells of 32 bytes for every
+    /// retained row, whatever that row holds. Bracketed from both sides rather than pinned to
+    /// a literal, because both sides are the real constraint — raising it has to argue with
+    /// the megabytes per pane it buys, and lowering it has to argue with how far back a person
+    /// can scroll. The measured price includes a per-row header the arithmetic below leaves
+    /// out (2,602 bytes at 80 columns against 2,560 here), so this is a floor on the cost.
+    #[test]
+    fn the_replica_row_cap_prices_a_pane_in_tens_of_megabytes_rather_than_hundreds() {
+        const CELL_BYTES: usize = 32;
+        let cells = |cols: usize| PANE_HISTORY_MAX_ROWS * cols * CELL_BYTES;
+        assert!(
+            cells(160) <= 64 << 20,
+            "a single pane's scrollback must stay inside 64 MiB at the widest layout Dock \
+             renders; {} rows of 160 columns is {} MiB",
+            PANE_HISTORY_MAX_ROWS,
+            cells(160) >> 20
+        );
+        assert!(
+            cells(80) <= 32 << 20,
+            "and inside 32 MiB at 80 columns: {} MiB",
+            cells(80) >> 20
+        );
+        // A `const` block because both sides are compile-time constants and clippy rightly
+        // refuses a runtime assertion that can never vary: this one fails the build, not a
+        // test run, which is if anything the better place for it.
+        const {
+            assert!(
+                PANE_HISTORY_MAX_ROWS >= 5 * 2_000,
+                "the cap must stay at least five times the 2000 rows a replica held before \
+                 pane history existed, or it has taken back the feature it bounds"
+            );
+        }
+    }
 
     #[test]
     fn a_reader_that_keeps_up_receives_every_byte_exactly_once() {

@@ -72,6 +72,24 @@ struct PaneHistoryCursor {
     /// Set once this log has dropped bytes off its front, after which `from` no longer names
     /// where it starts and no request can be built from it. See `retain_history_bytes`.
     wrapped: bool,
+    /// Set once a page-back answer arrived and left the replica holding no more rows than it
+    /// held before, which means asking again cannot help.
+    ///
+    /// The row-capacity and headroom stops in `history_request_for` both read
+    /// `history_rows()`, and `history_rows()` reads the *active* grid. A pane in the alternate
+    /// screen has no scrollback there at all — `vt100` builds the alternate grid with
+    /// `scrollback_len = 0` — so it answers 0 whatever the pane has printed, and both stops
+    /// silently invert: nothing is ever "enough rows", and there are never rows "above the
+    /// viewport" to be far from. That is vim, less, htop, and the agent TUIs that are most of
+    /// what Dock runs, and it is not only them: a progress bar or a spinner repainting in
+    /// place produces bytes without producing rows. Left alone, every wheel notch pays a
+    /// two-megabyte round trip and a rebuild of a log that has just grown by two megabytes,
+    /// for output the pane can never display.
+    ///
+    /// So the answer itself is the evidence: if a page-back did not raise the row count, this
+    /// pane stops asking. A fresh `PaneAttached` builds a new cursor and therefore clears it,
+    /// which is the right reset — a re-attach is the one event that can change the answer.
+    fruitless: bool,
     /// Every byte this replica has been fed, seed and deltas alike.
     ///
     /// Kept because a `vt100` parser cannot have rows prepended to it: the only way older
@@ -774,6 +792,7 @@ impl Dashboard {
                         from: history_from,
                         complete: false,
                         wrapped: false,
+                        fruitless: false,
                         log: seed,
                     },
                 );
@@ -885,12 +904,14 @@ impl Dashboard {
     /// A request for the next chunk of history, when this pane is scrolled near the top of
     /// what it holds and there is any point asking for more.
     ///
-    /// Three separate things say there is no point. The daemon's `complete` means nothing
+    /// Four separate things say there is no point. The daemon's `complete` means nothing
     /// older is retained. A replica already holding its full row budget means nothing older
     /// can be *shown*: `vt100` drops the oldest row for every row added, so those bytes would
-    /// be replayed at the cost of a full rebuild and then immediately discarded. And a log
+    /// be replayed at the cost of a full rebuild and then immediately discarded. A log
     /// that has wrapped can no longer name the sequence it starts at, so there is no honest
-    /// request to send — see `retain_history_bytes`.
+    /// request to send — see `retain_history_bytes`. And a pane whose last answer raised no
+    /// row has said, in the only way it can, that its rows are not going into scrollback at
+    /// all — see `PaneHistoryCursor::fruitless`, which is what covers the alternate screen.
     ///
     /// Takes `&mut self` because `history_rows` does: reading the row count means moving the
     /// scroll offset to the clamp and putting it back.
@@ -902,7 +923,7 @@ impl Dashboard {
             return None;
         }
         let before = match self.history.get(run_id) {
-            Some(cursor) if !cursor.complete && !cursor.wrapped => cursor.from,
+            Some(cursor) if !cursor.complete && !cursor.wrapped && !cursor.fruitless => cursor.from,
             _ => return None,
         };
         let screen = self.screens.get_mut(run_id)?;
@@ -964,6 +985,19 @@ impl Dashboard {
         let Ok(older) = STANDARD.decode(&bytes) else {
             return;
         };
+        debug_assert_eq!(
+            from + older.len() as u64,
+            cursor.from,
+            "a page-back answer must abut the head of the log it is spliced in front of: \
+             `OutputLog::before` returns a contiguous run ending exactly at the cursor it was \
+             asked about, so a gap or an overlap means the pane was re-seeded between the \
+             request and the answer while keeping its epoch. Nothing rejects that today; it is \
+             prevented only by `main.rs`'s loop being synchronous, which this assert is here to \
+             notice the loss of."
+        );
+        // Read before anything is spliced, so the verdict below compares the same pane's rows
+        // before and after this answer rather than against a number carried from elsewhere.
+        let held_before = screen.history_rows();
         cursor.from = from;
         cursor.complete = complete;
         // Not trimmed to `PANE_HISTORY_BYTES` here, unlike the live path: the front of this log
@@ -976,6 +1010,11 @@ impl Dashboard {
         // cannot disagree with what it replaces about how much history a pane may keep.
         let mut rebuilt = PaneScreen::new(rows, cols, screen.history_capacity());
         rebuilt.feed(&cursor.log);
+        // The answer is its own evidence. A page-back that bought no scrollback row bought
+        // nothing at all, and the next one would buy nothing either: see
+        // `PaneHistoryCursor::fruitless` for the alternate screen, which is where this happens
+        // and where the two stops in `history_request_for` cannot see it.
+        cursor.fruitless = rebuilt.history_rows() <= held_before;
         rebuilt.scroll_by(i32::try_from(offset).unwrap_or(i32::MAX));
         *screen = rebuilt;
     }
@@ -5199,11 +5238,8 @@ impl Dashboard {
                     return UiCommand::None;
                 }
                 // Three rows per notch matches what terminals send for a single wheel click.
-                let delta = if event.kind == MouseEventKind::ScrollUp {
-                    3
-                } else {
-                    -3
-                };
+                let back = event.kind == MouseEventKind::ScrollUp;
+                let delta = if back { 3 } else { -3 };
                 let run_id = self
                     .pane_areas
                     .iter()
@@ -5212,7 +5248,11 @@ impl Dashboard {
                     .and_then(|pane| pane.run_id.clone());
                 if let Some(run_id) = run_id {
                     self.scroll_pane(&run_id, delta);
-                    if let Some(request) = self.history_request_for(&run_id) {
+                    // Only a notch *back* can want output older than the pane holds; a notch
+                    // toward live output moves through rows it already has. Asking on both put
+                    // a two-megabyte round trip and a full parser rebuild on half of every
+                    // wheel gesture, for history nobody was scrolling towards.
+                    if back && let Some(request) = self.history_request_for(&run_id) {
                         return UiCommand::Request(Box::new(request));
                     }
                 }
@@ -10261,6 +10301,27 @@ mod tests {
             .collect()
     }
 
+    /// A page-back answer that abuts the head of the replica's log, which is the only kind the
+    /// daemon can send: `OutputLog::before` returns a contiguous run ending exactly at the
+    /// cursor it was asked about. Built from the cursor rather than written out by hand so a
+    /// test cannot accidentally describe a gap or an overlap the protocol cannot produce —
+    /// which is what `apply_pane_history_response`'s `debug_assert` now says out loud.
+    fn history_response(
+        dashboard: &Dashboard,
+        run_id: &str,
+        epoch: u64,
+        older: &[u8],
+        complete: bool,
+    ) -> Response {
+        Response::PaneHistory {
+            run_id: run_id.into(),
+            epoch,
+            from: dashboard.history[run_id].from - older.len() as u64,
+            bytes: STANDARD.encode(older),
+            complete,
+        }
+    }
+
     /// The payoff of the cursor an attach frame carries: once the viewport reaches the top of
     /// what this replica holds, the only place the rows above it can come from is the daemon.
     #[test]
@@ -10539,13 +10600,8 @@ mod tests {
         let before = dashboard.screens["run_1"].scroll_offset();
         assert_ne!(before, 0, "the viewport moved into history at all");
         let visible = dashboard.screens["run_1"].screen().contents();
-        dashboard.apply_pane_history_response(Response::PaneHistory {
-            run_id: "run_1".into(),
-            epoch: 1,
-            from: 0,
-            bytes: STANDARD.encode(b"older\r\nolder\r\nolder\r\n"),
-            complete: true,
-        });
+        let answer = history_response(&dashboard, "run_1", 1, b"older\r\nolder\r\nolder\r\n", true);
+        dashboard.apply_pane_history_response(answer);
         assert_eq!(
             dashboard.screens["run_1"].scroll_offset(),
             before,
@@ -10569,13 +10625,8 @@ mod tests {
         let older: Vec<u8> = (1..=40)
             .flat_map(|index| format!("ancient {index}\r\n").into_bytes())
             .collect();
-        dashboard.apply_pane_history_response(Response::PaneHistory {
-            run_id: "run_1".into(),
-            epoch: 1,
-            from: 0,
-            bytes: STANDARD.encode(&older),
-            complete: true,
-        });
+        let answer = history_response(&dashboard, "run_1", 1, &older, true);
+        dashboard.apply_pane_history_response(answer);
         for _ in 0..500 {
             dashboard.scroll_pane("run_1", 3);
         }
@@ -10598,13 +10649,8 @@ mod tests {
             2,
             b"a line printed after attaching\r\n",
         ));
-        dashboard.apply_pane_history_response(Response::PaneHistory {
-            run_id: "run_1".into(),
-            epoch: 1,
-            from: 0,
-            bytes: STANDARD.encode(b"older\r\n"),
-            complete: true,
-        });
+        let answer = history_response(&dashboard, "run_1", 1, b"older\r\n", true);
+        dashboard.apply_pane_history_response(answer);
         let live = render_to_string(&mut dashboard, 100, 30);
         assert!(
             live.contains("a line printed after attaching"),
@@ -10617,13 +10663,8 @@ mod tests {
         let mut dashboard = bound_dashboard();
         dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
         dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
-        dashboard.apply_pane_history_response(Response::PaneHistory {
-            run_id: "run_1".into(),
-            epoch: 1,
-            from: 0,
-            bytes: STANDARD.encode(b"oldest\r\n"),
-            complete: true,
-        });
+        let answer = history_response(&dashboard, "run_1", 1, b"oldest\r\n", true);
+        dashboard.apply_pane_history_response(answer);
         render_to_string(&mut dashboard, 100, 30);
         let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
         for _ in 0..500 {
@@ -10727,6 +10768,101 @@ mod tests {
         );
     }
 
+    /// The stopping condition the other three cannot express, and the one that matters most in
+    /// practice. A pane in the alternate screen — vim, less, htop, and the agent TUIs that are
+    /// most of what Dock runs — has no scrollback at all: `vt100` builds the alternate grid
+    /// with a zero-length one, and `history_rows()` reads the *active* grid. So it answers 0
+    /// forever, the row-capacity stop never trips, the headroom stop never trips, and every
+    /// wheel notch fires a two-megabyte request and a full parser rebuild for rows that can
+    /// never be displayed. One answer that raised nothing is proof enough.
+    #[test]
+    fn a_pane_in_the_alternate_screen_stops_asking_after_one_answer_that_showed_it_nothing() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        // `\x1b[?1049h` switches to the alternate screen, whose grid vt100 gives no scrollback.
+        let mut output = b"\x1b[?1049h".to_vec();
+        output.extend_from_slice(&history_lines(60));
+        dashboard.apply_event(delta_event("run_1", 2, &output));
+        assert_eq!(
+            dashboard
+                .screens
+                .get_mut("run_1")
+                .expect("the pane is attached")
+                .history_rows(),
+            0,
+            "the alternate screen retains no scrollback, which is the whole trap"
+        );
+        assert!(
+            dashboard.history_request_for("run_1").is_some(),
+            "the first ask is fair: nothing observed so far says it is pointless"
+        );
+        let answer = history_response(&dashboard, "run_1", 1, &history_lines(40), false);
+        dashboard.apply_pane_history_response(answer);
+        assert!(
+            dashboard.history_request_for("run_1").is_none(),
+            "an answer that added no row is proof the next one would not either"
+        );
+    }
+
+    /// The other side of the stop above, and the one that would be silent if it broke: a pane
+    /// whose answer *did* buy it rows must still be free to page further back, or deep history
+    /// would end after exactly one chunk and look like the daemon running out of it.
+    #[test]
+    fn a_pane_whose_answer_added_rows_is_still_free_to_ask_for_the_chunk_before_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 8192, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        for _ in 0..200 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert!(
+            dashboard.history_request_for("run_1").is_some(),
+            "the first ask"
+        );
+        let answer = history_response(&dashboard, "run_1", 1, &history_lines(40), false);
+        dashboard.apply_pane_history_response(answer);
+        for _ in 0..200 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert!(
+            dashboard.history_request_for("run_1").is_some(),
+            "an answer that added rows says the mechanism works, not that it is finished"
+        );
+    }
+
+    /// Scrolling toward live output moves through rows the pane already holds, so it can never
+    /// need anything older. The wheel arm asked on both directions, which put a two-megabyte
+    /// round trip and a full parser rebuild on half of every wheel gesture.
+    #[test]
+    fn a_wheel_notch_toward_live_output_never_asks_for_older_history() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        let notch = |kind| MouseEvent {
+            kind,
+            column: area.x + 2,
+            row: area.y + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..40 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert!(
+            matches!(
+                dashboard.mouse(notch(MouseEventKind::ScrollUp)),
+                UiCommand::Request(_)
+            ),
+            "at the top of what it holds, a notch back does ask — otherwise this proves nothing"
+        );
+        assert_eq!(
+            dashboard.mouse(notch(MouseEventKind::ScrollDown)),
+            UiCommand::None,
+            "a notch toward live output must not ask, however near the top the pane is"
+        );
+    }
+
     /// A frozen pane paints a clone taken before the request could ever be answered, so a
     /// rebuild of the live parser cannot add a row to what the user is looking at. Without
     /// this the wheel would fire a two-megabyte request and a full rebuild on every notch for
@@ -10765,13 +10901,9 @@ mod tests {
         let ghosts: Vec<u8> = (1..=40)
             .flat_map(|index| format!("ghost {index}\r\n").into_bytes())
             .collect();
-        dashboard.apply_pane_history_response(Response::PaneHistory {
-            run_id: "run_1".into(),
-            epoch: 1, // the previous incarnation of this pane
-            from: 0,
-            bytes: STANDARD.encode(&ghosts),
-            complete: true,
-        });
+        // Epoch 1 is the previous incarnation of this pane; the replica is showing epoch 2.
+        let answer = history_response(&dashboard, "run_1", 1, &ghosts, true);
+        dashboard.apply_pane_history_response(answer);
         assert_eq!(
             dashboard.screens["run_1"].screen().contents(),
             before,
@@ -12109,6 +12241,7 @@ mod tests {
                 from: 0,
                 complete: false,
                 wrapped: false,
+                fruitless: false,
                 log: vec![b'x'; PANE_HISTORY_BYTES],
             },
         );

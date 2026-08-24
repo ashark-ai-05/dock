@@ -28,12 +28,33 @@ use crate::{
     picker::{Picker, PickerItem},
     protocol::{
         BindingKind, DashboardProfile, DecideRequest, DispatchRequest, Event,
-        LaunchIntoPaneRequest, PROTOCOL_VERSION, PaneQueueSnapshot, QueueRequest, Request,
-        Response, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
+        LaunchIntoPaneRequest, PROTOCOL_VERSION, PaneHistoryRequest, PaneQueueSnapshot,
+        QueueRequest, Request, Response, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
     },
-    terminal::{KeyEncoding, PaneScreen, PaneSnapshot, encode_paste},
+    terminal::{KeyEncoding, PANE_HISTORY_BYTES, PaneScreen, PaneSnapshot, encode_paste},
     theme::Theme,
 };
+
+/// How much older output one page-back asks for.
+///
+/// Deliberately far below what a pane retains. Extending a replica's history means replaying
+/// every byte it holds through a fresh parser, because a parser cannot be prepended to, and
+/// that cost is paid on the wheel notch that asks for it. A chunk this size is thousands of
+/// rows — several screens of scrolling — for a rebuild that stays inside a frame.
+const PANE_PAGE_BACK_BYTES: u32 = 2 << 20;
+
+/// What a pane's replica holds, and where it would ask for more.
+///
+/// `from` is the sequence its own byte log begins at, which is exactly the cursor a
+/// `PaneHistory` request names. `epoch` is the byte stream those sequences belong to: a run
+/// that restarted has a new one, and an answer carrying the old one names positions in a
+/// stream this replica is no longer showing. `complete` is the daemon saying there is nothing
+/// older still retained.
+struct PaneHistoryCursor {
+    epoch: u64,
+    from: u64,
+    complete: bool,
+}
 
 /// Copy mode's bindings, published in the footer for as long as the mode is active. It is
 /// the only way in without reading the help, and the only reminder of the way out.
@@ -83,6 +104,15 @@ pub struct Dashboard {
     /// This client's own emulator for each run, advanced by pushed deltas. The daemon holds the
     /// authoritative screen; this is the local replica the dashboard actually paints from.
     pub screens: HashMap<String, PaneScreen>,
+    /// Where each replica's own history starts, and whether anything older is still to be had.
+    history: HashMap<String, PaneHistoryCursor>,
+    /// Every byte each replica has been fed, seed and deltas alike.
+    ///
+    /// Kept because a `vt100` parser cannot have rows prepended to it: the only way older
+    /// output enters a replica is to replay it, followed by everything the replica already
+    /// saw, through a brand new parser. Bounded by `PANE_HISTORY_BYTES` and trimmed from the
+    /// front, so a pane that runs for a week costs the same as one that just started.
+    history_bytes: HashMap<String, Vec<u8>>,
     /// Latest agent identity and state per run, as pushed by the daemon.
     pub agents: HashMap<String, (Option<AgentKind>, AgentState)>,
     revisions: HashMap<String, u64>,
@@ -677,10 +707,8 @@ impl Dashboard {
                 rows,
                 cols,
                 scrollback_rows,
-                // Not yet consumed here: paging back through history is Task 5's client
-                // behaviour. This task only carries the fields on the wire.
-                history_from: _,
-                epoch: _,
+                history_from,
+                epoch,
                 screen,
             } => {
                 // The daemon's own retention, so this replica holds exactly the history the
@@ -689,10 +717,22 @@ impl Dashboard {
                 // `ScrollUp`/`ScrollDown` arm) nothing to scroll into however much the pane
                 // produced.
                 let mut terminal = PaneScreen::new(rows, cols, scrollback_rows as usize);
-                if let Ok(bytes) = STANDARD.decode(&screen) {
-                    terminal.feed(&bytes);
-                }
+                let seed = STANDARD.decode(&screen).unwrap_or_default();
+                terminal.feed(&seed);
                 self.screens.insert(run_id.clone(), terminal);
+                // The seed is a replay of the daemon's log from `history_from`, so that is
+                // where this replica's own history begins and what anything older is *before*.
+                // A re-attach replaces both together: the frame is a fresh replay, so a log
+                // kept from the previous one would be replayed twice.
+                self.history.insert(
+                    run_id.clone(),
+                    PaneHistoryCursor {
+                        epoch,
+                        from: history_from,
+                        complete: false,
+                    },
+                );
+                self.history_bytes.insert(run_id.clone(), seed);
                 self.revisions.insert(run_id.clone(), revision);
                 self.end_copy_mode_for(&run_id, "the pane was re-attached");
             }
@@ -705,6 +745,8 @@ impl Dashboard {
                 if expected != Some(revision) {
                     self.screens.remove(&run_id);
                     self.revisions.remove(&run_id);
+                    self.history.remove(&run_id);
+                    self.history_bytes.remove(&run_id);
                     self.end_copy_mode_for(&run_id, "the pane lost sync and is re-seeding");
                     return;
                 }
@@ -712,7 +754,8 @@ impl Dashboard {
                     (self.screens.get_mut(&run_id), STANDARD.decode(&bytes))
                 {
                     terminal.feed(&decoded);
-                    self.revisions.insert(run_id, revision);
+                    self.revisions.insert(run_id.clone(), revision);
+                    self.retain_history_bytes(&run_id, &decoded);
                 }
             }
             Event::AgentStateChanged {
@@ -749,6 +792,11 @@ impl Dashboard {
     pub fn detach_screens(&mut self) {
         self.screens.clear();
         self.revisions.clear();
+        // The byte logs go with the parsers they were built to rebuild. A fresh subscription
+        // re-attaches with a new seed and a new cursor, and a log kept across that would be
+        // replayed in front of bytes it already contains.
+        self.history.clear();
+        self.history_bytes.clear();
         // The frozen screen would happily outlive the replica it was cloned from — nothing in
         // it points back at one — but a selection over a pane that is about to be rebuilt from
         // a fresh snapshot is a selection of rows the user is no longer being shown.
@@ -759,6 +807,129 @@ impl Dashboard {
         // only when a run's identity or state *changes*. Left behind, every entry from before
         // the drop would keep painting a sidebar row for a run that may no longer exist.
         self.agents.clear();
+    }
+
+    /// Records bytes a replica has been fed, so its parser can be rebuilt from them later.
+    ///
+    /// Trimmed from the front, never the back: the newest bytes are the ones on screen, and a
+    /// log missing its tail would rebuild a pane that has forgotten what it just printed.
+    /// Dropping the front moves where this log starts, so the paging cursor moves with it —
+    /// otherwise the next request would ask for bytes before a point the log no longer
+    /// reaches, and the answer would be spliced in with a hole between it and the rest.
+    fn retain_history_bytes(&mut self, run_id: &str, bytes: &[u8]) {
+        let Some(log) = self.history_bytes.get_mut(run_id) else {
+            return;
+        };
+        log.extend_from_slice(bytes);
+        let overflow = log.len().saturating_sub(PANE_HISTORY_BYTES);
+        if overflow == 0 {
+            return;
+        }
+        log.drain(..overflow);
+        if let Some(cursor) = self.history.get_mut(run_id) {
+            cursor.from += overflow as u64;
+            // `complete` is deliberately left alone. It says the daemon had nothing older when
+            // it last answered, and a pane that has since produced a whole budget of output
+            // has aged those same bytes out of the daemon's log too; re-asking would fetch
+            // bytes only to drop them again on the next write.
+        }
+    }
+
+    /// A request for the next chunk of history, when this pane is scrolled near the top of
+    /// what it holds and there is any point asking for more.
+    ///
+    /// Two separate things say there is no point. The daemon's `complete` means nothing older
+    /// is retained. A replica already holding its full row budget means nothing older can be
+    /// *shown*: `vt100` drops the oldest row for every row added, so those bytes would be
+    /// replayed at the cost of a full rebuild and then immediately discarded.
+    ///
+    /// Takes `&mut self` because `history_rows` does: reading the row count means moving the
+    /// scroll offset to the clamp and putting it back.
+    fn history_request_for(&mut self, run_id: &str) -> Option<Request> {
+        if self.copy.as_ref().is_some_and(|mode| mode.is_for(run_id)) {
+            // A frozen pane paints its snapshot, and rebuilding the live parser cannot add a
+            // row to a snapshot that was cloned before it. Without this the wheel would fire a
+            // request and a rebuild on every notch for as long as copy mode is open.
+            return None;
+        }
+        let before = match self.history.get(run_id) {
+            Some(cursor) if !cursor.complete => cursor.from,
+            _ => return None,
+        };
+        let screen = self.screens.get_mut(run_id)?;
+        let (rows, _) = screen.size();
+        let held = screen.history_rows();
+        if held >= screen.history_capacity() {
+            return None;
+        }
+        // Rows still above the viewport. One screen height of headroom, so the request goes
+        // out just before the user reaches the top rather than at the moment they hit it.
+        let above = held.saturating_sub(screen.scroll_offset());
+        if above > usize::from(rows) {
+            return None;
+        }
+        Some(Request::PaneHistory(PaneHistoryRequest {
+            run_id: run_id.to_owned(),
+            before,
+            max_bytes: PANE_PAGE_BACK_BYTES,
+        }))
+    }
+
+    /// Splices older output in front of what a pane holds, by rebuilding its parser from the
+    /// extended byte log.
+    ///
+    /// A parser cannot be prepended to, so this is the only way history enters a replica: a
+    /// fresh parser, fed the older bytes and then every byte this replica had already seen.
+    /// The viewport is preserved explicitly. `vt100` measures the scroll offset from the
+    /// bottom, so rows added above happen to leave it pointing at the same content — but that
+    /// is a property of the engine rather than of this code, and restoring the offset says so
+    /// where a swap of the engine would notice.
+    pub fn apply_pane_history_response(&mut self, response: Response) {
+        let Response::PaneHistory {
+            run_id,
+            epoch,
+            from,
+            bytes,
+            complete,
+        } = response
+        else {
+            if let Response::Error { message, .. } = response {
+                self.error = Some(message);
+            }
+            return;
+        };
+        let Some(cursor) = self.history.get_mut(&run_id) else {
+            return;
+        };
+        if cursor.epoch != epoch {
+            // The pane restarted between the request and the answer. These bytes belong to a
+            // stream this replica is not showing, and the sequences naming them mean nothing
+            // in the one it is.
+            return;
+        }
+        let Ok(older) = STANDARD.decode(&bytes) else {
+            return;
+        };
+        cursor.from = from;
+        cursor.complete = complete;
+        let Some(log) = self.history_bytes.get_mut(&run_id) else {
+            return;
+        };
+        // Not trimmed to `PANE_HISTORY_BYTES` here, unlike the live path: the front of this log
+        // is exactly what was just asked for, and trimming it would discard the answer. The
+        // total stays bounded anyway, because the daemon can only ever serve what it retains.
+        log.splice(0..0, older);
+        let Some(screen) = self.screens.get_mut(&run_id) else {
+            return;
+        };
+        let (rows, cols) = screen.size();
+        let offset = screen.scroll_offset();
+        // Read off the screen being replaced rather than carried on the cursor, so the rebuild
+        // cannot disagree with what it replaces about how much history a pane may keep.
+        let mut rebuilt = PaneScreen::new(rows, cols, screen.history_capacity());
+        rebuilt.feed(log);
+        rebuilt.scroll_by(i32::try_from(offset).unwrap_or(i32::MAX));
+        *screen = rebuilt;
     }
 
     /// Replaces the run list and drops any agent roster entry whose run is gone.
@@ -4793,6 +4964,9 @@ impl Dashboard {
                     .and_then(|pane| pane.run_id.clone());
                 if let Some(run_id) = run_id {
                     self.scroll_pane(&run_id, delta);
+                    if let Some(request) = self.history_request_for(&run_id) {
+                        return UiCommand::Request(Box::new(request));
+                    }
                 }
                 UiCommand::None
             }
@@ -5757,9 +5931,6 @@ mod tests {
 
     /// One delta of raw child output. Revisions must be contiguous or `apply_event` drops the
     /// screen rather than advancing it into a corrupted grid, so this counts for the caller.
-    ///
-    /// Not yet called from this file: it exists for the paging tests the next task adds.
-    #[allow(dead_code)]
     fn delta_event(run_id: &str, revision: u64, bytes: &[u8]) -> Event {
         Event::PaneDelta {
             run_id: run_id.into(),
@@ -9541,6 +9712,298 @@ mod tests {
         );
     }
 
+    /// Raw child output, which is the only thing that gives a replica scrollback: a screen
+    /// snapshot is cursor-addressed and never scrolls a row into history.
+    fn history_lines(count: u32) -> Vec<u8> {
+        (1..=count)
+            .flat_map(|index| format!("line {index}\r\n").into_bytes())
+            .collect()
+    }
+
+    /// The payoff of the cursor an attach frame carries: once the viewport reaches the top of
+    /// what this replica holds, the only place the rows above it can come from is the daemon.
+    #[test]
+    fn scrolling_to_the_top_of_what_a_pane_holds_asks_for_what_came_before() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        // Walk the viewport to the top of the replica's own history.
+        for _ in 0..200 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        let command = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: area.x + 2,
+            row: area.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(&command, UiCommand::Request(request)
+                if matches!(request.as_ref(), Request::PaneHistory(r) if r.before == 4096)),
+            "at the top of its history the client must ask for the bytes before its cursor: \
+             {command:?}"
+        );
+    }
+
+    /// The other half of that predicate. A wheel notch in the middle of a pane's own history
+    /// is answered locally, and a client that asked the daemon on every notch would spend a
+    /// two-megabyte round trip and a full parser rebuild on a scroll it already had the rows
+    /// for.
+    #[test]
+    fn scrolling_in_the_middle_of_what_a_pane_holds_asks_for_nothing() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(400)));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        let command = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: area.x + 2,
+            row: area.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            command,
+            UiCommand::None,
+            "hundreds of rows above the viewport are already held locally"
+        );
+    }
+
+    #[test]
+    fn history_that_arrives_extends_the_pane_upwards_without_moving_what_is_on_screen() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        for _ in 0..10 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        let before = dashboard.screens["run_1"].scroll_offset();
+        assert_ne!(before, 0, "the viewport moved into history at all");
+        let visible = dashboard.screens["run_1"].screen().contents();
+        dashboard.apply_pane_history_response(Response::PaneHistory {
+            run_id: "run_1".into(),
+            epoch: 1,
+            from: 0,
+            bytes: STANDARD.encode(b"older\r\nolder\r\nolder\r\n"),
+            complete: true,
+        });
+        assert_eq!(
+            dashboard.screens["run_1"].scroll_offset(),
+            before,
+            "the offset is measured from the bottom, so more history above must not move the view"
+        );
+        assert_eq!(
+            dashboard.screens["run_1"].screen().contents(),
+            visible,
+            "the same rows must still be on screen"
+        );
+    }
+
+    /// The whole point of the exercise: output produced before this client ever attached is
+    /// rows the wheel can reach. Everything else here is about not disturbing what is already
+    /// on screen while that happens.
+    #[test]
+    fn history_that_arrives_becomes_rows_the_wheel_can_scroll_into() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        let older: Vec<u8> = (1..=40)
+            .flat_map(|index| format!("ancient {index}\r\n").into_bytes())
+            .collect();
+        dashboard.apply_pane_history_response(Response::PaneHistory {
+            run_id: "run_1".into(),
+            epoch: 1,
+            from: 0,
+            bytes: STANDARD.encode(&older),
+            complete: true,
+        });
+        for _ in 0..500 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        let scrolled = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            scrolled.contains("ancient 2"),
+            "output from before the attach must be reachable by scrolling: {scrolled}"
+        );
+    }
+
+    /// The byte log has to track the parser, not just the seed. A rebuild replays the log, so
+    /// a log that stopped at the attach would silently drop everything the pane has printed
+    /// since — the most recent output, which is the output a person is actually looking at.
+    #[test]
+    fn a_rebuild_keeps_the_output_that_arrived_after_the_attach() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event(
+            "run_1",
+            2,
+            b"a line printed after attaching\r\n",
+        ));
+        dashboard.apply_pane_history_response(Response::PaneHistory {
+            run_id: "run_1".into(),
+            epoch: 1,
+            from: 0,
+            bytes: STANDARD.encode(b"older\r\n"),
+            complete: true,
+        });
+        let live = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            live.contains("a line printed after attaching"),
+            "the rebuild must replay the deltas as well as the seed: {live}"
+        );
+    }
+
+    #[test]
+    fn a_pane_that_has_reached_the_oldest_retained_byte_stops_asking() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        dashboard.apply_pane_history_response(Response::PaneHistory {
+            run_id: "run_1".into(),
+            epoch: 1,
+            from: 0,
+            bytes: STANDARD.encode(b"oldest\r\n"),
+            complete: true,
+        });
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        for _ in 0..500 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: area.x + 2,
+                row: area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None,
+            "there is nothing older, so scrolling must not keep asking"
+        );
+    }
+
+    /// The second thing that stops paging, and the one the daemon cannot tell the client
+    /// about. A replica retains a fixed number of rows; once it holds that many, older bytes
+    /// cannot be displayed however many of them are fetched, so fetching them is pure cost.
+    #[test]
+    fn a_pane_holding_every_row_it_is_allowed_to_stops_asking_for_older_bytes() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(Event::PaneAttached {
+            run_id: "run_1".into(),
+            revision: 1,
+            rows: PANE_ROWS,
+            cols: PANE_COLS,
+            scrollback_rows: 3,
+            history_from: 4096,
+            epoch: 1,
+            screen: String::new(),
+        });
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        for _ in 0..500 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: area.x + 2,
+                row: area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None,
+            "a replica already holding its full row budget has nowhere to put older bytes"
+        );
+    }
+
+    /// The cap on a client's own byte log, which is what keeps a pane that has run all week
+    /// costing the same as one that just started. Dropping the front moves where the log
+    /// begins, so the paging cursor moves with it: left behind, the next request would name a
+    /// point the log no longer reaches and the answer would be spliced in with a hole in it.
+    #[test]
+    fn a_byte_log_that_outgrows_its_budget_is_trimmed_from_the_front_and_carries_the_cursor() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        let seed = dashboard.history_bytes["run_1"].len();
+        let overflow = 1024;
+        // Fed straight to the log rather than through a delta: the point is the budget, and
+        // parsing sixteen megabytes to reach it would make this test the slowest in the file.
+        let written = vec![b'.'; PANE_HISTORY_BYTES + overflow - seed];
+        dashboard.retain_history_bytes("run_1", &written);
+        assert_eq!(
+            dashboard.history_bytes["run_1"].len(),
+            PANE_HISTORY_BYTES,
+            "the log must stay inside the budget"
+        );
+        assert_eq!(
+            dashboard.history["run_1"].from,
+            4096 + overflow as u64,
+            "the cursor must name the sequence the trimmed log now begins at"
+        );
+    }
+
+    /// A frozen pane paints a clone taken before the request could ever be answered, so a
+    /// rebuild of the live parser cannot add a row to what the user is looking at. Without
+    /// this the wheel would fire a two-megabyte request and a full rebuild on every notch for
+    /// as long as copy mode stayed open.
+    #[test]
+    fn scrolling_a_frozen_pane_asks_for_no_history_it_could_not_show() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(30)));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        assert_eq!(command(&mut dashboard, KeyCode::Char('[')), UiCommand::None);
+        assert!(dashboard.copy.is_some(), "the pane is frozen");
+        for _ in 0..10 {
+            assert_eq!(
+                dashboard.mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: area.x + 2,
+                    row: area.y + 2,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                UiCommand::None,
+                "a frozen pane cannot show anything a page-back would fetch"
+            );
+        }
+    }
+
+    /// Enough lines that they would unmistakably reach scrollback if they were spliced in —
+    /// a single line would be overwritten by the seed's repaint and prove nothing.
+    #[test]
+    fn history_from_a_restarted_run_is_discarded_rather_than_spliced_in() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 2));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        let before = dashboard.screens["run_1"].screen().contents();
+        let ghosts: Vec<u8> = (1..=40)
+            .flat_map(|index| format!("ghost {index}\r\n").into_bytes())
+            .collect();
+        dashboard.apply_pane_history_response(Response::PaneHistory {
+            run_id: "run_1".into(),
+            epoch: 1, // the previous incarnation of this pane
+            from: 0,
+            bytes: STANDARD.encode(&ghosts),
+            complete: true,
+        });
+        assert_eq!(
+            dashboard.screens["run_1"].screen().contents(),
+            before,
+            "a cursor from before a restart names a position in a stream that no longer exists"
+        );
+        for _ in 0..500 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        let scrolled = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            !scrolled.contains("ghost 2"),
+            "bytes from a dead stream must not be spliced into this one: {scrolled}"
+        );
+    }
+
     #[test]
     fn the_prefix_then_bracket_enters_copy_mode_and_escape_leaves_it() {
         let mut dashboard = bound_dashboard();
@@ -10828,6 +11291,35 @@ mod tests {
                 / u64::from(frames);
         }
         (fastest, allocations, bytes)
+    }
+
+    /// What a page-back costs, which is the cost of the wheel notch that asks for it.
+    ///
+    /// A parser cannot be prepended to, so extending a pane's history means replaying every
+    /// byte it holds through a fresh parser. That is the number the 2 MB chunk size is chosen
+    /// against: the log grows by a chunk per page-back, and the whole of it is replayed each
+    /// time, so the cost of the tenth page-back is the cost of replaying twenty megabytes.
+    /// Reported at three log sizes for that reason — the shape of the curve is the point, not
+    /// any one row of it.
+    #[test]
+    #[ignore = "a measurement, not an assertion; cargo test --release measure_what_paging_back -- --ignored --nocapture"]
+    fn measure_what_paging_back_through_a_panes_history_costs() {
+        println!();
+        println!("rebuilding a 40x160 replica from its own byte log");
+        println!("{:>12}  {:>10}  {:>10}", "lines", "bytes", "ms");
+        for lines in [20_000u32, 40_000, 80_000] {
+            let log: Vec<u8> = (0..lines)
+                .flat_map(|line| format!("line {line} of a long build log\r\n").into_bytes())
+                .collect();
+            let mut fastest = f64::MAX;
+            for _ in 0..7 {
+                let mut screen = PaneScreen::new(40, 160, crate::terminal::PANE_HISTORY_MAX_ROWS);
+                let start = std::time::Instant::now();
+                screen.feed(&log);
+                fastest = fastest.min(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!("{lines:>12}  {:>10}  {fastest:>10.2}", log.len());
+        }
     }
 
     #[test]

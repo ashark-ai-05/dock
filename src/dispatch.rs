@@ -3264,9 +3264,9 @@ impl RuntimeRegistry {
         self.scrollback_rows
     }
 
-    /// Bytes of raw output every pane retains. Announced to subscribers, in rows, so a
-    /// client's replica is sized to hold the history it will be sent rather than the
-    /// daemon's own parser depth.
+    /// Bytes of raw output every pane retains. The attach frame announces a row capacity
+    /// derived from this budget, so a client's replica is sized to hold the history it will
+    /// be sent rather than the daemon's own parser depth.
     pub fn pane_history_bytes(&self) -> usize {
         self.pane_history_bytes
     }

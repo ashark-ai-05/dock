@@ -528,7 +528,7 @@ fn stream_events(
             {
                 syncs.remove(&snapshot.run_id);
             }
-            let scrollback_rows = u32::try_from(runtime.scrollback_rows()).unwrap_or(u32::MAX);
+            let pane_history_bytes = runtime.pane_history_bytes();
             let frame = runtime.with_run_output(&snapshot.run_id, |output| {
                 match syncs.get_mut(&snapshot.run_id) {
                     Some(view) => view.next_delta(output),
@@ -567,7 +567,7 @@ fn stream_events(
                     revisions.insert(snapshot.run_id.clone(), revision);
                 }
                 StreamFrame::Seed(seed) => {
-                    let (view, bytes) = *seed;
+                    let (view, _history_from, bytes) = *seed;
                     let revision = revisions.get(&snapshot.run_id).copied().unwrap_or(0) + 1;
                     write_response(
                         stream,
@@ -577,7 +577,14 @@ fn stream_events(
                                 revision,
                                 rows: snapshot.rows,
                                 cols: snapshot.cols,
-                                scrollback_rows,
+                                // Rows the replica must retain to hold everything it can be
+                                // sent. Derived from the byte budget at a deliberately
+                                // pessimistic 8 bytes a row: over-sizing costs an empty
+                                // VecDeque slot per row, under-sizing silently discards
+                                // replayed history off the top, and only one of those is a bug
+                                // a person would ever see.
+                                scrollback_rows: u32::try_from(pane_history_bytes / 8)
+                                    .unwrap_or(u32::MAX),
                                 screen: STANDARD.encode(&bytes),
                             },
                         },
@@ -672,10 +679,19 @@ enum StreamFrame {
     /// erase drift appended. Empty when the pane has been silent, which is the common case.
     Delta(Vec<u8>),
     /// A full snapshot and the view that replaces this subscriber's, for a run it has never
-    /// seen, one whose geometry changed, or one whose output it has fallen behind.
+    /// seen, one whose geometry changed, or one whose output it has fallen behind. The `u64`
+    /// is the sequence the replayed bytes begin at; unused until Task 4 puts it on the wire
+    /// as the client's paging cursor.
     /// Boxed only to keep the common `Delta` frame small: a view carries two parsers.
-    Seed(Box<(SubscriberView, Vec<u8>)>),
+    Seed(Box<(SubscriberView, u64, Vec<u8>)>),
 }
+
+/// How much retained output rides along with an attach frame.
+///
+/// Enough that scrolling up is instant for the distance anyone scrolls without thinking, and
+/// small enough that attaching to a canvas of panes is not a stall: this is paid per pane, on
+/// every client start and every re-seed. Everything older is paged in on demand.
+const SEED_HISTORY_BYTES: usize = 256 * 1024;
 
 /// How far into one run's raw output this subscriber has read, a replica of what it should
 /// now be showing, and the geometry the view was built at. Revisions live outside this so
@@ -692,26 +708,23 @@ struct SubscriberView {
 }
 
 impl SubscriberView {
-    /// A snapshot of `output`'s screen and the view a subscriber sent it will then have.
+    /// A fresh subscriber's starting point: a replay of the pane's recent history, followed by
+    /// whatever correction that replay did not achieve on its own.
     ///
-    /// The snapshot is a repaint, which restores the visible grid but says nothing about
-    /// which buffer that grid is. A pane already in the alternate screen must therefore say
-    /// so first, or the client would paint a full-screen program's window onto its primary
-    /// buffer — scrolling the user's real history away and leaving the client on the wrong
-    /// buffer when the program exits.
+    /// Replaying raw history rather than sending the visible grid is what gives the client
+    /// something to scroll back through: a repaint is cursor-addressed and never scrolls a row
+    /// into scrollback, so a client seeded with one begins with no history at all.
     ///
-    /// There is deliberately no matching `\e[?1049l` for a pane on the primary screen, and
-    /// that is only safe because `Dashboard::apply_event` rebuilds the client's parser on
-    /// every `PaneAttached` (`src/dashboard.rs`), so a seed always lands in a fresh primary
-    /// buffer. Reusing an existing parser across a re-attach — to preserve its accumulated
-    /// history, say — would strand a client that was in the alternate screen when the pane
-    /// left it. Any such change must send the leave sequence from here.
-    fn seeded(output: &PaneOutput, rows: u16, cols: u16) -> (Self, Vec<u8>) {
-        let mut bytes = Vec::new();
-        if output.screen().alternate_screen() {
-            bytes.extend_from_slice(b"\x1b[?1049h");
-        }
-        bytes.extend_from_slice(&output.screen().state_bytes());
+    /// **The alternate screen is handled by comparison, not by assumption.** The replayed bytes
+    /// may themselves contain `1049h`/`1049l`, so after replay this subscriber's parser can be
+    /// in either buffer, and the older rule here — always land in a fresh primary buffer, so
+    /// only `1049h` is ever needed — no longer holds. Instead the seed's own `ScreenSync` is
+    /// asked which buffer the replay reached, and the corrective sequence is appended only when
+    /// it disagrees with the live screen. Both directions matter: a replica left in the
+    /// alternate screen paints a full-screen program over the user's history, and a replica left
+    /// on primary renders a full-screen program into scrollback.
+    fn seeded(output: &PaneOutput, rows: u16, cols: u16) -> (Self, u64, Vec<u8>) {
+        let (from, mut bytes) = output.log().tail(SEED_HISTORY_BYTES);
         let mut view = Self {
             sync: ScreenSync::new(rows, cols),
             size: (rows, cols),
@@ -719,7 +732,16 @@ impl SubscriberView {
             epoch: output.log().epoch(),
         };
         view.sync.apply(&bytes);
-        (view, bytes)
+        if view.sync.alternate_screen() != output.screen().alternate_screen() {
+            let correction: &[u8] = if output.screen().alternate_screen() {
+                b"\x1b[?1049h"
+            } else {
+                b"\x1b[?1049l"
+            };
+            bytes.extend_from_slice(correction);
+            view.sync.apply(correction);
+        }
+        (view, from, bytes)
     }
 
     /// The bytes owed to this subscriber, or `None` if it has fallen further behind than the
@@ -890,6 +912,7 @@ fn write_response(stream: &mut UnixStream, response: &Response) -> Result<(), St
 mod tests {
     use super::*;
     use crate::protocol::{HelloRequest, PaneInputRequest, PaneResizeRequest, SubscribeRequest};
+    use crate::terminal::PaneScreen;
     use std::{
         net::Shutdown,
         path::PathBuf,
@@ -2040,8 +2063,9 @@ mod tests {
             .expect("an attach frame");
         assert_eq!(
             attached as usize,
-            runtime.scrollback_rows(),
-            "the attach frame must carry the daemon's real retention, not a client-side guess"
+            runtime.pane_history_bytes() / 8,
+            "the attach frame must carry a capacity derived from the daemon's real history \
+             retention, not a client-side guess"
         );
 
         let mut replayed = replay(&events, &run_id);
@@ -2087,14 +2111,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_seed_carries_the_panes_history_and_not_just_its_visible_screen() {
+        let mut output = PaneOutput::new(2, 20, 100, 4096);
+        for line in 0..20 {
+            output.feed(format!("line {line}\r\n").as_bytes());
+        }
+        let (_, _, bytes) = SubscriberView::seeded(&output, 2, 20);
+        let seeded = String::from_utf8_lossy(&bytes);
+        assert!(
+            seeded.contains("line 0"),
+            "the seed must replay history, not just the two visible rows: {seeded:?}"
+        );
+    }
+
+    #[test]
+    fn a_seed_whose_history_ends_in_the_alternate_screen_returns_a_primary_pane_to_primary() {
+        let mut output = PaneOutput::new(4, 20, 100, 4096);
+        output.feed(b"history\r\n");
+        output.feed(b"\x1b[?1049h"); // a full-screen program starts
+        output.feed(b"inside the program");
+        output.feed(b"\x1b[?1049l"); // and exits, leaving the pane on primary
+        assert!(!output.screen().alternate_screen());
+        let (_, _, bytes) = SubscriberView::seeded(&output, 4, 20);
+        let mut replica = PaneScreen::new(4, 20, 100);
+        replica.feed(&bytes);
+        assert!(
+            !replica.alternate_screen(),
+            "a replica left in the alternate screen would paint over the user's history"
+        );
+    }
+
+    #[test]
+    fn a_seed_for_a_pane_inside_the_alternate_screen_puts_the_replica_there() {
+        let mut output = PaneOutput::new(4, 20, 100, 4096);
+        output.feed(b"history\r\n");
+        output.feed(b"\x1b[?1049h");
+        output.feed(b"inside the program");
+        assert!(output.screen().alternate_screen());
+        let (_, _, bytes) = SubscriberView::seeded(&output, 4, 20);
+        let mut replica = PaneScreen::new(4, 20, 100);
+        replica.feed(&bytes);
+        assert!(replica.alternate_screen());
+    }
+
+    /// What attaching a subscriber to a pane with a full history costs.
+    ///
+    /// This is paid per pane on every client start and every re-seed, so it is the number that
+    /// decides whether the seed prefix is the right size. Fastest of several rounds, for the
+    /// reason `measure_frame` gives: noise only ever makes a round slower.
+    #[test]
+    #[ignore = "a measurement, not an assertion: cargo test --release --lib -- --ignored --nocapture"]
+    fn measure_what_seeding_a_pane_with_its_history_costs() {
+        let mut output = PaneOutput::new(40, 160, 100_000, crate::terminal::PANE_HISTORY_BYTES);
+        for line in 0..200_000 {
+            output.feed(format!("line {line} of a long build log\r\n").as_bytes());
+        }
+        let mut fastest = f64::MAX;
+        let mut size = 0;
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            let (_, _, bytes) = SubscriberView::seeded(&output, 40, 160);
+            fastest = fastest.min(start.elapsed().as_secs_f64() * 1000.0);
+            size = bytes.len();
+        }
+        println!("\nseed of a full pane: {size} bytes in {fastest:.2}ms");
+    }
+
     /// A subscriber slow enough to fall past the retained window must be re-seeded. Serving it
     /// whatever bytes survive would skip the rest, and a mirror missing a run of bytes looks
     /// exactly like a rendering bug with nothing to attribute it to.
     #[test]
     fn a_subscriber_that_falls_behind_the_retained_output_is_re_seeded_rather_than_skipped() {
-        let mut output = PaneOutput::new(5, 20, 100, 16);
+        // Large enough that the re-seed's replayed tail still covers more than the five visible
+        // rows (so it reconstructs the live screen exactly, the same way a real log many times
+        // the size of `SEED_HISTORY_BYTES` would), small enough that the burst below still
+        // evicts the offset the subscriber fell behind at.
+        let mut output = PaneOutput::new(5, 20, 100, 128);
         output.feed(b"first\r\n");
-        let (mut view, seed) = SubscriberView::seeded(&output, 5, 20);
+        let (mut view, _history_from, seed) = SubscriberView::seeded(&output, 5, 20);
         let mut client = crate::terminal::VtTerminal::new(5, 20, 100);
         client.feed(&seed);
         assert_eq!(client.state_bytes(), output.screen().state_bytes());
@@ -2118,7 +2213,7 @@ mod tests {
             view.next_delta(&output).is_none(),
             "falling behind must be reported, not silently partially served"
         );
-        let (mut recovered, reseed) = SubscriberView::seeded(&output, 5, 20);
+        let (mut recovered, _history_from, reseed) = SubscriberView::seeded(&output, 5, 20);
         client.feed(&reseed);
         assert_eq!(
             client.state_bytes(),

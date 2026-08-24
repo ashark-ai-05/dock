@@ -54,6 +54,13 @@ impl ScreenSync {
     pub fn cursor(&self) -> (u16, u16) {
         self.sent.cursor()
     }
+
+    /// Which buffer this subscriber's replica is in. The seed compares it against the live
+    /// screen rather than assuming a fresh parser is on primary, because a replayed history
+    /// can leave it in either.
+    pub fn alternate_screen(&self) -> bool {
+        self.sent.alternate_screen()
+    }
 }
 
 /// How many bytes of raw child output each pane retains, and therefore how far back a person

@@ -8,7 +8,7 @@ use crate::{
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +32,7 @@ pub enum Request {
     PaneResize(PaneResizeRequest),
     Subscribe(SubscribeRequest),
     Queue(QueueRequest),
+    PaneHistory(PaneHistoryRequest),
 }
 
 /// Dashboard-safe launch authority.
@@ -170,6 +171,22 @@ pub struct PaneResizeRequest {
 #[serde(deny_unknown_fields)]
 pub struct SubscribeRequest {}
 
+/// A request for output older than the caller already holds.
+///
+/// The caller names the sequence it starts at rather than an offset or a line count, because
+/// the log is addressed by byte sequence and a line count cannot survive a resize. `epoch` in
+/// the response is what makes a stale cursor safe: a run that restarted has a new byte stream,
+/// and a cursor from the old one names a position in it that means nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaneHistoryRequest {
+    pub run_id: String,
+    /// The sequence the caller's own history begins at. The answer ends exactly here.
+    pub before: u64,
+    /// An upper bound on the answer, clamped daemon-side to what the log can hold.
+    pub max_bytes: u32,
+}
+
 /// Everything a client may ask of the per-pane prompt queues.
 ///
 /// An inner tagged enum in the shape `WorkspaceRequest` already uses, because these are one
@@ -279,6 +296,13 @@ pub enum Event {
         rows: u16,
         cols: u16,
         scrollback_rows: u32,
+        /// The sequence the seeded bytes begin at: the caller's cursor for paging further
+        /// back. Without it a client cannot name where its own history starts.
+        history_from: u64,
+        /// Identity of the byte stream these sequences belong to. A run that restarted gets a
+        /// new one, so a client holding a cursor from before the restart discards it rather
+        /// than paging into the middle of a different stream.
+        epoch: u64,
         screen: String,
     },
     /// The raw bytes the pane's child wrote since this subscriber's last frame, so the
@@ -516,6 +540,15 @@ pub enum Response {
     Queues {
         queues: Vec<PaneQueueSnapshot>,
         paused: bool,
+    },
+    /// Output older than the caller's cursor. `complete` says the answer reaches the oldest
+    /// byte still retained, so there is nothing further back to ask for.
+    PaneHistory {
+        run_id: String,
+        epoch: u64,
+        from: u64,
+        bytes: String,
+        complete: bool,
     },
     /// Acknowledges a request that has no payload of its own to report, such as a resize.
     Ack,
@@ -765,8 +798,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twelve() {
-        assert_eq!(PROTOCOL_VERSION, 12);
+    fn the_protocol_version_records_the_pane_history_request() {
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]
@@ -830,6 +863,8 @@ mod tests {
             rows: 40,
             cols: 120,
             scrollback_rows: 2000,
+            history_from: 0,
+            epoch: 1,
             screen: "AA==".into(),
         };
         let wire = serde_json::to_string(&event).expect("serialise attach event");
@@ -857,11 +892,49 @@ mod tests {
         );
         assert!(
             serde_json::from_str::<Event>(
-                r#"{"event":"pane_attached","run_id":"r1","revision":4,"rows":40,"cols":120,"scrollback_rows":2000,"screen":"AA==","extra":1}"#
+                r#"{"event":"pane_attached","run_id":"r1","revision":4,"rows":40,"cols":120,"scrollback_rows":2000,"history_from":0,"epoch":1,"screen":"AA==","extra":1}"#
             )
             .is_err(),
             "the event shape must stay closed"
         );
+    }
+
+    #[test]
+    fn a_pane_history_request_round_trips_and_rejects_unknown_fields() {
+        let request = Request::PaneHistory(PaneHistoryRequest {
+            run_id: "run_1".into(),
+            before: 4096,
+            max_bytes: 2 << 20,
+        });
+        let wire = serde_json::to_string(&request).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<Request>(&wire).expect("decode"),
+            request
+        );
+        assert!(
+            serde_json::from_str::<Request>(
+                r#"{"type":"pane_history","run_id":"r","before":0,"max_bytes":1,"extra":1}"#
+            )
+            .is_err(),
+            "an unknown field must be refused like every other request"
+        );
+    }
+
+    #[test]
+    fn an_attach_frame_carries_the_cursor_and_epoch_a_client_needs_to_page_back() {
+        let event = Event::PaneAttached {
+            run_id: "run_1".into(),
+            revision: 4,
+            rows: 40,
+            cols: 120,
+            scrollback_rows: 2000,
+            history_from: 8192,
+            epoch: 7,
+            screen: String::new(),
+        };
+        let wire = serde_json::to_string(&event).expect("encode");
+        assert!(wire.contains(r#""history_from":8192"#), "{wire}");
+        assert!(wire.contains(r#""epoch":7"#), "{wire}");
     }
 
     #[test]

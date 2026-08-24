@@ -246,6 +246,10 @@ pub struct RuntimeRegistry {
     runs: Mutex<HashMap<String, RuntimeSlot>>,
     receipts: PathBuf,
     scrollback_rows: usize,
+    /// Bytes of raw output each pane retains, and therefore how far back a person can scroll.
+    /// Separate from `scrollback_rows`, which is only what the daemon's own parser keeps: the
+    /// daemon renders nothing, so its parser depth serves detection, and this serves people.
+    pane_history_bytes: usize,
     store: LocalStore,
     programme: Mutex<ProgrammeState>,
     capacity: CapacityPolicy,
@@ -555,6 +559,7 @@ impl RuntimeRegistry {
             runs: Mutex::new(HashMap::new()),
             receipts,
             scrollback_rows,
+            pane_history_bytes: crate::terminal::PANE_HISTORY_BYTES,
             store,
             programme: Mutex::new(programme),
             capacity,
@@ -1407,6 +1412,7 @@ impl RuntimeRegistry {
             binding,
             adapter,
             self.scrollback_rows,
+            self.pane_history_bytes,
             size,
         ));
         let snapshot = runtime.snapshot();
@@ -2143,6 +2149,7 @@ impl RuntimeRegistry {
                     binding,
                     adapter,
                     self.scrollback_rows,
+                    self.pane_history_bytes,
                     size,
                 ));
                 let snapshot = replacement.snapshot();
@@ -3257,6 +3264,19 @@ impl RuntimeRegistry {
         self.scrollback_rows
     }
 
+    /// Bytes of raw output every pane retains. The attach frame announces a row capacity
+    /// derived from this budget, so a client's replica is sized to hold the history it will
+    /// be sent rather than the daemon's own parser depth.
+    pub fn pane_history_bytes(&self) -> usize {
+        self.pane_history_bytes
+    }
+
+    #[must_use]
+    pub fn with_pane_history_bytes(mut self, bytes: usize) -> Self {
+        self.pane_history_bytes = bytes;
+        self
+    }
+
     fn pane_size(&self, workspace_id: &str, pane_id: &str) -> PtySize {
         self.pane_sizes
             .lock()
@@ -4346,6 +4366,33 @@ mod tests {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         let registry = RuntimeRegistry::with_capacity(&state, 2000, capacity).unwrap();
         TestRegistry { registry, state }
+    }
+
+    #[test]
+    fn a_registry_reports_the_pane_history_budget_it_was_built_with() {
+        let registry = registry();
+        assert_eq!(
+            registry.pane_history_bytes(),
+            crate::terminal::PANE_HISTORY_BYTES,
+            "an unconfigured registry uses the default budget"
+        );
+        drop(registry);
+
+        let state = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "dock-registry-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let configured = RuntimeRegistry::new(&state, 2000)
+            .expect("registry")
+            .with_pane_history_bytes(4 << 20);
+        assert_eq!(configured.pane_history_bytes(), 4 << 20);
+        let _ = fs::remove_dir_all(&state);
     }
 
     #[test]

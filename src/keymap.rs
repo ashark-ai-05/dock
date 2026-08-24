@@ -54,6 +54,12 @@ pub enum PaneCommand {
     /// Give an exited pane a fresh shell. The keyboard recovery path out of a dead pane.
     Respawn,
     Launch,
+    /// Scroll the focused pane back half a screen into its history.
+    ScrollPageUp,
+    /// Scroll the focused pane forward half a screen, toward live output.
+    ScrollPageDown,
+    /// Stop scrolling and return the focused pane to following live output.
+    ScrollToLive,
     /// Freeze the focused pane's viewport for keyboard selection and yanking.
     CopyMode,
     Detach,
@@ -117,6 +123,10 @@ impl Keymap {
             // are both obvious, and spelling them out cost the columns the last binding needs.
             ("Tab/S-Tab ←↑→↓", "focus"),
             (",/. w 1-9", "workspace"),
+            // One entry for all three, in the same idiom as `Tab/S-Tab ←↑→↓`: PageUp and
+            // PageDown are an obvious opposing pair, and End's own key already says what it
+            // does. Three separate entries would push a later binding off the two-row bar.
+            ("PgUp/PgDn/End", "scroll"),
             ("f", "file"),
             ("a", "resume"),
             ("i", "review"),
@@ -197,6 +207,11 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Right => PaneCommand::Focus(FocusDirection::Right),
         KeyCode::Up => PaneCommand::Focus(FocusDirection::Up),
         KeyCode::Down => PaneCommand::Focus(FocusDirection::Down),
+        // Unclaimed by any shell or editor without a modifier, so they are free to carry the
+        // pane's own scrollback rather than something already spoken for.
+        KeyCode::PageUp => PaneCommand::ScrollPageUp,
+        KeyCode::PageDown => PaneCommand::ScrollPageDown,
+        KeyCode::End => PaneCommand::ScrollToLive,
         _ => return None,
     })
 }
@@ -342,6 +357,8 @@ mod tests {
             // The three ways to reach a workspace share one entry: the footer is two rows, and
             // listing them separately pushed the last published binding off the end of it.
             ",/. w 1-9",
+            // PageUp, PageDown, and End share one entry for the same reason.
+            "PgUp/PgDn/End",
         ] {
             assert!(keys.contains(&expected), "missing hint for {expected}");
         }

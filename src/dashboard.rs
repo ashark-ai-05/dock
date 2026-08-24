@@ -28,12 +28,75 @@ use crate::{
     picker::{Picker, PickerItem},
     protocol::{
         BindingKind, DashboardProfile, DecideRequest, DispatchRequest, Event,
-        LaunchIntoPaneRequest, PROTOCOL_VERSION, PaneQueueSnapshot, QueueRequest, Request,
-        Response, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
+        LaunchIntoPaneRequest, PROTOCOL_VERSION, PaneHistoryRequest, PaneQueueSnapshot,
+        QueueRequest, Request, Response, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
     },
-    terminal::{KeyEncoding, PaneScreen, PaneSnapshot, encode_paste},
+    terminal::{KeyEncoding, PANE_HISTORY_BYTES, PaneScreen, PaneSnapshot, encode_paste},
     theme::Theme,
 };
+
+/// How much older output one page-back asks for.
+///
+/// Deliberately far below what a pane retains. Extending a replica's history means replaying
+/// every byte it holds through a fresh parser, because a parser cannot be prepended to, and
+/// that cost is paid on the wheel notch that asks for it. A chunk this size is thousands of
+/// rows — several screens of scrolling — for a rebuild that stays inside a frame.
+const PANE_PAGE_BACK_BYTES: u32 = 2 << 20;
+
+/// How far a pane's byte log is allowed past its budget before it is trimmed back to it.
+///
+/// Trimming is a memmove of the whole log, and at the 16 MiB budget that is a third of a
+/// millisecond — paid on the event-drain path, ahead of render, for a daemon that pushes every
+/// 16 ms. Trimming on every delta would spend it on every delta. Letting the log run a
+/// megabyte past its budget and then cutting all the way back spends it once per megabyte of
+/// output instead, which is hundreds of deltas, in exchange for a megabyte of headroom per
+/// pane. The daemon's own `OutputLog` sidesteps the copy entirely with a `VecDeque` of whole
+/// writes; a client's log is replayed as one contiguous slice, so it buys the same amortisation
+/// with slack rather than with a second data structure.
+const PANE_HISTORY_TRIM_SLACK: usize = 1 << 20;
+
+/// What a pane's replica holds, and where it would ask for more.
+///
+/// The bytes live here rather than in a map of their own because every part of this is written
+/// together and read together: a cursor that named a position in a log it was not attached to
+/// would be the one bug this whole mechanism can produce.
+///
+/// `from` is the sequence `log` begins at, which is exactly the cursor a `PaneHistory` request
+/// names. `epoch` is the byte stream those sequences belong to: a run that restarted has a new
+/// one, and an answer carrying the old one names positions in a stream this replica is no
+/// longer showing. `complete` is the daemon saying there is nothing older still retained.
+struct PaneHistoryCursor {
+    epoch: u64,
+    from: u64,
+    complete: bool,
+    /// Set once this log has dropped bytes off its front, after which `from` no longer names
+    /// where it starts and no request can be built from it. See `retain_history_bytes`.
+    wrapped: bool,
+    /// Set once a page-back answer arrived and left the replica holding no more rows than it
+    /// held before, which means asking again cannot help.
+    ///
+    /// The row-capacity and headroom stops in `history_request_for` both read
+    /// `history_rows()`, and `history_rows()` reads the *active* grid. A pane in the alternate
+    /// screen has no scrollback there at all — `vt100` builds the alternate grid with
+    /// `scrollback_len = 0` — so it answers 0 whatever the pane has printed, and both stops
+    /// silently invert: nothing is ever "enough rows", and there are never rows "above the
+    /// viewport" to be far from. That is vim, less, htop, and the agent TUIs that are most of
+    /// what Dock runs, and it is not only them: a progress bar or a spinner repainting in
+    /// place produces bytes without producing rows. Left alone, every wheel notch pays a
+    /// two-megabyte round trip and a rebuild of a log that has just grown by two megabytes,
+    /// for output the pane can never display.
+    ///
+    /// So the answer itself is the evidence: if a page-back did not raise the row count, this
+    /// pane stops asking. A fresh `PaneAttached` builds a new cursor and therefore clears it,
+    /// which is the right reset — a re-attach is the one event that can change the answer.
+    fruitless: bool,
+    /// Every byte this replica has been fed, seed and deltas alike.
+    ///
+    /// Kept because a `vt100` parser cannot have rows prepended to it: the only way older
+    /// output enters a replica is to replay it, followed by everything the replica already
+    /// saw, through a brand new parser.
+    log: Vec<u8>,
+}
 
 /// Copy mode's bindings, published in the footer for as long as the mode is active. It is
 /// the only way in without reading the help, and the only reminder of the way out.
@@ -83,6 +146,11 @@ pub struct Dashboard {
     /// This client's own emulator for each run, advanced by pushed deltas. The daemon holds the
     /// authoritative screen; this is the local replica the dashboard actually paints from.
     pub screens: HashMap<String, PaneScreen>,
+    /// Each replica's own byte log, where it starts, and whether anything older is still to
+    /// be had. Bounded by `PANE_HISTORY_BYTES + PANE_HISTORY_TRIM_SLACK` (the trim only fires
+    /// once the log has passed the slack, see `retain_history_bytes`), so a pane that runs for
+    /// a week costs the same as one that just started.
+    history: HashMap<String, PaneHistoryCursor>,
     /// Latest agent identity and state per run, as pushed by the daemon.
     pub agents: HashMap<String, (Option<AgentKind>, AgentState)>,
     revisions: HashMap<String, u64>,
@@ -185,6 +253,29 @@ pub struct Dashboard {
     picker_row_areas: Vec<Rect>,
     /// Where each workspace's tab landed, so the strip is clickable like every other chrome.
     tab_areas: Vec<(String, Rect)>,
+    /// The index of the first workspace the strip is currently showing.
+    ///
+    /// Bounds-clamped on every render so a resize or a closed workspace cannot strand it past
+    /// the end, but *not* re-anchored to the active tab every render — see `tab_scroll_last_active`
+    /// and `render_tabs`. A wheel scroll is the one thing allowed to leave the active tab
+    /// scrolled out of view, and it does that by changing only this field.
+    tab_scroll: usize,
+    /// The workspace that was active the last time the strip was rendered.
+    ///
+    /// Exists to tell a jump from a plain re-render: `render_tabs` scrolls the active tab back
+    /// into view only when `workspace_index` differs from this, then updates it to match. A
+    /// wheel scroll never touches `workspace_index`, so it never triggers the correction — which
+    /// is the point, and why this clamp does not simply run every frame like the bounds one
+    /// above it. Do not "fix" it into an unconditional clamp; that regresses the wheel to a
+    /// no-op, which is the exact bug this field exists to avoid.
+    tab_scroll_last_active: usize,
+    /// The whole tab-strip row, recorded so the wheel arm can tell a scroll over the strip from
+    /// a scroll over a pane without duplicating the layout the strip's own render already did.
+    tab_strip_area: Option<Rect>,
+    /// `‹`/`›`, drawn in the strip's reserved edge columns only when tabs are hidden on that
+    /// side, and clickable like every other tab-strip control.
+    tab_scroll_left_area: Option<Rect>,
+    tab_scroll_right_area: Option<Rect>,
     /// The `+` at the end of the tab strip, and the rename and close affordances on the
     /// active tab.
     new_workspace_area: Option<Rect>,
@@ -677,6 +768,8 @@ impl Dashboard {
                 rows,
                 cols,
                 scrollback_rows,
+                history_from,
+                epoch,
                 screen,
             } => {
                 // The daemon's own retention, so this replica holds exactly the history the
@@ -685,10 +778,24 @@ impl Dashboard {
                 // `ScrollUp`/`ScrollDown` arm) nothing to scroll into however much the pane
                 // produced.
                 let mut terminal = PaneScreen::new(rows, cols, scrollback_rows as usize);
-                if let Ok(bytes) = STANDARD.decode(&screen) {
-                    terminal.feed(&bytes);
-                }
+                let seed = STANDARD.decode(&screen).unwrap_or_default();
+                terminal.feed(&seed);
                 self.screens.insert(run_id.clone(), terminal);
+                // The seed is a replay of the daemon's log from `history_from`, so that is
+                // where this replica's own history begins and what anything older is *before*.
+                // A re-attach replaces both together: the frame is a fresh replay, so a log
+                // kept from the previous one would be replayed twice.
+                self.history.insert(
+                    run_id.clone(),
+                    PaneHistoryCursor {
+                        epoch,
+                        from: history_from,
+                        complete: false,
+                        wrapped: false,
+                        fruitless: false,
+                        log: seed,
+                    },
+                );
                 self.revisions.insert(run_id.clone(), revision);
                 self.end_copy_mode_for(&run_id, "the pane was re-attached");
             }
@@ -701,6 +808,7 @@ impl Dashboard {
                 if expected != Some(revision) {
                     self.screens.remove(&run_id);
                     self.revisions.remove(&run_id);
+                    self.history.remove(&run_id);
                     self.end_copy_mode_for(&run_id, "the pane lost sync and is re-seeding");
                     return;
                 }
@@ -708,7 +816,8 @@ impl Dashboard {
                     (self.screens.get_mut(&run_id), STANDARD.decode(&bytes))
                 {
                     terminal.feed(&decoded);
-                    self.revisions.insert(run_id, revision);
+                    self.revisions.insert(run_id.clone(), revision);
+                    self.retain_history_bytes(&run_id, &decoded);
                 }
             }
             Event::AgentStateChanged {
@@ -745,6 +854,10 @@ impl Dashboard {
     pub fn detach_screens(&mut self) {
         self.screens.clear();
         self.revisions.clear();
+        // The byte logs go with the parsers they were built to rebuild. A fresh subscription
+        // re-attaches with a new seed and a new cursor, and a log kept across that would be
+        // replayed in front of bytes it already contains.
+        self.history.clear();
         // The frozen screen would happily outlive the replica it was cloned from — nothing in
         // it points back at one — but a selection over a pane that is about to be rebuilt from
         // a fresh snapshot is a selection of rows the user is no longer being shown.
@@ -755,6 +868,155 @@ impl Dashboard {
         // only when a run's identity or state *changes*. Left behind, every entry from before
         // the drop would keep painting a sidebar row for a run that may no longer exist.
         self.agents.clear();
+    }
+
+    /// Records bytes a replica has been fed, so its parser can be rebuilt from them later.
+    ///
+    /// Trimmed from the front, never the back: the newest bytes are the ones on screen, and a
+    /// log missing its tail would rebuild a pane that has forgotten what it just printed. The
+    /// trim runs only once the log has passed `PANE_HISTORY_TRIM_SLACK` beyond its budget and
+    /// then cuts all the way back, so the copy is paid once per slack rather than once per
+    /// delta.
+    ///
+    /// **A trim ends this pane's paging, and the arithmetic to avoid that does not exist.**
+    /// The obvious repair — advance `from` by the bytes dropped — is wrong, and subtly:
+    /// `from` counts *stream* sequence, while the log also holds the cursor-addressed
+    /// corrections `SubscriberView::next_delta` appends (`src/server.rs`), which occupy log
+    /// space and consume no sequence at all. Dropping `c` corrective bytes would leave `from`
+    /// naming a sequence `c` past where the log truly starts, the daemon's next contiguous
+    /// answer would overlap the log head by `c`, and the rebuild would replay those bytes
+    /// twice into a screen the pane never showed. A client cannot tell the two kinds of byte
+    /// apart, so the flag says so instead of guessing. Nothing is lost: reaching this point
+    /// takes a whole budget of output, which is hundreds of thousands of rows, and the
+    /// `PANE_HISTORY_MAX_ROWS` capacity stop has long since ended the paging anyway.
+    fn retain_history_bytes(&mut self, run_id: &str, bytes: &[u8]) {
+        let Some(cursor) = self.history.get_mut(run_id) else {
+            return;
+        };
+        cursor.log.extend_from_slice(bytes);
+        if cursor.log.len() <= PANE_HISTORY_BYTES + PANE_HISTORY_TRIM_SLACK {
+            return;
+        }
+        cursor.log.drain(..cursor.log.len() - PANE_HISTORY_BYTES);
+        cursor.wrapped = true;
+    }
+
+    /// A request for the next chunk of history, when this pane is scrolled near the top of
+    /// what it holds and there is any point asking for more.
+    ///
+    /// Four separate things say there is no point. The daemon's `complete` means nothing
+    /// older is retained. A replica already holding its full row budget means nothing older
+    /// can be *shown*: `vt100` drops the oldest row for every row added, so those bytes would
+    /// be replayed at the cost of a full rebuild and then immediately discarded. A log
+    /// that has wrapped can no longer name the sequence it starts at, so there is no honest
+    /// request to send — see `retain_history_bytes`. And a pane whose last answer raised no
+    /// row has said, in the only way it can, that its rows are not going into scrollback at
+    /// all — see `PaneHistoryCursor::fruitless`, which is what covers the alternate screen.
+    ///
+    /// Takes `&mut self` because `history_rows` does: reading the row count means moving the
+    /// scroll offset to the clamp and putting it back.
+    fn history_request_for(&mut self, run_id: &str) -> Option<Request> {
+        if self.copy.as_ref().is_some_and(|mode| mode.is_for(run_id)) {
+            // A frozen pane paints its snapshot, and rebuilding the live parser cannot add a
+            // row to a snapshot that was cloned before it. Without this the wheel would fire a
+            // request and a rebuild on every notch for as long as copy mode is open.
+            return None;
+        }
+        let before = match self.history.get(run_id) {
+            Some(cursor) if !cursor.complete && !cursor.wrapped && !cursor.fruitless => cursor.from,
+            _ => return None,
+        };
+        let screen = self.screens.get_mut(run_id)?;
+        let (rows, _) = screen.size();
+        let held = screen.history_rows();
+        if held >= screen.history_capacity() {
+            return None;
+        }
+        // Rows still above the viewport. One screen height of headroom, so the request goes
+        // out just before the user reaches the top rather than at the moment they hit it.
+        let above = held.saturating_sub(screen.scroll_offset());
+        if above > usize::from(rows) {
+            return None;
+        }
+        Some(Request::PaneHistory(PaneHistoryRequest {
+            run_id: run_id.to_owned(),
+            before,
+            max_bytes: PANE_PAGE_BACK_BYTES,
+        }))
+    }
+
+    /// Splices older output in front of what a pane holds, by rebuilding its parser from the
+    /// extended byte log.
+    ///
+    /// A parser cannot be prepended to, so this is the only way history enters a replica: a
+    /// fresh parser, fed the older bytes and then every byte this replica had already seen.
+    /// The viewport is preserved explicitly. `vt100` measures the scroll offset from the
+    /// bottom, so rows added above happen to leave it pointing at the same content — but that
+    /// is a property of the engine rather than of this code, and restoring the offset says so
+    /// where a swap of the engine would notice.
+    pub fn apply_pane_history_response(&mut self, response: Response) {
+        let Response::PaneHistory {
+            run_id,
+            epoch,
+            from,
+            bytes,
+            complete,
+        } = response
+        else {
+            if let Response::Error { message, .. } = response {
+                self.error = Some(message);
+            }
+            return;
+        };
+        // Every handle and every reason to give up comes first, so there is no ordering in
+        // which the cursor advances over a log that was never extended.
+        let Some(screen) = self.screens.get_mut(&run_id) else {
+            return;
+        };
+        let Some(cursor) = self.history.get_mut(&run_id) else {
+            return;
+        };
+        if cursor.epoch != epoch {
+            // The pane restarted between the request and the answer. These bytes belong to a
+            // stream this replica is not showing, and the sequences naming them mean nothing
+            // in the one it is.
+            return;
+        }
+        let Ok(older) = STANDARD.decode(&bytes) else {
+            return;
+        };
+        debug_assert_eq!(
+            from + older.len() as u64,
+            cursor.from,
+            "a page-back answer must abut the head of the log it is spliced in front of: \
+             `OutputLog::before` returns a contiguous run ending exactly at the cursor it was \
+             asked about, so a gap or an overlap means the pane was re-seeded between the \
+             request and the answer while keeping its epoch. Nothing rejects that today; it is \
+             prevented only by `main.rs`'s loop being synchronous, which this assert is here to \
+             notice the loss of."
+        );
+        // Read before anything is spliced, so the verdict below compares the same pane's rows
+        // before and after this answer rather than against a number carried from elsewhere.
+        let held_before = screen.history_rows();
+        cursor.from = from;
+        cursor.complete = complete;
+        // Not trimmed to `PANE_HISTORY_BYTES` here, unlike the live path: the front of this log
+        // is exactly what was just asked for, and trimming it would discard the answer. The
+        // total stays bounded anyway, because the daemon can only ever serve what it retains.
+        cursor.log.splice(0..0, older);
+        let (rows, cols) = screen.size();
+        let offset = screen.scroll_offset();
+        // Read off the screen being replaced rather than carried on the cursor, so the rebuild
+        // cannot disagree with what it replaces about how much history a pane may keep.
+        let mut rebuilt = PaneScreen::new(rows, cols, screen.history_capacity());
+        rebuilt.feed(&cursor.log);
+        // The answer is its own evidence. A page-back that bought no scrollback row bought
+        // nothing at all, and the next one would buy nothing either: see
+        // `PaneHistoryCursor::fruitless` for the alternate screen, which is where this happens
+        // and where the two stops in `history_request_for` cannot see it.
+        cursor.fruitless = rebuilt.history_rows() <= held_before;
+        rebuilt.scroll_by(i32::try_from(offset).unwrap_or(i32::MAX));
+        *screen = rebuilt;
     }
 
     /// Replaces the run list and drops any agent roster entry whose run is gone.
@@ -907,6 +1169,9 @@ impl Dashboard {
         self.launch_mode_area = None;
         self.picker_row_areas.clear();
         self.tab_areas.clear();
+        self.tab_strip_area = None;
+        self.tab_scroll_left_area = None;
+        self.tab_scroll_right_area = None;
         self.new_workspace_area = None;
         self.rename_workspace_area = None;
         self.close_workspace_area = None;
@@ -1127,19 +1392,92 @@ impl Dashboard {
 
     /// The workspace strip: one tab per workspace, numbered by the digit that jumps to it.
     ///
-    /// Tabs are laid out left to right and simply stop when the row runs out, rather than
-    /// scrolling. The numbers stay meaningful because they are positions, not labels, and a
-    /// workspace pushed off the end is still reachable by name through `Ctrl+B w`.
+    /// The strip scrolls rather than truncating, and follows the active tab: a workspace you
+    /// have jumped to is always visible, together with its own rename and close affordances,
+    /// which are the last thing that should fall off an edge. `‹` and `›` mark tabs hidden on
+    /// each side and are clickable. The numbers stay meaningful because they are positions,
+    /// not labels.
     fn render_tabs(&mut self, frame: &mut Frame, area: Rect) {
-        let mut x = area.x.saturating_add(1);
-        for (index, workspace) in self.layout.workspaces.iter().enumerate() {
+        self.tab_strip_area = Some(area);
+        let workspace_count = self.layout.workspaces.len();
+        if workspace_count == 0 {
+            return;
+        }
+
+        // Every tab's rendered width, measured once so the clamp below and the layout further
+        // down agree on what "fits" means. Only the active tab carries rename and close
+        // affordances, which is why it alone gets the extra width; the trailing `+ 1` on every
+        // tab is the one-column gap this loop always left between tabs.
+        let armed = self.close_workspace_armed.clone();
+        let labels: Vec<String> = self
+            .layout
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| format!(" {} {} ", index + 1, workspace.name))
+            .collect();
+        let widths: Vec<u16> = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                let mut width = label.chars().count() as u16 + 1;
+                if index == self.workspace_index {
+                    width += 3; // ✎
+                    width += 3; // ✘ (or the armed cancel)
+                    if armed.as_deref() == Some(self.layout.workspaces[index].workspace_id.as_str())
+                    {
+                        width += 3; // ✓ confirm, once armed
+                    }
+                }
+                width
+            })
+            .collect();
+
+        // Reserved so `‹`/`›` never shift the strip by a column as they appear or disappear —
+        // tabs are laid out between these two columns whether or not the markers are drawn.
+        let available = area.width.saturating_sub(2);
+
+        // Bounds clamp: runs every frame, and only ever keeps `tab_scroll` inside range so a
+        // resize or a closed workspace cannot strand it past the end. It never chases the active
+        // tab — that would undo a wheel scroll on the very next frame. See
+        // `tab_scroll_last_active` for the correction that does chase it, and why it is kept
+        // separate from this one.
+        self.tab_scroll = self.tab_scroll.min(workspace_count - 1);
+
+        // Bring-into-view correction: fires only when the active workspace differs from the one
+        // shown last render, i.e. only on a jump (digit, `Ctrl+B w`, a click, `,`/`.`). A wheel
+        // scroll never changes `workspace_index`, so it never reaches this branch, which is what
+        // lets a strip the user positioned by hand stay exactly where they left it.
+        //
+        // Accepted consequence: narrowing the terminal can carry the active tab out of view
+        // without a jump to bring it back — re-snapping on every width change would mean
+        // tracking the previous width for a case the next jump already resolves for free.
+        if self.tab_scroll_last_active != self.workspace_index {
+            if self.tab_scroll > self.workspace_index {
+                self.tab_scroll = self.workspace_index;
+            }
+            while self.tab_scroll < self.workspace_index {
+                let span: u16 = widths[self.tab_scroll..=self.workspace_index].iter().sum();
+                if span <= available {
+                    break;
+                }
+                self.tab_scroll += 1;
+            }
+            self.tab_scroll_last_active = self.workspace_index;
+        }
+
+        let left_edge = area.x.saturating_add(1);
+        let right_edge = area.right().saturating_sub(1);
+        let mut x = left_edge;
+        let mut last_drawn = None;
+        for (index, label) in labels.iter().enumerate().skip(self.tab_scroll) {
             let active = index == self.workspace_index;
-            let label = format!(" {} {} ", index + 1, workspace.name);
-            let width = label.chars().count() as u16;
-            if x.saturating_add(width) > area.right() {
+            let label_width = label.chars().count() as u16;
+            if x.saturating_add(label_width) > right_edge {
                 break;
             }
-            let tab = Rect::new(x, area.y, width, 1);
+            let workspace = &self.layout.workspaces[index];
+            let tab = Rect::new(x, area.y, label_width, 1);
             let style = if active {
                 Style::default()
                     .bg(self.theme.accent)
@@ -1148,12 +1486,12 @@ impl Dashboard {
             } else {
                 Style::default().fg(self.theme.muted)
             };
-            frame.render_widget(Paragraph::new(Line::styled(label, style)), tab);
+            frame.render_widget(Paragraph::new(Line::styled(label.clone(), style)), tab);
             self.tab_areas.push((workspace.workspace_id.clone(), tab));
-            x = x.saturating_add(width);
+            x = x.saturating_add(label_width);
             // The rename affordance rides only on the active tab. On every tab it would be
             // clutter, and on none of them renaming would stay keyboard-only.
-            if active && x.saturating_add(3) <= area.right() {
+            if active && x.saturating_add(3) <= right_edge {
                 let pencil = Rect::new(x, area.y, 3, 1);
                 frame.render_widget(Paragraph::new(Line::styled(" ✎ ", style)), pencil);
                 self.rename_workspace_area = Some(pencil);
@@ -1164,15 +1502,14 @@ impl Dashboard {
             // to hang off one stray click on a three-cell target; the armed tab says so in
             // words rather than opening a ninth modal overlay.
             if active {
-                let armed =
-                    self.close_workspace_armed.as_deref() == Some(workspace.workspace_id.as_str());
+                let tab_armed = armed.as_deref() == Some(workspace.workspace_id.as_str());
                 // Cancel keeps the cell the close control had, and confirm is the new target to
                 // its right. Putting confirm first read better and was a trap: the second press
                 // of a double-click would land on it and destroy the workspace the first press
                 // had only asked about.
-                if x.saturating_add(3) <= area.right() {
+                if x.saturating_add(3) <= right_edge {
                     let cancel = Rect::new(x, area.y, 3, 1);
-                    let cancel_style = if armed {
+                    let cancel_style = if tab_armed {
                         Style::default()
                             .bg(self.theme.blocked)
                             .fg(self.theme.surface)
@@ -1184,7 +1521,7 @@ impl Dashboard {
                     self.close_workspace_area = Some(cancel);
                     x = x.saturating_add(3);
                 }
-                if armed && x.saturating_add(3) <= area.right() {
+                if tab_armed && x.saturating_add(3) <= right_edge {
                     let confirm = Rect::new(x, area.y, 3, 1);
                     frame.render_widget(
                         Paragraph::new(Line::styled(
@@ -1201,14 +1538,36 @@ impl Dashboard {
                 }
             }
             x = x.saturating_add(1);
+            last_drawn = Some(index);
         }
-        if x.saturating_add(3) <= area.right() {
+        if x.saturating_add(3) <= right_edge {
             let plus = Rect::new(x, area.y, 3, 1);
             frame.render_widget(
                 Paragraph::new(Line::styled(" + ", Style::default().fg(self.theme.accent))),
                 plus,
             );
             self.new_workspace_area = Some(plus);
+        }
+
+        if self.tab_scroll > 0 {
+            let marker = Rect::new(area.x, area.y, 1, 1);
+            frame.render_widget(
+                Paragraph::new(Line::styled("‹", Style::default().fg(self.theme.accent))),
+                marker,
+            );
+            self.tab_scroll_left_area = Some(marker);
+        }
+        let hides_tabs_on_the_right = match last_drawn {
+            Some(last) => last + 1 < workspace_count,
+            None => self.tab_scroll < workspace_count,
+        };
+        if hides_tabs_on_the_right {
+            let marker = Rect::new(right_edge, area.y, 1, 1);
+            frame.render_widget(
+                Paragraph::new(Line::styled("›", Style::default().fg(self.theme.accent))),
+                marker,
+            );
+            self.tab_scroll_right_area = Some(marker);
         }
     }
 
@@ -1927,6 +2286,26 @@ impl Dashboard {
                 // screen, so borrowing it across that — or, worse, cloning it — is not free.
                 let copying =
                     run_id.is_some_and(|id| self.copy.as_ref().is_some_and(|mode| mode.is_for(id)));
+                // A pane that has stopped following live output looks exactly like a pane whose
+                // agent has hung. It has to say which it is, and say how to undo it: someone who
+                // scrolled by accident with the wheel has no other way to find out. The title is
+                // shortened to make room for it rather than the other way around — `fit_scroll_marker`
+                // reserves room for the marker first and only ellipsises the title into what is
+                // left, because the two are painted as independent titles on the same border row
+                // and neither knows the other is there; without a shared reservation the one
+                // rendered last (the marker) simply paints over the other.
+                let scroll_offset = run_id
+                    .and_then(|id| self.screens.get(id))
+                    .map(PaneScreen::scroll_offset)
+                    .filter(|offset| *offset > 0);
+                let copy_prefix_width = if copying { " COPY".chars().count() } else { 0 };
+                let title_row_budget = usize::from(area.width)
+                    .saturating_sub(2) // borders
+                    .saturating_sub(copy_prefix_width);
+                let (title, scroll_marker) = match scroll_offset {
+                    Some(offset) => fit_scroll_marker(&title, title_row_budget, offset),
+                    None => (title, None),
+                };
                 // `title` already opens with a space, so the prefix needs none of its own.
                 let title = if copying {
                     Line::from(vec![
@@ -2004,6 +2383,13 @@ impl Dashboard {
                     )
                 } else {
                     block
+                };
+                let block = match &scroll_marker {
+                    Some(note) => block.title_top(
+                        Line::styled(note.clone(), Style::default().fg(self.theme.muted))
+                            .right_aligned(),
+                    ),
+                    None => block,
                 };
                 let inner = block.inner(area);
                 self.queue_resize(&workspace.workspace_id, pane_id, run_id, inner);
@@ -2242,6 +2628,7 @@ impl Dashboard {
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
             Line::from("d leaves the dashboard; runs keep running until you close them."),
             Line::from("Tab/S-Tab or arrows focus   +/- resize"),
+            Line::from("PageUp/PageDown scroll history   End back to live output"),
             Line::styled("POINTER", heading),
             Line::from("Tab strip: click a tab to switch   ✎ rename   × close (twice)"),
             Line::from("+ at the end of the strip makes a workspace"),
@@ -2419,6 +2806,9 @@ impl Dashboard {
                 self.open_launch();
                 UiCommand::LoadCatalog
             }
+            PaneCommand::ScrollPageUp => self.scroll_page_back(),
+            PaneCommand::ScrollPageDown => self.scroll_page_forward(),
+            PaneCommand::ScrollToLive => self.scroll_to_live(),
             PaneCommand::CopyMode => self.enter_copy_mode(),
             // The daemon owns every run, so leaving the dashboard signals nothing and tears
             // nothing down. Detaching and quitting are therefore the same act here.
@@ -3807,6 +4197,48 @@ impl Dashboard {
         }
     }
 
+    /// `Ctrl+B PageUp`: half a screen back into history, the keyboard's equivalent of a few
+    /// wheel notches. Also asks for more history exactly as the wheel does — without this the
+    /// keyboard would silently stop paging at the seed boundary the wheel keeps going past.
+    fn scroll_page_back(&mut self) -> UiCommand {
+        let Some(run_id) = self.focused_run_id().map(str::to_owned) else {
+            return UiCommand::None;
+        };
+        let Some((rows, _)) = self.screens.get(&run_id).map(PaneScreen::size) else {
+            return UiCommand::None;
+        };
+        self.scroll_pane(&run_id, i32::from(rows) / 2);
+        match self.history_request_for(&run_id) {
+            Some(request) => UiCommand::Request(Box::new(request)),
+            None => UiCommand::None,
+        }
+    }
+
+    /// `Ctrl+B PageDown`: half a screen forward, toward live output. Never asks for more
+    /// history: paging forward only ever moves toward rows the pane already holds.
+    fn scroll_page_forward(&mut self) -> UiCommand {
+        let Some(run_id) = self.focused_run_id().map(str::to_owned) else {
+            return UiCommand::None;
+        };
+        let Some((rows, _)) = self.screens.get(&run_id).map(PaneScreen::size) else {
+            return UiCommand::None;
+        };
+        self.scroll_pane(&run_id, -(i32::from(rows) / 2));
+        UiCommand::None
+    }
+
+    /// `Ctrl+B End`: back to following live output, from wherever the pane was scrolled to.
+    fn scroll_to_live(&mut self) -> UiCommand {
+        let Some(run_id) = self.focused_run_id().map(str::to_owned) else {
+            return UiCommand::None;
+        };
+        let Some(offset) = self.screens.get(&run_id).map(PaneScreen::scroll_offset) else {
+            return UiCommand::None;
+        };
+        self.scroll_pane(&run_id, -(i32::try_from(offset).unwrap_or(i32::MAX)));
+        UiCommand::None
+    }
+
     /// Extends a pointer selection, entering copy mode on the first drag of the gesture.
     ///
     /// The anchor is re-applied on every event rather than only on the first: it is always
@@ -4612,6 +5044,22 @@ impl Dashboard {
                 {
                     return self.rename_workspace();
                 }
+                // The scroll markers sit on the same row as the tabs, so testing tabs first
+                // would swallow a click meant for one of them.
+                if self
+                    .tab_scroll_left_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    self.tab_scroll = self.tab_scroll.saturating_sub(1);
+                    return UiCommand::None;
+                }
+                if self
+                    .tab_scroll_right_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    self.tab_scroll = self.tab_scroll.saturating_add(1);
+                    return UiCommand::None;
+                }
                 if let Some(workspace_id) = self
                     .tab_areas
                     .iter()
@@ -4775,12 +5223,23 @@ impl Dashboard {
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                // The strip is tested first and returns early: it shares this arm with pane
+                // scrolling below, and a notch over the tabs must move the strip rather than
+                // whatever pane happens to sit under the same column further down the canvas.
+                if self
+                    .tab_strip_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
+                    if event.kind == MouseEventKind::ScrollDown {
+                        self.tab_scroll = self.tab_scroll.saturating_add(1);
+                    } else {
+                        self.tab_scroll = self.tab_scroll.saturating_sub(1);
+                    }
+                    return UiCommand::None;
+                }
                 // Three rows per notch matches what terminals send for a single wheel click.
-                let delta = if event.kind == MouseEventKind::ScrollUp {
-                    3
-                } else {
-                    -3
-                };
+                let back = event.kind == MouseEventKind::ScrollUp;
+                let delta = if back { 3 } else { -3 };
                 let run_id = self
                     .pane_areas
                     .iter()
@@ -4789,6 +5248,13 @@ impl Dashboard {
                     .and_then(|pane| pane.run_id.clone());
                 if let Some(run_id) = run_id {
                     self.scroll_pane(&run_id, delta);
+                    // Only a notch *back* can want output older than the pane holds; a notch
+                    // toward live output moves through rows it already has. Asking on both put
+                    // a two-megabyte round trip and a full parser rebuild on half of every
+                    // wheel gesture, for history nobody was scrolling towards.
+                    if back && let Some(request) = self.history_request_for(&run_id) {
+                        return UiCommand::Request(Box::new(request));
+                    }
                 }
                 UiCommand::None
             }
@@ -5572,6 +6038,64 @@ fn ellipsise(value: &str, width: usize) -> String {
         .collect()
 }
 
+/// Picks the richest form of the "stopped following" marker that fits, and returns the title
+/// shortened to make room for it.
+///
+/// The marker and the title are painted as two independent titles on the same border row (see
+/// the call site), and neither one knows the other is there — so without a shared reservation,
+/// whichever is drawn last simply paints over the other. For the two explanatory rungs — the
+/// full sentence and the row count alone — this is the reservation: try each from richest to
+/// sparsest, and take the first that still leaves `MIN_TITLE_WIDTH` columns of the title
+/// standing, so a pane wide enough to explain itself always keeps a recognisable title beside
+/// the explanation.
+///
+/// The bare glyph is a different, unconditional floor: a pane that has silently stopped
+/// following its own output is the exact failure this marker exists to catch, and a divider can
+/// be dragged to widths well under `MIN_TITLE_WIDTH` routinely — a pane that narrow already has
+/// no readable title of its own to protect. So the glyph rung asks only that the glyph and its
+/// one-column separator fit inside the border; the title gets whatever is left, down to one column.
+/// Only below that — not even two columns for the glyph itself — is there no marker at all, and
+/// the title is left exactly as it was.
+fn fit_scroll_marker(title: &str, budget: usize, offset: usize) -> (String, Option<String>) {
+    /// However short a pane's own name gets, this many columns of it must stay recognisable —
+    /// enough for the state glyph, the opening space, and the whole of a short label like
+    /// "editor" or "agent". Guards only the two explanatory rungs: the bare glyph is the floor
+    /// the marker itself is never dropped below, so it does not compete with the title for
+    /// this room at all — see the bare-glyph arm below.
+    const MIN_TITLE_WIDTH: usize = 8;
+    const SEPARATOR: usize = 1;
+    for candidate in [
+        format!("▲ {offset} rows · End to follow"),
+        format!("▲ {offset} rows"),
+    ] {
+        let marker_width = candidate.chars().count();
+        if budget >= marker_width + SEPARATOR + MIN_TITLE_WIDTH {
+            return (
+                ellipsise(title, budget - marker_width - SEPARATOR),
+                Some(candidate),
+            );
+        }
+    }
+    // The bare glyph is the floor this function never drops below for want of room to explain
+    // itself: a pane that has silently stopped following its own output is the exact failure
+    // this marker exists to catch, and on the narrowest panes — the ones a divider drag reaches
+    // routinely, well below `MIN_TITLE_WIDTH` — the title is already unreadable on its own. So
+    // this rung asks only that the glyph and its separator fit inside the border, and the title
+    // takes whatever is left, even if that is only one column — `ellipsise(_, 0)` still returns
+    // the "…" itself, so the title never actually disappears.
+    // "▲" is one `char` (a single Unicode scalar value), so this is a literal rather than
+    // `"▲".chars().count()`: the latter is not a `const fn` on stable, and the former is
+    // exactly as informative for exactly one character of literal text.
+    const BARE_MARKER_WIDTH: usize = 1;
+    if budget >= BARE_MARKER_WIDTH + SEPARATOR {
+        return (
+            ellipsise(title, budget - BARE_MARKER_WIDTH - SEPARATOR),
+            Some("▲".to_owned()),
+        );
+    }
+    (title.to_owned(), None)
+}
+
 fn runtime_label(runtime: PaneRuntime) -> &'static str {
     match runtime {
         PaneRuntime::Running => "running",
@@ -5731,6 +6255,12 @@ mod tests {
     /// A full-screen seed for `run_id`, sized to the inner geometry a 100x30 dashboard gives
     /// the left pane, so nothing this feeds is clipped for a reason other than pane size.
     fn attach_event(run_id: &str, bytes: &[u8]) -> Event {
+        attach_event_at(run_id, bytes, 0, 1)
+    }
+
+    /// An attach frame with a chosen paging cursor and epoch, for the tests that care where a
+    /// replica's own history starts and which byte stream it belongs to.
+    fn attach_event_at(run_id: &str, bytes: &[u8], history_from: u64, epoch: u64) -> Event {
         let mut source = crate::terminal::VtTerminal::new(PANE_ROWS, PANE_COLS, 0);
         source.feed(bytes);
         Event::PaneAttached {
@@ -5739,7 +6269,19 @@ mod tests {
             rows: PANE_ROWS,
             cols: PANE_COLS,
             scrollback_rows: 2000,
+            history_from,
+            epoch,
             screen: STANDARD.encode(source.state_bytes()),
+        }
+    }
+
+    /// One delta of raw child output. Revisions must be contiguous or `apply_event` drops the
+    /// screen rather than advancing it into a corrupted grid, so this counts for the caller.
+    fn delta_event(run_id: &str, revision: u64, bytes: &[u8]) -> Event {
+        Event::PaneDelta {
+            run_id: run_id.into(),
+            revision,
+            bytes: STANDARD.encode(bytes),
         }
     }
 
@@ -5786,6 +6328,36 @@ mod tests {
                 pane_id: "c".into(),
             },
         });
+        dashboard
+    }
+
+    /// A dashboard with `count` workspaces, each named `ws{n}` — short on purpose. Mirrors
+    /// `benchmark_dashboard`'s construction, but that helper names workspaces with a string long
+    /// enough to be ellipsised, deliberately, so its render benchmark exercises ellipsising. With
+    /// names that long barely one tab fits a narrow strip at all, which makes it useless for
+    /// telling scrolling apart from truncation — these names are short so several tabs fit and
+    /// the strip's own scrolling, rather than the ellipsiser, is what these tests exercise.
+    fn scrollable_tab_dashboard(count: usize) -> Dashboard {
+        let mut dashboard = Dashboard::default();
+        for index in 0..count {
+            let pane_id = format!("p{index}");
+            dashboard.layout.workspaces.push(WorkspaceLayout {
+                workspace_id: format!("w{index}"),
+                name: format!("ws{}", index + 1),
+                focused_pane_id: pane_id.clone(),
+                panes: BTreeMap::from([(
+                    pane_id.clone(),
+                    PaneLayout {
+                        pane_id: pane_id.clone(),
+                        name: "pane".into(),
+                        run_id: None,
+                        runtime: PaneRuntime::Empty,
+                        kind: PaneKind::Terminal,
+                    },
+                )]),
+                root: LayoutNode::Pane { pane_id },
+            });
+        }
         dashboard
     }
 
@@ -6273,6 +6845,7 @@ mod tests {
             "l launch",
             "q quit",
             "runs keep running",
+            "PageUp/PageDown scroll history",
         ] {
             assert!(text.contains(key), "missing published mnemonic: {key}");
         }
@@ -6706,6 +7279,164 @@ mod tests {
             UiCommand::None
         );
         assert_eq!(dashboard.workspace_index, 1);
+    }
+
+    #[test]
+    fn the_active_tab_stays_fully_visible_however_many_workspaces_there_are() {
+        let mut dashboard = scrollable_tab_dashboard(12);
+        for index in 0..12 {
+            dashboard.jump_to_workspace((index + 1) as u8);
+            let rendered = render_to_string(&mut dashboard, 60, 24);
+            let name = format!("{} ws{}", index + 1, index + 1);
+            assert!(
+                rendered.contains(&name),
+                "workspace {} must be visible when it is active: {rendered}",
+                index + 1
+            );
+            assert!(
+                rendered.contains('✎') && rendered.contains('✘'),
+                "the active tab's own affordances must not be what falls off the edge: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn jumping_to_an_offscreen_workspace_scrolls_it_fully_into_view() {
+        // A jump is the one thing allowed to re-anchor the strip: this dedicated test exists
+        // because that correction is now conditional on a jump having happened, rather than
+        // running unconditionally every frame, and a conditional correction is one that can
+        // silently stop firing.
+        let mut dashboard = scrollable_tab_dashboard(12);
+        render_to_string(&mut dashboard, 60, 24);
+        assert_eq!(dashboard.jump_to_workspace(11), UiCommand::None);
+        let rendered = render_to_string(&mut dashboard, 60, 24);
+        assert!(
+            rendered.contains("11 ws11"),
+            "the jumped-to workspace must be scrolled into view: {rendered}"
+        );
+        assert!(
+            rendered.contains('✎') && rendered.contains('✘'),
+            "its own affordances must come along, not be clipped: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_strip_marks_the_tabs_it_is_hiding_on_each_side() {
+        // The whole-frame string is the wrong thing to search here: the sidebar's own "current
+        // workspace" marker in its WORKSPACES list is the same '›' glyph, present for any active
+        // workspace whether or not the tab strip itself is scrolled. Reading just the tab-strip
+        // row is what actually tells the two apart.
+        let mut dashboard = scrollable_tab_dashboard(12);
+        dashboard.jump_to_workspace(7);
+        let terminal = render_terminal(&mut dashboard, 60, 24);
+        let strip = row_text(&terminal, Rect::new(0, 2, 60, 1), 2);
+        assert!(strip.contains('‹') && strip.contains('›'), "{strip:?}");
+    }
+
+    #[test]
+    fn a_strip_that_fits_shows_no_markers() {
+        // Same reasoning as above: the sidebar's own '›' for the active workspace would make a
+        // whole-frame search for the glyph pass or fail for the wrong reason. Scope the read to
+        // the tab-strip row alone.
+        let mut dashboard = scrollable_tab_dashboard(2);
+        let terminal = render_terminal(&mut dashboard, 120, 24);
+        let strip = row_text(&terminal, Rect::new(0, 2, 120, 1), 2);
+        assert!(!strip.contains('‹') && !strip.contains('›'), "{strip:?}");
+    }
+
+    #[test]
+    fn the_wheel_over_the_strip_scrolls_it_without_switching_workspace() {
+        let mut dashboard = scrollable_tab_dashboard(12);
+        let active = dashboard.workspace_index;
+        let before = render_to_string(&mut dashboard, 60, 24);
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 2, // the tab strip row
+            modifiers: KeyModifiers::NONE,
+        });
+        let after = render_to_string(&mut dashboard, 60, 24);
+        assert_ne!(before, after, "the strip must move");
+        assert_eq!(
+            dashboard.workspace_index, active,
+            "scrolling the strip must not switch workspace"
+        );
+    }
+
+    #[test]
+    fn scrolling_the_strip_by_wheel_is_not_reverted_by_the_next_render() {
+        // The bounds clamp runs every frame; the bring-into-view correction must not. If it did,
+        // a second render after the wheel event would silently undo the scroll — exactly the
+        // contradiction that made the previous test unsatisfiable until this distinction was
+        // drawn between the two clamps.
+        let mut dashboard = scrollable_tab_dashboard(12);
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        let once = render_to_string(&mut dashboard, 60, 24);
+        let twice = render_to_string(&mut dashboard, 60, 24);
+        assert_eq!(
+            once, twice,
+            "re-rendering with no new input must not move the strip back"
+        );
+        assert_eq!(dashboard.workspace_index, 0);
+    }
+
+    #[test]
+    fn clicking_the_right_marker_scrolls_the_strip_without_switching_workspace() {
+        let mut dashboard = scrollable_tab_dashboard(12);
+        let before = render_to_string(&mut dashboard, 60, 24);
+        let marker = dashboard
+            .tab_scroll_right_area
+            .expect("a strip this full must show a right marker");
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: marker.x,
+                row: marker.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None
+        );
+        let after = render_to_string(&mut dashboard, 60, 24);
+        assert_ne!(before, after, "the strip must move");
+        assert_eq!(dashboard.workspace_index, 0);
+    }
+
+    #[test]
+    fn clicking_the_left_marker_scrolls_the_strip_back() {
+        let mut dashboard = scrollable_tab_dashboard(12);
+        dashboard.jump_to_workspace(12);
+        render_to_string(&mut dashboard, 60, 24);
+        let scrolled = dashboard.tab_scroll;
+        assert!(
+            scrolled > 0,
+            "jumping to the last workspace must have scrolled the strip"
+        );
+        let marker = dashboard
+            .tab_scroll_left_area
+            .expect("a strip scrolled away from the start must show a left marker");
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: marker.x,
+                row: marker.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None
+        );
+        render_to_string(&mut dashboard, 60, 24);
+        assert!(
+            dashboard.tab_scroll < scrolled,
+            "the left marker must scroll back toward the start"
+        );
+        assert_eq!(
+            dashboard.workspace_index, 11,
+            "clicking a marker must not switch workspace"
+        );
     }
 
     #[test]
@@ -8977,6 +9708,8 @@ mod tests {
             rows: 24,
             cols: 80,
             scrollback_rows: 2000,
+            history_from: 0,
+            epoch: 1,
             screen: STANDARD.encode(source.state_bytes()),
         });
         let mut sync = crate::terminal::ScreenSync::new(24, 80);
@@ -9002,6 +9735,8 @@ mod tests {
             rows: 24,
             cols: 80,
             scrollback_rows: 2000,
+            history_from: 0,
+            epoch: 1,
             screen: String::new(),
         });
         dashboard.apply_event(Event::PaneDelta {
@@ -9021,6 +9756,8 @@ mod tests {
             rows: 24,
             cols: 80,
             scrollback_rows: 2000,
+            history_from: 0,
+            epoch: 1,
             screen: String::new(),
         });
         let mut source = crate::terminal::VtTerminal::new(10, 40, 0);
@@ -9031,6 +9768,8 @@ mod tests {
             rows: 10,
             cols: 40,
             scrollback_rows: 2000,
+            history_from: 0,
+            epoch: 1,
             screen: STANDARD.encode(source.state_bytes()),
         });
         assert_eq!(dashboard.screens["run_1"].size(), (10, 40));
@@ -9059,6 +9798,52 @@ mod tests {
         // The re-seed adopted the daemon's revision, which never restarts across a re-seed, so
         // the deltas above were contiguous rather than read as a gap and dropped.
         assert_eq!(dashboard.revisions.get("run_1"), Some(&8));
+    }
+
+    /// Not a regression test: this is a characterisation guard on `vt100` itself.
+    ///
+    /// A scrolled viewport is an offset counted from the *bottom* of history, so appending
+    /// rows underneath it should, in principle, need something to keep it pointed at the same
+    /// content. Investigating this exact failure mode turned up that `vt100` already does that
+    /// internally — `Grid::scroll_up` (`grid.rs:571-574` in `vt100` 0.16.2) advances
+    /// `scrollback_offset` by one for every row it pushes into scrollback while the offset is
+    /// non-zero — so no compensation code was added here; adding the naive fix on top of it
+    /// was tried and confirmed to double-count that same growth and slide the viewport the
+    /// *other* way (see `task-6-report.md` for the probe).
+    ///
+    /// `src/terminal/mod.rs:14` names `PaneScreen` as a swap point for the terminal engine
+    /// and calls out `rio-vt` as a candidate replacement. Nothing else in this codebase
+    /// pins the behaviour this test pins: swap the engine for one that does not self-adjust
+    /// the scroll offset on append, and every scrolled pane would silently slide under live
+    /// output again, with no other test positioned to catch it. Keep this test red-line: if
+    /// it ever starts failing, the replacement engine needs its own compensation added to the
+    /// `PaneDelta` arm of `Dashboard::apply_event`, which is exactly the fix this task
+    /// originally set out to write.
+    #[test]
+    fn output_arriving_under_a_scrolled_pane_does_not_slide_it_downwards() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        for line in 0..50 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        dashboard.scroll_pane("run_1", 10);
+        let pinned = dashboard.screens["run_1"].screen().contents();
+        for line in 50..60 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        assert_eq!(
+            dashboard.screens["run_1"].screen().contents(),
+            pinned,
+            "a person reading scrollback must not have it pulled out from under them"
+        );
     }
 
     #[test]
@@ -9388,6 +10173,8 @@ mod tests {
             rows: 5,
             cols: 20,
             scrollback_rows: 3,
+            history_from: 0,
+            epoch: 1,
             screen: String::new(),
         });
         let mut written = Vec::new();
@@ -9503,6 +10290,632 @@ mod tests {
         assert!(
             !dashboard.screens["run_1"].is_scrolled(),
             "the wheel must not scroll the focused pane (\"a\") when the pointer is elsewhere"
+        );
+    }
+
+    /// Raw child output, which is the only thing that gives a replica scrollback: a screen
+    /// snapshot is cursor-addressed and never scrolls a row into history.
+    fn history_lines(count: u32) -> Vec<u8> {
+        (1..=count)
+            .flat_map(|index| format!("line {index}\r\n").into_bytes())
+            .collect()
+    }
+
+    /// A page-back answer that abuts the head of the replica's log, which is the only kind the
+    /// daemon can send: `OutputLog::before` returns a contiguous run ending exactly at the
+    /// cursor it was asked about. Built from the cursor rather than written out by hand so a
+    /// test cannot accidentally describe a gap or an overlap the protocol cannot produce —
+    /// which is what `apply_pane_history_response`'s `debug_assert` now says out loud.
+    fn history_response(
+        dashboard: &Dashboard,
+        run_id: &str,
+        epoch: u64,
+        older: &[u8],
+        complete: bool,
+    ) -> Response {
+        Response::PaneHistory {
+            run_id: run_id.into(),
+            epoch,
+            from: dashboard.history[run_id].from - older.len() as u64,
+            bytes: STANDARD.encode(older),
+            complete,
+        }
+    }
+
+    /// The payoff of the cursor an attach frame carries: once the viewport reaches the top of
+    /// what this replica holds, the only place the rows above it can come from is the daemon.
+    #[test]
+    fn scrolling_to_the_top_of_what_a_pane_holds_asks_for_what_came_before() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        // Walk the viewport to the top of the replica's own history.
+        for _ in 0..200 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        let command = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: area.x + 2,
+            row: area.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(&command, UiCommand::Request(request)
+                if matches!(request.as_ref(), Request::PaneHistory(r) if r.before == 4096)),
+            "at the top of its history the client must ask for the bytes before its cursor: \
+             {command:?}"
+        );
+    }
+
+    /// The other half of that predicate. A wheel notch in the middle of a pane's own history
+    /// is answered locally, and a client that asked the daemon on every notch would spend a
+    /// two-megabyte round trip and a full parser rebuild on a scroll it already had the rows
+    /// for.
+    #[test]
+    fn scrolling_in_the_middle_of_what_a_pane_holds_asks_for_nothing() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(400)));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        let command = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: area.x + 2,
+            row: area.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            command,
+            UiCommand::None,
+            "hundreds of rows above the viewport are already held locally"
+        );
+    }
+
+    #[test]
+    fn the_prefix_and_page_keys_scroll_the_focused_pane() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        for line in 0..100 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(
+            dashboard.screens["run_1"].scroll_offset() > 0,
+            "Ctrl+B PageUp must scroll the focused pane back"
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(
+            dashboard.screens["run_1"].scroll_offset(),
+            0,
+            "Ctrl+B End must return the pane to following live output"
+        );
+    }
+
+    #[test]
+    fn a_scrolled_pane_says_so_rather_than_looking_hung() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        for line in 0..100 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        dashboard.scroll_pane("run_1", 12);
+        let rendered = render_to_string(&mut dashboard, 80, 24);
+        assert!(
+            rendered.contains('▲'),
+            "a pane that stopped following live output is indistinguishable from a hung agent: {rendered}"
+        );
+    }
+
+    /// The marker degrades through a ladder as the pane narrows — the full sentence, then just
+    /// the row count, then a bare glyph — and at every rung the pane's own title is still on
+    /// screen. A pane too narrow for both must shorten the title, never erase it: this is the
+    /// property `a_scrolled_pane_says_so_rather_than_looking_hung` cannot see on its own, because
+    /// it only ever renders at one width.
+    /// `MIN_TITLE_WIDTH` protects the two explanatory rungs, but the bare glyph is the floor
+    /// the marker itself must never be dropped below — and a divider dragged all the way to one
+    /// side reaches pane widths well under that floor routinely, not hypothetically. This drives
+    /// the real mouse-drag path, the same one `resize_to_narrow_during_drag_clears_stale_divider_safely`
+    /// uses, so the pane width is whatever `drag_ratio`'s own `MIN_PANE_WIDTH` clamp produces
+    /// rather than a width chosen by the test.
+    #[test]
+    fn the_bare_glyph_marker_survives_a_divider_dragged_to_the_minimum_pane_width() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        for line in 0..100 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        dashboard.scroll_pane("run_1", 12);
+        // Wide, so the divider has somewhere to go — a narrow terminal would clamp the drag
+        // before it ever reached `MIN_PANE_WIDTH`.
+        render_to_string(&mut dashboard, 200, 24);
+        let divider = dashboard.dividers[0].area;
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: divider.x,
+            row: divider.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        // All the way to column 0: `drag_ratio` clamps this to `MIN_PANE_WIDTH`, exactly what a
+        // user dragging a divider as far as it will go produces.
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 0,
+            row: divider.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let rendered = render_to_string(&mut dashboard, 200, 24);
+        let area = dashboard.pane_areas["a"];
+        assert!(
+            area.width <= MIN_PANE_WIDTH + 2,
+            "a divider dragged fully to one side should land at or near MIN_PANE_WIDTH: {area:?}"
+        );
+        assert!(
+            rendered.contains('▲'),
+            "the bare glyph must survive a pane dragged down to its minimum width, not just the \
+             wider panes a terminal-size sweep happens to hit: {rendered}"
+        );
+    }
+
+    /// The exact widths the review reproduced the defect at (6, 8, 10, 12 columns — all well
+    /// under `MIN_PANE_WIDTH`'s neighbourhood and all reachable by setting the split ratio
+    /// directly on a wide terminal, the same state a divider drag produces). At every one of
+    /// them the bare glyph must survive; below the two-column floor there is nowhere left to
+    /// put it and no marker is asserted.
+    #[test]
+    fn the_bare_glyph_marker_is_present_at_widths_where_it_previously_vanished() {
+        for width in [4u16, 6, 8, 10, 12] {
+            let mut dashboard = bound_dashboard();
+            dashboard.apply_event(attach_event("run_1", b""));
+            for line in 0..100 {
+                dashboard.apply_event(delta_event(
+                    "run_1",
+                    line + 2,
+                    format!("line {line}\r\n").as_bytes(),
+                ));
+            }
+            dashboard.scroll_pane("run_1", 12);
+            render_to_string(&mut dashboard, 300, 24);
+            // A wide terminal so any ratio_milli from 0..=1000 can place pane "a" at any width
+            // from 0 up to most of the terminal; searching it lands exactly on `width` rather
+            // than approximating it with a hand-picked ratio that would go stale if the layout
+            // arithmetic ever changed.
+            let landed = (0u16..=1000).any(|ratio| {
+                set_parent_ratio(&mut dashboard.layout.workspaces[0].root, "b", ratio);
+                render_to_string(&mut dashboard, 300, 24);
+                dashboard.pane_areas["a"].width == width
+            });
+            assert!(landed, "no split ratio placed pane \"a\" at width {width}");
+            let rendered = render_to_string(&mut dashboard, 300, 24);
+            assert!(
+                rendered.contains('▲'),
+                "pane width {width} (reachable by dragging a divider) lost the bare glyph \
+                 entirely instead of shortening the title for it: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scroll_marker_shortens_the_title_rather_than_erasing_it_at_every_width() {
+        let scrolled_dashboard_at = |width: u16| {
+            let mut dashboard = bound_dashboard();
+            dashboard.apply_event(attach_event("run_1", b""));
+            for line in 0..100 {
+                dashboard.apply_event(delta_event(
+                    "run_1",
+                    line + 2,
+                    format!("line {line}\r\n").as_bytes(),
+                ));
+            }
+            dashboard.scroll_pane("run_1", 12);
+            render_to_string(&mut dashboard, width, 24)
+        };
+
+        // Narrow: only a bare glyph fits beside the title, so that is all that is asked for.
+        let narrow = scrolled_dashboard_at(60);
+        assert!(
+            narrow.contains("editor"),
+            "a narrow pane must shorten its title for the marker, not erase it: {narrow}"
+        );
+        assert!(
+            narrow.contains('▲'),
+            "even the narrowest pane that can say anything must say it stopped following: {narrow}"
+        );
+        assert!(
+            !narrow.contains("rows"),
+            "a pane too narrow for the row count must not overwrite its own title to show it anyway: {narrow}"
+        );
+
+        // Mid: room for the row count, still not the whole sentence.
+        let mid = scrolled_dashboard_at(75);
+        assert!(
+            mid.contains("editor"),
+            "a mid-width pane must still show its own title: {mid}"
+        );
+        assert!(
+            mid.contains("rows"),
+            "a mid-width pane has room for more than the bare glyph: {mid}"
+        );
+        assert!(
+            !mid.contains("End to follow"),
+            "a mid-width pane must not claim room for the full sentence it does not have: {mid}"
+        );
+
+        // Wide: room for everything, so the pane gets everything.
+        let wide = scrolled_dashboard_at(110);
+        assert!(
+            wide.contains("editor"),
+            "a wide pane has no excuse to shorten the title at all: {wide}"
+        );
+        assert!(
+            wide.contains("End to follow"),
+            "a wide pane must show the full instruction once there is room for it: {wide}"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_page_down_scrolls_the_focused_pane_forward_toward_live_output() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        for line in 0..100 {
+            dashboard.apply_event(delta_event(
+                "run_1",
+                line + 2,
+                format!("line {line}\r\n").as_bytes(),
+            ));
+        }
+        dashboard.scroll_pane("run_1", 40);
+        let before = dashboard.screens["run_1"].scroll_offset();
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(
+            dashboard.screens["run_1"].scroll_offset() < before,
+            "Ctrl+B PageDown must scroll the focused pane forward, toward live output"
+        );
+    }
+
+    #[test]
+    fn history_that_arrives_extends_the_pane_upwards_without_moving_what_is_on_screen() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        for _ in 0..10 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        let before = dashboard.screens["run_1"].scroll_offset();
+        assert_ne!(before, 0, "the viewport moved into history at all");
+        let visible = dashboard.screens["run_1"].screen().contents();
+        let answer = history_response(&dashboard, "run_1", 1, b"older\r\nolder\r\nolder\r\n", true);
+        dashboard.apply_pane_history_response(answer);
+        assert_eq!(
+            dashboard.screens["run_1"].scroll_offset(),
+            before,
+            "the offset is measured from the bottom, so more history above must not move the view"
+        );
+        assert_eq!(
+            dashboard.screens["run_1"].screen().contents(),
+            visible,
+            "the same rows must still be on screen"
+        );
+    }
+
+    /// The whole point of the exercise: output produced before this client ever attached is
+    /// rows the wheel can reach. Everything else here is about not disturbing what is already
+    /// on screen while that happens.
+    #[test]
+    fn history_that_arrives_becomes_rows_the_wheel_can_scroll_into() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        let older: Vec<u8> = (1..=40)
+            .flat_map(|index| format!("ancient {index}\r\n").into_bytes())
+            .collect();
+        let answer = history_response(&dashboard, "run_1", 1, &older, true);
+        dashboard.apply_pane_history_response(answer);
+        for _ in 0..500 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        let scrolled = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            scrolled.contains("ancient 2"),
+            "output from before the attach must be reachable by scrolling: {scrolled}"
+        );
+    }
+
+    /// The byte log has to track the parser, not just the seed. A rebuild replays the log, so
+    /// a log that stopped at the attach would silently drop everything the pane has printed
+    /// since — the most recent output, which is the output a person is actually looking at.
+    #[test]
+    fn a_rebuild_keeps_the_output_that_arrived_after_the_attach() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event(
+            "run_1",
+            2,
+            b"a line printed after attaching\r\n",
+        ));
+        let answer = history_response(&dashboard, "run_1", 1, b"older\r\n", true);
+        dashboard.apply_pane_history_response(answer);
+        let live = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            live.contains("a line printed after attaching"),
+            "the rebuild must replay the deltas as well as the seed: {live}"
+        );
+    }
+
+    #[test]
+    fn a_pane_that_has_reached_the_oldest_retained_byte_stops_asking() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        let answer = history_response(&dashboard, "run_1", 1, b"oldest\r\n", true);
+        dashboard.apply_pane_history_response(answer);
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        for _ in 0..500 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: area.x + 2,
+                row: area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None,
+            "there is nothing older, so scrolling must not keep asking"
+        );
+    }
+
+    /// The second thing that stops paging, and the one the daemon cannot tell the client
+    /// about. A replica retains a fixed number of rows; once it holds that many, older bytes
+    /// cannot be displayed however many of them are fetched, so fetching them is pure cost.
+    #[test]
+    fn a_pane_holding_every_row_it_is_allowed_to_stops_asking_for_older_bytes() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(Event::PaneAttached {
+            run_id: "run_1".into(),
+            revision: 1,
+            rows: PANE_ROWS,
+            cols: PANE_COLS,
+            scrollback_rows: 3,
+            history_from: 4096,
+            epoch: 1,
+            screen: String::new(),
+        });
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        for _ in 0..500 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: area.x + 2,
+                row: area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None,
+            "a replica already holding its full row budget has nowhere to put older bytes"
+        );
+    }
+
+    /// The cap on a client's own byte log, which is what keeps a pane that has run all week
+    /// costing the same as one that just started — and the slack above it, which is what keeps
+    /// the copy that enforces the cap off the path every delta takes.
+    #[test]
+    fn a_byte_log_is_copied_only_once_it_passes_the_mark_above_its_budget() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        let seed = dashboard.history["run_1"].log.len();
+        let brim = PANE_HISTORY_BYTES + PANE_HISTORY_TRIM_SLACK;
+        // Fed straight to the log rather than through a delta: the point is the budget, and
+        // parsing seventeen megabytes to reach it would make this test the slowest in the file.
+        dashboard.retain_history_bytes("run_1", &vec![b'.'; brim - seed]);
+        assert_eq!(
+            dashboard.history["run_1"].log.len(),
+            brim,
+            "up to the mark the log is left alone, so no delta pays for a copy"
+        );
+        dashboard.retain_history_bytes("run_1", b".");
+        assert_eq!(
+            dashboard.history["run_1"].log.len(),
+            PANE_HISTORY_BYTES,
+            "past it, one copy takes the log all the way back to its budget"
+        );
+    }
+
+    /// A trimmed log no longer knows the sequence it starts at, and cannot work it out: it
+    /// holds cursor-addressed corrections as well as stream bytes, and those take up room
+    /// without advancing the sequence. Rather than page from a cursor that is wrong by however
+    /// many corrective bytes were dropped — which would have the daemon's next answer overlap
+    /// the log and replay bytes twice — such a pane stops asking.
+    #[test]
+    fn a_pane_whose_byte_log_has_wrapped_stops_asking_rather_than_guessing_where_it_starts() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        for _ in 0..200 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert!(
+            dashboard.history_request_for("run_1").is_some(),
+            "before the log wrapped this pane was ready to page"
+        );
+        dashboard.retain_history_bytes(
+            "run_1",
+            &vec![b'.'; PANE_HISTORY_BYTES + PANE_HISTORY_TRIM_SLACK + 1],
+        );
+        assert!(
+            dashboard.history_request_for("run_1").is_none(),
+            "a cursor that cannot name where its log begins must not be sent"
+        );
+    }
+
+    /// The stopping condition the other three cannot express, and the one that matters most in
+    /// practice. A pane in the alternate screen — vim, less, htop, and the agent TUIs that are
+    /// most of what Dock runs — has no scrollback at all: `vt100` builds the alternate grid
+    /// with a zero-length one, and `history_rows()` reads the *active* grid. So it answers 0
+    /// forever, the row-capacity stop never trips, the headroom stop never trips, and every
+    /// wheel notch fires a two-megabyte request and a full parser rebuild for rows that can
+    /// never be displayed. One answer that raised nothing is proof enough.
+    #[test]
+    fn a_pane_in_the_alternate_screen_stops_asking_after_one_answer_that_showed_it_nothing() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        // `\x1b[?1049h` switches to the alternate screen, whose grid vt100 gives no scrollback.
+        let mut output = b"\x1b[?1049h".to_vec();
+        output.extend_from_slice(&history_lines(60));
+        dashboard.apply_event(delta_event("run_1", 2, &output));
+        assert_eq!(
+            dashboard
+                .screens
+                .get_mut("run_1")
+                .expect("the pane is attached")
+                .history_rows(),
+            0,
+            "the alternate screen retains no scrollback, which is the whole trap"
+        );
+        assert!(
+            dashboard.history_request_for("run_1").is_some(),
+            "the first ask is fair: nothing observed so far says it is pointless"
+        );
+        let answer = history_response(&dashboard, "run_1", 1, &history_lines(40), false);
+        dashboard.apply_pane_history_response(answer);
+        assert!(
+            dashboard.history_request_for("run_1").is_none(),
+            "an answer that added no row is proof the next one would not either"
+        );
+    }
+
+    /// The other side of the stop above, and the one that would be silent if it broke: a pane
+    /// whose answer *did* buy it rows must still be free to page further back, or deep history
+    /// would end after exactly one chunk and look like the daemon running out of it.
+    #[test]
+    fn a_pane_whose_answer_added_rows_is_still_free_to_ask_for_the_chunk_before_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 8192, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        for _ in 0..200 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert!(
+            dashboard.history_request_for("run_1").is_some(),
+            "the first ask"
+        );
+        let answer = history_response(&dashboard, "run_1", 1, &history_lines(40), false);
+        dashboard.apply_pane_history_response(answer);
+        for _ in 0..200 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert!(
+            dashboard.history_request_for("run_1").is_some(),
+            "an answer that added rows says the mechanism works, not that it is finished"
+        );
+    }
+
+    /// Scrolling toward live output moves through rows the pane already holds, so it can never
+    /// need anything older. The wheel arm asked on both directions, which put a two-megabyte
+    /// round trip and a full parser rebuild on half of every wheel gesture.
+    #[test]
+    fn a_wheel_notch_toward_live_output_never_asks_for_older_history() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        let notch = |kind| MouseEvent {
+            kind,
+            column: area.x + 2,
+            row: area.y + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..40 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        assert!(
+            matches!(
+                dashboard.mouse(notch(MouseEventKind::ScrollUp)),
+                UiCommand::Request(_)
+            ),
+            "at the top of what it holds, a notch back does ask — otherwise this proves nothing"
+        );
+        assert_eq!(
+            dashboard.mouse(notch(MouseEventKind::ScrollDown)),
+            UiCommand::None,
+            "a notch toward live output must not ask, however near the top the pane is"
+        );
+    }
+
+    /// A frozen pane paints a clone taken before the request could ever be answered, so a
+    /// rebuild of the live parser cannot add a row to what the user is looking at. Without
+    /// this the wheel would fire a two-megabyte request and a full rebuild on every notch for
+    /// as long as copy mode stayed open.
+    #[test]
+    fn scrolling_a_frozen_pane_asks_for_no_history_it_could_not_show() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 1));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(30)));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        assert_eq!(command(&mut dashboard, KeyCode::Char('[')), UiCommand::None);
+        assert!(dashboard.copy.is_some(), "the pane is frozen");
+        for _ in 0..10 {
+            assert_eq!(
+                dashboard.mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: area.x + 2,
+                    row: area.y + 2,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                UiCommand::None,
+                "a frozen pane cannot show anything a page-back would fetch"
+            );
+        }
+    }
+
+    /// Enough lines that they would unmistakably reach scrollback if they were spliced in —
+    /// a single line would be overwritten by the seed's repaint and prove nothing.
+    #[test]
+    fn history_from_a_restarted_run_is_discarded_rather_than_spliced_in() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event_at("run_1", b"", 4096, 2));
+        dashboard.apply_event(delta_event("run_1", 2, &history_lines(60)));
+        let before = dashboard.screens["run_1"].screen().contents();
+        let ghosts: Vec<u8> = (1..=40)
+            .flat_map(|index| format!("ghost {index}\r\n").into_bytes())
+            .collect();
+        // Epoch 1 is the previous incarnation of this pane; the replica is showing epoch 2.
+        let answer = history_response(&dashboard, "run_1", 1, &ghosts, true);
+        dashboard.apply_pane_history_response(answer);
+        assert_eq!(
+            dashboard.screens["run_1"].screen().contents(),
+            before,
+            "a cursor from before a restart names a position in a stream that no longer exists"
+        );
+        for _ in 0..500 {
+            dashboard.scroll_pane("run_1", 3);
+        }
+        let scrolled = render_to_string(&mut dashboard, 100, 30);
+        assert!(
+            !scrolled.contains("ghost 2"),
+            "bytes from a dead stream must not be spliced into this one: {scrolled}"
         );
     }
 
@@ -9728,6 +11141,8 @@ mod tests {
                 rows: 12,
                 cols: 20,
                 scrollback_rows: 2000,
+                history_from: 0,
+                epoch: 1,
                 screen: String::new(),
             },
             // The other re-seed trigger: a revision gap means this client missed bytes, so
@@ -10791,6 +12206,154 @@ mod tests {
                 / u64::from(frames);
         }
         (fastest, allocations, bytes)
+    }
+
+    /// What holding a pane's byte log costs on the path every delta takes.
+    ///
+    /// This is the measurement that chose `PANE_HISTORY_TRIM_SLACK`. Enforcing the budget means
+    /// moving the whole log down, and a full log is sixteen megabytes; done on every delta that
+    /// arrives past the cap, that lands on the event drain, ahead of render, for a daemon that
+    /// pushes every 16 ms. Both policies are reported so the difference is the number, not the
+    /// argument.
+    #[test]
+    #[ignore = "a measurement, not an assertion; cargo test --release measure_what_keeping -- --ignored --nocapture"]
+    fn measure_what_keeping_a_panes_byte_log_costs() {
+        const DELTA: usize = 4 << 10;
+        let delta = vec![b'x'; DELTA];
+
+        // What every delta used to pay: a trim the moment the log is over its budget, which
+        // memmoves the entire budget down by the size of the delta.
+        let mut fastest_eager = f64::MAX;
+        for _ in 0..7 {
+            let mut log = vec![b'x'; PANE_HISTORY_BYTES + DELTA];
+            let start = std::time::Instant::now();
+            log.drain(..DELTA);
+            fastest_eager = fastest_eager.min(start.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(&log);
+        }
+
+        // What a delta pays now: an append, and a share of one copy per slack of output.
+        let mut dashboard = Dashboard::default();
+        dashboard.history.insert(
+            "run_1".into(),
+            PaneHistoryCursor {
+                epoch: 1,
+                from: 0,
+                complete: false,
+                wrapped: false,
+                fruitless: false,
+                log: vec![b'x'; PANE_HISTORY_BYTES],
+            },
+        );
+        // Four times the slack, so the amortised copy is included several times over rather
+        // than landing on a round boundary.
+        let deltas = (PANE_HISTORY_TRIM_SLACK / DELTA) * 4;
+        let mut fastest_amortised = f64::MAX;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            for _ in 0..deltas {
+                dashboard.retain_history_bytes("run_1", &delta);
+            }
+            let per_delta = start.elapsed().as_secs_f64() * 1000.0 / deltas as f64;
+            fastest_amortised = fastest_amortised.min(per_delta);
+        }
+
+        println!();
+        println!(
+            "a {DELTA}-byte delta into a full {}MiB log",
+            PANE_HISTORY_BYTES >> 20
+        );
+        println!("{:>34}  {:>10}", "policy", "ms/delta");
+        println!("{:>34}  {fastest_eager:>10.4}", "trim on every delta");
+        println!(
+            "{:>34}  {fastest_amortised:>10.4}",
+            format!("trim past {}MiB of slack", PANE_HISTORY_TRIM_SLACK >> 20)
+        );
+    }
+
+    /// What a page-back costs, which is the cost of the wheel notch that asks for it.
+    ///
+    /// A parser cannot be prepended to, so extending a pane's history means replaying every
+    /// byte it holds through a fresh parser. That is the number the 2 MB chunk size is chosen
+    /// against: the log grows by a chunk per page-back, and the whole of it is replayed each
+    /// time, so the cost of the tenth page-back is the cost of replaying twenty megabytes.
+    /// Reported at three log sizes for that reason — the shape of the curve is the point, not
+    /// any one row of it.
+    #[test]
+    #[ignore = "a measurement, not an assertion; cargo test --release measure_what_paging_back -- --ignored --nocapture"]
+    fn measure_what_paging_back_through_a_panes_history_costs() {
+        println!();
+        println!("rebuilding a 40x160 replica from its own byte log");
+        println!("{:>12}  {:>10}  {:>10}", "lines", "bytes", "ms");
+        for lines in [20_000u32, 40_000, 80_000] {
+            let log: Vec<u8> = (0..lines)
+                .flat_map(|line| format!("line {line} of a long build log\r\n").into_bytes())
+                .collect();
+            let mut fastest = f64::MAX;
+            for _ in 0..7 {
+                let mut screen = PaneScreen::new(40, 160, crate::terminal::PANE_HISTORY_MAX_ROWS);
+                let start = std::time::Instant::now();
+                screen.feed(&log);
+                fastest = fastest.min(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!("{lines:>12}  {:>10}  {fastest:>10.2}", log.len());
+        }
+    }
+
+    /// What entering copy mode costs, which is what a row of retained scrollback costs.
+    ///
+    /// Copy mode freezes a pane by cloning the grid *and* the scrollback (`terminal/vt.rs`),
+    /// so this one gesture pays for every row `PANE_HISTORY_MAX_ROWS` allows, at whatever the
+    /// pane is wide. It is therefore both the latency measurement for the gesture — it is
+    /// keyboard-driven, so it is felt — and the price list for the constant: the bytes column
+    /// divided by the rows column is what one retained row costs, which is the figure the
+    /// constant's doc comment quotes.
+    ///
+    /// The pre-history depth of 2000 rows is measured alongside the current cap so the
+    /// difference is the number rather than the argument. **Run with `--test-threads=1`:** the
+    /// byte counter is a process-global, and a benchmark sharing the process with another one
+    /// reports the other one's allocations as its own.
+    #[test]
+    #[ignore = "a measurement, not an assertion; cargo test --release measure_what_freezing -- --ignored --nocapture --test-threads=1"]
+    fn measure_what_freezing_a_pane_for_copy_mode_costs() {
+        println!();
+        println!("cloning a replica's grid and scrollback, which is all entering copy mode does");
+        println!(
+            "{:>10}  {:>10}  {:>10}  {:>14}  {:>12}",
+            "replica", "capacity", "ms/entry", "bytes/entry", "bytes/row"
+        );
+        for (rows, cols) in [(24u16, 80u16), (40, 160)] {
+            // 2000 is the depth a replica held before pane history; 50,000 is the cap this
+            // branch first shipped and then withdrew. Both are here so the row that matters —
+            // the current constant, in the middle — is read against what it replaced.
+            for capacity in [2_000usize, crate::terminal::PANE_HISTORY_MAX_ROWS, 50_000] {
+                let mut screen = PaneScreen::new(rows, cols, capacity);
+                // Enough lines to fill the scrollback to its capacity and then some, so the
+                // clone is of a full replica rather than of a half-empty one.
+                let log: Vec<u8> = (0..capacity + usize::from(rows) + 100)
+                    .map(|line| format!("line {line} of a long build log\r\n"))
+                    .collect::<String>()
+                    .into_bytes();
+                screen.feed(&log);
+                let held = screen.history_rows();
+                let mut fastest = f64::MAX;
+                let mut bytes = u64::MAX;
+                for _ in 0..7 {
+                    let before = ALLOCATED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+                    let start = std::time::Instant::now();
+                    let frozen = screen.snapshot();
+                    fastest = fastest.min(start.elapsed().as_secs_f64() * 1000.0);
+                    bytes = bytes
+                        .min(ALLOCATED_BYTES.load(std::sync::atomic::Ordering::Relaxed) - before);
+                    std::hint::black_box(&frozen);
+                }
+                println!(
+                    "{:>10}  {capacity:>10}  {fastest:>10.2}  {bytes:>14}  {:>12}",
+                    format!("{rows}x{cols}"),
+                    bytes / held.max(1) as u64
+                );
+            }
+        }
     }
 
     #[test]

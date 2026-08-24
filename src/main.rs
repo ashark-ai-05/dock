@@ -671,6 +671,13 @@ fn run_dashboard(
                 // reach the person who pressed the key, in the daemon's own words.
                 if matches!(request.as_ref(), Request::Queue(_)) {
                     dashboard.apply_queue_response(response);
+                } else if matches!(request.as_ref(), Request::PaneHistory(_)) {
+                    // The same shape, for the same reason: the answer is the product. It
+                    // carries the older output the wheel asked for, and the loop is
+                    // synchronous — this response is applied before the next input event is
+                    // read — so a request that fails simply leaves the cursor where it was and
+                    // the next notch asks again.
+                    dashboard.apply_pane_history_response(response);
                 } else {
                     match response {
                         Response::Error { message, .. } => dashboard.error = Some(message),

@@ -76,11 +76,18 @@ screen."* That warning names this project. §2 answers it.
 and never reads again"* (`client.rs:495`). A history request cannot ride the subscription. `Client::request`
 (`client.rs:100`) is a separate one-shot connection and is where it goes.
 
-**vt100's scrollback offset is measured from the bottom and does not self-adjust.**
+**vt100's scrollback offset is measured from the bottom, and it self-adjusts as rows arrive.**
 `grid.set_scrollback` is `self.scrollback_offset = rows.min(self.scrollback.len())` (`grid.rs:198`), and
-nothing touches `scrollback_offset` when rows are appended. Two consequences, one good and one a bug:
-a rebuilt parser with more history above keeps pointing at the same content (§4), and a scrolled-up view
-slides downward under incoming output (§4).
+`scroll_up` bumps the offset for every row it pushes into scrollback while the view is scrolled
+(`grid.rs:571-574`). So a scrolled-up pane stays pinned to the content the reader is looking at, and a
+rebuilt parser with more history above keeps pointing at the same content too (§4).
+
+**Corrected 2026-08-25.** An earlier revision of this section claimed "nothing touches `scrollback_offset`
+when rows are appended", and §4 accordingly specified a drift-compensation fix. That was wrong — read from
+`set_scrollback` alone without grepping for other writers — and the compensation would have double-counted
+vt100's own increment, un-pinning the very content it was meant to hold. The behaviour is now pinned by a
+characterisation test instead, because `terminal/mod.rs:14` names `PaneScreen` a swap point for the terminal
+engine and a replacement engine that lacked this would break scrolling everywhere with no other alarm.
 
 **vt100 exposes no scrollback-length getter.** `Grid::scrollback_len()` (`grid.rs:190`) returns the configured
 *capacity* and `Grid` is private; `Screen::scrollback()` (`screen.rs:122`) returns the current offset. The
@@ -183,8 +190,13 @@ fetch the older chunk, prepend, rebuild the parser from the whole log. One round
 rebuild. The alternative — asking the daemon for `from`-to-`end` and re-sending bytes the client already has
 — makes every page-back re-transmit the entire history.
 
-The client's log is capped at the **same byte budget the daemon announces**, so the two never disagree about
-how much history exists and the client cannot accumulate more than the daemon can re-serve.
+The client's log is capped by **its own copy of `PANE_HISTORY_BYTES`** (`terminal/mod.rs`), not by anything
+the daemon announces. **Corrected 2026-08-25**: nothing byte-valued is on the wire. The attach frame carries
+`scrollback_rows`, which is a row count, so `dockd --pane-history-bytes=N` moves the daemon's retention and
+leaves the client's 16 MB log cap exactly where it is. Both sides happen to agree because both read the same
+constant from the same source, and the flag exists to be *lowered*: a smaller daemon budget simply means less
+to re-serve, and the client's cap is then never the binding one. Raising it past 16 MB buys a client nothing,
+because the client stops logging at its own constant however much the daemon retains.
 
 Per-run state: `{ epoch, from, complete }`. When a scroll leaves the viewport **within one screen height of
 the top** of what the parser holds, and `complete` is not set, the client requests the next **2 MB**. An
@@ -199,9 +211,14 @@ second scroll cannot arrive while a history request is outstanding. A failed req
 (`grid.rs:198`), adding rows above leaves the same offset pointing at the same content. Nothing needs to be
 recomputed; the property needs a test so a later change cannot quietly break it.
 
-**Drift while scrolled is a real bug, and it must be fixed here or deep scrolling is pointless.** Nothing
-adjusts `scrollback_offset` when rows are appended, so today a scrolled-up view slides downward under
-incoming output. In a 2000-row pane that is a nuisance; in a 200k-row pane it makes scrolling unusable.
+**Drift while scrolled would make deep scrolling pointless — and vt100 already prevents it.** This section
+originally asserted that nothing adjusts `scrollback_offset` when rows are appended, and specified a fix.
+That was wrong: `Grid::scroll_up` bumps the offset for every row it pushes into scrollback while the view is
+scrolled (`grid.rs:571-574`), so a scrolled pane stays pinned on its own. Adding a second increment on top of
+vt100's would have un-pinned the content the fix was meant to hold — measured landing at offset 30 where 20
+was correct. **Corrected 2026-08-25**; what ships instead is a characterisation test pinning vt100's
+behaviour, because `terminal/mod.rs:14` names `PaneScreen` a swap point for the terminal engine and a
+replacement lacking this would break every scrolled pane with no other alarm.
 
 The row count is readable through the public API, since `set_scrollback` clamps to the actual length. This
 becomes a method on `VtTerminal` (`terminal/vt.rs`), beside the existing `scroll_by` and `scroll_offset`, so
@@ -217,8 +234,9 @@ fn history_rows(screen: &mut Screen) -> usize {
 }
 ```
 
-Sample either side of a delta; when the pane is scrolled, add the difference to the offset. O(1), no clone,
-and it pins the content the user is reading while output keeps arriving beneath it.
+`history_rows` survives the withdrawn compensation because §4's paging needs it for a different question:
+whether the replica is already holding as many rows as it is allowed to, which is the local stopping
+condition that keeps a client from asking for history it could never display. O(1), and no clone.
 
 **This is why scrolling does not freeze the pane.** Copy mode freezes by cloning the grid and the scrollback
 (`vt.rs:206`, *"costs a full copy of the grid **and** the scrollback"*). Correct at 2000 rows, unaffordable
@@ -236,7 +254,7 @@ carries. Renaming it is deliberately deferred to v13 in step 3 rather than done 
 
 **Scroll surface.** The wheel is unchanged. Added: `Ctrl+B PgUp` / `Ctrl+B PgDn` for half a page, and
 `Ctrl+B End` to snap back to following live output. While `scroll_offset() > 0` the pane chrome shows
-`▲ 1,240 rows · End to follow`, because a pane that has silently stopped following live output is
+`▲ 1240 rows · End to follow`, because a pane that has silently stopped following live output is
 indistinguishable from a hung agent.
 
 ## 5. The tab strip scrolls
@@ -265,8 +283,8 @@ would paint a full-screen program over a user's history, and it is the one the o
 `protocol.rs:769` updated.
 
 **Client** — paging fires at the top and exactly once while pending; `complete` stops it; an `epoch` mismatch
-discards the response; the scroll offset is preserved across a rebuild; drift compensation pins content while
-deltas arrive.
+discards the response; the scroll offset is preserved across a rebuild; and a characterisation test pins
+vt100's own offset compensation, which is what keeps content still while deltas arrive.
 
 **Tabs** — the active tab is fully visible including affordances at every scroll position; markers appear and
 disappear with hidden tabs; marker clicks and wheel scroll the strip; a single tab still renders with no
@@ -290,16 +308,28 @@ Each step ends green and shippable.
    Wire only; no client behaviour yet.
 4. **Client paging** — the client-side byte log, page-back on scroll, epoch and `complete` handling, offset
    preservation. **History from before attach becomes reachable here.**
-5. **Drift compensation** — `history_rows` sampling and offset adjustment. Independent of 1–4 and could ship
-   first; it is placed last because its value is only visible once there is depth to scroll through.
+5. **Drift guard** — a characterisation test pinning vt100's own offset compensation. Originally specified as
+   a compensation Dock would implement; the investigation found vt100 already does it and that a second
+   increment would un-pin the content, so what remains is the test and no production change.
 6. **Tab strip** — entirely independent of 1–5, and safe to build in parallel or first if the pane work
    stalls.
 
 ## 8. Risks
 
-**16 MB × pane count is real memory.** Eight panes is 128 MB worst case, though a typical pane holds far
-less — the log is bytes, not vt100 cell grids, and the cap is a ceiling rather than an allocation. Measured
-in step 1 and reported; the flag exists so it can be lowered.
+**16 MB × pane count is real memory on the daemon — and on the client the cells cost several times the
+bytes.** Eight daemon panes is 128 MB worst case, though a typical pane holds far less: *there* the log is
+bytes, not vt100 cell grids, and the cap is a ceiling rather than an allocation. **Corrected 2026-08-25: on
+the client that reassurance is backwards.** A replica keeps parsed cells, and `vt100` allocates a full row of
+them for every retained scrollback row — `Row::new(cols)` eagerly allocates `cols` cells and a `Cell` is
+exactly 32 bytes, whatever the row holds. Measured with an instrumented allocator: **2.6 KB per retained row
+at 80 columns, 5.2 KB at 160**, per pane, per attached run.
+
+`PANE_HISTORY_MAX_ROWS` (`terminal/mod.rs`) is therefore the client's real memory bound, and it shipped at
+50,000 — **124 MiB per pane at 24×80 and 246 MiB at 40×160**, dwarfing the 16 MiB byte log beside it.
+**Lowered to 10,000 before merge**: roughly **26 MB and 52 MB** per pane, still five times the 2000 rows a
+replica held before this project, and further back than anyone scrolls to read. The figures come from
+`measure_what_freezing_a_pane_for_copy_mode_costs` (`dashboard.rs`), which prices the row because copy mode's
+freeze clones every one of them; the daemon flag exists so its side can be lowered too.
 
 **Page-back hitches on a large rebuild.** Replaying 16 MB through vt100 is not free. Mitigated by paging in
 2 MB chunks rather than the whole log, and measured in step 4. If it proves visible, the fallback is a

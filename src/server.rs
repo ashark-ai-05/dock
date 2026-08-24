@@ -390,6 +390,35 @@ fn handle_connection_with_timeout(
                 Ok(()) => write_response(stream, &Response::Ack)?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
+            Ok(Request::PaneHistory(request)) => {
+                // Clamped to what the log can hold: a request for more than that is not an
+                // error, it is a caller that does not know the budget, and the honest answer
+                // is everything there is.
+                let max = (request.max_bytes as usize).min(runtime.pane_history_bytes());
+                let served = runtime.with_run_output(&request.run_id, |output| {
+                    let (from, bytes, complete) = output.log().before(request.before, max);
+                    (output.log().epoch(), from, bytes, complete)
+                });
+                match served {
+                    Some((epoch, from, bytes, complete)) => write_response(
+                        stream,
+                        &Response::PaneHistory {
+                            run_id: request.run_id,
+                            epoch,
+                            from,
+                            bytes: STANDARD.encode(&bytes),
+                            complete,
+                        },
+                    )?,
+                    None => write_response(
+                        stream,
+                        &Response::Error {
+                            code: ErrorCode::RunNotFound,
+                            message: format!("no live pane {}", request.run_id),
+                        },
+                    )?,
+                }
+            }
             Ok(Request::Queue(request)) => {
                 let response = match request {
                     QueueRequest::Inspect => Response::Queues {
@@ -528,7 +557,7 @@ fn stream_events(
             {
                 syncs.remove(&snapshot.run_id);
             }
-            let scrollback_rows = u32::try_from(runtime.scrollback_rows()).unwrap_or(u32::MAX);
+            let pane_history_bytes = runtime.pane_history_bytes();
             let frame = runtime.with_run_output(&snapshot.run_id, |output| {
                 match syncs.get_mut(&snapshot.run_id) {
                     Some(view) => view.next_delta(output),
@@ -567,8 +596,9 @@ fn stream_events(
                     revisions.insert(snapshot.run_id.clone(), revision);
                 }
                 StreamFrame::Seed(seed) => {
-                    let (view, bytes) = *seed;
+                    let (view, history_from, bytes) = *seed;
                     let revision = revisions.get(&snapshot.run_id).copied().unwrap_or(0) + 1;
+                    let epoch = view.epoch;
                     write_response(
                         stream,
                         &Response::Stream {
@@ -577,7 +607,24 @@ fn stream_events(
                                 revision,
                                 rows: snapshot.rows,
                                 cols: snapshot.cols,
-                                scrollback_rows,
+                                history_from,
+                                epoch,
+                                // Rows the replica must retain to hold everything it can be
+                                // sent, derived from the byte budget at a pessimistic 8 bytes
+                                // a row so under-sizing (which would silently discard replayed
+                                // history off the top) errs towards too many rather than too
+                                // few. But it is `PANE_HISTORY_MAX_ROWS` that actually bounds
+                                // this: a replica's rows are parsed cells, not raw bytes, and
+                                // `vt100` allocates a full row of them — `cols × 32` bytes —
+                                // whatever the row holds, so pricing a row at 8 bytes here
+                                // understates its real cost by roughly a thousandfold. Without
+                                // the cap, the byte budget alone would authorise gigabytes of
+                                // cells per pane.
+                                scrollback_rows: u32::try_from(
+                                    (pane_history_bytes / 8)
+                                        .min(crate::terminal::PANE_HISTORY_MAX_ROWS),
+                                )
+                                .unwrap_or(u32::MAX),
                                 screen: STANDARD.encode(&bytes),
                             },
                         },
@@ -672,10 +719,19 @@ enum StreamFrame {
     /// erase drift appended. Empty when the pane has been silent, which is the common case.
     Delta(Vec<u8>),
     /// A full snapshot and the view that replaces this subscriber's, for a run it has never
-    /// seen, one whose geometry changed, or one whose output it has fallen behind.
+    /// seen, one whose geometry changed, or one whose output it has fallen behind. The `u64`
+    /// is the sequence the replayed bytes begin at: the sequence a client would need to name
+    /// to page further back than this seed reaches.
     /// Boxed only to keep the common `Delta` frame small: a view carries two parsers.
-    Seed(Box<(SubscriberView, Vec<u8>)>),
+    Seed(Box<(SubscriberView, u64, Vec<u8>)>),
 }
+
+/// How much retained output rides along with an attach frame.
+///
+/// Enough that scrolling up is instant for the distance anyone scrolls without thinking, and
+/// small enough that attaching to a canvas of panes is not a stall: this is paid per pane, on
+/// every client start and every re-seed. Everything older is paged in on demand.
+const SEED_HISTORY_BYTES: usize = 256 * 1024;
 
 /// How far into one run's raw output this subscriber has read, a replica of what it should
 /// now be showing, and the geometry the view was built at. Revisions live outside this so
@@ -692,26 +748,23 @@ struct SubscriberView {
 }
 
 impl SubscriberView {
-    /// A snapshot of `output`'s screen and the view a subscriber sent it will then have.
+    /// A fresh subscriber's starting point: a replay of the pane's recent history, followed by
+    /// whatever correction that replay did not achieve on its own.
     ///
-    /// The snapshot is a repaint, which restores the visible grid but says nothing about
-    /// which buffer that grid is. A pane already in the alternate screen must therefore say
-    /// so first, or the client would paint a full-screen program's window onto its primary
-    /// buffer — scrolling the user's real history away and leaving the client on the wrong
-    /// buffer when the program exits.
+    /// Replaying raw history rather than sending the visible grid is what gives the client
+    /// something to scroll back through: a repaint is cursor-addressed and never scrolls a row
+    /// into scrollback, so a client seeded with one begins with no history at all.
     ///
-    /// There is deliberately no matching `\e[?1049l` for a pane on the primary screen, and
-    /// that is only safe because `Dashboard::apply_event` rebuilds the client's parser on
-    /// every `PaneAttached` (`src/dashboard.rs`), so a seed always lands in a fresh primary
-    /// buffer. Reusing an existing parser across a re-attach — to preserve its accumulated
-    /// history, say — would strand a client that was in the alternate screen when the pane
-    /// left it. Any such change must send the leave sequence from here.
-    fn seeded(output: &PaneOutput, rows: u16, cols: u16) -> (Self, Vec<u8>) {
-        let mut bytes = Vec::new();
-        if output.screen().alternate_screen() {
-            bytes.extend_from_slice(b"\x1b[?1049h");
-        }
-        bytes.extend_from_slice(&output.screen().state_bytes());
+    /// **The alternate screen is handled by comparison, not by assumption.** The replayed bytes
+    /// may themselves contain `1049h`/`1049l`, so after replay this subscriber's parser can be
+    /// in either buffer, and the older rule here — always land in a fresh primary buffer, so
+    /// only `1049h` is ever needed — no longer holds. Instead the seed's own `ScreenSync` is
+    /// asked which buffer the replay reached, and the corrective sequence is appended only when
+    /// it disagrees with the live screen. Both directions matter: a replica left in the
+    /// alternate screen paints a full-screen program over the user's history, and a replica left
+    /// on primary renders a full-screen program into scrollback.
+    fn seeded(output: &PaneOutput, rows: u16, cols: u16) -> (Self, u64, Vec<u8>) {
+        let (from, mut bytes) = output.log().tail(SEED_HISTORY_BYTES);
         let mut view = Self {
             sync: ScreenSync::new(rows, cols),
             size: (rows, cols),
@@ -719,7 +772,29 @@ impl SubscriberView {
             epoch: output.log().epoch(),
         };
         view.sync.apply(&bytes);
-        (view, bytes)
+        if view.sync.alternate_screen() != output.screen().alternate_screen() {
+            let correction: &[u8] = if output.screen().alternate_screen() {
+                b"\x1b[?1049h"
+            } else {
+                b"\x1b[?1049l"
+            };
+            bytes.extend_from_slice(correction);
+            view.sync.apply(correction);
+        }
+        // The replayed tail is not guaranteed to reproduce the live screen: it can be
+        // truncated (the oldest rows aged out of the retained log), and it can be silent
+        // where the live screen changed without a byte to replay at all — a resize reflows
+        // the screen without appending to the log. Left uncorrected, either leaves the
+        // replica showing something the daemon does not, with nothing further ever arriving
+        // to fix it: a silent pane has no future delta to carry the repair. This is the same
+        // primitive `next_delta` uses to erase drift; it is cursor-addressed, so it adds
+        // nothing to the replica's history.
+        let repaint = view.sync.delta_from(output.screen());
+        if !repaint.is_empty() {
+            view.sync.apply(&repaint);
+            bytes.extend_from_slice(&repaint);
+        }
+        (view, from, bytes)
     }
 
     /// The bytes owed to this subscriber, or `None` if it has fallen further behind than the
@@ -889,7 +964,10 @@ fn write_response(stream: &mut UnixStream, response: &Response) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{HelloRequest, PaneInputRequest, PaneResizeRequest, SubscribeRequest};
+    use crate::protocol::{
+        HelloRequest, PaneHistoryRequest, PaneInputRequest, PaneResizeRequest, SubscribeRequest,
+    };
+    use crate::terminal::PaneScreen;
     use std::{
         net::Shutdown,
         path::PathBuf,
@@ -2040,8 +2118,15 @@ mod tests {
             .expect("an attach frame");
         assert_eq!(
             attached as usize,
-            runtime.scrollback_rows(),
-            "the attach frame must carry the daemon's real retention, not a client-side guess"
+            (runtime.pane_history_bytes() / 8).min(crate::terminal::PANE_HISTORY_MAX_ROWS),
+            "the attach frame must carry a capacity derived from the daemon's real history \
+             retention, not a client-side guess"
+        );
+        assert_eq!(
+            attached as usize,
+            crate::terminal::PANE_HISTORY_MAX_ROWS,
+            "and at the default budget it is the row cap that binds, not the byte budget: a \
+             replica's rows are parsed cells, so the cap is what actually bounds client memory"
         );
 
         let mut replayed = replay(&events, &run_id);
@@ -2087,6 +2172,195 @@ mod tests {
         );
     }
 
+    /// A pane that has written more than a seed replays retains a cursor to page back from
+    /// (Task 3), and `PaneHistory` is what lets a client actually use it: asked for the bytes
+    /// behind that cursor, the daemon must answer from the same byte stream the attach frame
+    /// named (`epoch`), never run its answer past the caller's own cursor, and say so when the
+    /// answer reaches everything still retained.
+    #[test]
+    fn a_pane_history_request_answers_from_the_cursor_an_attach_frame_reported() {
+        let runtime = registry();
+        create_workspace(&runtime);
+        let run_id = runtime
+            .inspect(None)
+            .expect("inspect")
+            .into_iter()
+            .find(|run| run.pane_id == "p1")
+            .expect("bound run")
+            .run_id;
+
+        // More than a seed ever replays, so the attach frame below truncates its cursor away
+        // from the very start of the log and leaves genuine history behind it to page back
+        // into. Comfortably short of the daemon's own retention budget, so every one of these
+        // bytes is still there to be served back in full.
+        runtime
+            .pane_input("w1", "p1", b"yes | head -c 300000; echo DONEMARK\n")
+            .expect("type into the pane");
+        let deadline = Instant::now() + convergence_backstop();
+        while runtime
+            .with_run_output(&run_id, |output| output.log().end())
+            .expect("live output")
+            < (SEED_HISTORY_BYTES as u64 + 4096)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the shell never produced enough output to truncate the seed"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let responses = exchange(&[&hello(), &subscribe_line()], &runtime);
+        let (attached_history_from, attached_epoch) = collect_events(&responses)
+            .into_iter()
+            .find_map(|event| match event {
+                Event::PaneAttached {
+                    history_from,
+                    epoch,
+                    ..
+                } => Some((history_from, epoch)),
+                _ => None,
+            })
+            .expect("an attach frame");
+
+        let request = Request::PaneHistory(PaneHistoryRequest {
+            run_id: run_id.clone(),
+            before: attached_history_from,
+            max_bytes: 2 << 20,
+        });
+        let responses = exchange(
+            &[&hello(), &serde_json::to_string(&request).unwrap()],
+            &runtime,
+        );
+        match &responses[1] {
+            Response::PaneHistory {
+                epoch,
+                from,
+                complete,
+                bytes,
+                ..
+            } => {
+                assert_eq!(*epoch, attached_epoch, "the same byte stream");
+                assert!(*from <= attached_history_from);
+                assert!(
+                    *complete,
+                    "a fixture well inside the daemon's retention budget keeps everything it \
+                     wrote"
+                );
+                assert!(!STANDARD.decode(bytes).expect("base64").is_empty());
+            }
+            other => panic!("expected history, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_for_a_run_the_daemon_does_not_have_is_refused_rather_than_answered_empty() {
+        let runtime = registry();
+        let request = Request::PaneHistory(PaneHistoryRequest {
+            run_id: "no-such-run".into(),
+            before: 0,
+            max_bytes: 1 << 20,
+        });
+        let responses = exchange(
+            &[&hello(), &serde_json::to_string(&request).unwrap()],
+            &runtime,
+        );
+        match &responses[1] {
+            Response::Error { code, .. } => assert_eq!(
+                *code,
+                ErrorCode::RunNotFound,
+                "an empty answer and a missing pane must not look the same to a client"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_seed_carries_the_panes_history_and_not_just_its_visible_screen() {
+        let mut output = PaneOutput::new(2, 20, 100, 4096);
+        for line in 0..20 {
+            output.feed(format!("line {line}\r\n").as_bytes());
+        }
+        let (_, _, bytes) = SubscriberView::seeded(&output, 2, 20);
+        let seeded = String::from_utf8_lossy(&bytes);
+        assert!(
+            seeded.contains("line 0"),
+            "the seed must replay history, not just the two visible rows: {seeded:?}"
+        );
+    }
+
+    #[test]
+    fn a_seed_whose_history_ends_in_the_alternate_screen_returns_a_primary_pane_to_primary() {
+        let mut output = PaneOutput::new(4, 20, 100, 4096);
+        output.feed(b"history\r\n");
+        output.feed(b"\x1b[?1049h"); // a full-screen program starts
+        output.feed(b"inside the program");
+        output.feed(b"\x1b[?1049l"); // and exits, leaving the pane on primary
+        assert!(!output.screen().alternate_screen());
+        let (_, _, bytes) = SubscriberView::seeded(&output, 4, 20);
+        let mut replica = PaneScreen::new(4, 20, 100);
+        replica.feed(&bytes);
+        assert!(
+            !replica.alternate_screen(),
+            "a replica left in the alternate screen would paint over the user's history"
+        );
+    }
+
+    #[test]
+    fn a_seed_for_a_pane_inside_the_alternate_screen_puts_the_replica_there() {
+        let mut output = PaneOutput::new(4, 20, 100, 4096);
+        output.feed(b"history\r\n");
+        output.feed(b"\x1b[?1049h");
+        output.feed(b"inside the program");
+        assert!(output.screen().alternate_screen());
+        let (_, _, bytes) = SubscriberView::seeded(&output, 4, 20);
+        let mut replica = PaneScreen::new(4, 20, 100);
+        replica.feed(&bytes);
+        assert!(replica.alternate_screen());
+    }
+
+    /// A resize reflows the daemon's screen without appending a single byte to the log, so
+    /// replaying the retained tail can never reproduce it, no truncation required. A seed that
+    /// only replayed history would leave a subscriber on a pre-resize screen it has no future
+    /// delta to correct, since a silent pane sends nothing further to carry the repair.
+    #[test]
+    fn a_seed_repaints_whatever_the_replayed_tail_alone_could_not_reproduce() {
+        let mut output = PaneOutput::new(4, 20, 100, 4096);
+        output.feed(b"one two three four five\r\nsix seven eight\r\n");
+        // Reflows the live screen in place; the log above is untouched by it.
+        output.screen_mut().resize(4, 10);
+        let (_, _, bytes) = SubscriberView::seeded(&output, 4, 10);
+        let mut replica = PaneScreen::new(4, 10, 100);
+        replica.feed(&bytes);
+        assert_eq!(
+            replica.state_bytes(),
+            output.screen().state_bytes(),
+            "a seed must repaint whatever its replayed tail alone could not reproduce"
+        );
+    }
+
+    /// What attaching a subscriber to a pane with a full history costs.
+    ///
+    /// This is paid per pane on every client start and every re-seed, so it is the number that
+    /// decides whether the seed prefix is the right size. Fastest of several rounds, for the
+    /// reason `measure_frame` gives: noise only ever makes a round slower.
+    #[test]
+    #[ignore = "a measurement, not an assertion: cargo test --release --lib -- --ignored --nocapture"]
+    fn measure_what_seeding_a_pane_with_its_history_costs() {
+        let mut output = PaneOutput::new(40, 160, 100_000, crate::terminal::PANE_HISTORY_BYTES);
+        for line in 0..200_000 {
+            output.feed(format!("line {line} of a long build log\r\n").as_bytes());
+        }
+        let mut fastest = f64::MAX;
+        let mut size = 0;
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            let (_, _, bytes) = SubscriberView::seeded(&output, 40, 160);
+            fastest = fastest.min(start.elapsed().as_secs_f64() * 1000.0);
+            size = bytes.len();
+        }
+        println!("\nseed of a full pane: {size} bytes in {fastest:.2}ms");
+    }
+
     /// A subscriber slow enough to fall past the retained window must be re-seeded. Serving it
     /// whatever bytes survive would skip the rest, and a mirror missing a run of bytes looks
     /// exactly like a rendering bug with nothing to attribute it to.
@@ -2094,7 +2368,7 @@ mod tests {
     fn a_subscriber_that_falls_behind_the_retained_output_is_re_seeded_rather_than_skipped() {
         let mut output = PaneOutput::new(5, 20, 100, 16);
         output.feed(b"first\r\n");
-        let (mut view, seed) = SubscriberView::seeded(&output, 5, 20);
+        let (mut view, _history_from, seed) = SubscriberView::seeded(&output, 5, 20);
         let mut client = crate::terminal::VtTerminal::new(5, 20, 100);
         client.feed(&seed);
         assert_eq!(client.state_bytes(), output.screen().state_bytes());
@@ -2118,7 +2392,7 @@ mod tests {
             view.next_delta(&output).is_none(),
             "falling behind must be reported, not silently partially served"
         );
-        let (mut recovered, reseed) = SubscriberView::seeded(&output, 5, 20);
+        let (mut recovered, _history_from, reseed) = SubscriberView::seeded(&output, 5, 20);
         client.feed(&reseed);
         assert_eq!(
             client.state_bytes(),

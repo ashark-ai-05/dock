@@ -2383,12 +2383,17 @@ impl Dashboard {
     /// sidebar must not lose.
     fn render_sidebar_rail(&mut self, frame: &mut Frame, area: Rect) {
         // Two blank rows lead the roster, so the first glyph lands where the AGENTS list starts
-        // in the full sidebar rather than crowding the header the sidebar sits beneath.
+        // in the full sidebar rather than crowding the header the sidebar sits beneath. Those two
+        // rows are not glyph rows, so the roster is capped at `area.height - 2`: without the
+        // subtraction this could compute up to two more entries than `Paragraph` has room to
+        // draw, which is harmless only because the roster is already blocked-first sorted — the
+        // entries that would be over-provisioned are the ones least likely to matter — but the
+        // honest number is the one that matches what is actually visible.
         let mut lines = vec![Line::from(""), Line::from("")];
         for (state, _, _, _, _) in self
             .agent_roster()
             .into_iter()
-            .take(usize::from(area.height))
+            .take(usize::from(area.height).saturating_sub(2))
         {
             lines.push(Line::styled(
                 format!(" {}", state.glyph()),
@@ -9920,27 +9925,25 @@ mod tests {
         // The second line is what a two-line card is *for*, so it degrades in deliberate steps
         // rather than being left to the ellipsis.
         //
-        // The terminal widths below moved from 105/80 to 95/80 because columns no longer divide
-        // the pane equally (task 4): with one card apiece, `BACKLOG` and `ACTIVE` are now the
-        // only two filled columns and split the pane's surplus width between just themselves,
-        // so a terminal that used to land a column in the narrow bucket at 105 now needs 95 to
-        // land `ACTIVE` at the same eighteen cells (`FILLED_MIN`, the floor for an occupied
-        // column with no surplus left to hand out) — too narrow for
-        // `claude · a · needs you · 0 queued`, wide enough for the word that matters.
-        // Task 8's rail claims the sidebar's spare columns below its own threshold (88), so at
-        // 95 and 80 wide — both under it — the board pane would otherwise land at a canvas width
-        // this test's comment above was never written against. Two toggles pin the sidebar back
-        // to `Full` (the state a fresh dashboard already opens in, so the geometry below is
-        // unchanged) without the automatic rule overriding it for these renders.
+        // The terminal widths below moved twice now. Task 4 moved them from 105/80 to 95/80:
+        // with one card apiece, `BACKLOG` and `ACTIVE` are the only two filled columns and split
+        // the pane's surplus width between just themselves, so a terminal that used to land a
+        // column in the narrow bucket at 105 needed 95 to land `ACTIVE` at the same eighteen
+        // cells (`FILLED_MIN`, the floor for an occupied column with no surplus left to hand
+        // out). Task 8 moves them again, from 95/80 to 70/69: below the rail threshold (88) the
+        // sidebar now auto-rails and hands the canvas back the ~25 columns the 28-column sidebar
+        // used to keep, so the same `FILLED_MIN` landing — the pane still narrows exactly as
+        // steeply, just against a canvas that starts ~25 columns wider — now happens ~25 columns
+        // sooner. 70 lands `ACTIVE` at eighteen cells, too narrow for
+        // `claude · a · needs you · 0 queued`, wide enough for the word that matters; 69, one
+        // column short of that floor, is where the allocator's equal-column fallback still
+        // applies (exercised on its own by `a_pane_too_narrow_for_stubs_falls_back_to_
+        // equal_columns` above).
         let mut dashboard = dashboard_with_a_board_pane();
         dashboard.layout.workspaces[0].root = LayoutNode::Pane {
             pane_id: "b".into(),
         };
-        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
-        dashboard.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
-        dashboard.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        let terminal = render_terminal(&mut dashboard, 95, 24);
+        let terminal = render_terminal(&mut dashboard, 70, 24);
         let active = board_column(&terminal, "ACTIVE");
         assert!(
             active.contains("needs you"),
@@ -9951,13 +9954,13 @@ mod tests {
             "and everything that did not fit was dropped rather than cut: {active:?}"
         );
 
-        // At 80 there are too few cells even for stubs plus two eighteen-cell filled columns
+        // At 69 there are too few cells even for stubs plus two eighteen-cell filled columns
         // (the allocator's own fallback, exercised by `a_pane_too_narrow_for_stubs_falls_back_
         // to_equal_columns` above), so the board falls back to five equal columns, each too
         // narrow even for a one-line card. The card gives up its second line entirely: `nee…`
         // is worse than nothing, and the glyph and its colour are there to carry the state on
         // their own.
-        let terminal = render_terminal(&mut dashboard, 80, 24);
+        let terminal = render_terminal(&mut dashboard, 69, 24);
         let active = board_column(&terminal, "ACTIVE");
         assert!(active.contains("#7"), "the card is still drawn: {active:?}");
         assert!(
@@ -12614,9 +12617,13 @@ mod tests {
 
     #[test]
     fn the_scroll_marker_shortens_the_title_rather_than_erasing_it_at_every_width() {
-        // `pin_sidebar_full`: two toggles rather than one, so the net state is unchanged
-        // (`Full`, what a fresh dashboard already opens in) but `sidebar_chosen` becomes `true`
-        // and the automatic rail rule (task 8) stops overriding it for this render.
+        // `pin_sidebar_full` exists for the "narrow" rung below: at 60 columns the sidebar now
+        // auto-rails (task 8) and hands pane "a" back enough width that the bare-glyph-only case
+        // that rung tests is not reachable through total frame width at all any more — only a
+        // sidebar deliberately held `Full` still starves the pane down to that floor. Two
+        // toggles rather than one so the net state is unchanged (`Full`, what a fresh dashboard
+        // already opens in) while `sidebar_chosen` becomes `true`, which is what stops the
+        // automatic rule from undoing the pin on this render.
         let scrolled_dashboard_at = |width: u16, pin_sidebar_full: bool| {
             let mut dashboard = bound_dashboard();
             dashboard.apply_event(attach_event("run_1", b""));
@@ -12639,11 +12646,10 @@ mod tests {
 
         // Narrow: only a bare glyph fits beside the title, so that is all that is asked for.
         //
-        // A 60-column frame is under the rail threshold (task 8), so without pinning the
-        // sidebar it now auto-rails and hands pane "a" enough width for the row count — the
-        // rail giving width back is exactly this feature's point, and the geometry this rung
-        // depends on (a whole terminal narrow enough to starve the pane by itself) now only
-        // exists with the sidebar deliberately kept `Full`, which is what pinning it reproduces.
+        // This rung exists only when the sidebar is `Full`: the rail (task 8) gives the canvas
+        // back exactly the width this rung is testing the *absence* of, so at 60 columns the
+        // bare-glyph-only case has no other way to occur any more. Pinned rather than skipped,
+        // so the rung stays under test.
         let narrow = scrolled_dashboard_at(60, true);
         assert!(
             narrow.contains("editor"),

@@ -248,7 +248,11 @@ impl VtTerminal {
 }
 
 /// One row of a screen, whole.
-fn row_text(screen: &vt100::Screen, row: u16) -> String {
+///
+/// `pub(crate)` for the same reason [`text_between`] is: a selection that has not been frozen
+/// yet reads its rows off the live parser's own screen, and it must read them the same way a
+/// frozen one does.
+pub(crate) fn row_text(screen: &vt100::Screen, row: u16) -> String {
     let (_, cols) = screen.size();
     screen.contents_between(row, 0, row, cols)
 }
@@ -264,8 +268,10 @@ fn row_text(screen: &vt100::Screen, row: u16) -> String {
 ///
 /// Free-standing rather than a method so the live terminal and the frozen [`PaneSnapshot`]
 /// copy mode selects from share one answer. Two implementations of an inclusive/exclusive
-/// boundary is exactly how that off-by-one got in the first time.
-fn text_between(screen: &vt100::Screen, from: (u16, u16), to: (u16, u16)) -> String {
+/// boundary is exactly how that off-by-one got in the first time — and `pub(crate)` so a
+/// selection that has not been frozen yet can be read from the live screen through the same
+/// one answer.
+pub(crate) fn text_between(screen: &vt100::Screen, from: (u16, u16), to: (u16, u16)) -> String {
     let (start, end) = if (from.0, from.1) <= (to.0, to.1) {
         (from, to)
     } else {
@@ -308,15 +314,6 @@ pub struct PaneSnapshot {
 impl PaneSnapshot {
     pub fn size(&self) -> (u16, u16) {
         self.screen.size()
-    }
-
-    pub fn visible_row(&self, row: u16) -> String {
-        row_text(&self.screen, row)
-    }
-
-    /// Text between two inclusive endpoints of the frozen grid. See [`text_between`].
-    pub fn selection_text(&self, from: (u16, u16), to: (u16, u16)) -> String {
-        text_between(&self.screen, from, to)
     }
 
     /// Scrolls the frozen viewport. The clone carries the scrollback, so copy mode can walk

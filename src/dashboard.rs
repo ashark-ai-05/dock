@@ -31,7 +31,10 @@ use crate::{
         LaunchIntoPaneRequest, PROTOCOL_VERSION, PaneHistoryRequest, PaneQueueSnapshot,
         QueueRequest, Request, Response, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
     },
-    terminal::{KeyEncoding, PANE_HISTORY_BYTES, PaneScreen, PaneSnapshot, encode_paste},
+    terminal::{
+        KeyEncoding, PANE_HISTORY_BYTES, PaneScreen, PaneSnapshot, encode_paste, row_text,
+        text_between,
+    },
     theme::Theme,
 };
 
@@ -688,30 +691,60 @@ struct Click {
 /// separate clicks on the same word are not fused into one.
 const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(450);
 
+/// The grid a selection is against.
+///
+/// A selection starts `Live`: nothing has arrived for this pane since the gesture began, so
+/// the live parser's own screen still shows exactly the characters the pointer was put on,
+/// and cloning it would copy several megabytes to describe something already in hand. The
+/// moment output is about to change that grid — or the moment the user asks to walk back
+/// through scrollback, which the live viewport is not showing — the clone is taken and the
+/// selection becomes `Frozen` against it.
+///
+/// The observable behaviour is identical either way. What changes is that the common case,
+/// a selection dragged across a pane that is not printing anything, now costs nothing.
+///
+/// Deliberately unboxed despite `large_enum_variant`. The 216 bytes the lint counts are
+/// `vt100::Screen`'s own header — the grid and the scrollback it points at are heap already,
+/// and boxing would not move a byte of them. What it *would* move is exactly one of these,
+/// the single `Dashboard::copy`, off the struct and behind a pointer the render path then
+/// chases on every frame of every open selection. Trading a per-frame indirection for 216
+/// bytes that are allocated once is the wrong way round.
+#[allow(clippy::large_enum_variant)]
+enum SelectionScreen {
+    Live,
+    Frozen(PaneSnapshot),
+}
+
 /// An open copy mode: the selection, and the screen it is a selection *of*.
 ///
 /// The two are one object because a selection means nothing apart from the exact grid it was
 /// made against. Copy mode used to hold only the session and read the pane's live screen, so
 /// every pushed delta moved the text under coordinates that had already been chosen — the
-/// mode called itself frozen and was not. Freezing is this clone and nothing else: the live
-/// parser is never interrupted, so on exit there is no backlog to replay and the live screen
-/// is already current.
+/// mode called itself frozen and was not. Freezing is a clone of that screen and nothing
+/// else: the live parser is never interrupted, so on exit there is no backlog to replay and
+/// the live screen is already current.
+///
+/// What the clone is *not* is unconditional. See [`SelectionScreen`]: an untouched pane's
+/// live screen is already the grid the selection was made against, so the clone waits until
+/// something is about to make that untrue.
 ///
 /// Not `Clone`, because [`PaneSnapshot`] is not. That is deliberate rather than incidental:
 /// the render path wants this object on every frame for every pane, and a session that could
 /// be cloned there would copy the whole grid and scrollback sixty times a second.
 struct CopyMode {
     session: CopySession,
-    /// The pane's screen as it stood when the mode opened. Rendered from, selected from, and
-    /// scrolled through for as long as the mode lasts; dropping it is the entire exit path.
-    frozen: PaneSnapshot,
+    /// The grid this is a selection of: the pane's live screen while nothing has disturbed
+    /// it, and a clone taken the instant something was about to. Rendered from, selected
+    /// from, and scrolled through for as long as the mode lasts; dropping it is the entire
+    /// exit path.
+    screen: SelectionScreen,
 }
 
 impl CopyMode {
-    fn new(run_id: String, cursor: (u16, u16), frozen: PaneSnapshot) -> Self {
+    fn new(run_id: String, cursor: (u16, u16), screen: SelectionScreen) -> Self {
         Self {
             session: CopySession::new(run_id, cursor),
-            frozen,
+            screen,
         }
     }
 
@@ -719,11 +752,25 @@ impl CopyMode {
         self.session.run_id == run_id
     }
 
+    /// The grid to read: the clone once one has been taken, and the live parser until then.
+    ///
+    /// `live` is passed in rather than looked up because the mode does not know the map it
+    /// came out of — and because every caller that has one already holds it for other
+    /// reasons. [`Dashboard::selection_screen`] is the lookup.
+    fn screen_of<'a>(&'a self, live: Option<&'a PaneScreen>) -> Option<&'a vt100::Screen> {
+        match &self.screen {
+            SelectionScreen::Frozen(snapshot) => Some(snapshot.screen()),
+            SelectionScreen::Live => live.map(PaneScreen::screen),
+        }
+    }
+
     /// Moves the copy cursor, pulling the frozen viewport through scrollback when it walks off
     /// an edge so the cursor never leaves the rows on screen.
     ///
     /// The scrollback travels with the clone, so this walks back through history that new
-    /// output can no longer move underneath it.
+    /// output can no longer move underneath it. A selection still reading the live screen has
+    /// no scrollback of its own to walk, which is why every path that can reach this freezes
+    /// first; the guard here is the type system insisting rather than a case to handle.
     fn step(&mut self, rows: i32, cols: i32, bounds: (u16, u16)) {
         let (row, _) = self.session.cursor();
         let edge = if rows < 0 && row == 0 {
@@ -733,14 +780,16 @@ impl CopyMode {
         } else {
             0
         };
-        if edge != 0 {
-            let before = self.frozen.scroll_offset();
-            self.frozen.scroll_by(edge);
+        if edge != 0
+            && let SelectionScreen::Frozen(frozen) = &mut self.screen
+        {
+            let before = frozen.scroll_offset();
+            frozen.scroll_by(edge);
             // Only the anchor. The cursor is what the user is deliberately moving, and it is
             // pinned to the edge by the clamp in `move_cursor` below — which is exactly how
             // `k` past the top row walks into history a row at a time.
             self.session
-                .shift_anchor(scrolled(before, self.frozen.scroll_offset()), bounds);
+                .shift_anchor(scrolled(before, frozen.scroll_offset()), bounds);
         }
         self.session.move_cursor(rows, cols, bounds);
     }
@@ -822,9 +871,15 @@ impl Dashboard {
                     self.end_copy_mode_for(&run_id, "the pane lost sync and is re-seeding");
                     return;
                 }
-                if let (Some(terminal), Ok(decoded)) =
-                    (self.screens.get_mut(&run_id), STANDARD.decode(&bytes))
-                {
+                let Ok(decoded) = STANDARD.decode(&bytes) else {
+                    return;
+                };
+                // The one place a pointer selection ever pays for a clone: the grid it was
+                // made against is about to be written over, so it is captured first. Split
+                // out of the `if let` pair below because it has to happen *before* the
+                // parser is fed, not merely alongside it.
+                self.freeze_selection(&run_id);
+                if let Some(terminal) = self.screens.get_mut(&run_id) {
                     terminal.feed(&decoded);
                     self.revisions.insert(run_id.clone(), revision);
                     self.retain_history_bytes(&run_id, &decoded);
@@ -930,6 +985,10 @@ impl Dashboard {
             // A frozen pane paints its snapshot, and rebuilding the live parser cannot add a
             // row to a snapshot that was cloned before it. Without this the wheel would fire a
             // request and a rebuild on every notch for as long as copy mode is open.
+            //
+            // A selection still reading the live screen is stopped here too, and for the
+            // stronger reason: `apply_pane_history_response` replaces that screen wholesale,
+            // so a rebuild would swap the grid out from under coordinates already chosen.
             return None;
         }
         let before = match self.history.get(run_id) {
@@ -978,6 +1037,13 @@ impl Dashboard {
             }
             return;
         };
+        // This function ends by replacing the pane's parser outright, so a selection still
+        // reading it would silently change grids. `history_request_for` refuses to ask while
+        // any selection is open, which makes this reachable only by an answer already in
+        // flight when the selection opened — rare, and not a reason to leave the invariant to
+        // luck. The freeze costs nothing in every other case, and this path is about to pay
+        // for a full parser rebuild regardless.
+        self.freeze_selection(&run_id);
         // Every handle and every reason to give up comes first, so there is no ordering in
         // which the cursor advances over a log that was never extended.
         let Some(screen) = self.screens.get_mut(&run_id) else {
@@ -2428,11 +2494,13 @@ impl Dashboard {
                 // A frozen pane is painted from its own clone of the screen, which is what
                 // makes copy mode a freeze rather than a claim: the live parser keeps
                 // consuming every pushed delta behind it, and none of them reach the grid the
-                // selection was made against.
+                // selection was made against. Until a delta arrives there is nothing to
+                // diverge, and `selection_screen` hands back the live parser's own grid —
+                // which is the same picture, drawn without the clone.
                 let copying =
                     run_id.and_then(|id| self.copy.as_ref().filter(|mode| mode.is_for(id)));
                 let painted = match &copying {
-                    Some(mode) => Some(mode.frozen.screen()),
+                    Some(_) => self.selection_screen(),
                     None => run_id
                         .and_then(|id| self.screens.get(id))
                         .map(PaneScreen::screen),
@@ -3845,6 +3913,41 @@ impl Dashboard {
         ))
     }
 
+    /// The grid the open selection is against, whichever half of [`SelectionScreen`] holds it.
+    fn selection_screen(&self) -> Option<&vt100::Screen> {
+        let mode = self.copy.as_ref()?;
+        mode.screen_of(self.screens.get(&mode.session.run_id))
+    }
+
+    /// Size of the grid the open selection is against; `(0, 0)` when there is none, which
+    /// every caller already clamps against.
+    fn selection_bounds(&self) -> (u16, u16) {
+        self.selection_screen().map_or((0, 0), vt100::Screen::size)
+    }
+
+    /// Captures the grid a selection was made against, if it has not been captured already.
+    ///
+    /// Called at every point where the live screen is about to stop being that grid. Cheap
+    /// and idempotent when the selection is already frozen, which is what lets it sit on the
+    /// delta path without a second guard around it.
+    fn freeze_selection(&mut self, run_id: &str) {
+        let needs = self.copy.as_ref().is_some_and(|mode| {
+            mode.is_for(run_id) && matches!(mode.screen, SelectionScreen::Live)
+        });
+        if !needs {
+            return;
+        }
+        // Read before the mutable borrow below rather than inside it: `screens` and `copy`
+        // are both fields of `self`, and taking one mutably while reading the other is not
+        // something the borrow checker will allow in one expression.
+        let Some(snapshot) = self.screens.get(run_id).map(PaneScreen::snapshot) else {
+            return;
+        };
+        if let Some(mode) = self.copy.as_mut() {
+            mode.screen = SelectionScreen::Frozen(snapshot);
+        }
+    }
+
     /// Freezes the focused pane for keyboard selection, starting at its live cursor.
     ///
     /// The freeze is a clone of the pane's screen taken here and held for the life of the
@@ -3862,7 +3965,14 @@ impl Dashboard {
             self.error = Some("copy mode unavailable: this pane has not painted yet".into());
             return UiCommand::None;
         };
-        self.copy = Some(CopyMode::new(run_id, screen.cursor(), screen.snapshot()));
+        // Frozen straight away, unlike a pointer drag: `Ctrl+B [` is a deliberate request to
+        // walk the pane's history, and the first `k` past the top row needs scrollback the
+        // live viewport is not showing.
+        self.copy = Some(CopyMode::new(
+            run_id,
+            screen.cursor(),
+            SelectionScreen::Frozen(screen.snapshot()),
+        ));
         self.copy_searching = false;
         self.error = None;
         UiCommand::None
@@ -3872,13 +3982,25 @@ impl Dashboard {
     ///
     /// The mode is taken out of `self` for the duration: the handlers need `self.error` and
     /// the frozen screen at the same time, and leaving it in place would borrow `self` twice.
+    ///
+    /// Which is also why the freeze happens here, before the take, rather than beside the
+    /// motion keys that need it: once the mode is owned, `self.copy` is empty and
+    /// `freeze_selection` has nothing to find. Freezing on the first key of *any* keyboard
+    /// interaction is right on its own terms anyway — a user driving a selection with `hjkl`
+    /// is reading rows, and `k` past the top walks into scrollback the live viewport does not
+    /// hold. A pointer selection nobody types into still never pays for this.
     fn copy_key(&mut self, key: KeyEvent) -> UiCommand {
+        if let Some(run_id) = self.copy.as_ref().map(|mode| mode.session.run_id.clone()) {
+            self.freeze_selection(&run_id);
+        }
         let Some(mut mode) = self.copy.take() else {
             return UiCommand::None;
         };
         // The frozen grid, not the live one: every coordinate in the session is a cell of the
         // screen the mode was opened on, and a live resize must not silently re-scale them.
-        let bounds = mode.frozen.size();
+        let bounds = mode
+            .screen_of(self.screens.get(&mode.session.run_id))
+            .map_or((0, 0), vt100::Screen::size);
         // Esc unwinds one level at a time: the prompt first, then the mode. The invariant is
         // that a small bounded number of presses always reaches the live pane, not that one
         // press escapes every level — which is exactly what a rename form already does.
@@ -3967,9 +4089,10 @@ impl Dashboard {
             self.error = Some("no search yet · / starts one".into());
             return;
         };
-        let rows: Vec<String> = (0..bounds.0)
-            .map(|row| mode.frozen.visible_row(row))
-            .collect();
+        let rows: Vec<String> = match mode.screen_of(self.screens.get(&mode.session.run_id)) {
+            Some(screen) => (0..bounds.0).map(|row| row_text(screen, row)).collect(),
+            None => Vec::new(),
+        };
         if mode
             .session
             .jump_to_match(&find_matches(&rows, &query), forward, bounds)
@@ -3990,12 +4113,15 @@ impl Dashboard {
     /// The route is reported because OSC 52 is disabled by default in some terminals: a yank
     /// that silently reached nothing looks exactly like a yank that worked.
     fn yank(&mut self, mode: &CopyMode) {
-        // The frozen screen, so the clipboard gets the characters the highlight was over
-        // rather than whatever output has since scrolled through those cells.
-        let screen = &mode.frozen;
+        // The grid the selection is against, so the clipboard gets the characters the
+        // highlight was over rather than whatever output has since scrolled through those
+        // cells. On a pane that never printed, that grid is still the live parser's own.
+        let Some(screen) = mode.screen_of(self.screens.get(&mode.session.run_id)) else {
+            return;
+        };
         let (text, subject) = match mode.session.selection() {
             Some((from, to)) => {
-                let text = screen.selection_text(from, to);
+                let text = text_between(screen, from, to);
                 let count = text.chars().count();
                 (text, format!("{count} characters"))
             }
@@ -4003,7 +4129,7 @@ impl Dashboard {
                 let row = mode.session.cursor().0;
                 // Trailing blanks are grid padding, not content: nobody wants 60 spaces
                 // pasted after the path they just copied.
-                let text = screen.visible_row(row).trim_end().to_owned();
+                let text = row_text(screen, row).trim_end().to_owned();
                 let count = text.chars().count();
                 // 1-based for the same reason `copy_status` is, and it has to agree with it:
                 // seeing the same line called 0 in one place and 1 in another reads as a bug.
@@ -4051,7 +4177,8 @@ impl Dashboard {
             .as_ref()
             .and_then(|mode| {
                 let (from, to) = mode.session.selection()?;
-                Some(mode.frozen.selection_text(from, to))
+                let screen = mode.screen_of(self.screens.get(&mode.session.run_id))?;
+                Some(text_between(screen, from, to))
             })
             .filter(|text| !text.trim().is_empty())
         else {
@@ -4121,12 +4248,17 @@ impl Dashboard {
         let Some(drag) = self.pane_drag.clone() else {
             return;
         };
-        // Read the row from the frozen screen when this pane is already frozen. A second
-        // click inside an open selection must land on the characters the user can see, and
+        // Read the row from the selection's own grid when this pane already has a selection
+        // open. A second click inside one must land on the characters the user can see, and
         // the live screen may have scrolled several times since the mode opened.
-        let frozen_here = self.copy.as_ref().filter(|mode| mode.is_for(&drag.run_id));
-        let Some((bounds, row_text)) = frozen_here
-            .map(|mode| (mode.frozen.size(), mode.frozen.visible_row(drag.origin.0)))
+        let selecting_here = self
+            .copy
+            .as_ref()
+            .is_some_and(|mode| mode.is_for(&drag.run_id));
+        let Some((bounds, row)) = selecting_here
+            .then(|| self.selection_screen())
+            .flatten()
+            .map(|screen| (screen.size(), row_text(screen, drag.origin.0)))
             .or_else(|| {
                 self.screens
                     .get(&drag.run_id)
@@ -4136,9 +4268,9 @@ impl Dashboard {
             return;
         };
         let selection = if clicks >= 3 {
-            line_bounds(&row_text)
+            line_bounds(&row)
         } else {
-            word_bounds(&row_text, drag.origin.1)
+            word_bounds(&row, drag.origin.1)
         };
         // Deliberately before anything is committed: a double click on blank padding selects
         // nothing, and must therefore not freeze a pane or take the keyboard either.
@@ -4152,14 +4284,18 @@ impl Dashboard {
         session.begin_selection();
         session.set_cursor((drag.origin.0, last), bounds);
         match self.copy.as_mut() {
-            // Already frozen on this pane: keep the freeze rather than re-taking it, or a
-            // double click inside a scrolled-back selection would snap the view to the tail.
+            // Already open on this pane: keep whatever grid it is against rather than
+            // re-resolving it, or a double click inside a scrolled-back selection would snap
+            // the view to the tail.
             Some(mode) => mode.session = session,
+            // A word or line click is a pointer gesture like a drag, so it starts `Live` for
+            // the same reason: the pane is quite possibly idle, and the row was just read off
+            // the live screen a few lines above.
             None => {
-                let Some(frozen) = self.screens.get(&drag.run_id).map(PaneScreen::snapshot) else {
-                    return;
-                };
-                self.copy = Some(CopyMode { session, frozen });
+                self.copy = Some(CopyMode {
+                    session,
+                    screen: SelectionScreen::Live,
+                });
             }
         }
         self.copy_searching = false;
@@ -4190,14 +4326,24 @@ impl Dashboard {
     /// While the pane is frozen the wheel moves the *frozen* viewport, because that is the
     /// screen being painted; scrolling the live one would move nothing the user can see.
     fn scroll_pane(&mut self, run_id: &str, delta: i32) {
+        // A notch walks into scrollback, which is precisely what the live viewport is not
+        // showing, so the grid the selection was made against is captured before the viewport
+        // is asked to leave it. A no-op unless there is a live selection on this very pane.
+        self.freeze_selection(run_id);
         if let Some(mode) = self.copy.as_mut().filter(|mode| mode.is_for(run_id)) {
-            let before = mode.frozen.scroll_offset();
-            mode.frozen.scroll_by(delta);
-            let moved = scrolled(before, mode.frozen.scroll_offset());
+            // Still `Live` only when the pane has no screen at all, in which case there is
+            // nothing to scroll — and certainly not the live parser, which is not the grid
+            // this pane is painting.
+            let SelectionScreen::Frozen(frozen) = &mut mode.screen else {
+                return;
+            };
+            let before = frozen.scroll_offset();
+            frozen.scroll_by(delta);
+            let moved = scrolled(before, frozen.scroll_offset());
             if moved == 0 {
                 return;
             }
-            let bounds = mode.frozen.size();
+            let bounds = frozen.size();
             mode.session.shift_anchor(moved, bounds);
             mode.session.shift_cursor(moved, bounds);
             return;
@@ -4261,19 +4407,26 @@ impl Dashboard {
             self.leave_copy_mode(&stale);
         }
         if self.copy.is_none() {
-            // The first drag of a gesture is what freezes the pane, so the pointer keeps
+            // The first drag of a gesture is what arms the selection, so the pointer keeps
             // pointing at the characters it was put on however much the pane is producing.
-            let Some(frozen) = self.screens.get(&drag.run_id).map(PaneScreen::snapshot) else {
+            // `Live` rather than a clone: nothing has moved under this gesture yet, and on an
+            // idle pane nothing ever will — `freeze_selection` on the delta path is what
+            // makes that a saving rather than a hole.
+            if !self.screens.contains_key(&drag.run_id) {
                 return;
-            };
-            self.copy = Some(CopyMode::new(drag.run_id.clone(), drag.origin, frozen));
+            }
+            self.copy = Some(CopyMode::new(
+                drag.run_id.clone(),
+                drag.origin,
+                SelectionScreen::Live,
+            ));
             self.copy_searching = false;
             self.error = None;
         }
+        let bounds = self.selection_bounds();
         let Some(mode) = self.copy.as_mut() else {
             return;
         };
-        let bounds = mode.frozen.size();
         mode.session.set_cursor(drag.origin, bounds);
         mode.session.begin_selection();
         mode.session
@@ -11143,11 +11296,9 @@ mod tests {
         }
         assert_eq!(
             dashboard
-                .copy
-                .as_ref()
+                .selection_screen()
                 .expect("still frozen")
-                .frozen
-                .scroll_offset(),
+                .scrollback(),
             20,
             "`k` past the top row must move the frozen viewport, which is the one on screen"
         );
@@ -11920,6 +12071,75 @@ mod tests {
         );
     }
 
+    /// A selection on an idle pane must not clone the screen, and a selection on a pane that
+    /// then produces output must still yank the grid it was made against.
+    ///
+    /// Both halves matter and they pull opposite ways, which is why they are one test. The
+    /// freeze is what makes copy mode a freeze rather than a claim; doing it eagerly is what
+    /// put a multi-megabyte clone on the first frame of every drag.
+    #[test]
+    fn a_selection_clones_the_screen_only_once_output_arrives_under_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b""));
+        dashboard.apply_event(delta_event("run_1", 2, b"selected text\r\n"));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 8,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(
+                dashboard
+                    .copy
+                    .as_ref()
+                    .expect("the drag armed a selection")
+                    .screen,
+                SelectionScreen::Live
+            ),
+            "an idle pane must not have been cloned"
+        );
+
+        // Output arrives under the selection. The grid it was made against has to be captured
+        // before the delta reaches the parser, or the highlight would be over different text.
+        dashboard.apply_event(delta_event("run_1", 3, b"\x1b[2J\x1b[Hwiped\r\n"));
+        let mode = dashboard
+            .copy
+            .as_ref()
+            .expect("the selection is still open");
+        assert!(
+            matches!(mode.screen, SelectionScreen::Frozen(_)),
+            "output under a live selection must freeze it"
+        );
+        let (from, to) = mode
+            .session
+            .selection()
+            .expect("the drag anchored a selection");
+        // Read straight off the resolved grid with vt100's own inclusive/exclusive convention,
+        // the same one `text_between` applies: the point here is *which* grid answers, not how
+        // the end column is counted, which `a_mid_row_selection_yanks_exactly_as_many_…` owns.
+        let text = dashboard
+            .selection_screen()
+            .expect("a frozen selection has a grid")
+            .contents_between(from.0, from.1, to.0, to.1 + 1);
+        assert!(
+            text.contains("selecte"),
+            "the frozen grid must still be the one the pointer was put on, got {text:?}"
+        );
+        assert!(
+            dashboard.screens["run_1"].visible_row(0).contains("wiped"),
+            "the live parser kept consuming the delta the selection was frozen against"
+        );
+    }
+
     /// Selection endpoints are cells of the visible grid, so a viewport that moves under them
     /// leaves them pointing at different text. Before this, scrolling mid-selection silently
     /// re-aimed the anchor and the yank covered rows the highlight never touched.
@@ -11952,12 +12172,18 @@ mod tests {
             row: area.y + 2,
             modifiers: KeyModifiers::NONE,
         });
-        // Read through the frozen screen, because that is the one the pane is painting and
-        // the one the wheel now moves: the live parser is left following its own output.
+        // Read through the selection's own screen, because that is the one the pane is
+        // painting and the one the wheel now moves: the live parser is left following its own
+        // output. Before the first notch that screen still *is* the live one — the wheel is
+        // what makes them diverge, and what pays for the clone that lets them.
         let selected = |dashboard: &Dashboard| {
             let mode = dashboard.copy.as_ref().expect("a session");
             let (from, to) = mode.session.selection().expect("an anchored selection");
-            mode.frozen.selection_text(from, to)
+            text_between(
+                dashboard.selection_screen().expect("a grid to select from"),
+                from,
+                to,
+            )
         };
         let before = selected(&dashboard);
         assert!(!before.trim().is_empty(), "the drag selected something");
@@ -11970,11 +12196,9 @@ mod tests {
         });
         assert_ne!(
             dashboard
-                .copy
-                .as_ref()
+                .selection_screen()
                 .expect("still frozen")
-                .frozen
-                .scroll_offset(),
+                .scrollback(),
             0,
             "the wheel moved the viewport"
         );

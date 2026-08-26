@@ -1163,13 +1163,23 @@ struct CopyMode {
     /// from, and scrolled through for as long as the mode lasts; dropping it is the entire
     /// exit path.
     screen: SelectionScreen,
+    /// Whether this mode was *asked for*, with `Ctrl+B [`, or merely arrived at by dragging.
+    ///
+    /// A mode that was asked for owns the keyboard: in it `h`/`j`/`k`/`l` move a cursor, the
+    /// arrows do too, and `y` yanks — none of which can reach the pane. A pointer selection is
+    /// not that. Dragging over text in any terminal highlights it and leaves the keyboard
+    /// talking to the program, and Dock did the opposite: a drag opened the modal mode and
+    /// nothing closed it, so `Ctrl+R`, `Ctrl+L`, backspace and the arrows all went to the
+    /// selection instead of the shell, which read as the terminal being broken.
+    modal: bool,
 }
 
 impl CopyMode {
-    fn new(run_id: String, cursor: (u16, u16), screen: SelectionScreen) -> Self {
+    fn new(run_id: String, cursor: (u16, u16), screen: SelectionScreen, modal: bool) -> Self {
         Self {
             session: CopySession::new(run_id, cursor),
             screen,
+            modal,
         }
     }
 
@@ -1648,7 +1658,10 @@ impl Dashboard {
             OverlayKind::Review => self.review.is_some(),
             OverlayKind::Board => self.board.is_some(),
             OverlayKind::Git => self.git.is_some(),
-            OverlayKind::Copy => self.copy.is_some(),
+            // A pointer selection is deliberately not an open overlay. Only a mode that was
+            // asked for takes the keyboard; a highlight left by a drag must let every key
+            // through to the pane, which is what every other terminal does.
+            OverlayKind::Copy => self.copy.as_ref().is_some_and(|mode| mode.modal),
             OverlayKind::ContextMenu => self.menu.is_some(),
         }
     }
@@ -4731,13 +4744,31 @@ impl Dashboard {
             self.error = Some("copy mode unavailable: this pane has not painted yet".into());
             return UiCommand::None;
         };
-        // Frozen straight away, unlike a pointer drag: `Ctrl+B [` is a deliberate request to
-        // walk the pane's history, and the first `k` past the top row needs scrollback the
-        // live viewport is not showing.
+        // A pointer selection already standing on this pane is *promoted* rather than thrown
+        // away: the highlight the user just dragged is the thing they are asking to work with,
+        // and replacing it with a fresh cursor at the caret would discard it for no reason. It
+        // stays `Live` through the promotion, because entering the mode does not move a
+        // viewport — only a motion key does, and `copy_key` freezes when one arrives.
+        if self
+            .copy
+            .as_ref()
+            .is_some_and(|mode| !mode.modal && mode.is_for(&run_id))
+        {
+            if let Some(mode) = self.copy.as_mut() {
+                mode.modal = true;
+            }
+            self.copy_searching = false;
+            self.error = None;
+            return UiCommand::None;
+        }
+        // Frozen straight away when the mode is opened cold: `Ctrl+B [` on a pane with no
+        // selection is a deliberate request to walk the pane's history, and the first `k` past
+        // the top row needs scrollback the live viewport is not showing.
         self.copy = Some(CopyMode::new(
             run_id,
             screen.cursor(),
             SelectionScreen::Frozen(screen.snapshot()),
+            true,
         ));
         self.copy_searching = false;
         self.error = None;
@@ -5086,6 +5117,9 @@ impl Dashboard {
                 self.copy = Some(CopyMode {
                     session,
                     screen: SelectionScreen::Live,
+                    // A pointer gesture, so not modal: a double click selects a word and
+                    // leaves the keyboard where it was.
+                    modal: false,
                 });
             }
         }
@@ -5210,6 +5244,7 @@ impl Dashboard {
                 drag.run_id.clone(),
                 drag.origin,
                 SelectionScreen::Live,
+                false,
             ));
             self.copy_searching = false;
             self.error = None;
@@ -9620,6 +9655,66 @@ mod tests {
 
         dashboard.key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
         assert_eq!(crate::board::load(&dir)[0].status, "backlog");
+    }
+
+    /// Selecting text with the pointer must not make the pane deaf.
+    ///
+    /// Copy mode is modal: it takes every key, because in it `h`/`j`/`k`/`l` move a cursor and
+    /// `y` yanks. That is right when the mode was *asked for* with `Ctrl+B [`. It was also
+    /// being entered by a pointer drag, and nothing left it on release — so after selecting
+    /// text with the mouse, every keystroke went to the selection instead of the pane, and
+    /// `Ctrl+R`, `Ctrl+L` and backspace all appeared to stop working.
+    ///
+    /// No terminal behaves that way: dragging over text highlights it and the keyboard keeps
+    /// talking to the program.
+    #[test]
+    fn selecting_with_the_pointer_leaves_the_keyboard_talking_to_the_pane() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"a line worth selecting\r\n"));
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        let a = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        drop(terminal);
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), a.x + 1),
+            (MouseEventKind::Drag(MouseButton::Left), a.x + 8),
+            (MouseEventKind::Up(MouseButton::Left), a.x + 8),
+        ] {
+            dashboard.mouse(MouseEvent {
+                kind,
+                column,
+                row: a.y + 1,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        let reverse_search =
+            dashboard.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(&reverse_search, UiCommand::PaneInput(bytes) if bytes == &[0x12]),
+            "Ctrl+R must reach the pane after a pointer selection, not the selection: \
+             {reverse_search:?}"
+        );
+        let clear = dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(&clear, UiCommand::PaneInput(bytes) if bytes == &[0x0c]),
+            "and so must Ctrl+L: {clear:?}"
+        );
+    }
+
+    /// The mode that was asked for still takes its keys, or copy mode would stop working.
+    #[test]
+    fn copy_mode_entered_by_key_still_owns_the_keyboard() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"a line worth selecting\r\n"));
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        drop(terminal);
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert!(dashboard.copy.is_some(), "copy mode opened");
+        let moved = dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(
+            matches!(moved, UiCommand::None),
+            "`l` moves the copy cursor rather than reaching the pane: {moved:?}"
+        );
     }
 
     /// Width sharing exists to resolve scarcity. When there is enough room for every column to
@@ -14589,6 +14684,17 @@ mod tests {
     /// match, so a key that does not walk history cannot freeze whichever arm it lands in.
     #[test]
     fn only_a_motion_key_freezes_a_pointer_selection() {
+        // A pointer selection does not take keys at all — that is what stopped `Ctrl+R` and the
+        // arrows reaching the shell — so each case below promotes it with `Ctrl+B [` first.
+        // Promotion keeps the selection and leaves it `Live`, which is precisely the state this
+        // narrowing is about: the clone is still unpaid, and only a motion may spend it.
+        fn modal_dragged_selection() -> Dashboard {
+            let mut dashboard = dragged_selection();
+            dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+            dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+            dashboard
+        }
+
         // Every bound key that keeps the mode open and cannot move a viewport: begin a
         // selection, jump to either edge of the viewport it already has, open the search
         // prompt, jump to a match — `CopySession` holds no screen for any of these to move —
@@ -14601,7 +14707,7 @@ mod tests {
             KeyCode::Char('n'),
             KeyCode::Char('z'),
         ] {
-            let mut dashboard = dragged_selection();
+            let mut dashboard = modal_dragged_selection();
             dashboard.key(KeyEvent::new(code, KeyModifiers::NONE));
             assert!(
                 matches!(
@@ -14618,7 +14724,7 @@ mod tests {
 
         // A letter typed at the search prompt is query text, not a motion, however much it
         // looks like one: `h` there must no more clone the grid than `z` does.
-        let mut dashboard = dragged_selection();
+        let mut dashboard = modal_dragged_selection();
         dashboard.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         dashboard.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
         assert!(
@@ -14631,7 +14737,7 @@ mod tests {
 
         // And the one kind of key that does walk history still freezes, or `k` past the top
         // row would have no scrollback of its own to step into.
-        let mut dashboard = dragged_selection();
+        let mut dashboard = modal_dragged_selection();
         dashboard.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         assert!(
             matches!(

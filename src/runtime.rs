@@ -909,6 +909,21 @@ exec "$@" 3<&-"#,
     ))
 }
 
+/// What a pane's child is actually connected to.
+///
+/// Not the host's `TERM`. A child in a Dock pane talks to Dock's own `vt100` emulator over a
+/// PTY, and the host terminal — Ghostty, iTerm2, Kitty — is two layers away, seeing only what
+/// Dock chooses to paint. Passing the host's name through told the child it was speaking to
+/// something it was not: under Ghostty, `TERM=xterm-ghostty` made `clear` report "unknown
+/// terminal" wherever that entry is not installed, left `Ctrl+L` with no clear sequence to
+/// emit, and stopped readline initialising its display — which is what broke `Ctrl+R` and
+/// backspace. Where the entry does resolve it is still wrong, because it advertises
+/// capabilities this emulator does not implement.
+///
+/// `xterm-256color` is the answer tmux and screen reach for the same reason: a terminfo entry
+/// that is present on essentially every system, and whose capabilities the emulator honours.
+const PANE_TERM: &str = "xterm-256color";
+
 fn apply_child_environment(
     process: &mut Command,
     variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
@@ -919,13 +934,19 @@ fn apply_child_environment(
             .into_iter()
             .filter(|(key, _)| environment_is_allowed(key)),
     );
+    // After the filter, because this is Dock describing itself rather than anything inherited.
+    process.env("TERM", PANE_TERM);
 }
 
 fn environment_is_allowed(key: &std::ffi::OsStr) -> bool {
     let key = key.to_string_lossy();
     matches!(
         key.as_ref(),
-        "COLORTERM" | "HOME" | "LANG" | "LOGNAME" | "PATH" | "SHELL" | "TERM" | "TMPDIR" | "USER"
+        // `TERM` is deliberately absent: `apply_child_environment` sets it to `PANE_TERM`,
+        // because it describes the emulator the child is connected to rather than the terminal
+        // Dock happens to be running inside. `COLORTERM` stays, because whether the *outer*
+        // terminal can display 24-bit colour is a fact about the host that only the host knows.
+        "COLORTERM" | "HOME" | "LANG" | "LOGNAME" | "PATH" | "SHELL" | "TMPDIR" | "USER"
     ) || key.starts_with("LC_")
 }
 
@@ -1704,7 +1725,7 @@ mod tests {
         ] {
             assert!(!environment_is_allowed(std::ffi::OsStr::new(poisoned)));
         }
-        for safe in ["HOME", "LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"] {
+        for safe in ["HOME", "LANG", "LC_ALL", "PATH", "TMPDIR"] {
             assert!(environment_is_allowed(std::ffi::OsStr::new(safe)));
         }
         let mut child = Command::new("env");
@@ -1722,10 +1743,49 @@ mod tests {
         assert!(!output.contains("poison-"));
     }
 
+    /// A pane's child talks to Dock's own emulator, so Dock names the terminal it is talking to.
+    ///
+    /// The host's `TERM` used to pass straight through. Under Ghostty that is `xterm-ghostty`,
+    /// which describes a terminal the child is *not* connected to — so `clear` reported
+    /// "unknown terminal", `Ctrl+L` had no clear sequence to emit, and readline could not
+    /// initialise its display, which is what broke `Ctrl+R` and backspace. Even where the entry
+    /// resolves it advertises capabilities this emulator does not implement.
+    ///
+    /// `xterm-256color` is the same answer tmux and screen give for the same reason: name a
+    /// terminal that is present everywhere and that the emulator actually implements.
     #[test]
-    fn child_environment_allows_colour_capability_variables() {
+    fn a_pane_is_told_the_terminal_it_is_actually_talking_to() {
+        let mut child = Command::new("env");
+        apply_child_environment(
+            &mut child,
+            [
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("TERM".into(), "xterm-ghostty".into()),
+                ("COLORTERM".into(), "truecolor".into()),
+            ],
+        );
+        let output = String::from_utf8(child.output().unwrap().stdout).unwrap();
+        assert!(
+            output.contains("TERM=xterm-256color"),
+            "the child must be told what it is really talking to: {output}"
+        );
+        assert!(
+            !output.contains("xterm-ghostty"),
+            "the host's terminal name must not reach the child: {output}"
+        );
+        assert!(
+            output.contains("COLORTERM=truecolor"),
+            "and it must still know it may use 24-bit colour: {output}"
+        );
+    }
+
+    /// The host's own `TERM` is no longer inherited, so it is no longer on the allowlist —
+    /// Dock sets it. `COLORTERM` is still inherited, because whether the *outer* terminal can
+    /// show 24-bit colour is a fact about the host that Dock cannot know on its own.
+    #[test]
+    fn the_hosts_terminal_name_is_not_inherited() {
+        assert!(!environment_is_allowed(std::ffi::OsStr::new("TERM")));
         assert!(environment_is_allowed(std::ffi::OsStr::new("COLORTERM")));
-        assert!(environment_is_allowed(std::ffi::OsStr::new("TERM")));
         assert!(!environment_is_allowed(std::ffi::OsStr::new(
             "AWS_SECRET_ACCESS_KEY"
         )));

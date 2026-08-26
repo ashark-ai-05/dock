@@ -4018,10 +4018,18 @@ impl Dashboard {
         let bounds = mode
             .screen_of(self.screens.get(&mode.session.run_id))
             .map_or((0, 0), vt100::Screen::size);
-        // Esc unwinds one level at a time: the prompt first, then the mode. The invariant is
-        // that a small bounded number of presses always reaches the live pane, not that one
-        // press escapes every level — which is exactly what a rename form already does.
+        // Esc unwinds one level at a time: the prompt first, then the selection, then the
+        // mode. The invariant is that a small bounded number of presses always reaches the
+        // live pane, not that one press escapes every level — which is exactly what a rename
+        // form already does.
         if key.code == KeyCode::Esc && !self.copy_searching {
+            // Clearing a selection should not also close the mode behind it — the board
+            // overlay and a half-typed title already unwind the same way, one press at a time.
+            if mode.session.selecting() {
+                mode.session.clear_selection();
+                self.copy = Some(mode);
+                return UiCommand::None;
+            }
             self.leave_copy_mode(&mode.session.run_id);
             return UiCommand::None;
         }
@@ -4448,6 +4456,28 @@ impl Dashboard {
         mode.session.begin_selection();
         mode.session
             .set_cursor(clamp_cell(drag.inner, column, row), bounds);
+        // A drag that leaves the pane scrolls it, one row per motion report, rather than
+        // stopping at the boundary. Reaching for text just off-screen is the most common
+        // reason a selection needs correcting at all, and clamping made it impossible.
+        // Scrolling needs history the live viewport is not showing, so it freezes first.
+        let beyond = if row < drag.inner.y {
+            1
+        } else if row >= drag.inner.bottom() {
+            -1
+        } else {
+            0
+        };
+        if beyond != 0 {
+            self.freeze_selection(&drag.run_id);
+            if let Some(mode) = self.copy.as_mut()
+                && let SelectionScreen::Frozen(snapshot) = &mut mode.screen
+            {
+                let before = snapshot.scroll_offset();
+                snapshot.scroll_by(beyond);
+                let moved = scrolled(before, snapshot.scroll_offset());
+                mode.session.shift_anchor(moved, bounds);
+            }
+        }
     }
 
     /// Leaves copy mode and returns the pane to the live tail, which is where the user was
@@ -5300,13 +5330,32 @@ impl Dashboard {
                 else {
                     return UiCommand::None;
                 };
+                let run_id = self
+                    .workspace()
+                    .and_then(|workspace| workspace.panes.get(&pane_id))
+                    .and_then(|pane| pane.run_id.clone());
+                // Shift extends what is already selected rather than starting again. The
+                // anchor stays where the original press put it; only the cursor moves, which
+                // is the whole difference between correcting a selection and remaking it.
+                if event.modifiers.contains(KeyModifiers::SHIFT)
+                    && run_id.as_deref().is_some_and(|run_id| {
+                        self.copy.as_ref().is_some_and(|mode| mode.is_for(run_id))
+                    })
+                {
+                    let bounds = self.selection_bounds();
+                    if let Some(inner) = self.pane_inner_areas.get(&pane_id).copied()
+                        && let Some(mode) = self.copy.as_mut()
+                    {
+                        mode.session
+                            .set_cursor(clamp_cell(inner, event.column, event.row), bounds);
+                    }
+                    self.copy_pointer_selection();
+                    return UiCommand::None;
+                }
                 // A press inside a pane body only *arms* a selection; copy mode is entered
                 // on the first drag. Entering it here would mean every click that focuses a
                 // pane also puts the keyboard into a mode that swallows it.
-                let armed = self
-                    .workspace()
-                    .and_then(|workspace| workspace.panes.get(&pane_id))
-                    .and_then(|pane| pane.run_id.clone())
+                let armed = run_id
                     .zip(self.pane_inner_areas.get(&pane_id).copied())
                     .and_then(|(run_id, inner)| {
                         grid_cell(inner, event.column, event.row).map(|origin| PaneDrag {
@@ -11562,6 +11611,36 @@ mod tests {
         assert!(!dashboard.copy_mode(), "the second Esc leaves copy mode");
     }
 
+    /// Esc unwinds a selection before it closes the mode, matching the search prompt right
+    /// above and the board overlay: clearing what a press armed should never also cost the
+    /// press after it a whole context.
+    #[test]
+    fn escape_drops_the_selection_first_and_leaves_copy_mode_second() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"needle in here"));
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(
+            dashboard.copy_status().as_deref(),
+            Some("COPY SELECTING 1,2")
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            dashboard.copy_mode(),
+            "the first Esc drops the selection, not the mode"
+        );
+        assert_eq!(
+            dashboard.copy_status().as_deref(),
+            Some("COPY MOVE 1,2"),
+            "the anchor is gone but the cursor stayed where it was"
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!dashboard.copy_mode(), "the second Esc leaves copy mode");
+    }
+
     #[test]
     fn control_modified_letters_are_not_copy_mode_bindings() {
         let mut dashboard = bound_dashboard();
@@ -12230,6 +12309,143 @@ mod tests {
                 SelectionScreen::Frozen(_)
             ),
             "a motion must take the grid with it before walking off the viewport"
+        );
+    }
+
+    /// Shift+click extends the standing selection instead of starting a new one, which is what
+    /// every terminal does and what makes a selection correctable without re-dragging it.
+    #[test]
+    fn shift_clicking_extends_the_selection_rather_than_restarting_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"abcdefghijklmnop\r\n"));
+        render_terminal(&mut dashboard, 100, 30);
+        let a = dashboard.pane_areas["a"];
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), a.x + 1),
+            (MouseEventKind::Drag(MouseButton::Left), a.x + 4),
+            (MouseEventKind::Up(MouseButton::Left), a.x + 4),
+        ] {
+            dashboard.mouse(MouseEvent {
+                kind,
+                column,
+                row: a.y + 1,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        let before = dashboard
+            .copy
+            .as_ref()
+            .unwrap()
+            .session
+            .selection()
+            .unwrap();
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: a.x + 9,
+            row: a.y + 1,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        let after = dashboard
+            .copy
+            .as_ref()
+            .unwrap()
+            .session
+            .selection()
+            .unwrap();
+        assert_eq!(after.0, before.0, "the anchor must survive a shift+click");
+        assert_ne!(after.1, before.1, "and the cursor must have moved to it");
+    }
+
+    /// Dragging past a pane's top edge scrolls the frozen viewport, one row per motion report,
+    /// instead of clamping the selection at the boundary — reaching for text just off-screen is
+    /// the most common reason a selection needs correcting at all.
+    ///
+    /// Built on the same fixture as `scrolling_a_pane_carries_an_anchored_selection_…` below —
+    /// a delta fed after the attach, so the replica's own screen has real history to scroll
+    /// into. `attach_event` alone cannot prove this half of the feature: it seeds its replica
+    /// through `attach_event_at`'s `source` terminal, which is built with zero scrollback, so a
+    /// dashboard that never received a delta has no history for a drag past the edge to find.
+    #[test]
+    fn dragging_past_the_top_edge_scrolls_the_frozen_viewport_and_carries_the_anchor() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"seed\r\n"));
+        let mut output = Vec::new();
+        for line in 1..=40 {
+            output.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        dashboard.apply_event(Event::PaneDelta {
+            run_id: "run_1".into(),
+            revision: 2,
+            bytes: STANDARD.encode(&output),
+        });
+        render_to_string(&mut dashboard, 100, 30);
+        let area = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1,
+            row: area.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 1,
+            row: area.y + 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(
+                dashboard
+                    .copy
+                    .as_ref()
+                    .expect("the drag armed a selection")
+                    .screen,
+                SelectionScreen::Live
+            ),
+            "a drag that stays inside the pane must not clone the screen"
+        );
+        let anchor_before = dashboard
+            .copy
+            .as_ref()
+            .expect("armed")
+            .session
+            .anchor()
+            .expect("the drag anchored a selection");
+
+        // Past the top border, which is outside the pane entirely — exactly what dragging the
+        // pointer off the top edge of a terminal window does.
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 1,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(
+                dashboard.copy.as_ref().expect("still selecting").screen,
+                SelectionScreen::Frozen(_)
+            ),
+            "a drag past the edge must freeze the selection before it can scroll history the \
+             live viewport is not showing"
+        );
+        assert_ne!(
+            dashboard
+                .selection_screen()
+                .expect("a frozen grid")
+                .scrollback(),
+            0,
+            "the frozen viewport must actually have scrolled into history"
+        );
+        let anchor_after = dashboard
+            .copy
+            .as_ref()
+            .expect("still selecting")
+            .session
+            .anchor()
+            .expect("the anchor survived the scroll");
+        assert_ne!(
+            anchor_after, anchor_before,
+            "the anchor must move with the viewport it was placed in, or the highlight would \
+             land on different text than the one it started over"
         );
     }
 

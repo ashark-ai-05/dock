@@ -43,13 +43,18 @@ impl ClipboardRoute {
 /// routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClipboardPreference {
-    /// OSC 52 only. The default, because it is the only route that works over SSH.
-    #[default]
+    /// OSC 52 only, for a terminal known to honour it, or a session over SSH where a local
+    /// helper could never reach the machine at the other end.
     Osc52,
     /// A local helper only, for the terminals that refuse OSC 52.
     Helper,
     /// Both, for a terminal whose OSC 52 support is unknown. Setting the same text twice is
-    /// harmless; the second setter simply wins.
+    /// harmless; the second setter simply wins. The default: OSC 52 alone left the common case
+    /// on a Mac — Terminal.app disables it outright, iTerm2 disables it by default, tmux ignores
+    /// it without `set-clipboard on` — silently doing nothing, with a "copied" notice that gave
+    /// no way to tell the write had failed. A local `pbcopy` on the same gesture makes the copy
+    /// real; where no helper exists, `copy_with` finds none and falls back to OSC 52 alone.
+    #[default]
     Both,
     /// Neither. For a user who would rather Dock never touched their clipboard.
     Off,
@@ -60,7 +65,8 @@ pub enum ClipboardPreference {
 /// this variable exists to end.
 pub fn preference_from(value: Option<&str>) -> Result<ClipboardPreference, String> {
     match value.map(str::trim) {
-        None | Some("") | Some("auto") | Some("osc52") => Ok(ClipboardPreference::Osc52),
+        None | Some("") | Some("auto") => Ok(ClipboardPreference::Both),
+        Some("osc52") => Ok(ClipboardPreference::Osc52),
         Some("helper") | Some("command") => Ok(ClipboardPreference::Helper),
         Some("both") => Ok(ClipboardPreference::Both),
         Some("off") | Some("none") => Ok(ClipboardPreference::Off),
@@ -230,11 +236,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_clipboard_preference_is_osc_52_and_a_misspelt_one_is_refused() {
-        assert_eq!(preference_from(None), Ok(ClipboardPreference::Osc52));
-        assert_eq!(preference_from(Some("")), Ok(ClipboardPreference::Osc52));
+    fn an_unset_clipboard_preference_is_both_and_a_misspelt_one_is_refused() {
+        assert_eq!(preference_from(None), Ok(ClipboardPreference::Both));
+        assert_eq!(preference_from(Some("")), Ok(ClipboardPreference::Both));
+        assert_eq!(preference_from(Some("auto")), Ok(ClipboardPreference::Both));
         assert_eq!(
-            preference_from(Some("auto")),
+            preference_from(Some("osc52")),
             Ok(ClipboardPreference::Osc52)
         );
         assert_eq!(
@@ -247,6 +254,32 @@ mod tests {
         let refused = preference_from(Some("pbcopy")).expect_err("an unknown value is refused");
         assert!(refused.contains("pbcopy"), "got {refused}");
         assert!(refused.contains("helper"), "the error names the valid set");
+    }
+
+    /// An unset `DOCK_CLIPBOARD` must try a local helper as well as the terminal.
+    ///
+    /// OSC 52 is write-only — the terminal is asked and never answers — and Terminal.app
+    /// disables it outright, iTerm2 disables it by default, and tmux ignores it without
+    /// `set-clipboard on`. Defaulting to it alone meant the common case on a Mac was a notice
+    /// saying "copied", a clipboard that had not changed, and no way to tell from the message
+    /// which had happened. `Both` costs one extra `pbcopy` on a deliberate gesture and makes the
+    /// copy real; where no helper exists, `copy_with` finds none and the behaviour — and the
+    /// honest notice — are exactly what they were.
+    #[test]
+    fn the_default_preference_asks_the_terminal_and_a_local_helper() {
+        assert_eq!(preference_from(None), Ok(ClipboardPreference::Both));
+        assert_eq!(preference_from(Some("")), Ok(ClipboardPreference::Both));
+        assert_eq!(preference_from(Some("auto")), Ok(ClipboardPreference::Both));
+        // Explicit values still win, including the old default.
+        assert_eq!(
+            preference_from(Some("osc52")),
+            Ok(ClipboardPreference::Osc52)
+        );
+        assert_eq!(
+            preference_from(Some("helper")),
+            Ok(ClipboardPreference::Helper)
+        );
+        assert_eq!(preference_from(Some("off")), Ok(ClipboardPreference::Off));
     }
 
     #[test]

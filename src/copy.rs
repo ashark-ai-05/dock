@@ -34,6 +34,11 @@ impl CopySession {
         self.anchor = Some(self.cursor);
     }
 
+    /// Drops the anchor, leaving the cursor where it is. The mode stays open.
+    pub fn clear_selection(&mut self) {
+        self.anchor = None;
+    }
+
     pub fn move_cursor(&mut self, rows: i32, cols: i32, bounds: (u16, u16)) {
         let row = i64::from(self.cursor.0) + i64::from(rows);
         let col = i64::from(self.cursor.1) + i64::from(cols);

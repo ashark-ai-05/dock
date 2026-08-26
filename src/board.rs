@@ -26,6 +26,12 @@ pub struct BoardTask {
     /// acceptance criteria, what was ruled out. Dispatching a card sent an agent the title and
     /// nothing else, which asked it to do work nobody had described to it.
     pub body: String,
+    /// Retired from the board without being deleted from the repository.
+    ///
+    /// The board had no terminal state: a card moved to `done` stayed in that column
+    /// forever, because nothing prunes, expires or deletes. Absent means false, so every task
+    /// file that predates this field — which is all of them — reads back exactly as before.
+    pub archived: bool,
 }
 
 /// The order statuses are shown in, which is the order work moves through them.
@@ -170,6 +176,7 @@ pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
         priority: "medium".into(),
         file,
         body,
+        archived: false,
     })
 }
 
@@ -256,6 +263,52 @@ pub fn set_status(directory: &Path, id: u64, status: &str) -> Result<BoardTask, 
     })
 }
 
+/// Retires a task from the board, or brings it back, rewriting only its `archived:` line.
+///
+/// Follows `set_status`'s shape and for the same reason — a board is shared with `kanban-md`,
+/// with editors, and with whoever commits to it — with one difference: the field may not be
+/// there at all, since every task written before this existed has no `archived:` line. So an
+/// absent field is *inserted* immediately before the closing fence rather than treated as an
+/// error, which is what `set_status` does with a missing `status:`.
+pub fn set_archived(directory: &Path, id: u64, archived: bool) -> Result<BoardTask, String> {
+    let task = load(directory)
+        .into_iter()
+        .find(|task| task.id == id)
+        .ok_or_else(|| format!("no task {id} on this board"))?;
+    let text = fs::read_to_string(&task.file)
+        .map_err(|error| format!("could not read the task: {error}"))?;
+    let mut rewritten = String::with_capacity(text.len() + 20);
+    let mut in_front_matter = false;
+    let mut replaced = false;
+    for (index, line) in text.lines().enumerate() {
+        let fence = line.trim() == "---";
+        if fence && in_front_matter && !replaced {
+            // The closing fence, and no field was found on the way here: put one in above it,
+            // where the rest of the front matter is.
+            rewritten.push_str(&format!("archived: {archived}\n"));
+            replaced = true;
+        }
+        if fence {
+            // The opening fence turns it on; the closing fence turns it off, so an `archived:`
+            // in the body below cannot be mistaken for the field.
+            in_front_matter = index == 0 || !in_front_matter;
+        }
+        if in_front_matter && !replaced && line.starts_with("archived:") {
+            rewritten.push_str(&format!("archived: {archived}"));
+            replaced = true;
+        } else {
+            rewritten.push_str(line);
+        }
+        rewritten.push('\n');
+    }
+    if !replaced {
+        return Err(format!("task {id} has no front matter to archive"));
+    }
+    fs::write(&task.file, rewritten)
+        .map_err(|error| format!("could not write the task: {error}"))?;
+    Ok(BoardTask { archived, ..task })
+}
+
 /// Every task in `directory`, ordered by status then id.
 ///
 /// Best-effort by design: a file that cannot be read or has no `id` is skipped rather than failing
@@ -308,7 +361,8 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
     if opening.trim() != "---" {
         return None;
     }
-    let (mut id, mut title, mut status, mut priority) = (None, None, None, None);
+    let (mut id, mut title, mut status, mut priority, mut archived) =
+        (None, None, None, None, false);
     let mut body_start = text.len();
     let mut offset = opening.len();
     for line in lines {
@@ -329,6 +383,7 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
             "title" => title = Some(value.to_owned()),
             "status" => status = Some(value.to_owned()),
             "priority" => priority = Some(value.to_owned()),
+            "archived" => archived = value.eq_ignore_ascii_case("true"),
             _ => {}
         }
     }
@@ -339,6 +394,7 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
         priority: priority.unwrap_or_default(),
         file: path.to_path_buf(),
         body: text[body_start..].trim().to_owned(),
+        archived,
     })
 }
 
@@ -758,6 +814,42 @@ mod tests {
         }
     }
 
+    /// Archiving adds the field when the file has none and rewrites it when it has one, and in
+    /// both cases leaves every other byte of the file alone.
+    #[test]
+    fn archiving_a_task_adds_or_rewrites_only_that_field() {
+        let board = Board::new();
+        board.task(
+            "001-a.md",
+            "---\nid: 1\ntitle: 'Thing'\nstatus: done\npriority: medium\ntags:\n  - keep\n---\n\n# Outcome\n\nbody text\n",
+        );
+        let dir = board.0.join("kanban/tasks");
+
+        let archived = set_archived(&dir, 1, true).expect("archive");
+        assert!(archived.archived);
+        let text = fs::read_to_string(dir.join("001-a.md")).unwrap();
+        assert!(text.contains("archived: true"), "{text}");
+        assert!(
+            text.contains("  - keep"),
+            "the tags list must survive: {text}"
+        );
+        assert!(text.contains("body text"), "the body must survive: {text}");
+        assert_eq!(
+            text.matches("archived:").count(),
+            1,
+            "one field, not two: {text}"
+        );
+
+        set_archived(&dir, 1, false).expect("unarchive");
+        let text = fs::read_to_string(dir.join("001-a.md")).unwrap();
+        assert!(text.contains("archived: false"), "{text}");
+        assert_eq!(text.matches("archived:").count(), 1, "{text}");
+        assert!(
+            !load(&dir)[0].archived,
+            "and it reads back as visible again"
+        );
+    }
+
     #[test]
     fn this_repositorys_own_board_parses() {
         // The format is not hypothetical: Dock's own tasks are the fixture.
@@ -784,6 +876,9 @@ pub struct BoardView {
     statuses: Vec<String>,
     column: usize,
     row: usize,
+    /// Whether archived cards are shown. Off by default, so a board that has been archiving
+    /// finished work looks like what is left to do rather than everything that was ever on it.
+    reveal: bool,
 }
 
 impl Default for BoardView {
@@ -808,6 +903,7 @@ impl BoardView {
             statuses,
             column,
             row: 0,
+            reveal: false,
         }
     }
 
@@ -833,12 +929,35 @@ impl BoardView {
         self.row
     }
 
-    /// The cards in one column, in board order.
+    /// The cards in one column, in board order, minus anything archived unless revealed.
+    ///
+    /// Filtering *here* rather than at load is deliberate: `column_targets` builds the cursor's
+    /// walk from this same call, so the cursor cannot disagree with the grid about how many
+    /// cards a column has. A second filter anywhere else is how those two drift apart.
     pub fn cards(&self, status: &str) -> Vec<&BoardTask> {
         self.tasks
             .iter()
             .filter(|task| task.status == status)
+            .filter(|task| self.reveal || !task.archived)
             .collect()
+    }
+
+    /// How many cards this column is holding back, revealed or not.
+    pub fn archived_in(&self, status: &str) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.status == status && task.archived)
+            .count()
+    }
+
+    /// Shows or hides archived cards. `true` is what "revealed" means everywhere else on the
+    /// board — the count in the footer, the muted card style — so a caller flips one bit.
+    pub fn set_reveal(&mut self, reveal: bool) {
+        self.reveal = reveal;
+    }
+
+    pub fn revealing(&self) -> bool {
+        self.reveal
     }
 
     pub fn selected(&self) -> Option<&BoardTask> {
@@ -893,6 +1012,10 @@ mod view_tests {
     use super::*;
 
     fn task(id: u64, status: &str) -> BoardTask {
+        task_with(id, status, false)
+    }
+
+    fn task_with(id: u64, status: &str, archived: bool) -> BoardTask {
         BoardTask {
             id,
             title: format!("task {id}"),
@@ -900,6 +1023,7 @@ mod view_tests {
             priority: "medium".into(),
             file: PathBuf::from(format!("{id}.md")),
             body: format!("# Outcome\n\ntask {id}"),
+            archived,
         }
     }
 
@@ -910,6 +1034,26 @@ mod view_tests {
         let view = BoardView::new(vec![task(1, "in-progress"), task(2, "done")]);
         assert_eq!(STATUSES[view.column()], "in-progress");
         assert_eq!(view.selected().map(|task| task.id), Some(1));
+    }
+
+    /// A revealed board shows archived cards; a normal one does not, and says how many it is
+    /// holding back.
+    #[test]
+    fn archived_cards_are_hidden_until_revealed_and_counted_while_they_are() {
+        let mut view = BoardView::new(vec![
+            task_with(1, "done", false),
+            task_with(2, "done", true),
+            task_with(3, "done", true),
+        ]);
+        assert_eq!(view.cards("done").len(), 1);
+        assert_eq!(view.archived_in("done"), 2);
+        view.set_reveal(true);
+        assert_eq!(view.cards("done").len(), 3);
+        assert_eq!(
+            view.archived_in("done"),
+            2,
+            "the count is what is archived, revealed or not"
+        );
     }
 
     #[test]

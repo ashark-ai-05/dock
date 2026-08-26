@@ -3297,6 +3297,15 @@ impl Dashboard {
             // cannot do at all.
             KeyCode::Char('<' | ',') => return self.shift_task(-1),
             KeyCode::Char('>' | '.') => return self.shift_task(1),
+            // `h`, `j`, `k`, `l` are already cursor motion, so the obvious `h` for "hide" is
+            // unavailable — `v` reveals or hides archived cards instead, `a` retires or restores
+            // the one under the cursor, and `A` clears out the whole of `done` at once.
+            KeyCode::Char('v') => {
+                let revealing = board.view.revealing();
+                board.view.set_reveal(!revealing);
+            }
+            KeyCode::Char('a') => return self.archive_selected_task(),
+            KeyCode::Char('A') => return self.archive_finished_tasks(),
             KeyCode::Enter => return self.dispatch_selected_task(),
             _ => {}
         }
@@ -3370,6 +3379,75 @@ impl Dashboard {
             Err(message) => self.error = Some(message),
         }
         UiCommand::None
+    }
+
+    /// Archives the selected card, or brings it back if the board is revealing them.
+    ///
+    /// The same key does the opposite thing depending on `reveal`, rather than two keys for two
+    /// directions, because `v` already answers "what am I looking at" — a normal board's cards,
+    /// or its held-back ones — and `a` acts on whichever of those is on screen under the cursor.
+    fn archive_selected_task(&mut self) -> UiCommand {
+        let Some(board) = self.board.as_ref() else {
+            return UiCommand::None;
+        };
+        if !board.writable {
+            self.error = Some(
+                "this is the repository's board — retire tasks with kanban-md so its history \
+                 stays the repository's"
+                    .into(),
+            );
+            return UiCommand::None;
+        }
+        let (Some(directory), Some(task)) = (self.board_dir.clone(), self.cursor_card()) else {
+            return UiCommand::None;
+        };
+        let archived = !board.view.revealing();
+        match crate::board::set_archived(&directory, task, archived) {
+            Ok(_) => UiCommand::LoadBoard,
+            Err(message) => {
+                self.error = Some(message);
+                UiCommand::None
+            }
+        }
+    }
+
+    /// Archives every card in `done` at once, which is the answer to a column that has been
+    /// accumulating since the board was made.
+    fn archive_finished_tasks(&mut self) -> UiCommand {
+        let Some(board) = self.board.as_ref() else {
+            return UiCommand::None;
+        };
+        if !board.writable {
+            self.error = Some(
+                "this is the repository's board — retire tasks with kanban-md so its history \
+                 stays the repository's"
+                    .into(),
+            );
+            return UiCommand::None;
+        }
+        let Some(directory) = self.board_dir.clone() else {
+            return UiCommand::None;
+        };
+        let finished: Vec<u64> = board
+            .view
+            .cards("done")
+            .iter()
+            .filter(|task| !task.archived)
+            .map(|task| task.id)
+            .collect();
+        if finished.is_empty() {
+            self.error = Some("nothing in done to archive".into());
+            return UiCommand::None;
+        }
+        let count = finished.len();
+        for id in finished {
+            if let Err(message) = crate::board::set_archived(&directory, id, true) {
+                self.error = Some(message);
+                return UiCommand::LoadBoard;
+            }
+        }
+        self.error = Some(format!("archived {count} finished tasks"));
+        UiCommand::LoadBoard
     }
 
     /// Puts an agent on the selected card.
@@ -5917,6 +5995,30 @@ fn render_board_columns(
                 area.bottom().saturating_sub(area.y + 2),
             ),
         );
+        // A card that is `done` and archived is off the board, not off the screen: it still
+        // happened, so the column says how many it is holding back rather than letting them
+        // vanish without a trace. Skipped on a stub-width column, which has no room for the
+        // words and would only ellipsise into noise.
+        let hidden = view.archived_in(status);
+        if hidden > 0 && column_width > STUB_MAX {
+            let note = if view.revealing() {
+                format!("{hidden} archived · v hides")
+            } else {
+                format!("{hidden} archived · v reveals")
+            };
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    ellipsise(&note, width),
+                    Style::default().fg(theme.muted),
+                )),
+                Rect::new(
+                    x,
+                    area.bottom().saturating_sub(1),
+                    column_width.saturating_sub(1),
+                    1,
+                ),
+            );
+        }
         x += column_width;
     }
 }
@@ -5976,7 +6078,14 @@ fn card_lines<'a>(
     let mut lines = Vec::with_capacity(rows.min(cards.len()));
     for (row, task) in cards.iter().skip(first).take(rows).enumerate() {
         let here = selected == Some(first + row);
-        let style = card_style(theme, here, true);
+        // Archived cards only ever appear here while revealed, and a revealed archived card
+        // must never read as an ordinary one — muted regardless of the cursor, so `v` alone
+        // tells the difference rather than a colour that also depends on where the cursor is.
+        let style = if task.archived {
+            Style::default().fg(theme.muted)
+        } else {
+            card_style(theme, here, true)
+        };
         let marker = if here { "›" } else { " " };
         let identifier = task.id.to_string();
         // One budget for both shapes' *titles*. The badge branch spends two more fixed cells
@@ -8117,6 +8226,7 @@ mod tests {
             priority: "high".into(),
             file: std::path::PathBuf::from(format!("kanban/tasks/{id}.md")),
             body: format!("# Outcome\n\n{title}"),
+            archived: false,
         }
     }
 

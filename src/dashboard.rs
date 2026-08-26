@@ -3210,11 +3210,24 @@ impl Dashboard {
     }
 
     /// Receives the board and opens it as columns of cards.
+    ///
+    /// A reload is not a fresh open of the overlay: `LoadBoard` runs this on every archive and
+    /// unarchive as well as on the key that first pops the overlay up, and `v` is a preference
+    /// for as long as the overlay is on screen, not for one keystroke. `archive_selected_task`
+    /// reads `revealing()` to decide which direction `a` means, then triggers exactly this
+    /// reload — so a `BoardView::new` that always opened un-revealed made "reveal, then bring a
+    /// card back" re-hide everything else in the same pile on the very next frame. The reveal a
+    /// caller had is carried forward into the freshly loaded view instead.
     pub fn set_board_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
+        let reveal = self.board.as_ref().map(|board| board.view.revealing());
         self.set_board_pane_tasks(tasks.clone(), directory.clone());
         let writable = self.board_is_personal;
+        let mut view = BoardView::new(tasks);
+        if let Some(reveal) = reveal {
+            view.set_reveal(reveal);
+        }
         self.board = Some(BoardOverlay {
-            view: BoardView::new(tasks),
+            view,
             directory,
             writable,
             composing: None,
@@ -3228,9 +3241,20 @@ impl Dashboard {
     /// of it — which is what made this a second entry point rather than a flag. It is also the
     /// path a board pane takes on start-up, because a pane is not opened by a keystroke and
     /// nothing else in the loop would ever read the board for it.
+    ///
+    /// Carries the pane's own `reveal` across the reload for the same reason `set_board_tasks`
+    /// carries the overlay's: nothing currently sets it to `true` on this view (only the overlay
+    /// has a `v` bound to it), so today this is a no-op — but a rebuild that silently discarded
+    /// it would be a trap for whoever wires reveal to the pane next, and a `BoardView::new` this
+    /// function calls unconditionally is exactly the discarding shape `set_board_tasks` had.
     pub fn set_board_pane_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
         self.board_is_personal = crate::board::is_personal(&directory);
-        self.board_pane_view = Some(BoardView::new(tasks.clone()));
+        let reveal = self.board_pane_view.as_ref().map(|view| view.revealing());
+        let mut view = BoardView::new(tasks.clone());
+        if let Some(reveal) = reveal {
+            view.set_reveal(reveal);
+        }
+        self.board_pane_view = Some(view);
         self.board_tasks = tasks;
         self.board_dir = Some(directory);
     }
@@ -5941,16 +5965,36 @@ fn render_board_columns(
         let column_width = widths[index];
         let width = usize::from(column_width.saturating_sub(1));
         let active_column = index == cursor.0;
+        // A card that is `done` and archived is off the board, not off the screen: it still
+        // happened, so the column says how many it is holding back rather than letting them
+        // vanish without a trace. Skipped on a stub-width column, which has no room for the
+        // words and would only ellipsise into noise.
+        //
+        // Decided before the cards are laid out, not after, and the row it costs is subtracted
+        // from `rows` below rather than the footer being painted on top of whatever the card
+        // paragraph put in the last row: a filled column has no spare row to give up, and a
+        // footer drawn over its bottom card would be exactly the "where did my card go"
+        // confusion this feature exists to remove.
+        let hidden = view.archived_in(status);
+        let show_footer = hidden > 0 && column_width > STUB_MAX;
+        let rows = if show_footer {
+            card_rows.saturating_sub(1)
+        } else {
+            card_rows
+        };
         // A column taller than the space scrolls to keep the cursor visible, rather than hiding
         // the selected card behind the bottom edge — so the selected row is passed down to
-        // whichever of the two card shapes this column draws.
+        // whichever of the two card shapes this column draws. `rows` is the same figure the
+        // card paragraph below is sized to, so a column with a footer scrolls to keep the
+        // cursor inside the space that is actually left for cards rather than inside the
+        // taller figure that would let it scroll to a row the footer has already painted over.
         let selected = active_column.then_some(cursor.1);
         let lines = if status == ACTIVE_STATUS {
             let entries = active.take().unwrap_or_default();
-            active_lines(theme, &entries, width, card_rows, selected)
+            active_lines(theme, &entries, width, rows, selected)
         } else {
             let cards = view.cards(status);
-            card_lines(theme, &cards, live, width, card_rows, selected)
+            card_lines(theme, &cards, live, width, rows, selected)
         };
         // A rule under each heading gives the columns edges without spending a column of
         // width on borders, which at five columns would cost a fifth of the card text.
@@ -5985,22 +6029,18 @@ fn render_board_columns(
         // One paragraph for the whole column rather than one per card. Each card used to be its
         // own widget over its own one-row rectangle, which put a ratatui render — and the dozen
         // allocations inside it — behind every card on the board, on a path that repaints at
-        // 60fps.
+        // 60fps. Sized to `rows`, not to the full space below the heading, so a column with a
+        // footer never draws a card into the row that footer is about to occupy.
         frame.render_widget(
             Paragraph::new(lines),
             Rect::new(
                 x,
                 area.y + 2,
                 column_width.saturating_sub(1),
-                area.bottom().saturating_sub(area.y + 2),
+                u16::try_from(rows).unwrap_or(u16::MAX),
             ),
         );
-        // A card that is `done` and archived is off the board, not off the screen: it still
-        // happened, so the column says how many it is holding back rather than letting them
-        // vanish without a trace. Skipped on a stub-width column, which has no room for the
-        // words and would only ellipsise into noise.
-        let hidden = view.archived_in(status);
-        if hidden > 0 && column_width > STUB_MAX {
+        if show_footer {
             let note = if view.revealing() {
                 format!("{hidden} archived · v hides")
             } else {
@@ -8578,6 +8618,57 @@ mod tests {
     }
 
     #[test]
+    fn a_columns_last_visible_card_is_not_lost_to_the_archived_footer() {
+        // The footer must be reserved out of the card area, not painted over whatever the card
+        // paragraph already put in the last row. The clearest way to see the difference: put the
+        // cursor — which `scroll_to` always parks on the very last visible row once a column has
+        // scrolled past the cursor — on the last of a column's visible cards, in a column that
+        // also has an archived card triggering the footer. A footer painted *over* that row
+        // rather than reserved *before* it would make the selected card disappear, overwritten
+        // by unrelated muted text — exactly the "where did my card go" confusion this feature
+        // exists to remove, and worse for happening to the one card the cursor is on.
+        let mut dashboard = bound_dashboard();
+        let mut tasks: Vec<BoardTask> = (1..=40)
+            .map(|id| board_task(id, &format!("finished thing {id}"), "done"))
+            .collect();
+        // One archived card in the same column — invisible itself, but enough to make the
+        // footer appear under the 40 cards that are shown.
+        let mut archived = board_task(41, "already retired", "done");
+        archived.archived = true;
+        tasks.push(archived);
+        let last_visible_id = 40;
+
+        dashboard.set_board_tasks(
+            tasks,
+            crate::board::tasks_dir("", "workspace_footer_reservation").expect("a board"),
+        );
+        let done_column = dashboard
+            .board
+            .as_ref()
+            .unwrap()
+            .view
+            .statuses()
+            .iter()
+            .position(|status| status == "done")
+            .expect("a done column");
+        // Puts the cursor directly on the last visible card rather than pressing `j` forty
+        // times, and exercises the same `follow`/`board_cursor_at` machinery a real move does.
+        dashboard.set_board_cursor(done_column, Some(BoardTarget::Card(last_visible_id)));
+
+        let terminal = render_terminal(&mut dashboard, 120, 40);
+        let done = board_column(&terminal, "DONE");
+        assert!(
+            done.contains("archived"),
+            "the footer must be drawn: {done:?}"
+        );
+        assert!(
+            done.contains("finished thing 40"),
+            "the selected card, scrolled to the last visible row, must still be on screen \
+             rather than lost to the footer painted where it used to be: {done:?}"
+        );
+    }
+
+    #[test]
     fn a_live_agent_is_a_card_in_the_active_column_instead_of_a_lane_above_the_grid() {
         // What the first real use of this pane asked out loud: the user's agent was running in a
         // strip above the columns, and they asked why their work "was not in the table". One
@@ -9520,6 +9611,73 @@ mod tests {
             dashboard.board.as_ref().unwrap().view.status(),
             Some("backlog")
         );
+    }
+
+    #[test]
+    fn revealing_survives_the_reload_an_archive_action_itself_triggers() {
+        // `archive_selected_task` reads `revealing()` to choose which way `a` goes, then returns
+        // `UiCommand::LoadBoard` — the same command that fires on every archive and unarchive.
+        // A `LoadBoard` that rebuilt the view at `reveal: false` made "reveal the pile, bring one
+        // card back" re-hide everything else in the same pile on the very next frame: the one
+        // sequence that is supposed to prove `v` and `a` work together undid itself.
+        //
+        // A real personal board rather than an arbitrary temp directory, and deliberately so:
+        // `LoadBoard` — which is what this test simulates by calling `set_board_tasks` again —
+        // recomputes `writable` from `board::is_personal(directory)` on every reload in the real
+        // event loop too. An arbitrary directory is never personal, so a second reload would
+        // silently flip `writable` back to `false` and the second `a` would be refused for a
+        // reason this test is not about; a real personal board keeps `is_personal` — and so
+        // `writable` — true across every reload, which is what an actual session looks like.
+        let workspace_id = format!("reveal-survives-{}", std::process::id());
+        let dir = crate::board::tasks_dir("", &workspace_id).expect("a personal board");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::board::create(&dir, "finished work").expect("seed a task");
+        let id = crate::board::load(&dir)[0].id;
+        crate::board::set_status(&dir, id, "done").expect("move it to done");
+
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        render_to_string(&mut dashboard, 130, 32);
+
+        // Not revealing, so `a` archives it.
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            UiCommand::LoadBoard
+        );
+        // What the real event loop does with that command: read the board back off disk.
+        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        assert!(crate::board::load(&dir)[0].archived, "archived on disk");
+        assert_eq!(
+            dashboard.board.as_ref().unwrap().view.cards("done").len(),
+            0
+        );
+
+        // Reveal the pile.
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)),
+            UiCommand::None
+        );
+        assert!(dashboard.board.as_ref().unwrap().view.revealing());
+        assert_eq!(
+            dashboard.board.as_ref().unwrap().view.cards("done").len(),
+            1
+        );
+
+        // Revealing, so `a` on the card sitting there brings it back — and triggers the same
+        // `LoadBoard` reload that used to reset `reveal` out from under this exact sequence.
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            UiCommand::LoadBoard
+        );
+        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+
+        assert!(!crate::board::load(&dir)[0].archived, "unarchived on disk");
+        assert!(
+            dashboard.board.as_ref().unwrap().view.revealing(),
+            "the reload an archive action triggers must not silently re-hide what was revealed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

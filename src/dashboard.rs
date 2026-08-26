@@ -368,9 +368,15 @@ pub enum PaneControl {
 /// What a rename form is editing. The protocol already distinguishes these — `Rename` takes an
 /// optional `pane_id` — but the keyboard path only ever renamed panes, so nothing produced the
 /// workspace form until tabs became clickable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Pane` carries the pane it was opened on rather than meaning "whichever pane has focus". The
+/// form only reads a name in; the object is not chosen until Enter, and focus can move in
+/// between — a `refresh` rewrites the whole layout, and any `PaneState` or `LayoutChanged` event
+/// triggers one. Renaming what the form was opened on is the only reading that matches what the
+/// form has been showing the user the entire time it was open.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenameTarget {
-    Pane,
+    Pane(String),
     Workspace,
 }
 
@@ -891,7 +897,11 @@ impl ContextMenu {
                 }),
                 MenuEntry::Item(MenuItem {
                     label: "Dispatch",
-                    key: Some("Enter"),
+                    // No key, and deliberately not `Enter`: Enter is the menu's own "take the
+                    // highlighted item", so printing it here would advertise a key that, pressed
+                    // with the cursor where it opens, does `Move left` instead. An item may only
+                    // print a key that means the same thing whether or not the menu is open.
+                    key: None,
                     action: MenuAction::DispatchCard(*id),
                     enabled: true,
                 }),
@@ -1624,6 +1634,12 @@ impl Dashboard {
         );
         if area.width < 52 || area.height < 14 {
             self.dragging = None;
+            // This path returns before the overlay loop, so the menu is neither drawn nor
+            // re-placed — and `menu_area` would keep the rectangle the last wide frame left,
+            // where a click would take an item that is not on screen. Dismissed rather than
+            // merely un-clicked: a menu nobody can see is not a menu.
+            self.menu = None;
+            self.menu_area = Rect::default();
             self.render_narrow(frame, area);
             return;
         }
@@ -3150,15 +3166,12 @@ impl Dashboard {
             width,
             5,
         );
-        let (target, value) = match self.rename_form.as_ref() {
-            Some((target, value)) => (*target, value.as_str()),
-            None => (RenameTarget::Pane, ""),
-        };
         // The form says what it is renaming: the same box now reaches panes and workspaces, and
         // a rename that lands on the wrong one is invisible until something else looks wrong.
-        let subject = match target {
-            RenameTarget::Pane => "Pane",
-            RenameTarget::Workspace => "Workspace",
+        let (subject, value) = match self.rename_form.as_ref() {
+            Some((RenameTarget::Pane(_), value)) => ("Pane", value.as_str()),
+            Some((RenameTarget::Workspace, value)) => ("Workspace", value.as_str()),
+            None => ("Pane", ""),
         };
         frame.render_widget(
             Paragraph::new(vec![
@@ -5476,7 +5489,7 @@ impl Dashboard {
             return UiCommand::None;
         };
         self.rename_form = Some((
-            RenameTarget::Pane,
+            RenameTarget::Pane(workspace.focused_pane_id.clone()),
             workspace.panes[&workspace.focused_pane_id].name.clone(),
         ));
         self.error = None;
@@ -5608,7 +5621,7 @@ impl Dashboard {
             }
             KeyCode::Enter => {
                 let (target, value) = self.rename_form.as_ref().expect("rename form");
-                let (target, name) = (*target, value.trim().to_owned());
+                let (target, name) = (target.clone(), value.trim().to_owned());
                 if name.is_empty() {
                     self.error = Some("rename unavailable: name cannot be empty".into());
                     return UiCommand::None;
@@ -5617,16 +5630,24 @@ impl Dashboard {
                     .workspace()
                     .expect("workspace retained while form open");
                 let workspace_id = workspace.workspace_id.clone();
-                let pane_id = workspace.focused_pane_id.clone();
                 // Painted locally before the request, like every other command here, so the new
                 // name is on screen before the daemon has answered.
                 let pane_id = match target {
-                    RenameTarget::Pane => {
-                        self.layout.workspaces[self.workspace_index]
+                    // The pane the form was opened on, looked up by id rather than by focus. If
+                    // it has left the layout since — a refresh between opening the form and
+                    // pressing Enter — the rename is refused rather than redirected onto
+                    // whatever holds focus now, which would rename an object the user never
+                    // pointed at and never saw named in the form.
+                    RenameTarget::Pane(pane_id) => {
+                        let Some(pane) = self.layout.workspaces[self.workspace_index]
                             .panes
                             .get_mut(&pane_id)
-                            .expect("focused pane")
-                            .name = name.clone();
+                        else {
+                            self.rename_form = None;
+                            self.error = Some(format!("that pane is gone: {pane_id}"));
+                            return UiCommand::None;
+                        };
+                        pane.name = name.clone();
                         Some(pane_id)
                     }
                     RenameTarget::Workspace => {
@@ -5804,7 +5825,17 @@ impl Dashboard {
         // "Close pane" on an unfocused pane's menu, or "Close workspace" on another tab's, would
         // otherwise destroy the wrong one. This is the same defect the card actions carry an id
         // to avoid, and it is fixed the same way: point the selection at the target first.
-        self.aim_at(&menu.target);
+        //
+        // A guard, not a statement. A menu is open across whatever else the dashboard is doing —
+        // an agent exits, a refresh rewrites the layout, another client closes the workspace —
+        // so by the time an item is taken its target may be gone. Aiming would then quietly do
+        // nothing and the action would run against whatever is selected instead, which is how
+        // "Close pane" ends up closing the pane the user was looking at. Refusing and saying so
+        // is the only safe answer; `archive_card` has always worked this way.
+        if !self.aim_at(&menu.target) {
+            self.error = Some(target_gone(&menu.target));
+            return UiCommand::None;
+        }
         match action {
             MenuAction::Pane(command) => self.run_command(command),
             MenuAction::CopySelection => {
@@ -5824,38 +5855,46 @@ impl Dashboard {
         }
     }
 
-    /// Puts the dashboard's own selection on whatever the menu was opened over.
+    /// Puts the dashboard's own selection on whatever the menu was opened over, and says whether
+    /// it could. `false` means the target has left the canvas since the menu was opened, and the
+    /// caller must do nothing at all rather than act on whatever is selected instead.
     ///
-    /// Local only, and deliberately so: it does not tell the daemon which pane has focus. Every
-    /// request a menu item goes on to send names its subject explicitly, so what this has to get
-    /// right is which pane or workspace the *next few lines* read — and a `Focus` round trip in
-    /// front of the item the user actually picked would put a blocking daemon call between the
-    /// click and the thing it asked for.
-    fn aim_at(&mut self, target: &MenuTarget) {
+    /// Local only: it does not send `Workspace::Focus`. Not because the request would block — the
+    /// left-click path posts the same request with a non-blocking `UiCommand::Send` — but because
+    /// focus is the daemon's record of where the user is typing, and a menu item is not the user
+    /// moving there. Taking `Close pane` from an unfocused pane's menu should close that pane and
+    /// leave the keyboard where it was; announcing focus would move it, and the next `refresh`
+    /// would paint the move. What this has to get right is which pane or workspace the *next few
+    /// lines* read, and every request those lines send names its subject explicitly.
+    fn aim_at(&mut self, target: &MenuTarget) -> bool {
         match target {
             MenuTarget::Pane(pane_id) => {
-                if self
+                if !self
                     .workspace()
                     .is_some_and(|workspace| workspace.panes.contains_key(pane_id))
                 {
-                    self.layout.workspaces[self.workspace_index].focused_pane_id = pane_id.clone();
+                    return false;
                 }
+                self.layout.workspaces[self.workspace_index].focused_pane_id = pane_id.clone();
+                true
             }
             MenuTarget::Tab(workspace_id) | MenuTarget::SidebarWorkspace(workspace_id) => {
-                if let Some(index) = self
+                let Some(index) = self
                     .layout
                     .workspaces
                     .iter()
                     .position(|workspace| workspace.workspace_id == *workspace_id)
-                {
-                    self.workspace_index = index;
-                }
+                else {
+                    return false;
+                };
+                self.workspace_index = index;
+                true
             }
             MenuTarget::SidebarAgent(run_id) => self.aim_at_run(run_id),
-            // The card actions carry their own id and move the board cursor themselves, and the
-            // canvas menu is the one menu whose items are about the dashboard rather than about
-            // anything under the pointer.
-            MenuTarget::BoardCard(_) | MenuTarget::Canvas => {}
+            // The card actions carry their own id and aim themselves — and refuse themselves, in
+            // `aim_at_card` — and the canvas menu is the one menu whose items are about the
+            // dashboard rather than about anything under the pointer. Neither can go stale here.
+            MenuTarget::BoardCard(_) | MenuTarget::Canvas => true,
         }
     }
 
@@ -5864,7 +5903,7 @@ impl Dashboard {
     /// The sidebar roster is the one list that spans workspaces, so a row of it can name a run
     /// that is not on screen — and `Resume` or `Restart` taken from that row must reach that
     /// agent rather than whichever pane happened to be focused.
-    fn aim_at_run(&mut self, run_id: &str) {
+    fn aim_at_run(&mut self, run_id: &str) -> bool {
         let found = self
             .layout
             .workspaces
@@ -5877,33 +5916,28 @@ impl Dashboard {
                     .find(|pane| pane.run_id.as_deref() == Some(run_id))
                     .map(|pane| (index, pane.pane_id.clone()))
             });
-        if let Some((index, pane_id)) = found {
-            self.workspace_index = index;
-            self.layout.workspaces[index].focused_pane_id = pane_id;
-        }
+        let Some((index, pane_id)) = found else {
+            return false;
+        };
+        self.workspace_index = index;
+        self.layout.workspaces[index].focused_pane_id = pane_id;
+        true
     }
 
     /// Focuses the pane a run is in and tells the daemon, which is what a left click on that
     /// pane would have done had the pane been on screen.
     fn focus_run(&mut self, run_id: &str) -> UiCommand {
-        self.aim_at_run(run_id);
-        let Some(workspace) = self.workspace() else {
+        if !self.aim_at_run(run_id) {
             self.error = Some(format!("that agent's pane is gone: {run_id}"));
             return UiCommand::None;
-        };
+        }
+        let workspace = self
+            .workspace()
+            .expect("aim_at_run selected a workspace that holds the run");
         let (workspace_id, pane_id) = (
             workspace.workspace_id.clone(),
             workspace.focused_pane_id.clone(),
         );
-        if self
-            .workspace()
-            .and_then(|workspace| workspace.panes.get(&pane_id))
-            .and_then(|pane| pane.run_id.as_deref())
-            != Some(run_id)
-        {
-            self.error = Some(format!("that agent's pane is gone: {run_id}"));
-            return UiCommand::None;
-        }
         self.error = None;
         UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Focus {
             workspace_id,
@@ -6026,14 +6060,7 @@ impl Dashboard {
                     return UiCommand::None;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    // Plain arithmetic rather than `Rect::contains`, which would need a
-                    // `layout::Position` import this file does not have; the module already
-                    // tests rectangles this way in `grid_cell` and `clamp_cell`.
-                    let inside = event.column >= area.x
-                        && event.column < area.right()
-                        && event.row >= area.y
-                        && event.row < area.bottom();
-                    if inside {
+                    if contains(area, event.column, event.row) {
                         if let Some(index) = self.menu_row_at(event.column, event.row)
                             && let Some(menu) = self.menu.as_mut()
                             && matches!(menu.entries[index], MenuEntry::Item(_))
@@ -7236,6 +7263,26 @@ fn separate(buffer: &mut String) {
 
 fn bound_task(run: &RuntimeSnapshot) -> Option<&str> {
     Some(run.external_task_ref.trim()).filter(|task| !task.is_empty())
+}
+
+/// Why a menu item did nothing: the thing it was opened on is no longer there.
+///
+/// Said rather than swallowed. A menu is open across whatever else the dashboard is doing, so a
+/// target really can leave the canvas between the right-click and the Enter — and a destructive
+/// item that silently declines is indistinguishable from one that silently acted on the wrong
+/// object, which is the failure this whole refusal path exists to make impossible.
+fn target_gone(target: &MenuTarget) -> String {
+    match target {
+        MenuTarget::Pane(pane_id) => format!("that pane is gone: {pane_id}"),
+        MenuTarget::Tab(id) | MenuTarget::SidebarWorkspace(id) => {
+            format!("that workspace is gone: {id}")
+        }
+        MenuTarget::SidebarAgent(run_id) => format!("that agent's pane is gone: {run_id}"),
+        // `aim_at` never refuses these, so this is unreachable rather than merely unlikely; it
+        // is spelled out anyway so a future target added to the enum cannot reach a `_ => ""`.
+        MenuTarget::BoardCard(id) => format!("that card is gone: {id}"),
+        MenuTarget::Canvas => "that is no longer there".to_owned(),
+    }
 }
 
 /// The one-row rectangle for the sidebar line at `index`, or `None` when that line falls past
@@ -11134,7 +11181,10 @@ mod tests {
         // The form opens on the workspace, not the focused pane — the protocol has always
         // distinguished them, but nothing produced the workspace form until tabs were clickable.
         assert_eq!(
-            dashboard.rename_form.as_ref().map(|(target, _)| *target),
+            dashboard
+                .rename_form
+                .as_ref()
+                .map(|(target, _)| target.clone()),
             Some(RenameTarget::Workspace)
         );
         assert!(render_to_string(&mut dashboard, 110, 30).contains("Workspace name:"));
@@ -11240,10 +11290,14 @@ mod tests {
             .expect("a rename control");
         assert_eq!(click(&mut dashboard, pencil), UiCommand::None);
         // The pane, not the workspace: the tab strip's pencil is the one that renames a
-        // workspace, and the two forms are a click apart on screen.
+        // workspace, and the two forms are a click apart on screen. Named, too — the form holds
+        // the pane it was opened on rather than a promise to reread focus later.
         assert_eq!(
-            dashboard.rename_form.as_ref().map(|(target, _)| *target),
-            Some(RenameTarget::Pane)
+            dashboard
+                .rename_form
+                .as_ref()
+                .map(|(target, _)| target.clone()),
+            Some(RenameTarget::Pane("a".into()))
         );
         assert!(render_to_string(&mut dashboard, 110, 30).contains("Pane name: editor"));
     }
@@ -12770,7 +12824,7 @@ mod tests {
         dashboard.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
         assert!(dashboard.copy_mode(), "copy mode is the eighth surface");
         dashboard.help_open = true;
-        dashboard.rename_form = Some((RenameTarget::Pane, "ledger".into()));
+        dashboard.rename_form = Some((RenameTarget::Pane("a".into()), "ledger".into()));
         dashboard.open_launch();
         dashboard.picker = Some((PickerPurpose::Workspace, Picker::new(Vec::new())));
         dashboard.set_review_inbox(vec![(handoff("dock_01J9", "DOCK-7"), None)]);
@@ -15188,5 +15242,205 @@ mod tests {
             ),
             "the fallback menu closes the pane it was opened on"
         );
+    }
+
+    /// A menu sits open across whatever else the dashboard is doing, so its target can leave the
+    /// canvas between the right-click and the Enter — an agent exits, a refresh rewrites the
+    /// layout, another client closes the workspace. Aiming used to fail silently there and the
+    /// action ran anyway, against whatever was selected instead: `Close pane` closed the pane the
+    /// user was looking at rather than the one they pointed at. Nothing is the only safe answer,
+    /// and it has to be a said nothing — a destructive item that declines in silence cannot be
+    /// told from one that acted on the wrong object.
+    #[test]
+    fn a_destructive_item_whose_target_has_gone_does_nothing_and_says_so() {
+        let mut dashboard = bound_dashboard();
+        render_terminal(&mut dashboard, 100, 30);
+        let b = dashboard.pane_areas["b"];
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: b.x + 2,
+            row: b.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        let index = dashboard
+            .menu
+            .as_ref()
+            .expect("the pane menu")
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Item(item) if item.label == "Close pane"))
+            .expect("the pane menu offers Close pane");
+        dashboard.menu.as_mut().expect("the pane menu").cursor = index;
+
+        // What a refresh does: the pane the menu was opened on is no longer in the layout, and
+        // focus is back on the pane it was on before.
+        dashboard.layout.workspaces[0].panes.remove("b");
+        dashboard.layout.workspaces[0].focused_pane_id = "a".into();
+
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiCommand::None,
+            "no Close request may be sent for a pane that is gone — least of all for pane a, \
+             which is what the old code would have closed"
+        );
+        assert!(
+            dashboard
+                .error
+                .as_deref()
+                .is_some_and(|notice| notice.contains("that pane is gone")),
+            "the refusal has to be visible: {:?}",
+            dashboard.error
+        );
+        assert!(dashboard.menu.is_none(), "the menu closed either way");
+        assert!(
+            dashboard.layout.workspaces[0].panes.contains_key("a"),
+            "and the pane that did still exist was left alone"
+        );
+    }
+
+    /// A rename form only reads a name in; the object is not chosen until Enter. Focus can move in
+    /// between — `refresh` rewrites the whole layout and any `PaneState` event triggers one — so a
+    /// form that resolved "the focused pane" at Enter renamed whichever pane focus had drifted to,
+    /// silently, while showing the right pane's old name the entire time. The form carries the
+    /// pane it was opened on instead, which is what this measures: focus is moved away between
+    /// opening the form and pressing Enter, and the rename still lands where it was aimed.
+    #[test]
+    fn renaming_from_a_panes_menu_lands_on_that_pane_even_after_focus_moves() {
+        let mut dashboard = bound_dashboard();
+        render_terminal(&mut dashboard, 100, 30);
+        let b = dashboard.pane_areas["b"];
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: b.x + 2,
+            row: b.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        let index = dashboard
+            .menu
+            .as_ref()
+            .expect("the pane menu")
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Item(item) if item.label == "Rename"))
+            .expect("the pane menu offers Rename");
+        dashboard.menu.as_mut().expect("the pane menu").cursor = index;
+        dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // The form names the pane that was right-clicked, and opens on its name — which is what
+        // the user reads for as long as the form is up, and therefore what Enter has to honour.
+        assert_eq!(
+            dashboard.rename_form,
+            Some((RenameTarget::Pane("b".into()), "agent".into()))
+        );
+
+        // What a refresh does: focus back on the pane it was on before the menu was opened.
+        dashboard.layout.workspaces[0].focused_pane_id = "a".into();
+
+        for character in "ledger".chars() {
+            dashboard.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        // The form opened on `agent`, so the typed name is appended to it; clearing it is not
+        // what this test is about, and the assertion below reads whatever ended up in the form.
+        let typed = dashboard
+            .rename_form
+            .as_ref()
+            .map(|(_, value)| value.clone())
+            .expect("the form is still open");
+        assert!(
+            matches!(
+                dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                UiCommand::Request(request)
+                    if matches!(request.as_ref(),
+                        Request::Workspace(WorkspaceRequest::Rename { pane_id, name, .. })
+                            if pane_id.as_deref() == Some("b") && *name == typed)
+            ),
+            "the rename names the pane the form was opened on"
+        );
+        assert_eq!(
+            dashboard.layout.workspaces[0].panes["b"].name, typed,
+            "and repaints it locally"
+        );
+        assert_eq!(
+            dashboard.layout.workspaces[0].panes["a"].name, "editor",
+            "the pane focus had drifted to is untouched"
+        );
+    }
+
+    /// A menu open across a shrink into narrow mode is dismissed, not merely hidden.
+    ///
+    /// `render` returns through `render_narrow` before the overlay loop, so the menu is neither
+    /// drawn nor re-placed — and `menu_area` would keep the rectangle the last wide frame left it.
+    /// A left click inside those coordinates would then take an item that is nowhere on screen,
+    /// which is the same "acts on something the user cannot see" failure as a stale target.
+    #[test]
+    fn a_menu_open_across_a_shrink_is_dismissed_rather_than_left_clickable() {
+        let mut dashboard = bound_dashboard();
+        render_terminal(&mut dashboard, 100, 30);
+        let a = dashboard.pane_areas["a"];
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: a.x + 2,
+            row: a.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        render_terminal(&mut dashboard, 100, 30);
+        let stale = dashboard.menu_area;
+        assert!(stale.width > 0, "the menu really was drawn somewhere");
+
+        render_terminal(&mut dashboard, 40, 10);
+        assert!(
+            dashboard.menu.is_none(),
+            "a menu the frame cannot draw is not a menu"
+        );
+        assert_eq!(
+            dashboard.menu_area,
+            Rect::default(),
+            "and its rectangle cannot be clicked after it stops being drawn"
+        );
+        assert_eq!(
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: stale.x + 1,
+                row: stale.y + 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+            UiCommand::None,
+            "a click where the menu used to be takes nothing"
+        );
+    }
+
+    /// No item may print a key the menu itself owns.
+    ///
+    /// The key column is a promise: it says how to do this without the menu next time. `Dispatch`
+    /// used to print `Enter`, which is true of the board and false of the menu — with the cursor
+    /// where the menu opens, Enter takes `Move left`. A hint is only honest if it means the same
+    /// thing whether or not the menu is open, so the four keys `menu_key` consumes are exactly
+    /// the four no item may advertise.
+    #[test]
+    fn no_menu_item_advertises_a_key_the_menu_itself_consumes() {
+        let owned = ["Enter", "Esc", "Up", "Down"];
+        for target in [
+            MenuTarget::Pane("a".into()),
+            MenuTarget::Tab("w".into()),
+            MenuTarget::SidebarWorkspace("w".into()),
+            MenuTarget::SidebarAgent("run_1".into()),
+            MenuTarget::BoardCard(7),
+            MenuTarget::Canvas,
+        ] {
+            let menu = ContextMenu::for_target(target.clone(), true);
+            for entry in &menu.entries {
+                let MenuEntry::Item(item) = entry else {
+                    continue;
+                };
+                let Some(key) = item.key else {
+                    continue;
+                };
+                assert!(
+                    !owned.iter().any(|owned| key.eq_ignore_ascii_case(owned)),
+                    "{target:?}'s {:?} prints {key:?}, which the menu itself takes for something \
+                     else",
+                    item.label
+                );
+            }
+        }
     }
 }

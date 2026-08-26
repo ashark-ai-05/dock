@@ -65,6 +65,8 @@ pub enum PaneCommand {
     Detach,
     Help,
     Quit,
+    /// Collapse the sidebar to a rail, or bring it back.
+    ToggleSidebar,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +194,9 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         // the prefix key itself — pressing it twice already means "send a literal Ctrl+B".
         KeyCode::Char('B') => PaneCommand::SplitBoard,
         KeyCode::Char('g') => PaneCommand::Git,
+        // `s` for sidebar. `b` would be the obvious letter and is unavailable: the prefix is
+        // Ctrl+B, so pressing it twice already means "send a literal Ctrl+B".
+        KeyCode::Char('s') => PaneCommand::ToggleSidebar,
         // Cycling is fine for two workspaces and miserable for eight. A digit is the only way to
         // reach a distant workspace in constant time. `0` is deliberately unbound: the positions
         // are 1-based on screen, so binding it would place a tenth workspace under a key that

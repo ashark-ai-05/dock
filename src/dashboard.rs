@@ -353,6 +353,29 @@ pub struct Dashboard {
     /// behind the pointer. The local layout is still updated on every event, so the drag looks
     /// live; only the authority call waits for the release.
     pending_divider_resize: Option<(String, String, u16)>,
+    /// How much of the sidebar is showing.
+    sidebar: SidebarState,
+    /// True once the user has toggled it by hand, so the automatic rule in `render` stops
+    /// overriding a deliberate choice until the terminal is resized again.
+    sidebar_chosen: bool,
+    /// The rectangle the rail was last drawn into, so a click on it can expand it. `Rect::default()`
+    /// whenever the sidebar is not currently a rail, the same way `menu_area` is zeroed whenever
+    /// there is no menu — a stale rectangle from a wider frame would otherwise claim coordinates
+    /// nothing is drawn at any more.
+    sidebar_rail_area: Rect,
+}
+
+/// How much of the sidebar is showing.
+///
+/// A rail rather than nothing, because the sidebar's one irreplaceable job is saying that an
+/// agent wants you, and a collapse that takes that away has traded a capability for width.
+/// Three cells hold one state glyph per agent in the same blocked-first order the full list
+/// uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SidebarState {
+    #[default]
+    Full,
+    Rail,
 }
 
 /// A control drawn on the focused pane's border. Each mirrors a published key, so the mouse
@@ -1173,6 +1196,37 @@ impl Dashboard {
         }
     }
 
+    /// Lets the automatic rail rule take over again.
+    ///
+    /// A deliberate toggle outranks the automatic rule, but only until the geometry the rule
+    /// is about actually changes — otherwise one collapse early in a session would mean a
+    /// dashboard dragged to full screen kept a rail nobody wanted any more.
+    pub fn forget_sidebar_choice(&mut self) {
+        self.sidebar_chosen = false;
+    }
+
+    /// `DOCK_SIDEBAR=full|rail` picks the state a dashboard opens in. An environment variable
+    /// rather than a config file for the reason `clipboard::preference` gives: this is a
+    /// property of the terminal a dashboard was started in, not of the repository it is
+    /// looking at.
+    fn sidebar_from_env() -> (SidebarState, bool) {
+        match std::env::var("DOCK_SIDEBAR").ok().as_deref().map(str::trim) {
+            Some("rail") => (SidebarState::Rail, true),
+            Some("full") => (SidebarState::Full, true),
+            _ => (SidebarState::Full, false),
+        }
+    }
+
+    /// Applies `DOCK_SIDEBAR` once, on the construction path in `main.rs` where a running
+    /// dashboard is built from `Dashboard::default()`. A method rather than inlining the match
+    /// there because `sidebar`/`sidebar_chosen` are private — the same reason
+    /// `set_repository_catalog` exists instead of `main.rs` writing those fields directly.
+    pub fn apply_sidebar_env(&mut self) {
+        let (sidebar, chosen) = Self::sidebar_from_env();
+        self.sidebar = sidebar;
+        self.sidebar_chosen = chosen;
+    }
+
     /// Feeds a pushed event into this client's own emulator.
     ///
     /// `PaneAttached` is always a (re-)seed: the daemon sends it when a run is first seen and
@@ -1625,6 +1679,10 @@ impl Dashboard {
         self.board_card_areas.clear();
         self.sidebar_workspace_areas.clear();
         self.sidebar_agent_areas.clear();
+        // Cleared unconditionally, like `menu_area` below: the narrow path returns before the
+        // sidebar is drawn at all, and a rail rectangle left over from a wider frame would
+        // otherwise claim coordinates for a click-to-expand that has nothing to expand into.
+        self.sidebar_rail_area = Rect::default();
         let area = frame.area();
         // Painted first so every widget that leaves cells untouched still sits on the theme's
         // surface rather than whatever the host terminal happens to use.
@@ -1655,7 +1713,23 @@ impl Dashboard {
             area.width,
             area.height.saturating_sub(4 + tabs_height),
         );
-        let sidebar_width = body.width.min(28);
+        const FULL_SIDEBAR: u16 = 28;
+        const RAIL_SIDEBAR: u16 = 3;
+        // A full sidebar that would leave the canvas under sixty columns is a sidebar taking
+        // more than it gives, so below that the rail is automatic — until the user says
+        // otherwise, at which point their choice stands until the next resize
+        // (`forget_sidebar_choice`).
+        if !self.sidebar_chosen {
+            self.sidebar = if body.width < FULL_SIDEBAR + 60 {
+                SidebarState::Rail
+            } else {
+                SidebarState::Full
+            };
+        }
+        let sidebar_width = body.width.min(match self.sidebar {
+            SidebarState::Full => FULL_SIDEBAR,
+            SidebarState::Rail => RAIL_SIDEBAR,
+        });
         let sidebar = Rect::new(body.x, body.y, sidebar_width, body.height);
         let panes = Rect::new(
             body.x + sidebar_width,
@@ -2122,6 +2196,15 @@ impl Dashboard {
     }
 
     fn render_sidebar(&mut self, frame: &mut Frame, area: Rect) {
+        // The rail draws nothing this function builds below — no WORKSPACES list, no AGENTS
+        // heading, no START HERE menu — so it returns before `sidebar_workspace_areas` and
+        // `sidebar_agent_areas` are touched. `render` already cleared both for this frame, so
+        // a right-click resolves against what is actually on screen (the rail's glyphs, which
+        // record only `sidebar_rail_area`) rather than a full-sidebar row left over from the
+        // last frame that had room for one.
+        if matches!(self.sidebar, SidebarState::Rail) {
+            return self.render_sidebar_rail(frame, area);
+        }
         let heading = Style::default()
             .fg(self.theme.text)
             .add_modifier(Modifier::BOLD);
@@ -2292,6 +2375,31 @@ impl Dashboard {
             ),
             area,
         );
+    }
+
+    /// One glyph per agent, blocked first, in the order the full roster sorts — the rail's
+    /// entire reason to exist. No border, no heading, no click rectangles for the rows
+    /// themselves: three columns is not room for a menu, only for the one fact a collapsed
+    /// sidebar must not lose.
+    fn render_sidebar_rail(&mut self, frame: &mut Frame, area: Rect) {
+        // Two blank rows lead the roster, so the first glyph lands where the AGENTS list starts
+        // in the full sidebar rather than crowding the header the sidebar sits beneath.
+        let mut lines = vec![Line::from(""), Line::from("")];
+        for (state, _, _, _, _) in self
+            .agent_roster()
+            .into_iter()
+            .take(usize::from(area.height))
+        {
+            lines.push(Line::styled(
+                format!(" {}", state.glyph()),
+                Style::default().fg(self.theme.agent(state)),
+            ));
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+        // Recorded so `mouse` can expand the sidebar on a left click here. Set only once the
+        // rail is actually the thing drawn into `area`, the same discipline `launch_area` and
+        // every other click rectangle in this file follow.
+        self.sidebar_rail_area = area;
     }
 
     /// Live agents ordered by how much they are costing the user: blocked first, then by
@@ -3306,6 +3414,14 @@ impl Dashboard {
             PaneCommand::Help => {
                 self.error = None;
                 self.help_open = true;
+                UiCommand::None
+            }
+            PaneCommand::ToggleSidebar => {
+                self.sidebar = match self.sidebar {
+                    SidebarState::Full => SidebarState::Rail,
+                    SidebarState::Rail => SidebarState::Full,
+                };
+                self.sidebar_chosen = true;
                 UiCommand::None
             }
         }
@@ -6227,6 +6343,12 @@ impl Dashboard {
                         PaneControl::Rename => PaneCommand::Rename,
                         PaneControl::Close => PaneCommand::Close,
                     });
+                }
+                // `sidebar_rail_area` is `Rect::default()` (and so contains nothing) whenever the
+                // rail is not actually on screen, so this can only ever expand a rail that is
+                // drawn — never toggle a full sidebar from a rectangle a taller frame left behind.
+                if contains(self.sidebar_rail_area, event.column, event.row) {
+                    return self.run_command(PaneCommand::ToggleSidebar);
                 }
                 if let Some(command) = self
                     .quick_action_areas
@@ -9805,10 +9927,19 @@ mod tests {
         // land `ACTIVE` at the same eighteen cells (`FILLED_MIN`, the floor for an occupied
         // column with no surplus left to hand out) — too narrow for
         // `claude · a · needs you · 0 queued`, wide enough for the word that matters.
+        // Task 8's rail claims the sidebar's spare columns below its own threshold (88), so at
+        // 95 and 80 wide — both under it — the board pane would otherwise land at a canvas width
+        // this test's comment above was never written against. Two toggles pin the sidebar back
+        // to `Full` (the state a fresh dashboard already opens in, so the geometry below is
+        // unchanged) without the automatic rule overriding it for these renders.
         let mut dashboard = dashboard_with_a_board_pane();
         dashboard.layout.workspaces[0].root = LayoutNode::Pane {
             pane_id: "b".into(),
         };
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         let terminal = render_terminal(&mut dashboard, 95, 24);
         let active = board_column(&terminal, "ACTIVE");
         assert!(
@@ -11788,6 +11919,107 @@ mod tests {
         );
     }
 
+    /// `Ctrl+B s` toggles the sidebar between full and a rail, and the rail keeps the one thing
+    /// the sidebar is for: which agents want something.
+    #[test]
+    fn the_sidebar_collapses_to_a_rail_that_still_shows_who_needs_you() {
+        let mut dashboard = dashboard();
+        dashboard.agents.insert(
+            "run_a".into(),
+            (Some(AgentKind::Claude), AgentState::Blocked),
+        );
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        let wide = dashboard.pane_areas["a"].width;
+        drop(terminal);
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        assert!(
+            dashboard.pane_areas["a"].width > wide,
+            "collapsing the sidebar must give the canvas the width"
+        );
+        let painted = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            painted.contains(AgentState::Blocked.glyph()),
+            "a rail with no state glyph is a rail that has thrown away its only job"
+        );
+        assert!(
+            !painted.contains("WORKSPACES"),
+            "but the headings are gone: {painted:?}"
+        );
+        drop(terminal);
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        render_terminal(&mut dashboard, 100, 30);
+        assert_eq!(dashboard.pane_areas["a"].width, wide, "and it comes back");
+    }
+
+    /// A terminal too narrow for both rails itself, so the canvas is never mostly sidebar.
+    #[test]
+    fn a_narrow_terminal_rails_the_sidebar_on_its_own() {
+        let mut dashboard = dashboard();
+        render_terminal(&mut dashboard, 80, 24);
+        assert!(
+            dashboard.pane_areas["a"].width + dashboard.pane_areas["b"].width > 80 - 28,
+            "80 columns is under the threshold, so the sidebar should have railed itself"
+        );
+    }
+
+    /// A right-click over the rail must never resolve to a full-sidebar row that is not on
+    /// screen: task 7's pointer menu resolves a right-click against `sidebar_workspace_areas`
+    /// and `sidebar_agent_areas`, which `render` clears every frame and the rail path never
+    /// refills. So a right-click in the rail's column finds nothing sidebar-specific — not a
+    /// stale row from the last frame that had room for the full list.
+    #[test]
+    fn a_right_click_on_the_rail_never_resolves_to_a_stale_full_sidebar_row() {
+        let mut dashboard = dashboard();
+        dashboard.agents.insert(
+            "run_a".into(),
+            (Some(AgentKind::Claude), AgentState::Blocked),
+        );
+        // Full first, so `sidebar_workspace_areas`/`sidebar_agent_areas` are populated with real
+        // rows — the exact staleness this test rules out if the rail path forgot to clear them.
+        render_terminal(&mut dashboard, 100, 30);
+        assert!(
+            !dashboard.sidebar_workspace_areas.is_empty(),
+            "premise: the full sidebar must have recorded a row or this proves nothing"
+        );
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        render_terminal(&mut dashboard, 100, 30);
+        assert!(
+            dashboard.sidebar_workspace_areas.is_empty(),
+            "the rail path must not leave the full sidebar's rows recorded"
+        );
+        assert!(
+            dashboard.sidebar_agent_areas.is_empty(),
+            "the rail path must not leave the full sidebar's rows recorded"
+        );
+        let rail = dashboard.sidebar_rail_area;
+        assert!(
+            rail.width > 0,
+            "the rail itself must have recorded where it drew"
+        );
+
+        let target = dashboard.menu_target_at(rail.x, rail.y + 2);
+        assert!(
+            !matches!(
+                target,
+                MenuTarget::SidebarWorkspace(_) | MenuTarget::SidebarAgent(_)
+            ),
+            "a right-click on the rail resolved to a sidebar row: {target:?}"
+        );
+    }
+
     /// The roster reads every agent's task out of one index rather than scanning the run list
     /// once per agent, so that index has to answer exactly what a single lookup answers —
     /// including for the run whose binding is blank, the run this dashboard dispatched itself,
@@ -12382,7 +12614,10 @@ mod tests {
 
     #[test]
     fn the_scroll_marker_shortens_the_title_rather_than_erasing_it_at_every_width() {
-        let scrolled_dashboard_at = |width: u16| {
+        // `pin_sidebar_full`: two toggles rather than one, so the net state is unchanged
+        // (`Full`, what a fresh dashboard already opens in) but `sidebar_chosen` becomes `true`
+        // and the automatic rail rule (task 8) stops overriding it for this render.
+        let scrolled_dashboard_at = |width: u16, pin_sidebar_full: bool| {
             let mut dashboard = bound_dashboard();
             dashboard.apply_event(attach_event("run_1", b""));
             for line in 0..100 {
@@ -12393,11 +12628,23 @@ mod tests {
                 ));
             }
             dashboard.scroll_pane("run_1", 12);
+            if pin_sidebar_full {
+                for _ in 0..2 {
+                    dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+                    dashboard.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+                }
+            }
             render_to_string(&mut dashboard, width, 24)
         };
 
         // Narrow: only a bare glyph fits beside the title, so that is all that is asked for.
-        let narrow = scrolled_dashboard_at(60);
+        //
+        // A 60-column frame is under the rail threshold (task 8), so without pinning the
+        // sidebar it now auto-rails and hands pane "a" enough width for the row count — the
+        // rail giving width back is exactly this feature's point, and the geometry this rung
+        // depends on (a whole terminal narrow enough to starve the pane by itself) now only
+        // exists with the sidebar deliberately kept `Full`, which is what pinning it reproduces.
+        let narrow = scrolled_dashboard_at(60, true);
         assert!(
             narrow.contains("editor"),
             "a narrow pane must shorten its title for the marker, not erase it: {narrow}"
@@ -12412,7 +12659,7 @@ mod tests {
         );
 
         // Mid: room for the row count, still not the whole sentence.
-        let mid = scrolled_dashboard_at(75);
+        let mid = scrolled_dashboard_at(75, false);
         assert!(
             mid.contains("editor"),
             "a mid-width pane must still show its own title: {mid}"
@@ -12427,7 +12674,7 @@ mod tests {
         );
 
         // Wide: room for everything, so the pane gets everything.
-        let wide = scrolled_dashboard_at(110);
+        let wide = scrolled_dashboard_at(110, false);
         assert!(
             wide.contains("editor"),
             "a wide pane has no excuse to shorten the title at all: {wide}"

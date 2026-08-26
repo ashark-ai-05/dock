@@ -3983,14 +3983,31 @@ impl Dashboard {
     /// The mode is taken out of `self` for the duration: the handlers need `self.error` and
     /// the frozen screen at the same time, and leaving it in place would borrow `self` twice.
     ///
-    /// Which is also why the freeze happens here, before the take, rather than beside the
-    /// motion keys that need it: once the mode is owned, `self.copy` is empty and
-    /// `freeze_selection` has nothing to find. Freezing on the first key of *any* keyboard
-    /// interaction is right on its own terms anyway — a user driving a selection with `hjkl`
-    /// is reading rows, and `k` past the top walks into scrollback the live viewport does not
-    /// hold. A pointer selection nobody types into still never pays for this.
+    /// Which is why the freeze below is *decided* before the take and not beside the arm that
+    /// needs it: once the mode is owned, `self.copy` is empty and `freeze_selection` has
+    /// nothing to find. Deciding early is not the same as freezing eagerly, and the
+    /// difference is the whole point of `SelectionScreen` — "drag a selection, press Esc" is
+    /// the flow this mode is used in most, and it must not pay for a grid it never reads.
     fn copy_key(&mut self, key: KeyEvent) -> UiCommand {
-        if let Some(run_id) = self.copy.as_ref().map(|mode| mode.session.run_id.clone()) {
+        // Exactly one thing in this function can move a viewport: `CopyMode::step`'s `edge`
+        // branch, reached only by the four motions and their arrows. Everything else needs
+        // only the grid already in hand — `Esc` and `q` exit and drop it, `y` yanks through
+        // `screen_of` (and `Live` *means* no output has arrived, so the live grid is still the
+        // one the selection was made against), and `v`/`g`/`G`/`/`/`n`/`N` and the unhandled
+        // keys move nothing but session coordinates: `CopySession` holds no screen to move.
+        //
+        // The two exclusions are the same two the match below applies. A composing modifier
+        // means somebody is reaching past copy mode rather than stepping (`Ctrl+H` must not
+        // move left), and while the search prompt is open every letter is query text.
+        let walks_history = !self.copy_searching
+            && match key.code {
+                KeyCode::Char('h' | 'j' | 'k' | 'l') => !composed(key),
+                KeyCode::Left | KeyCode::Down | KeyCode::Up | KeyCode::Right => true,
+                _ => false,
+            };
+        if walks_history
+            && let Some(run_id) = self.copy.as_ref().map(|mode| mode.session.run_id.clone())
+        {
             self.freeze_selection(&run_id);
         }
         let Some(mut mode) = self.copy.take() else {
@@ -12071,14 +12088,10 @@ mod tests {
         );
     }
 
-    /// A selection on an idle pane must not clone the screen, and a selection on a pane that
-    /// then produces output must still yank the grid it was made against.
-    ///
-    /// Both halves matter and they pull opposite ways, which is why they are one test. The
-    /// freeze is what makes copy mode a freeze rather than a claim; doing it eagerly is what
-    /// put a multi-megabyte clone on the first frame of every drag.
-    #[test]
-    fn a_selection_clones_the_screen_only_once_output_arrives_under_it() {
+    /// A dashboard whose pane "a" carries a pointer selection over the word "selected", made
+    /// by a press and one drag. This is the state every "does that key clone the grid?"
+    /// question below is asked from.
+    fn dragged_selection() -> Dashboard {
         let mut dashboard = bound_dashboard();
         dashboard.apply_event(attach_event("run_1", b""));
         dashboard.apply_event(delta_event("run_1", 2, b"selected text\r\n"));
@@ -12096,6 +12109,18 @@ mod tests {
             row: area.y + 1,
             modifiers: KeyModifiers::NONE,
         });
+        dashboard
+    }
+
+    /// A selection on an idle pane must not clone the screen, and a selection on a pane that
+    /// then produces output must still yank the grid it was made against.
+    ///
+    /// Both halves matter and they pull opposite ways, which is why they are one test. The
+    /// freeze is what makes copy mode a freeze rather than a claim; doing it eagerly is what
+    /// put a multi-megabyte clone on the first frame of every drag.
+    #[test]
+    fn a_selection_clones_the_screen_only_once_output_arrives_under_it() {
+        let mut dashboard = dragged_selection();
         assert!(
             matches!(
                 dashboard
@@ -12137,6 +12162,74 @@ mod tests {
         assert!(
             dashboard.screens["run_1"].visible_row(0).contains("wiped"),
             "the live parser kept consuming the delta the selection was frozen against"
+        );
+    }
+
+    /// Only a motion key may cost a pointer selection its clone, because only a motion can
+    /// move a viewport into scrollback the live screen is not showing.
+    ///
+    /// The first cut of this froze on *every* key reaching copy mode, which meant the single
+    /// most common thing anyone does with a pointer selection — drag it, then dismiss the
+    /// mode — paid the whole multi-megabyte clone and threw it away on the next line. That is
+    /// the exact cost `SelectionScreen` exists to remove, so the narrowing is pinned here in
+    /// both directions rather than left to a comment.
+    ///
+    /// `Esc`, `q` and `y` are the flow that motivated this and cannot be asserted directly:
+    /// each ends the mode and takes the screen with it, leaving nothing to match on. They are
+    /// covered by construction instead — the guard is one expression evaluated before the
+    /// match, so a key that does not walk history cannot freeze whichever arm it lands in.
+    #[test]
+    fn only_a_motion_key_freezes_a_pointer_selection() {
+        // Every bound key that keeps the mode open and cannot move a viewport: begin a
+        // selection, jump to either edge of the viewport it already has, open the search
+        // prompt, jump to a match — `CopySession` holds no screen for any of these to move —
+        // and one key copy mode does not bind at all, for the `_ => {}` arm.
+        for code in [
+            KeyCode::Char('v'),
+            KeyCode::Char('g'),
+            KeyCode::Char('G'),
+            KeyCode::Char('/'),
+            KeyCode::Char('n'),
+            KeyCode::Char('z'),
+        ] {
+            let mut dashboard = dragged_selection();
+            dashboard.key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(
+                matches!(
+                    dashboard
+                        .copy
+                        .as_ref()
+                        .expect("the key must not have ended the mode")
+                        .screen,
+                    SelectionScreen::Live
+                ),
+                "{code:?} reads the grid the selection already has and must not clone it"
+            );
+        }
+
+        // A letter typed at the search prompt is query text, not a motion, however much it
+        // looks like one: `h` there must no more clone the grid than `z` does.
+        let mut dashboard = dragged_selection();
+        dashboard.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(
+            matches!(
+                dashboard.copy.as_ref().expect("still selecting").screen,
+                SelectionScreen::Live
+            ),
+            "a letter typed into the search query is not a walk into history"
+        );
+
+        // And the one kind of key that does walk history still freezes, or `k` past the top
+        // row would have no scrollback of its own to step into.
+        let mut dashboard = dragged_selection();
+        dashboard.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert!(
+            matches!(
+                dashboard.copy.as_ref().expect("still selecting").screen,
+                SelectionScreen::Frozen(_)
+            ),
+            "a motion must take the grid with it before walking off the viewport"
         );
     }
 

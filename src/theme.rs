@@ -79,8 +79,13 @@ impl Theme {
         }
     }
 
-    /// `DOCK_THEME=warm` keeps the old palette. Same shape as `DOCK_CLIPBOARD` and
-    /// `DOCK_SIDEBAR`, and for the same reason.
+    /// `DOCK_THEME=warm` keeps the old palette. Not read through `Default`, for the reason
+    /// `DOCK_SIDEBAR` is not read through it either: `Default for Theme` backs
+    /// `Dashboard::default()`, which every test in this file builds a dashboard from, and a
+    /// palette that changed underneath the whole suite whenever `DOCK_THEME` happened to be
+    /// set in a shell or a CI runner would fail nothing while quietly rendering the wrong
+    /// tokens. This is applied once, explicitly, on the real construction path — see
+    /// `Dashboard::apply_theme_env`, called from `main.rs` beside `apply_sidebar_env`.
     pub fn from_env() -> Theme {
         match std::env::var("DOCK_THEME").ok().as_deref().map(str::trim) {
             Some("warm") => Theme::warm(),
@@ -103,12 +108,8 @@ impl Theme {
 }
 
 impl Default for Theme {
-    /// `const fn` cannot read the environment, so the palette switch lives here rather than in
-    /// `warm()`/`cool()` — every call site that builds a `Theme` through `Default` (which is
-    /// how `Dashboard` gets one, since it derives `Default` itself) picks up `DOCK_THEME`
-    /// without having to know that variable exists.
     fn default() -> Self {
-        Self::from_env()
+        Self::cool()
     }
 }
 

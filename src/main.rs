@@ -528,6 +528,7 @@ fn run_dashboard(
     let mut dashboard = Dashboard::default();
     dashboard.runtime_directory = runtime_directory.clone();
     dashboard.apply_sidebar_env();
+    dashboard.apply_theme_env();
     let (catalog_tx, catalog_rx) = mpsc::channel();
     let mut catalog_loading = false;
     let mut test_events = test_events()?;

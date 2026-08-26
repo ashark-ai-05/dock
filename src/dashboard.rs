@@ -1227,6 +1227,16 @@ impl Dashboard {
         self.sidebar_chosen = chosen;
     }
 
+    /// Applies `DOCK_THEME` once, on the same construction path as `apply_sidebar_env` and for
+    /// the same reason: `theme` is private, and `Theme::default()` deliberately does *not*
+    /// read the environment (see `Theme::from_env`'s doc comment) because `Dashboard::default()`
+    /// backs every test dashboard in this file, and a palette that shifted under the whole
+    /// suite whenever `DOCK_THEME` happened to be set would fail nothing while quietly
+    /// rendering the wrong tokens.
+    pub fn apply_theme_env(&mut self) {
+        self.theme = Theme::from_env();
+    }
+
     /// Feeds a pushed event into this client's own emulator.
     ///
     /// `PaneAttached` is always a (re-)seed: the daemon sends it when a run is first seen and
@@ -2402,7 +2412,14 @@ impl Dashboard {
                 Style::default().fg(self.theme.agent(state)),
             ));
         }
-        frame.render_widget(Paragraph::new(lines), area);
+        // `panel`, matching the full sidebar: without this the rail and the expanded sidebar
+        // it collapses to/from disagreed on ground colour, which reads as the one surface in
+        // the dashboard whose background depends on which of its two states it happens to be
+        // in rather than on what it is (chrome).
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(self.theme.panel)),
+            area,
+        );
         // Recorded so `mouse` can expand the sidebar on a left click here. Set only once the
         // rail is actually the thing drawn into `area`, the same discipline `launch_area` and
         // every other click rectangle in this file follow.

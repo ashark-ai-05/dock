@@ -205,6 +205,15 @@ pub struct Dashboard {
     /// than inside `CopySession` because the query outlives the prompt: `n`/`N` reuse it once
     /// Enter has closed the editor.
     copy_searching: bool,
+    /// The open pointer menu, if any.
+    menu: Option<ContextMenu>,
+    /// Where the pointer was when the menu was opened. Kept apart from the menu itself
+    /// because `place` is a pure function of it and the frame, and because `Paste last copy`
+    /// pastes at the point that was right-clicked rather than wherever the menu ended up.
+    menu_origin: (u16, u16),
+    /// The rectangle the last frame drew the menu into, so a click can be tested against what
+    /// is on screen rather than against a rectangle recomputed from a stale frame size.
+    menu_area: Rect,
     rename_form: Option<(RenameTarget, String)>,
     /// The open chooser, if any, and what taking a row from it will do. Client-local: filtering a
     /// list the daemon already sent costs the daemon nothing.
@@ -305,6 +314,24 @@ pub struct Dashboard {
     pane_control_areas: Vec<(PaneControl, Rect)>,
     /// The sidebar's clickable menu of what this dashboard can do.
     quick_action_areas: Vec<(PaneCommand, Rect)>,
+    /// Where each sidebar WORKSPACES row landed, and which workspace it names.
+    ///
+    /// Recorded for the same reason `quick_action_areas` is, through the same `clickable_row`
+    /// helper, so a row the sidebar had no room to draw claims no coordinates. Nothing acts on
+    /// a left click here today — these exist so the pointer menu can tell which workspace a
+    /// right-click landed on rather than guessing from the row number.
+    sidebar_workspace_areas: Vec<(String, Rect)>,
+    /// Where each sidebar AGENTS row landed, and the run it names. A two-line entry records
+    /// only its first row: the second line is the workspace the agent is in, and it belongs to
+    /// the row above rather than being an entry of its own.
+    sidebar_agent_areas: Vec<(String, Rect)>,
+    /// Where each card of the open board overlay landed.
+    ///
+    /// Only the overlay's, not the Board pane's: everything the card menu offers — archive,
+    /// move, dispatch — is written against `self.board`, so a card menu over a pane would print
+    /// items that quietly do nothing. A right-click in a Board pane gets the pane's menu, which
+    /// is true of it.
+    board_card_areas: Vec<(u64, Rect)>,
     last_launch_profile: usize,
     last_repository_mode: bool,
     /// The last text this dashboard put on the clipboard, and what a middle or right click
@@ -580,6 +607,7 @@ pub enum OverlayKind {
     Board,
     Git,
     Copy,
+    ContextMenu,
 }
 
 /// Every overlay, in the one order that governs both drawing and key routing.
@@ -594,7 +622,13 @@ pub enum OverlayKind {
 ///
 /// Both sites now derive from this array, so adding a surface is one entry in one place and
 /// there is no second list to get half right.
-const OVERLAY_ORDER: [OverlayKind; 8] = [
+///
+/// The pointer menu is the one surface that can genuinely be open *over* another — a right-click
+/// while the board or the Git overlay is up opens a menu on top of it — so it is also the one
+/// exception to "the first open overlay takes the key". See `key`, which takes the menu first
+/// when it is open precisely because this array draws it last. Every other pair is mutually
+/// exclusive in practice, so this order still decides the rest.
+const OVERLAY_ORDER: [OverlayKind; 9] = [
     OverlayKind::Help,
     OverlayKind::Rename,
     OverlayKind::LaunchForm,
@@ -603,6 +637,9 @@ const OVERLAY_ORDER: [OverlayKind; 8] = [
     OverlayKind::Board,
     OverlayKind::Git,
     OverlayKind::Copy,
+    // Last, so it draws over whatever it was opened on top of. A menu is the most transient
+    // surface Dock has, and what is on top is what the pointer and the keyboard are aimed at.
+    OverlayKind::ContextMenu,
 ];
 
 /// What an open picker does with the row the user takes.
@@ -673,9 +710,9 @@ struct PaneDrag {
 }
 
 /// What a right-click landed on. The menu's contents are a function of this and nothing else.
-// Every variant but `Pane` is only ever constructed where a right-click is resolved to a
-// target — the mouse handling Task 7 adds. The allow comes off once that call site lands.
-#[allow(dead_code)]
+///
+/// Every variant is constructed by `menu_target_at`, which is the one place a pointer position
+/// becomes a target — so there is no second opinion about what a click landed on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MenuTarget {
     Pane(String),
@@ -726,9 +763,6 @@ struct ContextMenu {
     cursor: usize,
 }
 
-// Nothing constructs a `ContextMenu` outside its own tests until Task 7 wires it to the mouse,
-// the key router, and the render pass. The allow comes off there, when those call sites land.
-#[allow(dead_code)]
 impl ContextMenu {
     /// The menu for one target. `has_selection` greys out the items that need one rather than
     /// hiding them: an item that appears and disappears is one a person cannot learn.
@@ -1494,6 +1528,7 @@ impl Dashboard {
             OverlayKind::Board => self.board.is_some(),
             OverlayKind::Git => self.git.is_some(),
             OverlayKind::Copy => self.copy.is_some(),
+            OverlayKind::ContextMenu => self.menu.is_some(),
         }
     }
 
@@ -1521,6 +1556,7 @@ impl Dashboard {
             OverlayKind::Board => self.render_board(frame, area),
             OverlayKind::Git => self.render_git(frame, area),
             OverlayKind::Copy => {}
+            OverlayKind::ContextMenu => self.render_context_menu(frame),
         }
     }
 
@@ -1543,6 +1579,7 @@ impl Dashboard {
             OverlayKind::Board => self.board_key(key),
             OverlayKind::Git => self.git_key(key),
             OverlayKind::Copy => self.copy_key(key),
+            OverlayKind::ContextMenu => self.menu_key(key),
         }
     }
 
@@ -1564,6 +1601,12 @@ impl Dashboard {
         self.close_workspace_area = None;
         self.confirm_close_workspace_area = None;
         self.pane_control_areas.clear();
+        // Cleared here rather than only where they are filled: `render_board` returns early when
+        // the overlay is closed, and a card rectangle left over from the frame it was open on
+        // would claim coordinates belonging to whatever is drawn there now.
+        self.board_card_areas.clear();
+        self.sidebar_workspace_areas.clear();
+        self.sidebar_agent_areas.clear();
         let area = frame.area();
         // Painted first so every widget that leaves cells untouched still sits on the theme's
         // surface rather than whatever the host terminal happens to use.
@@ -2066,6 +2109,10 @@ impl Dashboard {
         let inner_width = usize::from(area.width).saturating_sub(1);
         let mut rows = SidebarRows::new(area.height);
         rows.push(|| Line::styled("WORKSPACES", heading));
+        // Taken out of `self` rather than built fresh, because the closure below borrows `self`
+        // immutably for the whole loop and cannot push through it — and because `render` already
+        // emptied this, so taking it back reuses the buffer instead of allocating one per frame.
+        let mut workspace_rows = std::mem::take(&mut self.sidebar_workspace_areas);
         for (index, workspace) in self.layout.workspaces.iter().enumerate() {
             rows.push(|| {
                 Line::styled(
@@ -2085,14 +2132,21 @@ impl Dashboard {
                     }),
                 )
             });
+            if let Some(row) = clickable_row(area, rows.last()) {
+                workspace_rows.push((workspace.workspace_id.clone(), row));
+            }
         }
+        self.sidebar_workspace_areas = workspace_rows;
         rows.push(|| Line::from(""));
         rows.push(|| Line::styled("AGENTS", heading));
         // Sized so the leading glyph and its two spaces still fit inside the border.
         let label_width = inner_width.saturating_sub(3);
+        // Taken before the roster, which borrows `self` for the length of the loop below.
+        // Reused per frame, for the reason `workspace_rows` above is.
+        let mut agent_rows = std::mem::take(&mut self.sidebar_agent_areas);
         let roster = self.agent_roster();
         let roster_is_empty = roster.is_empty();
-        for (state, label, task, workspace) in roster {
+        for (state, label, task, workspace, run_id) in roster {
             // An agent below the sidebar's last row cannot be seen, and neither can any agent
             // after it. Everything below is off the bottom too, so every remaining index is
             // one `clickable_row` already answers `None` for and no rectangle can be misplaced
@@ -2145,6 +2199,11 @@ impl Dashboard {
                     ),
                 ])
             });
+            // Recorded against the identity line only. The overflow line below is the workspace
+            // this agent is in, which belongs to the row above rather than being a row of its own.
+            if let Some(row) = clickable_row(area, rows.last()) {
+                agent_rows.push((run_id.to_owned(), row));
+            }
             if let Some(workspace) = overflow {
                 // Indented under its agent and muted, so the eye reads it as belonging to the row
                 // above rather than as another agent.
@@ -2159,6 +2218,7 @@ impl Dashboard {
                 });
             }
         }
+        self.sidebar_agent_areas = agent_rows;
         if roster_is_empty {
             rows.push(|| Line::styled(" none running", Style::default().fg(self.theme.muted)));
         }
@@ -2239,7 +2299,13 @@ impl Dashboard {
                 // only once you know where to go.
                 let task = tasks.get(run_id.as_str()).cloned();
                 let workspace = workspaces.get(run_id.as_str()).copied();
-                Some((*state, kind.as_ref()?.label(), task, workspace))
+                Some((
+                    *state,
+                    kind.as_ref()?.label(),
+                    task,
+                    workspace,
+                    run_id.as_str(),
+                ))
             })
             .collect();
         roster.sort_by(|left, right| {
@@ -2249,6 +2315,7 @@ impl Dashboard {
                 .then_with(|| left.1.cmp(right.1))
                 .then_with(|| left.2.cmp(&right.2))
                 .then_with(|| left.3.cmp(&right.3))
+                .then_with(|| left.4.cmp(right.4))
         });
         roster
     }
@@ -2590,7 +2657,10 @@ impl Dashboard {
         // a column's entries, and the two of them asking separately made that two passes for one
         // answer that cannot have changed in between.
         let cursor = self.board_cursor_at(view, &live);
-        render_board_columns(
+        // Discarded: the card actions a menu would offer are all written against the board
+        // *overlay*, so a card menu raised over a pane would print items that do nothing. A
+        // right-click here gets the pane's own menu, which is what this rectangle really is.
+        let _ = render_board_columns(
             frame,
             &self.theme,
             view,
@@ -3106,7 +3176,17 @@ impl Dashboard {
         // The whole stack sits ahead of the keymap on purpose: an open picker is taking a query
         // and copy mode owns every motion (`h`, `j`, `k`, `l`) and verb (`v`, `y`), so neither
         // can be allowed to reach a binding or the PTY as ordinary input.
-        let overlay = self.open_overlays().next();
+        //
+        // The pointer menu is the exception, and the only one: it is the single surface that can
+        // be open *over* another — right-clicking while the board is up opens a menu on top of it
+        // — and the surface a person is looking at is the surface their next key is meant for.
+        // Everything else in the array is mutually exclusive in practice, so `next()` still
+        // decides between the rest.
+        let overlay = self
+            .menu
+            .is_some()
+            .then_some(OverlayKind::ContextMenu)
+            .or_else(|| self.open_overlays().next());
         if let Some(kind) = overlay {
             return self.overlay_key(kind, key);
         }
@@ -3337,7 +3417,7 @@ impl Dashboard {
         // pane and an overlay differ in the rectangle they are handed and in whether Esc closes
         // them, which is the whole reason keeping the overlay costs nothing. They share the
         // cursor too — one board, one place the user is on it.
-        render_board_columns(
+        self.board_card_areas = render_board_columns(
             frame,
             &self.theme,
             &board.view,
@@ -5581,7 +5661,392 @@ impl Dashboard {
         })))
     }
 
+    /// What is under the pointer, most specific first. The rectangles are the ones the last
+    /// frame recorded, which is what makes this agree with what the user is looking at.
+    ///
+    /// Every lookup here is the same named method the left button uses where the left button
+    /// resolves the same thing, rather than a second copy of the hit-test. Two lookups that can
+    /// disagree about what is under the pointer would put the menu on one thing and the click on
+    /// another, and no test of either alone would see it.
+    fn menu_target_at(&self, column: u16, row: u16) -> MenuTarget {
+        if let Some(id) = self.board_card_at(column, row) {
+            return MenuTarget::BoardCard(id);
+        }
+        if let Some(workspace_id) = self.tab_at(column, row) {
+            return MenuTarget::Tab(workspace_id);
+        }
+        if let Some(target) = self.sidebar_target_at(column, row) {
+            return target;
+        }
+        if let Some(pane_id) = self.pane_at(column, row) {
+            return MenuTarget::Pane(pane_id);
+        }
+        MenuTarget::Canvas
+    }
+
+    /// The card of the open board overlay under the pointer, if any.
+    fn board_card_at(&self, column: u16, row: u16) -> Option<u64> {
+        self.board_card_areas
+            .iter()
+            .find(|(_, area)| contains(*area, column, row))
+            .map(|(id, _)| *id)
+    }
+
+    /// The workspace whose tab is under the pointer, if any. Shared with the left button's own
+    /// tab arm, which switches to whatever this names.
+    fn tab_at(&self, column: u16, row: u16) -> Option<String> {
+        self.tab_areas
+            .iter()
+            .find(|(_, area)| contains(*area, column, row))
+            .map(|(workspace_id, _)| workspace_id.clone())
+    }
+
+    /// The sidebar row under the pointer, as the menu target it stands for.
+    ///
+    /// Workspaces before agents only because a row belongs to exactly one of the two lists;
+    /// the order is a formality, not a precedence.
+    fn sidebar_target_at(&self, column: u16, row: u16) -> Option<MenuTarget> {
+        if let Some((workspace_id, _)) = self
+            .sidebar_workspace_areas
+            .iter()
+            .find(|(_, area)| contains(*area, column, row))
+        {
+            return Some(MenuTarget::SidebarWorkspace(workspace_id.clone()));
+        }
+        self.sidebar_agent_areas
+            .iter()
+            .find(|(_, area)| contains(*area, column, row))
+            .map(|(run_id, _)| MenuTarget::SidebarAgent(run_id.clone()))
+    }
+
+    /// The pane under the pointer, if any. Shared with the left button's focus arm and with the
+    /// wheel, both of which ask the same question of the same rectangles.
+    fn pane_at(&self, column: u16, row: u16) -> Option<String> {
+        self.pane_areas
+            .iter()
+            .find(|(_, area)| contains(**area, column, row))
+            .map(|(pane_id, _)| pane_id.clone())
+    }
+
+    /// Which entry of the open menu the pointer is over, as an index into `entries`.
+    ///
+    /// Tested against `menu_area` — what the last frame actually drew — rather than against a
+    /// rectangle recomputed from `place`, because the frame may have been resized since and a
+    /// menu the user is aiming at is the one on screen.
+    fn menu_row_at(&self, column: u16, row: u16) -> Option<usize> {
+        let menu = self.menu.as_ref()?;
+        let area = self.menu_area;
+        // The border rows and columns are not entries: a click on the frame of the menu is a
+        // click on the menu, which dismisses nothing and takes nothing.
+        if !contains(area, column, row) || row < area.y + 1 || row + 1 >= area.bottom() {
+            return None;
+        }
+        let index = usize::from(row - (area.y + 1));
+        (index < menu.entries.len()).then_some(index)
+    }
+
+    /// Keys while the menu is open. Nothing else sees them: a menu is modal for exactly as long
+    /// as it is on screen, which is why Esc has to close it rather than reaching past it.
+    fn menu_key(&mut self, key: KeyEvent) -> UiCommand {
+        let Some(menu) = self.menu.as_mut() else {
+            return UiCommand::None;
+        };
+        match key.code {
+            KeyCode::Esc => self.menu = None,
+            KeyCode::Up => menu.move_cursor(-1),
+            KeyCode::Down => menu.move_cursor(1),
+            KeyCode::Enter => return self.take_menu_item(),
+            // Typing an item's own key takes it. The key column is not decoration — it is
+            // the answer to "how do I do this without the menu next time", and a menu that
+            // prints a key it will not accept is teaching one thing and doing another.
+            KeyCode::Char(typed) => {
+                let matched = menu.entries.iter().position(|entry| match entry {
+                    MenuEntry::Item(item) => {
+                        item.enabled
+                            && item
+                                .key
+                                .is_some_and(|key| key.ends_with(typed) && key.len() <= 2)
+                    }
+                    MenuEntry::Separator => false,
+                });
+                if let Some(index) = matched {
+                    menu.cursor = index;
+                    return self.take_menu_item();
+                }
+            }
+            _ => {}
+        }
+        UiCommand::None
+    }
+
+    /// Runs the item under the cursor and closes the menu.
+    fn take_menu_item(&mut self) -> UiCommand {
+        let Some(menu) = self.menu.take() else {
+            return UiCommand::None;
+        };
+        let MenuEntry::Item(item) = &menu.entries[menu.cursor] else {
+            return UiCommand::None;
+        };
+        if !item.enabled {
+            return UiCommand::None;
+        }
+        let action = item.action.clone();
+        // Aimed before it is run, never after. Every `PaneCommand` acts on whatever the dashboard
+        // currently has selected, and the thing that was right-clicked is very often not it — so
+        // "Close pane" on an unfocused pane's menu, or "Close workspace" on another tab's, would
+        // otherwise destroy the wrong one. This is the same defect the card actions carry an id
+        // to avoid, and it is fixed the same way: point the selection at the target first.
+        self.aim_at(&menu.target);
+        match action {
+            MenuAction::Pane(command) => self.run_command(command),
+            MenuAction::CopySelection => {
+                self.copy_pointer_selection();
+                UiCommand::None
+            }
+            MenuAction::PasteLastCopy => {
+                let (column, row) = self.menu_origin;
+                self.paste_last_copied(column, row)
+            }
+            MenuAction::ArchiveCard(id) => self.archive_card(id),
+            MenuAction::MoveCard(id, delta) => self.move_card(id, delta),
+            MenuAction::DispatchCard(id) => self.dispatch_card(id),
+            MenuAction::FocusPane(run_id) => self.focus_run(&run_id),
+            MenuAction::SwitchWorkspace(id) => self.take_picked(PickerPurpose::Workspace, &id),
+        }
+    }
+
+    /// Puts the dashboard's own selection on whatever the menu was opened over.
+    ///
+    /// Local only, and deliberately so: it does not tell the daemon which pane has focus. Every
+    /// request a menu item goes on to send names its subject explicitly, so what this has to get
+    /// right is which pane or workspace the *next few lines* read — and a `Focus` round trip in
+    /// front of the item the user actually picked would put a blocking daemon call between the
+    /// click and the thing it asked for.
+    fn aim_at(&mut self, target: &MenuTarget) {
+        match target {
+            MenuTarget::Pane(pane_id) => {
+                if self
+                    .workspace()
+                    .is_some_and(|workspace| workspace.panes.contains_key(pane_id))
+                {
+                    self.layout.workspaces[self.workspace_index].focused_pane_id = pane_id.clone();
+                }
+            }
+            MenuTarget::Tab(workspace_id) | MenuTarget::SidebarWorkspace(workspace_id) => {
+                if let Some(index) = self
+                    .layout
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.workspace_id == *workspace_id)
+                {
+                    self.workspace_index = index;
+                }
+            }
+            MenuTarget::SidebarAgent(run_id) => self.aim_at_run(run_id),
+            // The card actions carry their own id and move the board cursor themselves, and the
+            // canvas menu is the one menu whose items are about the dashboard rather than about
+            // anything under the pointer.
+            MenuTarget::BoardCard(_) | MenuTarget::Canvas => {}
+        }
+    }
+
+    /// Selects the workspace and pane a run is in, wherever on the canvas it is.
+    ///
+    /// The sidebar roster is the one list that spans workspaces, so a row of it can name a run
+    /// that is not on screen — and `Resume` or `Restart` taken from that row must reach that
+    /// agent rather than whichever pane happened to be focused.
+    fn aim_at_run(&mut self, run_id: &str) {
+        let found = self
+            .layout
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(index, workspace)| {
+                workspace
+                    .panes
+                    .values()
+                    .find(|pane| pane.run_id.as_deref() == Some(run_id))
+                    .map(|pane| (index, pane.pane_id.clone()))
+            });
+        if let Some((index, pane_id)) = found {
+            self.workspace_index = index;
+            self.layout.workspaces[index].focused_pane_id = pane_id;
+        }
+    }
+
+    /// Focuses the pane a run is in and tells the daemon, which is what a left click on that
+    /// pane would have done had the pane been on screen.
+    fn focus_run(&mut self, run_id: &str) -> UiCommand {
+        self.aim_at_run(run_id);
+        let Some(workspace) = self.workspace() else {
+            self.error = Some(format!("that agent's pane is gone: {run_id}"));
+            return UiCommand::None;
+        };
+        let (workspace_id, pane_id) = (
+            workspace.workspace_id.clone(),
+            workspace.focused_pane_id.clone(),
+        );
+        if self
+            .workspace()
+            .and_then(|workspace| workspace.panes.get(&pane_id))
+            .and_then(|pane| pane.run_id.as_deref())
+            != Some(run_id)
+        {
+            self.error = Some(format!("that agent's pane is gone: {run_id}"));
+            return UiCommand::None;
+        }
+        self.error = None;
+        UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Focus {
+            workspace_id,
+            pane_id,
+        })))
+    }
+
+    /// Puts the board's one cursor on a card by id.
+    ///
+    /// The by-id card actions below exist entirely for this: `archive_selected_task`,
+    /// `shift_task` and `dispatch_selected_task` all act on whatever the cursor is on, and the
+    /// card that was right-clicked is very often not it. Without this the menu would archive the
+    /// card the cursor happened to be resting on — silently, and destructively.
+    fn aim_at_card(&mut self, id: u64) -> bool {
+        let Some(view) = self.cursor_view() else {
+            return false;
+        };
+        let Some(status) = view
+            .tasks()
+            .iter()
+            .find(|task| task.id == id)
+            .map(|task| task.status.clone())
+        else {
+            return false;
+        };
+        let Some(column) = view.statuses().iter().position(|known| *known == status) else {
+            return false;
+        };
+        self.set_board_cursor(column, Some(BoardTarget::Card(id)));
+        true
+    }
+
+    fn archive_card(&mut self, id: u64) -> UiCommand {
+        if !self.aim_at_card(id) {
+            return UiCommand::None;
+        }
+        self.archive_selected_task()
+    }
+
+    fn move_card(&mut self, id: u64, delta: isize) -> UiCommand {
+        if !self.aim_at_card(id) {
+            return UiCommand::None;
+        }
+        self.shift_task(delta)
+    }
+
+    fn dispatch_card(&mut self, id: u64) -> UiCommand {
+        if !self.aim_at_card(id) {
+            return UiCommand::None;
+        }
+        self.dispatch_selected_task()
+    }
+
+    /// A bordered popup at the pointer. Only backgrounds and text — no shadow, no animation:
+    /// this is a terminal and the frame it is drawn over is a real thing the user is reading.
+    fn render_context_menu(&mut self, frame: &mut Frame) {
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        let area = menu.place(self.menu_origin, frame.area());
+        self.menu_area = area;
+        frame.render_widget(Clear, area);
+        let mut lines = Vec::with_capacity(menu.entries.len());
+        let inner_width = usize::from(area.width.saturating_sub(2));
+        for (index, entry) in menu.entries.iter().enumerate() {
+            lines.push(match entry {
+                MenuEntry::Separator => Line::styled(
+                    "─".repeat(inner_width),
+                    Style::default().fg(self.theme.border),
+                ),
+                MenuEntry::Item(item) => {
+                    let here = index == menu.cursor;
+                    // A disabled item is drawn in the border's own colour rather than hidden.
+                    // An item that comes and goes is one a person cannot learn.
+                    let colour = if !item.enabled {
+                        self.theme.border
+                    } else if here {
+                        self.theme.surface
+                    } else {
+                        self.theme.text
+                    };
+                    let mut style = Style::default().fg(colour);
+                    if here && item.enabled {
+                        style = style.bg(self.theme.accent);
+                    }
+                    let key = item.key.unwrap_or("");
+                    let gap = inner_width
+                        .saturating_sub(item.label.chars().count() + key.chars().count() + 2);
+                    Line::styled(format!(" {}{}{} ", item.label, " ".repeat(gap), key), style)
+                }
+            });
+        }
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(Theme::border_type())
+                    .border_style(Style::default().fg(self.theme.border_focused))
+                    // `theme.panel` arrives in Task 9 and this becomes it; the surface token is
+                    // the closest thing Dock has to a panel background until then.
+                    .style(Style::default().bg(self.theme.surface)),
+            ),
+            area,
+        );
+    }
+
     pub fn mouse(&mut self, event: MouseEvent) -> UiCommand {
+        // The menu is ahead of every other surface for the reason it is ahead of them in `key`:
+        // it is drawn last, so it is what the pointer is on top of.
+        if self.menu.is_some() {
+            let area = self.menu_area;
+            match event.kind {
+                MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                    if let Some(index) = self.menu_row_at(event.column, event.row)
+                        && let Some(menu) = self.menu.as_mut()
+                        && matches!(menu.entries[index], MenuEntry::Item(_))
+                    {
+                        menu.cursor = index;
+                    }
+                    return UiCommand::None;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // Plain arithmetic rather than `Rect::contains`, which would need a
+                    // `layout::Position` import this file does not have; the module already
+                    // tests rectangles this way in `grid_cell` and `clamp_cell`.
+                    let inside = event.column >= area.x
+                        && event.column < area.right()
+                        && event.row >= area.y
+                        && event.row < area.bottom();
+                    if inside {
+                        if let Some(index) = self.menu_row_at(event.column, event.row)
+                            && let Some(menu) = self.menu.as_mut()
+                            && matches!(menu.entries[index], MenuEntry::Item(_))
+                        {
+                            menu.cursor = index;
+                            return self.take_menu_item();
+                        }
+                        return UiCommand::None;
+                    }
+                    // Outside: dismiss and stop. A click that both closes a menu and does
+                    // whatever was underneath it is a click that does something the user did
+                    // not ask for — they were aiming at the menu.
+                    self.menu = None;
+                    return UiCommand::None;
+                }
+                // A right-click falls through to the arm below, which re-targets rather than
+                // stacking: a right-click while a menu is open is a request for a different
+                // menu, never for two.
+                MouseEventKind::Down(MouseButton::Right) => {}
+                _ => return UiCommand::None,
+            }
+        }
         // An open picker is modal: clicking a row takes it, and clicking anywhere else is
         // swallowed rather than reaching the panes underneath, which are not what is being
         // pointed at while an overlay covers them.
@@ -5709,12 +6174,7 @@ impl Dashboard {
                     self.tab_scroll = self.tab_scroll.saturating_add(1);
                     return UiCommand::None;
                 }
-                if let Some(workspace_id) = self
-                    .tab_areas
-                    .iter()
-                    .find(|(_, area)| contains(*area, event.column, event.row))
-                    .map(|(workspace_id, _)| workspace_id.clone())
-                {
+                if let Some(workspace_id) = self.tab_at(event.column, event.row) {
                     return self.take_picked(PickerPurpose::Workspace, &workspace_id);
                 }
                 // Pane controls sit on the border, which is outside the pane body, so they can be
@@ -5758,11 +6218,7 @@ impl Dashboard {
                     });
                     return UiCommand::None;
                 }
-                let pane = self
-                    .pane_areas
-                    .iter()
-                    .find(|(_, area)| contains(**area, event.column, event.row))
-                    .map(|(id, _)| id.clone());
+                let pane = self.pane_at(event.column, event.row);
                 let Some((workspace_id, pane_id)) = self
                     .workspace()
                     .and_then(|w| pane.map(|p| (w.workspace_id.clone(), p)))
@@ -5829,9 +6285,18 @@ impl Dashboard {
                     pane_id,
                 })))
             }
-            MouseEventKind::Down(MouseButton::Middle)
-            | MouseEventKind::Down(MouseButton::Right) => {
+            MouseEventKind::Down(MouseButton::Middle) => {
                 self.paste_last_copied(event.column, event.row)
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                let target = self.menu_target_at(event.column, event.row);
+                let has_selection = self
+                    .copy
+                    .as_ref()
+                    .is_some_and(|mode| mode.session.selecting());
+                self.menu = Some(ContextMenu::for_target(target, has_selection));
+                self.menu_origin = (event.column, event.row);
+                UiCommand::None
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 // A press landed either on a divider or in a pane body, never both, so this
@@ -5909,11 +6374,9 @@ impl Dashboard {
                 let back = event.kind == MouseEventKind::ScrollUp;
                 let delta = if back { 3 } else { -3 };
                 let run_id = self
-                    .pane_areas
-                    .iter()
-                    .find(|(_, area)| contains(**area, event.column, event.row))
-                    .and_then(|(pane_id, _)| self.workspace()?.panes.get(pane_id))
-                    .and_then(|pane| pane.run_id.clone());
+                    .pane_at(event.column, event.row)
+                    .and_then(|pane_id| self.workspace()?.panes.get(&pane_id).cloned())
+                    .and_then(|pane| pane.run_id);
                 if let Some(run_id) = run_id {
                     self.scroll_pane(&run_id, delta);
                     // Only a notch *back* can want output older than the pane holds; a notch
@@ -6077,7 +6540,17 @@ fn first_leaf(node: &LayoutNode) -> &str {
 /// One row of the agent roster: how badly the agent wants attention, what it is, the task it is
 /// on, and the workspace it is in. Borrowed out of the dashboard rather than copied, so an entry
 /// the sidebar turns out to have no room for costs nothing beyond the comparison that sorted it.
-type RosterEntry<'a> = (AgentState, &'a str, Option<Cow<'a, str>>, Option<&'a str>);
+/// One agent as the sidebar draws it: its state, its label, the task it is on, the workspace it
+/// is in, and the run it is. The run id is last because it is the one field the roster never
+/// prints — it is there so a pointer landing on the row can name what it landed on, and so two
+/// otherwise identical agents sort in a stable order rather than in `HashMap` order.
+type RosterEntry<'a> = (
+    AgentState,
+    &'a str,
+    Option<Cow<'a, str>>,
+    Option<&'a str>,
+    &'a str,
+);
 
 /// The sidebar's rows as they are built: numbered as if all of them existed, kept only while
 /// they still fit inside the sidebar.
@@ -6247,10 +6720,11 @@ fn render_board_columns(
     area: Rect,
     live: &BoardLive<'_>,
     cursor: (usize, usize),
-) {
+) -> Vec<(u64, Rect)> {
+    let mut card_areas = Vec::new();
     let statuses = view.statuses();
     if statuses.is_empty() || area.width < statuses.len() as u16 || area.height < 3 {
-        return;
+        return card_areas;
     }
     // A board with nothing on it drew five headings reading `· 0` above four dashes and filled
     // the pane with them, which reads as broken rather than as empty. A board with an agent on it
@@ -6268,7 +6742,7 @@ fn render_board_columns(
             ]),
             area,
         );
-        return;
+        return card_areas;
     }
     let card_rows = usize::from(area.height.saturating_sub(2));
 
@@ -6326,13 +6800,30 @@ fn render_board_columns(
         // cursor inside the space that is actually left for cards rather than inside the
         // taller figure that would let it scroll to a row the footer has already painted over.
         let selected = active_column.then_some(cursor.1);
-        let lines = if status == ACTIVE_STATUS {
+        // `owners` is one entry per *line*, naming the card that line was drawn for, so the
+        // rectangles below come from the layout that was actually painted rather than from a
+        // second copy of the scroll arithmetic. A two-line ACTIVE entry names its card twice,
+        // which is right: both of its rows are that card.
+        let (lines, owners) = if status == ACTIVE_STATUS {
             let entries = active.take().unwrap_or_default();
             active_lines(theme, &entries, width, rows, selected)
         } else {
             let cards = view.cards(status);
             card_lines(theme, &cards, live, width, rows, selected)
         };
+        for (offset, owner) in owners.iter().enumerate().take(rows) {
+            if let Some(id) = owner {
+                card_areas.push((
+                    *id,
+                    Rect::new(
+                        x,
+                        area.y + 2 + u16::try_from(offset).unwrap_or(u16::MAX),
+                        column_width.saturating_sub(1),
+                        1,
+                    ),
+                ));
+            }
+        }
         // A rule under each heading gives the columns edges without spending a column of
         // width on borders, which at five columns would cost a fifth of the card text.
         frame.render_widget(
@@ -6398,6 +6889,7 @@ fn render_board_columns(
         }
         x += column_width;
     }
+    card_areas
 }
 
 /// What a column is called on screen.
@@ -6447,14 +6939,19 @@ fn card_lines<'a>(
     width: usize,
     rows: usize,
     selected: Option<usize>,
-) -> Vec<Line<'a>> {
+) -> (Vec<Line<'a>>, Vec<Option<u64>>) {
     if cards.is_empty() {
-        return vec![Line::styled("  —", Style::default().fg(theme.border))];
+        return (
+            vec![Line::styled("  —", Style::default().fg(theme.border))],
+            vec![None],
+        );
     }
     let first = scroll_to(selected, rows, 1);
     let mut lines = Vec::with_capacity(rows.min(cards.len()));
+    let mut owners = Vec::with_capacity(rows.min(cards.len()));
     for (row, task) in cards.iter().skip(first).take(rows).enumerate() {
         let here = selected == Some(first + row);
+        owners.push(Some(task.id));
         // Archived cards only ever appear here while revealed, and a revealed archived card
         // must never read as an ordinary one — muted regardless of the cursor, so `v` alone
         // tells the difference rather than a colour that also depends on where the cursor is.
@@ -6502,7 +6999,7 @@ fn card_lines<'a>(
             ),
         });
     }
-    lines
+    (lines, owners)
 }
 
 /// The two-line entries of the `ACTIVE` column: identity above, liveness below.
@@ -6517,19 +7014,29 @@ fn active_lines(
     width: usize,
     rows: usize,
     selected: Option<usize>,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<Option<u64>>) {
     use std::fmt::Write as _;
 
     if entries.is_empty() {
-        return vec![Line::styled("  —", Style::default().fg(theme.border))];
+        return (
+            vec![Line::styled("  —", Style::default().fg(theme.border))],
+            vec![None],
+        );
     }
     let per = if width < ONE_LINE_CARD { 1 } else { 2 };
     let visible = (rows / per).max(1);
     let first = scroll_to(selected, rows, per);
     let mut lines = Vec::with_capacity(visible * per);
+    let mut owners = Vec::with_capacity(visible * per);
     for (row, entry) in entries.iter().skip(first).take(visible).enumerate() {
         let here = selected == Some(first + row);
         let run = entry.run();
+        // A loose agent has no card behind it, so its rows belong to nothing the card menu can
+        // act on — the pointer falls through to whatever is underneath, which is the truth.
+        let owner = match *entry {
+            ActiveEntry::Card(task, _) => Some(task.id),
+            ActiveEntry::Loose(_) => None,
+        };
         // A dispatched card whose agent has gone is dimmed rather than hidden. It is precisely
         // the card a person has forgotten about, and hiding it would be the board agreeing.
         let style = card_style(theme, here, run.is_some());
@@ -6562,6 +7069,7 @@ fn active_lines(
             ),
             Span::styled(identity, style),
         ]));
+        owners.push(owner);
 
         if per == 1 {
             continue;
@@ -6582,8 +7090,9 @@ fn active_lines(
         }
         ellipsise_in_place(&mut liveness, width);
         lines.push(Line::styled(liveness, live_style));
+        owners.push(owner);
     }
-    lines
+    (lines, owners)
 }
 
 /// Where a column starts drawing, so the cursor stays on screen in a column taller than the
@@ -8853,8 +9362,8 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect()
         };
-        let unbadged_text = line_text(&unbadged[0]);
-        let badged_text = line_text(&badged[0]);
+        let unbadged_text = line_text(&unbadged.0[0]);
+        let badged_text = line_text(&badged.0[0]);
 
         // Both lines open with the same marker-and-id prefix — no cursor marker, since
         // neither call passed a `selected` row — so stripping it leaves exactly the ellipsised
@@ -11392,7 +11901,10 @@ mod tests {
                 // No workspace: this fixture binds no pane to `run_1`. The roster names where an
                 // agent is when the layout places it and says nothing when it cannot, rather than
                 // inventing somewhere for a run it does not hold.
-                None
+                None,
+                // The run itself, which the roster never prints: it is carried so a pointer
+                // landing on the row can say which agent it landed on.
+                "run_1"
             )]
         );
         let rows = sidebar_rows(&mut dashboard, 100, 30);
@@ -12233,8 +12745,12 @@ mod tests {
     /// test could catch it, and no test could be written while the two orders lived in two `if`
     /// chains with nothing in common to assert about.
     ///
-    /// Opening all eight at once is the only way to make the orders observable, which is why
-    /// this test does something a user never can.
+    /// Opening all nine at once is the only way to make the orders observable, which is why
+    /// this test does something a user never can — with one exception. The pointer menu really
+    /// can be open over another surface, and that is why it is the one documented departure from
+    /// "drawn first, routed first": it is drawn last, over everything, and takes the key first.
+    /// The rest of the array still has to agree with itself, which is what the second half here
+    /// measures once the menu is out of the way.
     #[test]
     fn every_open_overlay_takes_keys_in_the_same_order_it_is_drawn() {
         let mut dashboard = bound_dashboard();
@@ -12254,17 +12770,28 @@ mod tests {
             crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
         );
         dashboard.set_git(git_facts(), "diff --git a/x b/x".into());
+        dashboard.menu = Some(ContextMenu::for_target(MenuTarget::Canvas, false));
 
         // What `render` walks: every open overlay, in `OVERLAY_ORDER`, later ones over earlier.
         assert_eq!(
             dashboard.open_overlays().collect::<Vec<_>>(),
             OVERLAY_ORDER.to_vec(),
-            "with all eight open the draw sequence is OVERLAY_ORDER entire"
+            "with all nine open the draw sequence is OVERLAY_ORDER entire"
         );
 
-        // What `key` walks: the first open overlay takes the key. Measured rather than asserted
-        // against the constant directly — each Esc is answered by whichever surface actually
-        // holds the keyboard, so this is the routing order as a user would experience it.
+        // The menu first, ahead of eight surfaces that were open before it. A menu on top of
+        // something else is the only stack a user can actually build, and the key belongs to
+        // what is on top.
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            dashboard.menu.is_none(),
+            "the menu is drawn last, so it takes the key first"
+        );
+
+        // What `key` walks once it is gone: the first open overlay takes the key. Measured
+        // rather than asserted against the constant directly — each Esc is answered by whichever
+        // surface actually holds the keyboard, so this is the routing order as a user would
+        // experience it.
         let mut routed = Vec::new();
         loop {
             let Some(kind) = dashboard.open_overlays().next() else {
@@ -12279,7 +12806,10 @@ mod tests {
         }
         assert_eq!(
             routed,
-            OVERLAY_ORDER.to_vec(),
+            OVERLAY_ORDER
+                .into_iter()
+                .filter(|kind| *kind != OverlayKind::ContextMenu)
+                .collect::<Vec<_>>(),
             "the order keys are routed in must be the order overlays are drawn in"
         );
     }
@@ -13084,8 +13614,11 @@ mod tests {
         );
     }
 
+    /// Right-click used to paste too. It opens a menu now, so the paste it gave up has to still
+    /// be reachable from that menu — which is what makes this one test rather than two: a change
+    /// that took the button and quietly dropped the paste would pass either half alone.
     #[test]
-    fn a_middle_or_right_click_pastes_the_last_copied_text_into_the_focused_pane() {
+    fn a_middle_click_pastes_the_last_copied_text_and_the_menu_still_offers_it() {
         let mut dashboard = bound_dashboard();
         dashboard.apply_event(attach_event("run_1", b"paste me\r\n"));
         render_to_string(&mut dashboard, 100, 30);
@@ -13125,13 +13658,33 @@ mod tests {
         });
         assert_eq!(dashboard.last_copied.as_deref(), Some("aste"));
 
-        for button in [MouseButton::Middle, MouseButton::Right] {
-            assert_eq!(
-                dashboard.mouse(inside(MouseEventKind::Down(button))),
-                UiCommand::PaneInput(b"aste".to_vec()),
-                "{button:?} pastes what was last copied, through the paste encoder"
-            );
-        }
+        assert_eq!(
+            dashboard.mouse(inside(MouseEventKind::Down(MouseButton::Middle))),
+            UiCommand::PaneInput(b"aste".to_vec()),
+            "middle-click pastes what was last copied, through the paste encoder"
+        );
+
+        // The same paste, by the route right-click now takes. `Paste last copy` pastes at the
+        // point that was right-clicked rather than wherever the menu was drawn, which is why
+        // the origin is kept apart from the menu.
+        dashboard.mouse(inside(MouseEventKind::Down(MouseButton::Right)));
+        let index = dashboard
+            .menu
+            .as_ref()
+            .expect("a right-click in a pane opens the pane menu")
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, MenuEntry::Item(item) if item.action == MenuAction::PasteLastCopy)
+            })
+            .expect("the pane menu offers the paste right-click used to do");
+        dashboard.menu.as_mut().expect("the pane menu").cursor = index;
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiCommand::PaneInput(b"aste".to_vec()),
+            "the menu item reaches the same paste path the button used to"
+        );
+        assert!(dashboard.menu.is_none(), "taking an item closes the menu");
         // A press outside the focused pane's body is not a paste into it: input is
         // destructive, and a click that landed elsewhere must never be typed here.
         assert_eq!(
@@ -14231,5 +14784,294 @@ mod tests {
         assert_eq!(menu.cursor, 0, "cursor moved despite no item to land on");
         menu.move_cursor(-1);
         assert_eq!(menu.cursor, 0, "cursor moved despite no item to land on");
+    }
+
+    /// Right-click opens a menu for whatever is under it, and middle-click still pastes.
+    ///
+    /// Both halves in one test because they are one decision: the menu took right-click, so the
+    /// paste that used to live there had to keep a home, and a change that quietly dropped it
+    /// would pass a test that only checked the menu.
+    #[test]
+    fn right_click_opens_a_menu_and_middle_click_still_pastes() {
+        let mut dashboard = bound_dashboard();
+        render_terminal(&mut dashboard, 100, 30);
+        let a = dashboard.pane_areas["a"];
+
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: a.x + 2,
+            row: a.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(dashboard.menu.as_ref().map(|menu| &menu.target), Some(MenuTarget::Pane(id)) if id == "a"),
+            "a right-click in a pane opens that pane's menu"
+        );
+
+        // Esc dismisses, and the menu must not have swallowed the pane's focus on the way.
+        dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(dashboard.menu.is_none(), "Esc dismisses the menu");
+
+        let pasted = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Middle),
+            column: a.x + 2,
+            row: a.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            !matches!(pasted, UiCommand::None) || dashboard.error.is_some(),
+            "middle-click must still reach the paste path"
+        );
+    }
+
+    /// A click outside the menu dismisses it rather than activating whatever it landed on.
+    #[test]
+    fn a_click_outside_the_menu_only_dismisses_it() {
+        let mut dashboard = bound_dashboard();
+        render_terminal(&mut dashboard, 100, 30);
+        let a = dashboard.pane_areas["a"];
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: a.x + 2,
+            row: a.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        render_terminal(&mut dashboard, 100, 30);
+        let focused_before = dashboard.workspace().unwrap().focused_pane_id.clone();
+        let b = dashboard.pane_areas["b"];
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: b.x + 1,
+            row: b.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(dashboard.menu.is_none(), "the click dismissed the menu");
+        assert_eq!(
+            dashboard.workspace().unwrap().focused_pane_id,
+            focused_before,
+            "and did not also focus the pane it landed on"
+        );
+    }
+
+    /// The menu names the thing the pointer was actually on, for every surface that has one.
+    ///
+    /// One test rather than six because `menu_target_at` is one ordered chain: what it gets wrong
+    /// is a rectangle tested in the wrong place relative to another, and that is only visible
+    /// when the surfaces are checked against each other on the same frame.
+    #[test]
+    fn a_right_click_names_whatever_surface_it_landed_on() {
+        let mut dashboard = two_workspace_dashboard();
+        dashboard.agents.insert(
+            "run_1".into(),
+            (Some(AgentKind::Claude), AgentState::Working),
+        );
+        render_terminal(&mut dashboard, 120, 34);
+
+        let right_click_at = |dashboard: &mut Dashboard, column: u16, row: u16| {
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+            dashboard.menu.take().expect("a menu opened").target
+        };
+
+        let (_, tab) = *dashboard
+            .tab_areas
+            .iter()
+            .find(|(workspace_id, _)| workspace_id == "w2")
+            .expect("the second workspace has a tab");
+        assert_eq!(
+            right_click_at(&mut dashboard, tab.x, tab.y),
+            MenuTarget::Tab("w2".into())
+        );
+
+        let (_, row) = dashboard
+            .sidebar_workspace_areas
+            .iter()
+            .find(|(workspace_id, _)| workspace_id == "w2")
+            .cloned()
+            .expect("the second workspace has a sidebar row");
+        assert_eq!(
+            right_click_at(&mut dashboard, row.x + 2, row.y),
+            MenuTarget::SidebarWorkspace("w2".into())
+        );
+
+        let (_, row) = dashboard
+            .sidebar_agent_areas
+            .first()
+            .cloned()
+            .expect("the roster lists the one agent");
+        assert_eq!(
+            right_click_at(&mut dashboard, row.x + 2, row.y),
+            MenuTarget::SidebarAgent("run_1".into())
+        );
+
+        let pane = dashboard.pane_areas["b"];
+        assert_eq!(
+            right_click_at(&mut dashboard, pane.x + 2, pane.y + 2),
+            MenuTarget::Pane("b".into())
+        );
+
+        // The header, which is chrome belonging to no pane, tab or row. The canvas menu is what
+        // is left when nothing more specific claims the pointer, so it is also the assertion
+        // that nothing above over-claims.
+        assert_eq!(right_click_at(&mut dashboard, 1, 0), MenuTarget::Canvas);
+    }
+
+    /// The defect the card actions carry an id to avoid.
+    ///
+    /// `archive_selected_task` acts on the board's cursor, and the card a person right-clicked is
+    /// very often not the card the cursor is resting on. Wiring the menu straight to it would
+    /// archive whichever card the keyboard had last touched — silently, destructively, and on a
+    /// board that is files in the user's own repository. So `ArchiveCard` carries the id and the
+    /// cursor is moved onto it first, which is what this measures: the cursor starts on the first
+    /// card and the *second* is the one that ends up archived.
+    #[test]
+    fn archiving_from_a_cards_menu_archives_that_card_not_the_one_the_cursor_was_on() {
+        let board = PersonalBoard::new(&format!("menu-archives-{}", std::process::id()));
+        let dir = board.tasks_dir();
+        crate::board::create(&dir, "first finished thing").expect("seed a task");
+        crate::board::create(&dir, "second finished thing").expect("seed a task");
+        let ids: Vec<u64> = crate::board::load(&dir)
+            .iter()
+            .map(|task| task.id)
+            .collect();
+        for id in &ids {
+            crate::board::set_status(&dir, *id, "done").expect("move it to done");
+        }
+
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        render_terminal(&mut dashboard, 130, 32);
+        // The premise: the cursor is on the first card, so archiving "the selected card" would
+        // take that one. Without it the assertion below would pass for the wrong reason.
+        assert_eq!(
+            dashboard.cursor_card(),
+            Some(ids[0]),
+            "the cursor must start on the first card or this proves nothing"
+        );
+
+        let (id, area) = *dashboard
+            .board_card_areas
+            .iter()
+            .find(|(id, _)| *id == ids[1])
+            .expect("the second card has a rectangle on screen");
+        assert_eq!(id, ids[1]);
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: area.x + 1,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            dashboard.menu.as_ref().map(|menu| menu.target.clone()),
+            Some(MenuTarget::BoardCard(ids[1]))
+        );
+        let index = dashboard
+            .menu
+            .as_ref()
+            .expect("the card menu")
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Item(item) if item.label == "Archive"))
+            .expect("the card menu offers Archive");
+        dashboard.menu.as_mut().expect("the card menu").cursor = index;
+        dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let on_disk = crate::board::load(&dir);
+        let archived: Vec<u64> = on_disk
+            .iter()
+            .filter(|task| task.archived)
+            .map(|task| task.id)
+            .collect();
+        assert_eq!(
+            archived,
+            vec![ids[1]],
+            "the card that was right-clicked is the card that was archived"
+        );
+    }
+
+    /// The menu is drawn where the pointer was, and both routes into an item — clicking its row
+    /// and typing the key printed beside it — reach the same thing Enter would.
+    #[test]
+    fn the_menu_is_drawn_at_the_pointer_and_a_row_can_be_clicked_or_typed() {
+        let mut dashboard = bound_dashboard();
+        render_terminal(&mut dashboard, 100, 30);
+        let pane = dashboard.pane_areas["a"];
+        let (column, row) = (pane.x + 3, pane.y + 3);
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        let area = dashboard.menu_area;
+        assert_eq!(
+            (area.x, area.y),
+            (column, row),
+            "with room below and to the right the menu opens at the pointer"
+        );
+        assert!(
+            row_text(&terminal, area, area.y + 1).contains("Copy selection"),
+            "the first item is drawn inside the border: {:?}",
+            row_text(&terminal, area, area.y + 1)
+        );
+
+        // Moving the pointer over a row takes the cursor with it, so what Enter would do is
+        // whatever is under the hand.
+        let zoom = dashboard
+            .menu
+            .as_ref()
+            .expect("the pane menu")
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Item(item) if item.label == "Zoom"))
+            .expect("the pane menu offers Zoom");
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: area.x + 2,
+            row: area.y + 1 + u16::try_from(zoom).expect("a small menu"),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(dashboard.menu.as_ref().expect("still open").cursor, zoom);
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 2,
+            row: area.y + 1 + u16::try_from(zoom).expect("a small menu"),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(dashboard.menu.is_none(), "clicking a row takes it");
+        assert_eq!(
+            dashboard.zoomed.as_deref(),
+            Some("a"),
+            "and Zoom is what it took"
+        );
+
+        // The key column is not decoration: `y` is printed beside `Copy selection`, so typing it
+        // has to be the same act as taking that row. Disabled here — nothing is selected — which
+        // is exactly the case a menu must not lie about, so it takes nothing and stays open.
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        dashboard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            dashboard.menu.is_some(),
+            "a disabled item's key takes nothing"
+        );
+        // `z` is `Ctrl+B z`, whose last character is the one a menu key match is keyed on — but
+        // that is a three-token string, not a one-key shortcut, so it is printed and not typed.
+        // `Down` then Enter is how it is reached instead.
+        dashboard.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            dashboard.menu.as_ref().expect("still open").cursor,
+            1,
+            "Down walks to the next item"
+        );
     }
 }

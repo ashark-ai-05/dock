@@ -5979,12 +5979,19 @@ fn card_lines<'a>(
         let style = card_style(theme, here, true);
         let marker = if here { "›" } else { " " };
         let identifier = task.id.to_string();
-        // One budget for both shapes. The badge branch spends its width on three extra cells
-        // — a space, the glyph, a space — and the plain branch does not, but the *title* must
-        // ellipsise at the same place either way or an agent attaching to a card silently
-        // shortens its title.
+        // One budget for both shapes' *titles*. The badge branch spends two more fixed cells
+        // than the plain one — the glyph, and the space that follows it — so the budget is
+        // sized for the badge branch and the plain branch ends up with a couple of cells to
+        // spare rather than the reverse.
+        //
+        // The space that separates the id from the title sits outside the ellipsised string in
+        // both branches, so it is never counted as one of the title's own characters. That one
+        // character was the bug: the badge branch used to ellipsise `" {title}"` as a single
+        // budgeted string, so the leading space ate a character that should have gone to the
+        // title, and an agent attaching to a card silently shortened its title by one cell
+        // relative to an identical unbadged card.
         let prefix = marker.len() + 2 + identifier.len();
-        let title_budget = width.saturating_sub(prefix + 2);
+        let title_budget = width.saturating_sub(prefix + 3);
         // The badge is its own span so it keeps the state's colour against a selected card's
         // inverted background, where a single styled line would have lost it.
         lines.push(match live.by_task.get(&task.id) {
@@ -5998,7 +6005,7 @@ fn card_lines<'a>(
                         Style::default().fg(theme.agent(run.state))
                     },
                 ),
-                Span::styled(ellipsise(&format!(" {}", task.title), title_budget), style),
+                Span::styled(format!(" {}", ellipsise(&task.title, title_budget)), style),
             ]),
             None => Line::styled(
                 format!(
@@ -8275,6 +8282,82 @@ mod tests {
         assert!(
             widths.iter().all(|width| *width <= 8),
             "a narrow pane divides evenly rather than starving a column: {widths:?}"
+        );
+    }
+
+    /// A live run must not shorten a card's title relative to an identical card with none.
+    ///
+    /// `card_lines`' two branches build their line differently — the badge branch spends extra
+    /// cells on a glyph the plain branch does not draw — but the *title* is meant to ellipsise
+    /// at the same place either way. It used to not: the badge branch ellipsised a string with
+    /// the separating space baked in, which spent one of the title's own budgeted characters on
+    /// that space, so an agent attaching to a card silently cost its title one cell relative to
+    /// an identical card with no run.
+    #[test]
+    fn an_attached_run_does_not_shorten_a_cards_title_relative_to_an_identical_unbadged_card() {
+        let theme = Theme::default();
+        // Long enough that a width of 30 must ellipsise it under either branch — a test built
+        // on a title that happened to fit whole would not exercise the bug at all.
+        let task = board_task(
+            7,
+            "a card whose title is long enough that thirty columns cannot show all of it",
+            "backlog",
+        );
+        let cards: Vec<&BoardTask> = vec![&task];
+        let width = 30;
+
+        let no_run = BoardLive::new(&[]);
+        let unbadged = card_lines(&theme, &cards, &no_run, width, 5, None);
+
+        let run = LiveRun {
+            run_id: "run_1",
+            workspace_id: "w",
+            pane_id: "a",
+            agent: AgentKind::Claude,
+            state: AgentState::Blocked,
+            task_id: Some(7),
+            queued: 0,
+            auto_feed: false,
+            awaiting_ack: false,
+            holding_because: None,
+        };
+        let with_run = BoardLive::new(std::slice::from_ref(&run));
+        let badged = card_lines(&theme, &cards, &with_run, width, 5, None);
+
+        let line_text = |line: &Line<'_>| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let unbadged_text = line_text(&unbadged[0]);
+        let badged_text = line_text(&badged[0]);
+
+        // Both lines open with the same marker-and-id prefix — no cursor marker, since
+        // neither call passed a `selected` row — so stripping it leaves exactly the ellipsised
+        // title in the unbadged line, and the glyph plus its own separating space ahead of the
+        // title in the badged one. Mirrors `card_lines`' own `"{marker} #{identifier} "` with
+        // `marker` fixed at `" "`, which is what an unselected row always gets.
+        let marker = " ";
+        let prefix = format!("{marker} #{} ", task.id);
+        let unbadged_title = unbadged_text
+            .strip_prefix(prefix.as_str())
+            .expect("the plain line starts with the marker and id");
+        let after_prefix = badged_text
+            .strip_prefix(prefix.as_str())
+            .expect("the badge line starts with the same marker and id");
+        // One glyph — always a single `char`, per `AgentState::glyph` — then the space this
+        // fix moved outside the budgeted title, then the title itself.
+        let badged_title: String = after_prefix.chars().skip(2).collect();
+
+        assert!(
+            unbadged_title.contains('…'),
+            "the fixture title must actually need truncation at this width: {unbadged_title:?}"
+        );
+        assert_eq!(
+            unbadged_title, badged_title,
+            "a run attached to a card must not shorten its title relative to an identical \
+             unbadged card: unbadged {unbadged_title:?} vs badged {badged_title:?}"
         );
     }
 

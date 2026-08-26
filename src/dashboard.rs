@@ -3327,6 +3327,14 @@ impl Dashboard {
             KeyCode::Char('v') => {
                 let revealing = board.view.revealing();
                 board.view.set_reveal(!revealing);
+                // One board, one reveal: a Board pane can be showing the same board underneath
+                // this overlay, and if `v` moved only the overlay's own copy the two surfaces
+                // would disagree about whether this board is revealing its archived pile — the
+                // exact drift `set_board_cursor`'s "one cursor over two surfaces" comment exists
+                // to prevent, just for `reveal` instead of the cursor.
+                if let Some(pane) = self.board_pane_view.as_mut() {
+                    pane.set_reveal(!revealing);
+                }
             }
             KeyCode::Char('a') => return self.archive_selected_task(),
             KeyCode::Char('A') => return self.archive_finished_tasks(),
@@ -3382,23 +3390,26 @@ impl Dashboard {
         match crate::board::set_status(&directory, id, &columns[next]) {
             Ok(_) => {
                 // Re-read rather than editing the copy in hand: the board is files on disk and
-                // anything else may have written to it since it was opened.
-                let tasks = crate::board::load(&directory);
+                // anything else may have written to it since it was opened. Routed through
+                // `set_board_tasks` — the one place both the overlay and the pane are rebuilt —
+                // rather than a second, hand-rolled rebuild here: that used to reconstruct the
+                // overlay's view with a bare `BoardView::new`, which drops `reveal`, while the
+                // pane (already going through `set_board_pane_tasks`) kept it, so the two
+                // surfaces disagreed about what `v` had done. One rebuild path both surfaces
+                // share cannot drift apart like that.
+                self.set_board_tasks(crate::board::load(&directory), directory);
                 // Both views, because a Board pane may be on the canvas underneath this overlay
                 // and a card that moved in one and not the other is two answers to one question.
-                self.set_board_pane_tasks(tasks.clone(), directory.clone());
                 if let Some(view) = self.board_pane_view.as_mut() {
                     view.follow(id);
                 }
                 if let Some(board) = self.board.as_mut() {
-                    board.view = BoardView::new(tasks);
                     board.view.follow(id);
                 }
                 // The one cursor goes with the card, which is what `follow` does for each view:
                 // a card moved out from under the cursor would otherwise leave it on whatever
                 // slid into that position.
                 self.set_board_cursor(next, Some(BoardTarget::Card(id)));
-                self.error = None;
             }
             Err(message) => self.error = Some(message),
         }
@@ -3426,6 +3437,21 @@ impl Dashboard {
             return UiCommand::None;
         };
         let archived = !board.view.revealing();
+        // Pressing `a` on a card that is already on the side of `archived` that `v` currently
+        // means is a no-op — most reachable by pressing `a` on a revealed, still-unarchived
+        // card. Writing anyway would still rewrite the file: inserting an `archived:` line (or
+        // rewriting an identical one) and touching its mtime for a change that never happened,
+        // in a file that belongs to the user's repository. `set_archived` is only reached when
+        // it would actually change something.
+        let already = board
+            .view
+            .tasks()
+            .iter()
+            .find(|candidate| candidate.id == task)
+            .is_some_and(|candidate| candidate.archived == archived);
+        if already {
+            return UiCommand::None;
+        }
         match crate::board::set_archived(&directory, task, archived) {
             Ok(_) => UiCommand::LoadBoard,
             Err(message) => {
@@ -8258,6 +8284,42 @@ mod tests {
         dashboard
     }
 
+    /// A real personal board under `$HOME/.dock/boards`, deleted when it drops — even if the
+    /// test panics before reaching its own cleanup.
+    ///
+    /// `board::is_personal` decides by path, so a test that needs `writable` to actually mean
+    /// something (rather than being forced true by hand, as the tests that only move or shift a
+    /// card do) has to write under a directory `board::is_personal` recognises, which is this
+    /// one. That directory is also what `board::boards()` enumerates as a live board — so a
+    /// `fs::remove_dir_all` that only ran after every assertion in the test body left a failing
+    /// run's board sitting in the real, live boards list. `Drop` runs during the unwind a
+    /// failing `assert!` produces too, which a plain end-of-function cleanup does not survive.
+    struct PersonalBoard(std::path::PathBuf);
+
+    impl PersonalBoard {
+        /// `id` becomes the workspace name `board::tasks_dir` builds a path from; the whole
+        /// `<workspace>` directory is removed on drop, not just its `tasks` subdirectory,
+        /// because that whole directory is the unit `board::boards()` lists.
+        fn new(id: &str) -> Self {
+            let tasks =
+                crate::board::tasks_dir("", id).expect("HOME is set in the test environment");
+            let root = tasks.parent().unwrap_or(&tasks).to_path_buf();
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&tasks).unwrap();
+            Self(root)
+        }
+
+        fn tasks_dir(&self) -> std::path::PathBuf {
+            self.0.join("tasks")
+        }
+    }
+
+    impl Drop for PersonalBoard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn board_task(id: u64, title: &str, status: &str) -> BoardTask {
         BoardTask {
             id,
@@ -8321,17 +8383,18 @@ mod tests {
 
     #[test]
     fn a_card_can_be_moved_across_columns_and_the_cursor_goes_with_it() {
-        // A real board directory, because moving a card writes the task file.
-        let root = std::env::temp_dir().join(format!("dock-move-{}", std::process::id()));
-        let dir = root.join("tasks");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&dir).unwrap();
+        // A real personal board directory, not an arbitrary temp one: `shift_task` now routes
+        // every move through `set_board_tasks`, which recomputes `writable` from
+        // `board::is_personal(directory)` on each of the two moves below rather than leaving a
+        // hand-set `writable = true` untouched the way the single-field rebuild this replaced
+        // did — so a directory that is not genuinely personal would have the *second* move
+        // silently refused. `PersonalBoard` also cleans up on drop, unwind included.
+        let personal = PersonalBoard::new(&format!("card-move-{}", std::process::id()));
+        let dir = personal.tasks_dir();
         crate::board::create(&dir, "wire the parser").expect("seed a task");
 
         let mut dashboard = bound_dashboard();
-        // Point the board at this directory and make it writable the way a workspace board is.
         dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
-        dashboard.board.as_mut().unwrap().writable = true;
         assert_eq!(
             dashboard.board.as_ref().unwrap().view.status(),
             Some("backlog")
@@ -8350,7 +8413,6 @@ mod tests {
 
         dashboard.key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
         assert_eq!(crate::board::load(&dir)[0].status, "backlog");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The allocator's three invariants, over every shape a board can take.
@@ -9628,10 +9690,12 @@ mod tests {
         // silently flip `writable` back to `false` and the second `a` would be refused for a
         // reason this test is not about; a real personal board keeps `is_personal` — and so
         // `writable` — true across every reload, which is what an actual session looks like.
-        let workspace_id = format!("reveal-survives-{}", std::process::id());
-        let dir = crate::board::tasks_dir("", &workspace_id).expect("a personal board");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        //
+        // `PersonalBoard` cleans this up on drop, unwind included: this writes under the real
+        // `$HOME/.dock/boards`, which `board::boards()` enumerates as a live board, and a
+        // failing assertion below must not leave one sitting in it.
+        let board = PersonalBoard::new(&format!("reveal-survives-{}", std::process::id()));
+        let dir = board.tasks_dir();
         crate::board::create(&dir, "finished work").expect("seed a task");
         let id = crate::board::load(&dir)[0].id;
         crate::board::set_status(&dir, id, "done").expect("move it to done");
@@ -9663,6 +9727,21 @@ mod tests {
             dashboard.board.as_ref().unwrap().view.cards("done").len(),
             1
         );
+        // The board's only card was archived, so the opening-column heuristic — correctly, once
+        // it is visibility-aware — did not open on `done` at the last reload; `v` toggles
+        // `reveal` without re-homing the cursor. Put it on the card directly, the same way a
+        // real `j`/`k` walk over the now-visible pile would, rather than leaning on a fallback
+        // this test is not about.
+        let done_column = dashboard
+            .board
+            .as_ref()
+            .unwrap()
+            .view
+            .statuses()
+            .iter()
+            .position(|status| status == "done")
+            .expect("a done column");
+        dashboard.set_board_cursor(done_column, Some(BoardTarget::Card(id)));
 
         // Revealing, so `a` on the card sitting there brings it back — and triggers the same
         // `LoadBoard` reload that used to reset `reveal` out from under this exact sequence.
@@ -9677,7 +9756,99 @@ mod tests {
             dashboard.board.as_ref().unwrap().view.revealing(),
             "the reload an archive action triggers must not silently re-hide what was revealed"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revealing_and_pressing_a_on_an_already_unarchived_card_writes_nothing() {
+        // Revealing shows every card, archived or not, and `a` inside reveal means "bring it
+        // back" — but a card that was never archived has nothing to bring back. Writing anyway
+        // would still rewrite a file that has no `archived:` line at all today (`create` never
+        // writes one), purely because the cursor happened to be sitting on that card while `v`
+        // was on: an insert and a touched mtime in the user's repository for a change that never
+        // happened.
+        let board = PersonalBoard::new(&format!("archive-noop-{}", std::process::id()));
+        let dir = board.tasks_dir();
+        crate::board::create(&dir, "not yet finished").expect("seed a task");
+        let id = crate::board::load(&dir)[0].id;
+        crate::board::set_status(&dir, id, "done").expect("move it to done");
+        let file = crate::board::load(&dir)[0].file.clone();
+        let before = std::fs::read_to_string(&file).expect("the seeded file");
+        assert!(!before.contains("archived:"), "no field yet: {before:?}");
+
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        render_to_string(&mut dashboard, 130, 32);
+
+        // Reveal, then `a` on the one card there — not archived, so bringing it back is a
+        // no-op.
+        dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(dashboard.board.as_ref().unwrap().view.revealing());
+        assert_eq!(
+            dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            UiCommand::None,
+            "nothing changed, so there is nothing to reload"
+        );
+
+        let after = std::fs::read_to_string(&file).expect("the file is still there");
+        assert_eq!(
+            before, after,
+            "a no-op archive must not touch the file at all"
+        );
+    }
+
+    #[test]
+    fn moving_a_revealed_archived_card_does_not_switch_reveal_off() {
+        // `shift_task` used to be a third place a fresh `BoardView` got built for the overlay —
+        // a raw `board.view = BoardView::new(tasks)`, bypassing the reveal-preserving path
+        // `set_board_tasks`/`set_board_pane_tasks` carry. The pane (rebuilt through
+        // `set_board_pane_tasks` in the same call) kept its reveal; the overlay did not — so the
+        // exact sequence the whole feature exists for (reveal the pile, act on a card in it)
+        // moved a revealed archived card and had the pile snap shut under it in the same motion,
+        // and the two surfaces disagreed about whether the board was revealing at all.
+        let board = PersonalBoard::new(&format!("shift-keeps-reveal-{}", std::process::id()));
+        let dir = board.tasks_dir();
+        crate::board::create(&dir, "already retired").expect("seed a task");
+        let id = crate::board::load(&dir)[0].id;
+        crate::board::set_status(&dir, id, "done").expect("move it to done");
+        crate::board::set_archived(&dir, id, true).expect("archive it");
+
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        render_to_string(&mut dashboard, 130, 32);
+
+        // Reveal, then put the cursor directly on the one archived card reveal just made
+        // visible — the same `set_board_cursor`/`follow` machinery a real move through the
+        // column uses, without forty keypresses to get there.
+        dashboard.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        let done_column = dashboard
+            .board
+            .as_ref()
+            .unwrap()
+            .view
+            .statuses()
+            .iter()
+            .position(|status| status == "done")
+            .expect("a done column");
+        dashboard.set_board_cursor(done_column, Some(BoardTarget::Card(id)));
+
+        // `<` moves it back to `review` — a real move, not a saturated no-op at an edge column.
+        dashboard.key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
+        assert_eq!(
+            crate::board::load(&dir)[0].status,
+            "review",
+            "the card actually moved"
+        );
+
+        let overlay_reveals = dashboard.board.as_ref().unwrap().view.revealing();
+        let pane_reveals = dashboard.board_pane_view.as_ref().unwrap().revealing();
+        assert!(
+            overlay_reveals,
+            "moving the card must not switch reveal off"
+        );
+        assert_eq!(
+            overlay_reveals, pane_reveals,
+            "the overlay and the pane must not disagree about whether this board is revealing"
+        );
     }
 
     #[test]
@@ -9686,15 +9857,17 @@ mod tests {
         // `>` walk `board.view.statuses()`, which is the board's own columns and still holds
         // `in-progress` — so the heading changed and nothing else did. A file with
         // `status: active` in it would be a file `kanban-md` has never heard of.
-        let root = std::env::temp_dir().join(format!("dock-heading-{}", std::process::id()));
-        let dir = root.join("tasks");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&dir).unwrap();
+        //
+        // A real personal board, not an arbitrary temp directory: `shift_task` routes every move
+        // through `set_board_tasks`, which recomputes `writable` from
+        // `board::is_personal(directory)` on each of the two moves below, so a directory that is
+        // not genuinely personal would have the second move silently refused.
+        let board = PersonalBoard::new(&format!("heading-{}", std::process::id()));
+        let dir = board.tasks_dir();
         crate::board::create(&dir, "wire the parser").expect("seed a task");
 
         let mut dashboard = bound_dashboard();
         dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
-        dashboard.board.as_mut().unwrap().writable = true;
         let frame = render_to_string(&mut dashboard, 130, 32);
         assert!(frame.contains("ACTIVE"), "{frame:?}");
 
@@ -9708,7 +9881,6 @@ mod tests {
             "and the cursor followed the card into the column it is actually in"
         );
         assert!(crate::board::STATUSES.contains(&"in-progress"));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

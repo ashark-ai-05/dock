@@ -894,9 +894,17 @@ impl BoardView {
     /// does not open staring at nothing.
     pub fn new(tasks: Vec<BoardTask>) -> Self {
         let statuses = statuses(&tasks);
+        // Membership by what would actually be visible, not by raw status: a column holding
+        // only archived cards is empty to a board that opens un-revealed, and picking it as the
+        // opening column left the cursor on a column `cards()` immediately reports as having
+        // nothing in it — `a`, `Enter`, `<` and `>` all had nothing to act on.
         let column = statuses
             .iter()
-            .position(|status| tasks.iter().any(|task| task.status == *status))
+            .position(|status| {
+                tasks
+                    .iter()
+                    .any(|task| task.status == *status && !task.archived)
+            })
             .unwrap_or(0);
         Self {
             tasks,
@@ -1034,6 +1042,19 @@ mod view_tests {
         let view = BoardView::new(vec![task(1, "in-progress"), task(2, "done")]);
         assert_eq!(STATUSES[view.column()], "in-progress");
         assert_eq!(view.selected().map(|task| task.id), Some(1));
+    }
+
+    /// A column whose only card is archived is not "holding anything" to a board that opens
+    /// un-revealed: `cards()` reports it empty, so the opening cursor must skip past it to the
+    /// next column that actually has something visible in it.
+    #[test]
+    fn an_all_archived_column_does_not_capture_the_opening_cursor() {
+        let view = BoardView::new(vec![
+            task_with(1, "backlog", true),
+            task_with(2, "todo", false),
+        ]);
+        assert_eq!(STATUSES[view.column()], "todo");
+        assert_eq!(view.selected().map(|task| task.id), Some(2));
     }
 
     /// A revealed board shows archived cards; a normal one does not, and says how many it is

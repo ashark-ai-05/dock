@@ -2183,7 +2183,7 @@ impl Dashboard {
         self.picker_row_areas = row_areas;
         frame.render_widget(
             Paragraph::new(lines)
-                .style(Style::default().fg(self.theme.text).bg(self.theme.surface))
+                .style(Style::default().fg(self.theme.text).bg(self.theme.panel))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -2368,11 +2368,13 @@ impl Dashboard {
         });
         self.launch_area = clickable_row(area, rows.last());
         frame.render_widget(
-            Paragraph::new(rows.into_lines()).block(
-                Block::default()
-                    .borders(Borders::RIGHT)
-                    .border_style(Style::default().fg(self.theme.border)),
-            ),
+            Paragraph::new(rows.into_lines())
+                .style(Style::default().bg(self.theme.panel))
+                .block(
+                    Block::default()
+                        .borders(Borders::RIGHT)
+                        .border_style(Style::default().fg(self.theme.border)),
+                ),
             area,
         );
     }
@@ -2772,6 +2774,14 @@ impl Dashboard {
     /// `in-progress` column with the live entries derived on top of it, which answers that
     /// without ever putting a card in two columns at once.
     fn render_board_pane(&self, frame: &mut Frame, inner: Rect, focused: bool) {
+        // Chrome, not a pane body: a board pane draws Dock's own grid, never a program's own
+        // output, so unlike `render_node`'s shared pane-border block — which must stay
+        // transparent because it also wraps real terminal panes — this one is free to paint
+        // the `panel` surface the rest of the dashboard's chrome sits on.
+        frame.render_widget(
+            Block::default().style(Style::default().bg(self.theme.panel)),
+            inner,
+        );
         if inner.height < 4 || inner.width < 12 {
             return;
         }
@@ -3259,7 +3269,7 @@ impl Dashboard {
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: true })
-                .style(Style::default().fg(self.theme.text))
+                .style(Style::default().fg(self.theme.text).bg(self.theme.panel))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -3291,7 +3301,7 @@ impl Dashboard {
                 Line::from(format!("{subject} name: {value}█")),
                 Line::from("Enter saves · Esc cancels"),
             ])
-            .style(Style::default().fg(self.theme.text))
+            .style(Style::default().fg(self.theme.text).bg(self.theme.panel))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -3540,7 +3550,7 @@ impl Dashboard {
                 .borders(Borders::ALL)
                 .border_type(Theme::border_type())
                 .border_style(Style::default().fg(self.theme.border_focused))
-                .style(Style::default().bg(self.theme.surface))
+                .style(Style::default().bg(self.theme.panel))
                 .title(" BOARD "),
             popup,
         );
@@ -3698,7 +3708,7 @@ impl Dashboard {
         ));
         frame.render_widget(
             Paragraph::new(lines)
-                .style(Style::default().fg(self.theme.text).bg(self.theme.surface))
+                .style(Style::default().fg(self.theme.text).bg(self.theme.panel))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -4296,7 +4306,7 @@ impl Dashboard {
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .style(Style::default().fg(self.theme.text).bg(self.theme.surface))
+                .style(Style::default().fg(self.theme.text).bg(self.theme.panel))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -5496,8 +5506,13 @@ impl Dashboard {
                         "unavailable: fixed executable not found"
                     }
                 ),
+                // A row that fails the filter is not hidden by omission but by colour: its text
+                // is set to the popup's own background, `panel`, so it stays in the layout (the
+                // rows below it do not shift) while reading as blank. That trick only works
+                // because the block below is painted `panel` too — `surface` would leave it
+                // legible against the chrome it is meant to disappear into.
                 Style::default().fg(if !matches {
-                    self.theme.surface
+                    self.theme.panel
                 } else if available {
                     self.theme.accent
                 } else {
@@ -5524,7 +5539,7 @@ impl Dashboard {
         ));
         frame.render_widget(
             Paragraph::new(lines)
-                .style(Style::default().fg(self.theme.text))
+                .style(Style::default().fg(self.theme.text).bg(self.theme.panel))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -6157,9 +6172,7 @@ impl Dashboard {
                     .borders(Borders::ALL)
                     .border_type(Theme::border_type())
                     .border_style(Style::default().fg(self.theme.border_focused))
-                    // `theme.panel` arrives in Task 9 and this becomes it; the surface token is
-                    // the closest thing Dock has to a panel background until then.
-                    .style(Style::default().bg(self.theme.surface)),
+                    .style(Style::default().bg(self.theme.panel)),
             ),
             area,
         );
@@ -8072,7 +8085,10 @@ mod tests {
         let mut dashboard = dashboard();
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
         terminal.draw(|frame| dashboard.render(frame)).unwrap();
-        let theme = Theme::warm();
+        // `Theme::default()`, not `Theme::warm()`: the dashboard under test was built
+        // with `Dashboard::default()`, and the two have to stay the same theme or this
+        // proves nothing about what actually got painted.
+        let theme = Theme::default();
         let focused = dashboard.pane_areas["a"];
         let unfocused = dashboard.pane_areas["b"];
         let buffer = terminal.backend().buffer();
@@ -11098,7 +11114,9 @@ mod tests {
         dashboard.set_git(git_facts(), SAMPLE_DIFF.into());
         let mut terminal = Terminal::new(TestBackend::new(110, 34)).unwrap();
         terminal.draw(|frame| dashboard.render(frame)).unwrap();
-        let theme = Theme::warm();
+        // `Theme::default()`, not `Theme::warm()`, for the same reason as above: this
+        // dashboard was built with `Dashboard::default()`.
+        let theme = Theme::default();
         let buffer = terminal.backend().buffer();
         // Find the two rows by their first cell's glyph, then assert the palette they were
         // painted with is Dock's own.

@@ -898,6 +898,16 @@ impl ContextMenu {
         if matches!(menu.entries.first(), Some(MenuEntry::Separator)) {
             menu.move_cursor(1);
         }
+        // `move_cursor` only ever steps off a separator onto an item; it cannot manufacture one
+        // out of a menu that has none, or rescue a cursor already resting on a separator that
+        // isn't the leading one. Every arm above is hand-checked to avoid that, but nothing in
+        // the type stops a future arm from getting it wrong — so check here, loudly, in debug
+        // builds, rather than shipping a menu where Enter silently does nothing.
+        debug_assert!(
+            matches!(menu.entries.get(menu.cursor), Some(MenuEntry::Item(_))),
+            "for_target built a menu whose cursor is not on an item: {:?}",
+            menu.target
+        );
         menu
     }
 
@@ -941,8 +951,14 @@ impl ContextMenu {
         } else {
             origin.1.saturating_sub(height)
         };
-        let x = x.clamp(frame.x, frame.right().saturating_sub(width));
-        let y = y.clamp(frame.y, frame.bottom().saturating_sub(height));
+        // The upper bound is raised back to at least `frame.x`/`frame.y` because a
+        // zero-width or zero-height frame makes `right() - width` (or `bottom() - height`)
+        // underflow below the origin once the origin itself is nonzero — `saturating_sub`
+        // stops it going negative, but not below `frame.x`, and `clamp` panics if its min
+        // exceeds its max. A degenerate frame can't contain the menu either way; this just
+        // keeps that fact from becoming a panic instead of a rectangle nobody can see.
+        let x = x.clamp(frame.x, frame.right().saturating_sub(width).max(frame.x));
+        let y = y.clamp(frame.y, frame.bottom().saturating_sub(height).max(frame.y));
         Rect::new(x, y, width, height)
     }
 
@@ -14143,6 +14159,28 @@ mod tests {
         );
     }
 
+    /// A zero-width frame with a nonzero origin used to panic: `frame.right().saturating_sub(width)`
+    /// underflows below `frame.x` once `width` is forced up to 1 by the `.max(1)` guard, and
+    /// `clamp` asserts its min is no greater than its max. No test could see this before, because
+    /// every existing frame started at `(0, 0)`, where the pathological case cancels out. A
+    /// degenerate frame can't contain the menu regardless, so this only pins "does not panic."
+    #[test]
+    fn a_zero_width_frame_at_a_nonzero_origin_does_not_panic() {
+        let menu = ContextMenu::for_target(MenuTarget::Pane("a".into()), true);
+        let frame = Rect::new(5, 5, 0, 10);
+        let placed = menu.place((6, 6), frame);
+        assert!(placed.height > 0, "{placed:?}");
+    }
+
+    /// The height mirror of the width case above: a zero-height frame with a nonzero origin.
+    #[test]
+    fn a_zero_height_frame_at_a_nonzero_origin_does_not_panic() {
+        let menu = ContextMenu::for_target(MenuTarget::Pane("a".into()), true);
+        let frame = Rect::new(5, 5, 10, 0);
+        let placed = menu.place((6, 6), frame);
+        assert!(placed.width > 0, "{placed:?}");
+    }
+
     /// The cursor skips separators in both directions and stops at the ends rather than wrapping
     /// into one. A cursor that can land on a separator is a menu where Enter does nothing.
     #[test]
@@ -14160,5 +14198,38 @@ mod tests {
             menu.move_cursor(-1);
             assert!(matches!(menu.entries[menu.cursor], MenuEntry::Item(_)));
         }
+    }
+
+    /// A trailing separator is not one of the six menus `for_target` builds today, but nothing
+    /// in `move_cursor` assumes the last entry is an item — it just refuses to step onto one.
+    /// Pinned directly, rather than only by a hand-trace in review.
+    #[test]
+    fn the_menu_cursor_skips_a_trailing_separator() {
+        let mut menu = ContextMenu::for_target(MenuTarget::Pane("a".into()), true);
+        menu.entries.push(MenuEntry::Separator);
+        menu.cursor = menu.entries.len() - 2; // the last real item, just before the new rule
+        menu.move_cursor(1);
+        assert!(
+            matches!(menu.entries[menu.cursor], MenuEntry::Item(_)),
+            "cursor landed on the trailing separator at {}",
+            menu.cursor
+        );
+    }
+
+    /// A menu with no items at all cannot honour "the cursor is always on an item" — there is
+    /// nowhere for it to go. `for_target` can never build one (its `debug_assert!` catches that
+    /// arm-by-arm), but `move_cursor` itself must still not panic or loop forever if one ever
+    /// reaches it; it just leaves the cursor where it was.
+    #[test]
+    fn the_menu_cursor_does_not_panic_with_no_items_to_land_on() {
+        let mut menu = ContextMenu {
+            target: MenuTarget::Canvas,
+            entries: vec![MenuEntry::Separator, MenuEntry::Separator],
+            cursor: 0,
+        };
+        menu.move_cursor(1);
+        assert_eq!(menu.cursor, 0, "cursor moved despite no item to land on");
+        menu.move_cursor(-1);
+        assert_eq!(menu.cursor, 0, "cursor moved despite no item to land on");
     }
 }

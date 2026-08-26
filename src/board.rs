@@ -850,6 +850,92 @@ mod tests {
         );
     }
 
+    /// A `---` in the *body* is a Markdown horizontal rule, not a fence, and archiving must not
+    /// treat it as one.
+    ///
+    /// `set_archived` is correct here for a reason nothing else pins: the body rule flips
+    /// `in_front_matter` back to `true`, but `replaced` is already `true` by then, so neither
+    /// the insert branch nor the rewrite branch can fire a second time. That is a two-variable
+    /// argument holding a file the user's repository owns together, and it deserves better than
+    /// a hand-trace in review.
+    ///
+    /// Asserted as the whole rewritten file against an expected string rather than as four
+    /// `contains` checks, because "rewrites only the line it means to touch" is a claim about
+    /// every other byte — and `contains` cannot see a byte that moved, doubled, or vanished.
+    #[test]
+    fn a_horizontal_rule_in_the_body_is_not_mistaken_for_the_front_matters_fence() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        board.task(
+            "001-a.md",
+            concat!(
+                "---\n",
+                "id: 1\n",
+                "title: 'Thing'\n",
+                "status: done\n",
+                "archived: false\n",
+                "tags:\n",
+                "  - keep\n",
+                "---\n",
+                "\n",
+                "# Outcome\n",
+                "\n",
+                "before the rule\n",
+                "\n",
+                "---\n",
+                "\n",
+                "after the rule\n",
+                "\n",
+                "archived: true\n",
+            ),
+        );
+
+        set_archived(&dir, 1, true).expect("archive");
+        assert_eq!(
+            fs::read_to_string(dir.join("001-a.md")).unwrap(),
+            concat!(
+                "---\n",
+                "id: 1\n",
+                "title: 'Thing'\n",
+                "status: done\n",
+                // The one line that changed.
+                "archived: true\n",
+                "tags:\n",
+                "  - keep\n",
+                "---\n",
+                "\n",
+                "# Outcome\n",
+                "\n",
+                "before the rule\n",
+                "\n",
+                // The rule survives as a rule: no `archived:` line was inserted above it, which
+                // is what would happen if it were read as a closing fence.
+                "---\n",
+                "\n",
+                "after the rule\n",
+                "\n",
+                // And prose that merely looks like the field is prose. Rewriting this would be
+                // Dock editing the user's sentences.
+                "archived: true\n",
+            ),
+        );
+
+        // The same file, back the other way, so the insert branch and the rewrite branch are
+        // both walked past the rule rather than only one of them.
+        set_archived(&dir, 1, false).expect("unarchive");
+        let text = fs::read_to_string(dir.join("001-a.md")).unwrap();
+        assert_eq!(
+            text.matches("archived: false").count(),
+            1,
+            "one field, and it is the one in the front matter: {text}"
+        );
+        assert!(
+            text.ends_with("after the rule\n\narchived: true\n"),
+            "the body is untouched: {text}"
+        );
+        assert!(!load(&dir)[0].archived);
+    }
+
     #[test]
     fn this_repositorys_own_board_parses() {
         // The format is not hypothetical: Dock's own tasks are the fixture.

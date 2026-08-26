@@ -139,8 +139,16 @@ impl Keymap {
             ("[", "copy mode"),
             ("+/-", "resize"),
             ("z", "zoom"),
+            // The sidebar's own key. It was bound and published nowhere — not here, not in
+            // help — which made a collapsed sidebar something a person could arrive at by
+            // resizing the terminal and have no advertised way back out of.
+            ("s", "sidebar"),
             ("r", "rename"),
-            ("x", "close"),
+            // Paired like `h/v` and `k/B`: one act on two scopes, and the shifted form is the
+            // wider one. Listed together rather than only as `x`, because `Ctrl+B X` is a real
+            // binding the pointer menu already prints, and a bar that claims to publish every
+            // binding may not quietly hold one back — least of all the destructive one.
+            ("x/X", "close pane/workspace"),
             ("R", "restart"),
             ("l", "launch"),
             ("d", "leave · runs keep running"),
@@ -343,9 +351,12 @@ mod tests {
             "n",
             "h/v",
             "z",
+            "s",
             "r",
             "R",
-            "x",
+            // Pane close and workspace close share one entry, as `h/v` does: one act, two
+            // scopes, the shifted form being the wider one.
+            "x/X",
             "l",
             "d",
             "?",
@@ -366,6 +377,32 @@ mod tests {
             "PgUp/PgDn/End",
         ] {
             assert!(keys.contains(&expected), "missing hint for {expected}");
+        }
+    }
+
+    /// The which-key bar's whole claim is that it publishes *every* binding, and that claim
+    /// went stale twice on this branch without anything noticing: `Ctrl+B s` toggles the
+    /// sidebar and `Ctrl+B X` closes a workspace, and neither appeared in the bar or in help.
+    ///
+    /// Checked against `command_for` itself rather than against a second hand-written list,
+    /// because a hand-written list is exactly what failed — it can only ever go stale in the
+    /// same direction the thing it is checking did.
+    #[test]
+    fn every_character_binding_appears_in_the_published_hints() {
+        let published: String = Keymap::hints().iter().map(|(key, _)| *key).collect();
+        for character in '!'..='~' {
+            if command_for(plain(character)).is_none() {
+                continue;
+            }
+            // The nine workspace digits share one entry that names the range, `1-9`, rather
+            // than printing nine of them. A range is how a person reads that binding anyway.
+            if character.is_ascii_digit() {
+                continue;
+            }
+            assert!(
+                published.contains(character),
+                "Ctrl+B {character} is bound and published nowhere"
+            );
         }
     }
 

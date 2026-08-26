@@ -211,7 +211,11 @@ mod tests {
             ("working", theme.working),
             ("done", theme.done),
             ("idle", theme.idle),
-            ("border", theme.border_focused),
+            // `border_focused`, named for what it is. Plain `border` is deliberately absent:
+            // it is a structural line rather than text and cannot clear 3:1 by design, so a
+            // label saying "border" over a value that is the focused one was the one entry
+            // here that could be read as covering a token nothing covers.
+            ("border_focused", theme.border_focused),
         ] {
             for (ground, surface) in [("surface", theme.surface), ("panel", theme.panel)] {
                 let ratio = contrast(colour, surface);

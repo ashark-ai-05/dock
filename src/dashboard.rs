@@ -363,6 +363,15 @@ pub struct Dashboard {
     /// there is no menu — a stale rectangle from a wider frame would otherwise claim coordinates
     /// nothing is drawn at any more.
     sidebar_rail_area: Rect,
+    /// Where the full sidebar's collapse chevron was last drawn, so a click on it can put the
+    /// sidebar back to a rail. The other half of `sidebar_rail_area`: the rail expands by
+    /// pointer, so the full sidebar has to collapse by pointer too, or the mouse can open a
+    /// thing it cannot close.
+    ///
+    /// A narrow rectangle on the WORKSPACES heading row rather than the whole row, following
+    /// `pane_control_areas`: a control is the cells it is drawn on, and a row-wide target would
+    /// collapse the sidebar for anyone who clicked the word "WORKSPACES".
+    sidebar_collapse_area: Option<Rect>,
 }
 
 /// How much of the sidebar is showing.
@@ -701,6 +710,22 @@ const QUICK_ACTIONS: [(&str, &str, PaneCommand); 4] = [
     ("Ctrl+B ?", "every key", PaneCommand::Help),
 ];
 
+/// What Dock says when it is asked to retire a task on a board that is not its to write.
+///
+/// One string rather than the same sentence typed at both refusal sites, so the tests that pin
+/// the two guards assert against what the guards actually say rather than against a copy of it
+/// that can drift. The guards themselves are the branch's standing data-safety constraint made
+/// executable: Dock writes task files only on its own board (`board::is_personal`), and a
+/// repository's kanban directory belongs to the repository's history.
+const REPOSITORY_BOARD_IS_NOT_OURS: &str = "this is the repository's board — retire tasks with kanban-md so its history stays the \
+     repository's";
+
+/// The glyph the full sidebar collapses by, drawn at the right edge of its heading row.
+///
+/// The same chevron the sidebar's own WORKSPACES rows use to mark the selected one, turned to
+/// point the way this one moves: left, back to the rail it came from.
+const SIDEBAR_COLLAPSE: &str = "‹";
+
 const PROFILES: &[(DashboardProfile, &str)] = &[
     (DashboardProfile::Fixture, "Fixture"),
     (DashboardProfile::Amp, "Amp"),
@@ -968,15 +993,29 @@ impl ContextMenu {
             entries,
             cursor: 0,
         };
-        // The first entry is an item in every menu above, but the cursor is normalised anyway
-        // so a menu edited later cannot open with Enter pointing at a rule.
-        if matches!(menu.entries.first(), Some(MenuEntry::Separator)) {
-            menu.move_cursor(1);
-        }
-        // `move_cursor` only ever steps off a separator onto an item; it cannot manufacture one
-        // out of a menu that has none, or rescue a cursor already resting on a separator that
-        // isn't the leading one. Every arm above is hand-checked to avoid that, but nothing in
-        // the type stops a future arm from getting it wrong — so check here, loudly, in debug
+        // The cursor opens on the first entry Enter can actually take. Two things can make the
+        // first entry the wrong place to rest, and the menu really does hit both: a leading
+        // separator (no arm above has one, but nothing in the type stops a later one), and a
+        // leading *disabled* item — which the pane menu has every time it is opened without a
+        // standing selection, because `Copy selection` is its first entry. That is the common
+        // case for the most-used menu on this branch, and it opened with the highlight resting
+        // on the one row that does nothing.
+        menu.cursor = menu
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Item(item) if item.enabled))
+            // A menu with nothing enabled at all still rests on an item rather than a rule.
+            // The highlight answers "what would Enter take", and a rule is not a candidate for
+            // that even when the honest answer is "nothing".
+            .or_else(|| {
+                menu.entries
+                    .iter()
+                    .position(|entry| matches!(entry, MenuEntry::Item(_)))
+            })
+            .unwrap_or(0);
+        // The search above can only land on an item; it cannot manufacture one out of a menu
+        // that has none. Every arm above is hand-checked to have one, but nothing in the type
+        // stops a future arm from being written without — so check here, loudly, in debug
         // builds, rather than shipping a menu where Enter silently does nothing.
         debug_assert!(
             matches!(menu.entries.get(menu.cursor), Some(MenuEntry::Item(_))),
@@ -1689,6 +1728,17 @@ impl Dashboard {
         self.board_card_areas.clear();
         self.sidebar_workspace_areas.clear();
         self.sidebar_agent_areas.clear();
+        // The START HERE rows belong here for the same reason the two lists above do, and for a
+        // worse one: they used to be cleared inside `render_sidebar`, *after* its early return
+        // for the rail. So every rail frame kept four full-sidebar rectangles spanning
+        // x ∈ [0, 27] — which is where the panes are once the sidebar is three columns wide —
+        // and a left click on a pane opened the task board, the file picker, git or help
+        // instead of focusing it. An auto-rail on a resize below 88 columns reached that with
+        // no keystroke at all.
+        self.quick_action_areas.clear();
+        // Only the full sidebar draws the collapse chevron, so every path that draws something
+        // else — the rail, the narrow layout — has to leave nothing of it behind.
+        self.sidebar_collapse_area = None;
         // Cleared unconditionally, like `menu_area` below: the narrow path returns before the
         // sidebar is drawn at all, and a rail rectangle left over from a wider frame would
         // otherwise claim coordinates for a click-to-expand that has nothing to expand into.
@@ -1798,7 +1848,9 @@ impl Dashboard {
                 self.render_overlay(kind, frame, area);
             }
         }
-        // The which-key bar publishes every binding, and there are now more bindings than two rows
+        // The which-key bar publishes every binding — `Keymap`'s own
+        // `every_character_binding_appears_in_the_published_hints` is what keeps that sentence
+        // true rather than merely intended — and there are now more bindings than two rows
         // can hold. Rather than shaving words off the table until the last entry fits — which
         // silently truncates and reads as a missing binding — it is drawn over the bottom of the
         // body while the prefix is held, and gives the rows back the moment it is released.
@@ -2207,11 +2259,14 @@ impl Dashboard {
 
     fn render_sidebar(&mut self, frame: &mut Frame, area: Rect) {
         // The rail draws nothing this function builds below — no WORKSPACES list, no AGENTS
-        // heading, no START HERE menu — so it returns before `sidebar_workspace_areas` and
-        // `sidebar_agent_areas` are touched. `render` already cleared both for this frame, so
-        // a right-click resolves against what is actually on screen (the rail's glyphs, which
-        // record only `sidebar_rail_area`) rather than a full-sidebar row left over from the
-        // last frame that had room for one.
+        // heading, no START HERE menu, no collapse chevron — so it returns before
+        // `sidebar_workspace_areas`, `sidebar_agent_areas`, `quick_action_areas` and
+        // `sidebar_collapse_area` are touched. `render` already cleared all four for this
+        // frame, so a click resolves against what is actually on screen (the rail's glyphs,
+        // which record only `sidebar_rail_area`) rather than a full-sidebar row left over from
+        // the last frame that had room for one. Every one of those four is cleared *there*
+        // rather than here for that reason: a clear this side of the return is a clear the rail
+        // frame never reaches.
         if matches!(self.sidebar, SidebarState::Rail) {
             return self.render_sidebar_rail(frame, area);
         }
@@ -2225,7 +2280,34 @@ impl Dashboard {
         // this records for the pointer.
         let inner_width = usize::from(area.width).saturating_sub(1);
         let mut rows = SidebarRows::new(area.height);
-        rows.push(|| Line::styled("WORKSPACES", heading));
+        // The heading row carries the collapse control at its right edge. Clicking the rail
+        // expands it, so something has to close it again or the pointer can open a thing it
+        // cannot shut — and the keyboard's `Ctrl+B s` is not an answer to that, it is a
+        // different vocabulary. A chevron rather than a word because twenty-eight columns is
+        // the whole sidebar, and it points the way the sidebar goes.
+        let collapse_gap = inner_width
+            .saturating_sub("WORKSPACES".chars().count() + SIDEBAR_COLLAPSE.chars().count());
+        rows.push(|| {
+            Line::from(vec![
+                Span::styled("WORKSPACES", heading),
+                Span::raw(" ".repeat(collapse_gap)),
+                Span::styled(SIDEBAR_COLLAPSE, Style::default().fg(self.theme.accent)),
+            ])
+        });
+        // The control is the cells it is drawn on, the way `pane_control_areas` is, rather than
+        // the whole row: a row-wide target would collapse the sidebar for anyone who clicked the
+        // word beside it. Two columns rather than one — the chevron and the blank in front of it
+        // — because a single-cell target is a target people miss. Derived from the right edge
+        // rather than measured from the render, for the reason the pane controls are: ratatui
+        // lays the line out and never reports back where it put anything.
+        self.sidebar_collapse_area = clickable_row(area, rows.last()).map(|row| {
+            Rect::new(
+                row.x + area.width.saturating_sub(3),
+                row.y,
+                2.min(area.width),
+                1,
+            )
+        });
         // Taken out of `self` rather than built fresh, because the closure below borrows `self`
         // immutably for the whole loop and cannot push through it — and because `render` already
         // emptied this, so taking it back reuses the buffer instead of allocating one per frame.
@@ -2345,7 +2427,6 @@ impl Dashboard {
         // session. Its replacement answers the question a quiet dashboard actually raises: what
         // can I do from here. Each row is clickable, so the list is a menu rather than a poster.
         rows.push(|| Line::styled("START HERE", heading));
-        self.quick_action_areas.clear();
         for (key, action, command) in QUICK_ACTIONS {
             rows.push(|| {
                 Line::from(vec![
@@ -2903,8 +2984,10 @@ impl Dashboard {
                 };
                 // Copy mode swallows every key for this pane, so the pane itself has to say
                 // so. A flag rather than the mode itself: the render below needs `self`
-                // mutably for the resize bookkeeping, and `CopyMode` owns a whole cloned
-                // screen, so borrowing it across that — or, worse, cloning it — is not free.
+                // mutably for the resize bookkeeping, and a `CopyMode` may be holding a whole
+                // cloned screen — it takes one the instant the live grid is about to move
+                // under the selection — so borrowing it across that, or worse cloning it, is
+                // not free in the case that matters.
                 let copying =
                     run_id.is_some_and(|id| self.copy.as_ref().is_some_and(|mode| mode.is_for(id)));
                 // A pane that has stopped following live output looks exactly like a pane whose
@@ -3239,13 +3322,15 @@ impl Dashboard {
             Line::from("Every key goes to the focused pane, Esc and Ctrl-C included."),
             Line::from("Ctrl+B is the only key Dock keeps; Ctrl+B Ctrl+B sends a literal one."),
             Line::styled("AFTER Ctrl+B", heading),
-            Line::from("n new workspace   h/v split   z zoom"),
-            Line::from("r rename   R restart shell   x close   l launch   q quit"),
+            Line::from("n new workspace   h/v split   z zoom   s sidebar (or click it)"),
+            Line::from("r rename   R restart shell   x close   X close workspace"),
+            Line::from("l launch   q quit"),
             Line::from("w pick a workspace by name   1-9 jump to one   ,/. previous/next"),
             Line::from("f find a file here and type its path into the pane"),
             Line::from("a resume the agent that last ran here, continuing its own session"),
             Line::from("i review handoffs agents are waiting on: a accept · c request changes"),
             Line::from("k board: ←/→ column · ↑/↓ card · </> move · n new · Enter dispatch"),
+            Line::from("  a archive or restore · A archive all of done · v show the archived"),
             Line::from("B splits the same board into the canvas as a pane, with its runs lane"),
             Line::from("g what changed in this pane's worktree · j/k scroll · g/G ends"),
             Line::from("[ copy mode: hjkl move   v select   y yank   / search   Esc exits"),
@@ -3256,6 +3341,7 @@ impl Dashboard {
             Line::from("Tab strip: click a tab to switch   ✎ rename   × close (twice)"),
             Line::from("+ at the end of the strip makes a workspace"),
             Line::from("Focused pane's lower border: ⇋ ⇵ split   ✎ rename   × close"),
+            Line::from("Sidebar: ‹ at its top collapses it   click the rail to bring it back"),
             Line::from("Drag a divider to resize   drag inside a pane to select text"),
             Line::styled("FORMS AND PICKERS", heading),
             Line::from("type to filter/edit   ↑/↓ or j/k select   Enter review/confirm"),
@@ -3986,11 +4072,7 @@ impl Dashboard {
             return UiCommand::None;
         };
         if !board.writable {
-            self.error = Some(
-                "this is the repository's board — retire tasks with kanban-md so its history \
-                 stays the repository's"
-                    .into(),
-            );
+            self.error = Some(REPOSITORY_BOARD_IS_NOT_OURS.into());
             return UiCommand::None;
         }
         let (Some(directory), Some(task)) = (self.board_dir.clone(), self.cursor_card()) else {
@@ -4028,11 +4110,7 @@ impl Dashboard {
             return UiCommand::None;
         };
         if !board.writable {
-            self.error = Some(
-                "this is the repository's board — retire tasks with kanban-md so its history \
-                 stays the repository's"
-                    .into(),
-            );
+            self.error = Some(REPOSITORY_BOARD_IS_NOT_OURS.into());
             return UiCommand::None;
         }
         let Some(directory) = self.board_dir.clone() else {
@@ -6019,6 +6097,15 @@ impl Dashboard {
     /// leave the keyboard where it was; announcing focus would move it, and the next `refresh`
     /// would paint the move. What this has to get right is which pane or workspace the *next few
     /// lines* read, and every request those lines send names its subject explicitly.
+    ///
+    /// It is still a visible side effect, and worth knowing before adding an item. Aiming at a
+    /// `Tab` or a `SidebarWorkspace` moves `workspace_index`, so the canvas switches to that
+    /// workspace on the way to running the item — which is what you want from `Rename` (you are
+    /// about to be shown a form naming that workspace) and a surprise from `New workspace`,
+    /// which lands you on someone else's tab for the instant before the new one arrives. Left
+    /// deliberately: the alternative is an aim that varies per item, and an item that acts on a
+    /// workspace the dashboard is not pointed at is the far worse failure — it is the one
+    /// `aim_at` exists to prevent.
     fn aim_at(&mut self, target: &MenuTarget) -> bool {
         match target {
             MenuTarget::Pane(pane_id) => {
@@ -6163,19 +6250,28 @@ impl Dashboard {
                 ),
                 MenuEntry::Item(item) => {
                     let here = index == menu.cursor;
-                    // A disabled item is drawn in the border's own colour rather than hidden.
-                    // An item that comes and goes is one a person cannot learn.
-                    let colour = if !item.enabled {
-                        self.theme.border
-                    } else if here {
-                        self.theme.surface
-                    } else {
-                        self.theme.text
+                    // A disabled item is dimmed rather than hidden — an item that comes and
+                    // goes is one a person cannot learn — but in `muted`, not `border`.
+                    // `border` is 1.19:1 on `panel`, which is not dim, it is gone; the
+                    // palette's own contrast test excludes plain `border` from the 3:1 floor
+                    // precisely because it is a structural line and never text. `muted` is in
+                    // that tested set, at 4.61:1 on panel.
+                    //
+                    // And the cursor row keeps a background whether or not its item is
+                    // enabled. Withholding it meant the pane menu — whose first entry is
+                    // `Copy selection`, greyed out whenever nothing is selected, which is the
+                    // common case — could open showing a blank first row and no visible cursor
+                    // anywhere on it. `muted` behind a `panel` foreground still says "here"
+                    // while reading as plainly weaker than the accent that says "and Enter
+                    // takes this".
+                    let style = match (here, item.enabled) {
+                        (true, true) => Style::default()
+                            .fg(self.theme.surface)
+                            .bg(self.theme.accent),
+                        (true, false) => Style::default().fg(self.theme.panel).bg(self.theme.muted),
+                        (false, true) => Style::default().fg(self.theme.text),
+                        (false, false) => Style::default().fg(self.theme.muted),
                     };
-                    let mut style = Style::default().fg(colour);
-                    if here && item.enabled {
-                        style = style.bg(self.theme.accent);
-                    }
                     let key = item.key.unwrap_or("");
                     let gap = inner_width
                         .saturating_sub(item.label.chars().count() + key.chars().count() + 2);
@@ -6232,6 +6328,33 @@ impl Dashboard {
                 // menu, never for two.
                 MouseEventKind::Down(MouseButton::Right) => {}
                 _ => return UiCommand::None,
+            }
+        }
+        // Help, Git, Review and Board cover the canvas the same way the picker and the launch
+        // form below do — and, unlike those two, used to let every click straight through to
+        // whatever the last frame recorded underneath them. A right-click while help was up
+        // resolved against `pane_areas` and opened a `Pane` menu for a pane the overlay was
+        // covering; every item on it then acted on that hidden pane. The pointer can only mean
+        // what is on screen, and while one of these is open the only thing on screen is it.
+        //
+        // The open board's own cards are the one exception, because they are the exception to
+        // the premise: a card is drawn *by* the overlay, so a right-click on one is aimed at
+        // something genuinely there. `menu_target_at` resolves cards before anything else for
+        // exactly that reason, and this leaves that route open rather than closing the only
+        // pointer menu the board has.
+        if [
+            OverlayKind::Help,
+            OverlayKind::Git,
+            OverlayKind::Review,
+            OverlayKind::Board,
+        ]
+        .into_iter()
+        .any(|kind| self.overlay_is_open(kind))
+        {
+            let on_a_card = event.kind == MouseEventKind::Down(MouseButton::Right)
+                && self.board_card_at(event.column, event.row).is_some();
+            if !on_a_card {
+                return UiCommand::None;
             }
         }
         // An open picker is modal: clicking a row takes it, and clicking anywhere else is
@@ -6383,6 +6506,16 @@ impl Dashboard {
                 // rail is not actually on screen, so this can only ever expand a rail that is
                 // drawn — never toggle a full sidebar from a rectangle a taller frame left behind.
                 if contains(self.sidebar_rail_area, event.column, event.row) {
+                    return self.run_command(PaneCommand::ToggleSidebar);
+                }
+                // The other direction, through the same command: the chevron on the full
+                // sidebar's heading row. `None` unless the full sidebar actually drew it this
+                // frame, so this can no more collapse from a stale rectangle than the rail
+                // above can expand from one.
+                if self
+                    .sidebar_collapse_area
+                    .is_some_and(|area| contains(area, event.column, event.row))
+                {
                     return self.run_command(PaneCommand::ToggleSidebar);
                 }
                 if let Some(command) = self
@@ -8422,7 +8555,11 @@ mod tests {
         let mut dashboard = dashboard();
         assert_eq!(command(&mut dashboard, KeyCode::Char('?')), UiCommand::None);
         assert!(dashboard.help_open);
-        let text = render_to_string(&mut dashboard, 90, 24);
+        // Tall enough to hold the whole list. Help grows every time a control is published and
+        // it does not scroll, so a terminal that cannot show the last section is a terminal
+        // this test would silently stop checking the newest lines on — which is exactly the
+        // half of the list the newly published `s`, `X` and the board's write keys live in.
+        let text = render_to_string(&mut dashboard, 90, 44);
         for key in [
             "Every key goes to the focused pane",
             "n new workspace",
@@ -8434,6 +8571,16 @@ mod tests {
             "q quit",
             "runs keep running",
             "PageUp/PageDown scroll history",
+            // Published here for the first time. `Ctrl+B s` was bound and named nowhere, and
+            // the board's three write keys were reachable only by having read the source.
+            "s sidebar",
+            "X close workspace",
+            "a archive or restore",
+            "A archive all of done",
+            "v show the archived",
+            // The pointer half of the sidebar, which is a control rather than a key and so has
+            // no other place it could be published.
+            "‹ at its top collapses it",
         ] {
             assert!(text.contains(key), "missing published mnemonic: {key}");
         }
@@ -11076,6 +11223,67 @@ mod tests {
         );
     }
 
+    /// A repository's board, opened read-only, with two finished cards on it — the setup both
+    /// archive refusals below are about.
+    fn repository_board() -> Dashboard {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(
+            vec![
+                board_task(1, "Theirs", "done"),
+                board_task(2, "Also theirs", "done"),
+            ],
+            "/repo/real/kanban/tasks".into(),
+        );
+        assert!(
+            !dashboard.board.as_ref().expect("the board").writable,
+            "premise: a repository's board is not Dock's to write"
+        );
+        dashboard
+    }
+
+    /// `a` on a card of a board that is not Dock's refuses, and says so.
+    ///
+    /// This guard is the branch's standing data-safety constraint made executable — Dock writes
+    /// task files only where `board::is_personal` says it may — and nothing proved it was
+    /// wired. Asserted against `REPOSITORY_BOARD_IS_NOT_OURS` rather than against a copy of its
+    /// wording, so a reworded refusal cannot leave this passing against a sentence Dock no
+    /// longer says.
+    #[test]
+    fn archiving_one_card_is_refused_on_a_repositorys_own_board() {
+        let mut dashboard = repository_board();
+        assert_eq!(dashboard.archive_selected_task(), UiCommand::None);
+        assert_eq!(
+            dashboard.error.as_deref(),
+            Some(REPOSITORY_BOARD_IS_NOT_OURS)
+        );
+        // Not a reload: `LoadBoard` would be Dock reporting that it did something, and the
+        // whole point is that it did nothing at all.
+        assert!(
+            dashboard
+                .board
+                .as_ref()
+                .is_some_and(|board| board.view.tasks().len() == 2)
+        );
+    }
+
+    /// `A` is the same write multiplied by however many cards are sitting in `done`, so it
+    /// carries its own copy of the guard and needs its own proof that the copy is reached.
+    #[test]
+    fn archiving_all_of_done_is_refused_on_a_repositorys_own_board() {
+        let mut dashboard = repository_board();
+        assert_eq!(dashboard.archive_finished_tasks(), UiCommand::None);
+        assert_eq!(
+            dashboard.error.as_deref(),
+            Some(REPOSITORY_BOARD_IS_NOT_OURS)
+        );
+        assert!(
+            dashboard
+                .board
+                .as_ref()
+                .is_some_and(|board| board.view.tasks().len() == 2)
+        );
+    }
+
     fn git_facts() -> GitFacts {
         GitFacts {
             worktree: std::path::PathBuf::from("/repo/real"),
@@ -12055,6 +12263,111 @@ mod tests {
                 MenuTarget::SidebarWorkspace(_) | MenuTarget::SidebarAgent(_)
             ),
             "a right-click on the rail resolved to a sidebar row: {target:?}"
+        );
+    }
+
+    /// The left button's half of the same fault, on the third cached-geometry vector.
+    ///
+    /// `quick_action_areas` was cleared inside `render_sidebar`, *below* its early return for
+    /// the rail — so a rail frame kept the four START HERE rectangles from the last full
+    /// sidebar, spanning x ∈ [0, 27], which is where the panes are once the sidebar is three
+    /// columns wide. A left click meant to focus a pane opened the task board instead. The
+    /// rectangles are captured while the sidebar is full and then clicked *after* it collapses,
+    /// because a test that only asserts the vector is empty proves the clear ran without
+    /// proving the click now reaches what is under it.
+    #[test]
+    fn a_left_click_on_a_pane_never_resolves_to_a_stale_quick_action() {
+        let mut dashboard = dashboard();
+        render_terminal(&mut dashboard, 100, 30);
+        let stale: Vec<Rect> = dashboard
+            .quick_action_areas
+            .iter()
+            .map(|(_, area)| *area)
+            .collect();
+        assert!(
+            !stale.is_empty(),
+            "premise: the full sidebar must have recorded START HERE rows or this proves nothing"
+        );
+
+        dashboard.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        dashboard.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        render_terminal(&mut dashboard, 100, 30);
+        assert!(
+            dashboard.quick_action_areas.is_empty(),
+            "the rail path must not leave the full sidebar's START HERE rows recorded"
+        );
+
+        // Focus is moved off the pane being clicked first, so the click has something to say:
+        // clicking the already-focused pane is deliberately `None`, which is indistinguishable
+        // from a click that landed on nothing.
+        dashboard.layout.workspaces[0].focused_pane_id = "b".into();
+        for row in stale {
+            let column = row.x + 10;
+            assert_eq!(
+                dashboard.pane_at(column, row.y).as_deref(),
+                Some("a"),
+                "premise: a pane must be drawn where the START HERE row used to be"
+            );
+            let outcome = dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(
+                matches!(&outcome, UiCommand::Send(request)
+                    if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Focus { pane_id, .. }) if pane_id == "a")),
+                "a click on a pane ran a stale quick action instead of focusing it: {outcome:?}"
+            );
+            dashboard.layout.workspaces[0].focused_pane_id = "b".into();
+        }
+        // And nothing a quick action does happened along the way.
+        assert!(!dashboard.help_open && dashboard.picker.is_none());
+    }
+
+    /// Spec §7's second half: the rail expands by pointer, so the full sidebar has to collapse
+    /// by pointer. Both directions in one test because they are one loop — a chevron that
+    /// collapses to a rail that cannot expand, or the reverse, is a dead end either way.
+    #[test]
+    fn the_sidebars_chevron_collapses_it_and_the_rail_brings_it_back() {
+        let mut dashboard = dashboard();
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        let chevron = dashboard
+            .sidebar_collapse_area
+            .expect("the full sidebar draws a collapse control");
+        // Drawn, not merely recorded: a rectangle over blank cells is a click target nobody can
+        // see, which is the same defect as a control that is decoration only, from the other end.
+        assert_eq!(
+            row_text(&terminal, chevron, chevron.y).trim(),
+            SIDEBAR_COLLAPSE,
+            "the chevron's rectangle must be where the chevron actually is"
+        );
+
+        let outcome = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: chevron.x + 1,
+            row: chevron.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(outcome, UiCommand::None);
+        assert_eq!(dashboard.sidebar, SidebarState::Rail);
+
+        render_terminal(&mut dashboard, 100, 30);
+        assert!(
+            dashboard.sidebar_collapse_area.is_none(),
+            "a rail frame must not leave the chevron's rectangle behind"
+        );
+        let rail = dashboard.sidebar_rail_area;
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rail.x,
+            row: rail.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            dashboard.sidebar,
+            SidebarState::Full,
+            "clicking the rail brings the sidebar back"
         );
     }
 
@@ -15531,6 +15844,172 @@ mod tests {
         );
     }
 
+    /// A pane menu opened with nothing selected — the common case, and the most-used menu on
+    /// this branch — has a cursor you can see and a first row you can read.
+    ///
+    /// Neither was true: the disabled `Copy selection` was painted in `border`, which is 1.19:1
+    /// on `panel` and so is not dim but absent, and the cursor's background was withheld from
+    /// any row whose item was disabled — which, opening at index 0, was that row. The menu came
+    /// up looking like a blank line with no highlight anywhere on it.
+    ///
+    /// Asserted against the buffer's own colours rather than against the text, because the text
+    /// was never the thing that was wrong.
+    #[test]
+    fn a_menu_with_nothing_selected_still_has_a_visible_cursor_and_a_legible_first_row() {
+        let mut dashboard = bound_dashboard();
+        render_terminal(&mut dashboard, 100, 30);
+        let pane = dashboard.pane_areas["a"];
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: pane.x + 3,
+            row: pane.y + 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        let menu = dashboard.menu.as_ref().expect("the pane menu");
+        assert!(
+            matches!(&menu.entries[0], MenuEntry::Item(item) if !item.enabled),
+            "premise: with no selection the first entry is the disabled Copy selection"
+        );
+        assert_ne!(
+            menu.cursor, 0,
+            "the cursor does not open on a disabled item"
+        );
+        let cursor = menu.cursor;
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        let area = dashboard.menu_area;
+        let buffer = terminal.backend().buffer();
+        let theme = dashboard.theme;
+
+        let disabled = &buffer[(area.x + 2, area.y + 1)];
+        assert_eq!(
+            disabled.fg, theme.muted,
+            "the disabled row is dimmed, not painted in a colour it cannot be read in"
+        );
+        assert_ne!(disabled.fg, theme.border, "1.19:1 on panel is not a colour");
+
+        let here = &buffer[(
+            area.x + 2,
+            area.y + 1 + u16::try_from(cursor).expect("a small menu"),
+        )];
+        assert_eq!(
+            here.bg, theme.accent,
+            "the cursor row carries a background the eye can find"
+        );
+    }
+
+    /// A cursor that is walked onto a disabled item keeps a background, so "where am I" never
+    /// stops having an answer. It is a different background from the accent, because the accent
+    /// means "and Enter takes this" and here Enter takes nothing.
+    #[test]
+    fn the_cursor_stays_visible_when_it_is_walked_onto_a_disabled_item() {
+        let mut dashboard = bound_dashboard();
+        render_terminal(&mut dashboard, 100, 30);
+        let pane = dashboard.pane_areas["a"];
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: pane.x + 3,
+            row: pane.y + 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        dashboard.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            dashboard.menu.as_ref().expect("still open").cursor,
+            0,
+            "Up reaches the disabled first entry: disabled is greyed out, never skipped over"
+        );
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        let area = dashboard.menu_area;
+        let cell = &terminal.backend().buffer()[(area.x + 2, area.y + 1)];
+        assert_ne!(
+            cell.bg, dashboard.theme.panel,
+            "the cursor row must carry a background even when its item is disabled"
+        );
+        assert_ne!(
+            cell.bg, dashboard.theme.accent,
+            "and not the one that means Enter would take this"
+        );
+    }
+
+    /// Help, Git, Review and Board cover the canvas, and a right-click inside one used to open
+    /// a `Pane` menu for a pane the overlay was hiding — every item of which then acted on that
+    /// hidden pane. All four in one test because they are one guard.
+    ///
+    /// The board's cards are the exception the guard has to keep: they are drawn by the overlay
+    /// itself, so a right-click on one is aimed at something genuinely on screen. Both halves
+    /// are here, because a guard written without the exception would pass the first half and
+    /// silently take the board's only pointer menu away.
+    #[test]
+    fn a_right_click_inside_a_full_screen_overlay_never_names_a_pane_underneath_it() {
+        for open in [
+            OverlayKind::Help,
+            OverlayKind::Git,
+            OverlayKind::Review,
+            OverlayKind::Board,
+        ] {
+            let mut dashboard = bound_dashboard();
+            render_terminal(&mut dashboard, 110, 34);
+            let pane = dashboard.pane_areas["a"];
+            match open {
+                OverlayKind::Help => dashboard.help_open = true,
+                OverlayKind::Git => dashboard.set_git(git_facts(), SAMPLE_DIFF.into()),
+                OverlayKind::Review => {
+                    dashboard.set_review_inbox(vec![(handoff("dock_01J9", "DOCK-7"), None)]);
+                }
+                OverlayKind::Board => dashboard.set_board_tasks(
+                    vec![board_task(1, "Covered", "backlog")],
+                    "/repo/real/kanban/tasks".into(),
+                ),
+                _ => unreachable!("only the four full-screen overlays are under test"),
+            }
+            render_terminal(&mut dashboard, 110, 34);
+            assert!(
+                dashboard.overlay_is_open(open),
+                "premise: {open:?} must actually be open"
+            );
+
+            let (column, row) = (pane.x + 3, pane.y + 3);
+            assert!(
+                dashboard.board_card_at(column, row).is_none(),
+                "premise: the point clicked must not be one of the board's own cards"
+            );
+            let outcome = dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(outcome, UiCommand::None);
+            assert!(
+                dashboard.menu.is_none(),
+                "{open:?} let a right-click name a pane it was covering: {:?}",
+                dashboard.menu.as_ref().map(|menu| menu.target.clone())
+            );
+        }
+
+        // And the exception. A card of the open board is on screen, so its menu still opens.
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(
+            vec![board_task(1, "Reachable", "backlog")],
+            "/repo/real/kanban/tasks".into(),
+        );
+        render_terminal(&mut dashboard, 110, 34);
+        let (id, card) = *dashboard
+            .board_card_areas
+            .first()
+            .expect("the open board drew a card");
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: card.x + 1,
+            row: card.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            dashboard.menu.as_ref().map(|menu| menu.target.clone()),
+            Some(MenuTarget::BoardCard(id)),
+            "the guard must not close the board's own pointer menu"
+        );
+    }
+
     /// The menu is drawn where the pointer was, and both routes into an item — clicking its row
     /// and typing the key printed beside it — reach the same thing Enter would.
     #[test]
@@ -15602,14 +16081,21 @@ mod tests {
             dashboard.menu.is_some(),
             "a disabled item's key takes nothing"
         );
+        // And it opened on `Paste last copy` rather than on the disabled `Copy selection` above
+        // it: the cursor rests on the first entry Enter can actually take.
+        assert_eq!(
+            dashboard.menu.as_ref().expect("still open").cursor,
+            1,
+            "a menu opens on the first item that is not disabled"
+        );
         // `z` is `Ctrl+B z`, whose last character is the one a menu key match is keyed on — but
         // that is a three-token string, not a one-key shortcut, so it is printed and not typed.
         // `Down` then Enter is how it is reached instead.
         dashboard.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
             dashboard.menu.as_ref().expect("still open").cursor,
-            1,
-            "Down walks to the next item"
+            3,
+            "Down walks to the next item, stepping over the rule between them"
         );
     }
 

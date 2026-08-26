@@ -109,6 +109,16 @@ const MIN_PANE_HEIGHT: u16 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     Request(Box<Request>),
+    /// A request whose answer nobody needs: painted, posted, and not waited on.
+    ///
+    /// `Request` blocks on the daemon and then refreshes, which is four round trips and
+    /// possibly a `ps`. That is right when the answer is the product — a queue listing, a
+    /// page of history. It is wrong for a change the dashboard has already made locally and
+    /// is only telling the daemon about, because there the waiting is pure latency in front
+    /// of whatever gesture the user is mid-way through. `PaneResize` already goes this way
+    /// for the same reason; a refused request is not lost, because the client counts unread
+    /// replies and `take_deferred_error` surfaces them on the next drain.
+    Send(Box<Request>),
     /// Several requests that only mean anything together, sent in order. Closing a workspace is
     /// the one command Dock has that cannot be expressed as a single `WorkspaceRequest`: the
     /// daemon drops a workspace when its last pane goes, so the workspace is closed by closing
@@ -5156,7 +5166,7 @@ impl Dashboard {
                     return UiCommand::None;
                 }
                 self.layout.workspaces[self.workspace_index].focused_pane_id = pane_id.clone();
-                UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Focus {
+                UiCommand::Send(Box::new(Request::Workspace(WorkspaceRequest::Focus {
                     workspace_id,
                     pane_id,
                 })))
@@ -6596,7 +6606,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert!(
-            matches!(focus, UiCommand::Request(request) if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Focus { pane_id, .. }) if pane_id == "a"))
+            matches!(focus, UiCommand::Send(request) if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Focus { pane_id, .. }) if pane_id == "a"))
         );
         let divider = dashboard.dividers[0].area;
         dashboard.mouse(MouseEvent {
@@ -6623,6 +6633,42 @@ mod tests {
         });
         assert!(
             matches!(resize, UiCommand::Request(request) if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Resize { ratio_milli, .. }) if *ratio_milli > 0 && *ratio_milli < 500))
+        );
+    }
+
+    /// A press that focuses a pane must not put a blocking daemon round trip in front of the
+    /// drag it begins. `Send` is painted and posted; `Request` would be waited on, and then
+    /// `refresh` would wait on three more — which is what made the first click of a selection
+    /// hitch. The pane is focused locally either way, so nothing is lost by not waiting.
+    #[test]
+    fn focusing_a_pane_by_pointer_is_posted_rather_than_waited_on() {
+        let mut dashboard = dashboard();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        let b = dashboard.pane_areas["b"];
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: b.x + 1,
+            row: b.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        terminal.draw(|frame| dashboard.render(frame)).unwrap();
+        let a = dashboard.pane_areas["a"];
+        let focus = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: a.x + 1,
+            row: a.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(&focus, UiCommand::Send(request) if matches!(request.as_ref(),
+                Request::Workspace(WorkspaceRequest::Focus { pane_id, .. }) if pane_id == "a")),
+            "a pointer focus must be posted, not awaited: {focus:?}"
+        );
+        assert_eq!(
+            dashboard.workspace().unwrap().focused_pane_id,
+            "a",
+            "and the focus must already be applied locally, or the paint would show the old pane"
         );
     }
 
@@ -11970,7 +12016,7 @@ mod tests {
         assert!(
             matches!(
                 moved,
-                UiCommand::Request(ref request)
+                UiCommand::Send(ref request)
                     if matches!(**request, Request::Workspace(WorkspaceRequest::Focus { .. }))
             ),
             "got {moved:?}"

@@ -705,6 +705,16 @@ fn run_dashboard(
                         .map_err(|e| e.to_string())?;
                 }
             }
+            UiCommand::Send(request) => {
+                // Painted first, exactly as `Request` is, so the optimistic local change is on
+                // screen before anything touches the socket. Then posted and forgotten: there
+                // is no `refresh` here, because the daemon's own event stream is what
+                // reconciles a change the dashboard has already made.
+                terminal
+                    .draw(|frame| dashboard.render(frame))
+                    .map_err(|e| e.to_string())?;
+                let _ = client.send(&request);
+            }
             UiCommand::Requests(requests) => {
                 // Painted before the batch for the same reason a single request is, then sent in
                 // order. The loop keeps going after a refusal rather than stopping at the first

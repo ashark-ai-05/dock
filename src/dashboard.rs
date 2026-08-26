@@ -733,6 +733,11 @@ enum MenuAction {
     Pane(PaneCommand),
     CopySelection,
     PasteLastCopy,
+    /// The visible workspace's own rename form, which is a different form from the focused
+    /// pane's. Its own variant rather than a `PaneCommand`, because `PaneCommand` is shared with
+    /// the key router and there is no key that renames a workspace — the tab strip's pencil and
+    /// this item are the only two ways in.
+    RenameWorkspace,
     ArchiveCard(u64),
     MoveCard(u64, isize),
     DispatchCard(u64),
@@ -835,8 +840,11 @@ impl ContextMenu {
                 }),
                 MenuEntry::Item(MenuItem {
                     label: "Rename",
-                    key: Some("Ctrl+B r"),
-                    action: MenuAction::Pane(PaneCommand::Rename),
+                    // No key, because there is none: `Ctrl+B r` renames the focused *pane*, and
+                    // printing it here would teach a key that does something else to a different
+                    // object. The tab strip's pencil and this item are the whole vocabulary.
+                    key: None,
+                    action: MenuAction::RenameWorkspace,
                     enabled: true,
                 }),
                 MenuEntry::Separator,
@@ -5807,6 +5815,7 @@ impl Dashboard {
                 let (column, row) = self.menu_origin;
                 self.paste_last_copied(column, row)
             }
+            MenuAction::RenameWorkspace => self.rename_workspace(),
             MenuAction::ArchiveCard(id) => self.archive_card(id),
             MenuAction::MoveCard(id, delta) => self.move_card(id, delta),
             MenuAction::DispatchCard(id) => self.dispatch_card(id),
@@ -15072,6 +15081,112 @@ mod tests {
             dashboard.menu.as_ref().expect("still open").cursor,
             1,
             "Down walks to the next item"
+        );
+    }
+
+    /// A tab's `Rename` renames the workspace, not the pane inside it.
+    ///
+    /// The failure mode is silent: both functions open the same rename form, so a menu aimed at
+    /// the wrong one still puts a form on screen and still accepts a name — it just writes it to
+    /// the wrong object. Only the `RenameTarget` says which, which is why that is what this
+    /// asserts. The name it opens with is checked too, because it doubles as proof that the item
+    /// was aimed at the workspace that was right-clicked rather than at the visible one.
+    #[test]
+    fn renaming_from_a_tabs_menu_renames_the_workspace_and_not_the_pane() {
+        let mut dashboard = two_workspace_dashboard();
+        render_terminal(&mut dashboard, 120, 34);
+        // The second workspace, which is deliberately not the visible one: `Daily` is on screen
+        // and `Deploy` is the tab being pointed at.
+        assert_eq!(dashboard.workspace().expect("a workspace").name, "Daily");
+        let (_, tab) = *dashboard
+            .tab_areas
+            .iter()
+            .find(|(workspace_id, _)| workspace_id == "w2")
+            .expect("the second workspace has a tab");
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: tab.x,
+            row: tab.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let menu = dashboard.menu.as_ref().expect("the tab menu");
+        assert_eq!(menu.target, MenuTarget::Tab("w2".into()));
+        let index = menu
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Item(item) if item.label == "Rename"))
+            .expect("the tab menu offers Rename");
+        dashboard.menu.as_mut().expect("the tab menu").cursor = index;
+        dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            dashboard.rename_form,
+            Some((RenameTarget::Workspace, "Deploy".into())),
+            "the tab menu renames the workspace it was opened on, not the focused pane"
+        );
+    }
+
+    /// A right-click on a card drawn inside a Board *pane* gets that pane's menu.
+    ///
+    /// Card rectangles are recorded only from the board overlay, because every card action is
+    /// written against `self.board` and a card menu over a pane would print four items that all
+    /// silently do nothing. That makes the fallback load-bearing rather than incidental: it has
+    /// to be the pane's own menu, which works, and not `Canvas` — a menu about the dashboard
+    /// raised by a click that landed squarely inside a pane — and not nothing at all.
+    #[test]
+    fn a_right_click_on_a_card_in_a_board_pane_falls_through_to_that_panes_menu() {
+        let mut dashboard = bound_dashboard();
+        let pane = dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("b")
+            .expect("pane b");
+        pane.kind = PaneKind::Board;
+        pane.run_id = None;
+        dashboard.set_board_pane_tasks(
+            vec![board_task(7, "a card inside a pane", "backlog")],
+            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+        );
+        let terminal = render_terminal(&mut dashboard, 130, 34);
+        let area = dashboard.pane_areas["b"];
+
+        // The premise: a card really is painted inside that pane, so the click below lands on
+        // one rather than on empty column space. Without this the test would pass for a board
+        // pane that drew nothing at all.
+        // `#7` rather than the title: five columns across half a screen leave about seven cells
+        // each, so the title is ellipsised away — which is `card_lines` working as designed. The
+        // id is what identifies the card, and it is enough to know one is painted on this row.
+        let card_row = (area.y..area.bottom())
+            .find(|row| row_text(&terminal, area, *row).contains("#7"))
+            .expect("the board pane draws its one card");
+
+        dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: area.x + 3,
+            row: card_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        let menu = dashboard.menu.as_ref().expect("a menu opened on the card");
+        assert_eq!(
+            menu.target,
+            MenuTarget::Pane("b".into()),
+            "a card in a pane is a pane, not a card menu and not the canvas"
+        );
+        // And it is a working pane menu rather than an empty one: taking `Close pane` closes the
+        // pane that was right-clicked, which is the fallback actually doing something.
+        let index = menu
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Item(item) if item.label == "Close pane"))
+            .expect("the pane menu offers Close pane");
+        dashboard.menu.as_mut().expect("the pane menu").cursor = index;
+        assert!(
+            matches!(
+                dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                UiCommand::Request(request)
+                    if matches!(request.as_ref(),
+                        Request::Workspace(WorkspaceRequest::Close { pane_id, .. }) if pane_id == "b")
+            ),
+            "the fallback menu closes the pane it was opened on"
         );
     }
 }

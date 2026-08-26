@@ -8,6 +8,9 @@ use std::{
 
 pub use keys::{KeyEncoding, encode_key, encode_paste};
 pub use vt::{PaneSnapshot, ShellSignals, VtTerminal};
+// The two grid readers, re-exported so the dashboard can point them at whichever screen an
+// open selection resolves to — the live parser's until output forces a clone, the clone after.
+pub(crate) use vt::{row_text, text_between};
 
 /// Single swap point for the terminal engine. `rio-vt` can replace `VtTerminal` here
 /// without touching any caller once it is mature enough to depend on.

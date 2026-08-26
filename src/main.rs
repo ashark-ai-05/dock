@@ -527,6 +527,8 @@ fn run_dashboard(
         Terminal::new(CrosstermBackend::new(io::stdout())).map_err(|e| e.to_string())?;
     let mut dashboard = Dashboard::default();
     dashboard.runtime_directory = runtime_directory.clone();
+    dashboard.apply_sidebar_env();
+    dashboard.apply_theme_env();
     let (catalog_tx, catalog_rx) = mpsc::channel();
     let mut catalog_loading = false;
     let mut test_events = test_events()?;
@@ -643,7 +645,10 @@ fn run_dashboard(
             Event::Key(key) if key.kind == KeyEventKind::Press => dashboard.key(key),
             Event::Paste(text) => dashboard.paste(text),
             Event::Mouse(mouse) => dashboard.mouse(mouse),
-            Event::Resize(_, _) => UiCommand::None,
+            Event::Resize(_, _) => {
+                dashboard.forget_sidebar_choice();
+                UiCommand::None
+            }
             _ => UiCommand::None,
         };
         match command {
@@ -704,6 +709,16 @@ fn run_dashboard(
                         .draw(|frame| dashboard.render(frame))
                         .map_err(|e| e.to_string())?;
                 }
+            }
+            UiCommand::Send(request) => {
+                // Painted first, exactly as `Request` is, so the optimistic local change is on
+                // screen before anything touches the socket. Then posted and forgotten: there
+                // is no `refresh` here, because the daemon's own event stream is what
+                // reconciles a change the dashboard has already made.
+                terminal
+                    .draw(|frame| dashboard.render(frame))
+                    .map_err(|e| e.to_string())?;
+                let _ = client.send(&request);
             }
             UiCommand::Requests(requests) => {
                 // Painted before the batch for the same reason a single request is, then sent in

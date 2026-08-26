@@ -15030,6 +15030,193 @@ mod tests {
         }
     }
 
+    /// A fresh, single-workspace dashboard with pane "b" bound to a run but *not* focused —
+    /// pane "a" keeps the fixture's default focus. `bound_dashboard` binds the pane that
+    /// already has focus, which cannot exercise the unfocused-press path this measurement is
+    /// about, so this is its own fixture rather than a reuse.
+    fn unfocused_bound_pane() -> (Dashboard, Rect) {
+        let mut dashboard = dashboard();
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("b")
+            .unwrap()
+            .run_id = Some("run_2".into());
+        dashboard.apply_event(attach_event("run_2", b"drag over me\r\n"));
+        render_to_string(&mut dashboard, 100, 30);
+        let area = dashboard.pane_areas["b"];
+        (dashboard, area)
+    }
+
+    /// The same shape as `unfocused_bound_pane`, but with real scrollback behind it, so row 3's
+    /// clone size means something. A pane still producing output mid-drag has usually been
+    /// running for a while, not holding the one line the other two rows need; a clone measured
+    /// against that one line would understate the cost this row exists to price. Six hundred
+    /// lines rather than a full 2000-row fill: that worst case already has its own number, in
+    /// `measure_what_freezing_a_pane_for_copy_mode_costs`, and is not what this row is for.
+    fn unfocused_bound_pane_with_history() -> (Dashboard, Rect) {
+        let mut dashboard = dashboard();
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("b")
+            .unwrap()
+            .run_id = Some("run_2".into());
+        dashboard.apply_event(attach_event("run_2", b""));
+        if let Some(screen) = dashboard.screens.get_mut("run_2") {
+            for line in 1..=600 {
+                screen.feed(format!("line {line} of a long build log\r\n").as_bytes());
+            }
+        }
+        render_to_string(&mut dashboard, 100, 30);
+        let area = dashboard.pane_areas["b"];
+        (dashboard, area)
+    }
+
+    /// What a user feels as "it didn't grab": a press into a pane that does not have focus,
+    /// followed by the first drag that produces a highlight. Task 1 and Task 2 fixed two
+    /// different halves of that feeling, so this reports two different numbers rather than
+    /// blending them into one.
+    ///
+    /// Row 1 is the press. Before Task 1 this cost four blocking daemon round trips — this
+    /// request, then `refresh`'s `Workspace(Inspect)` and `Inspect`, one of which could shell
+    /// out to `ps` on a cache miss — because focusing a pane waited for the daemon to agree
+    /// before painting anything. It now paints the local layout and returns `UiCommand::Send`,
+    /// which is posted and never waited on (see `UiCommand::Send`'s doc comment).
+    ///
+    /// Row 2 is the first drag, measured on a pane nothing else disturbs — the case Task 2
+    /// made free. `drag_selection` opens copy mode against the live screen
+    /// (`SelectionScreen::Live`); nothing clones the grid because nothing is about to change
+    /// under it.
+    ///
+    /// Row 3 is what Task 2 did *not* make free, measured separately because reporting only
+    /// row 2 would make the fix look unconditional when it is conditional on purpose: a
+    /// `PaneDelta` landing while that same selection is open and `Live` — output still
+    /// arriving mid-gesture — freezes it, which is one clone of the pane's grid and
+    /// scrollback. `freeze_selection`'s doc comment calls this "the one place a pointer
+    /// selection ever pays for a clone," and this row is that place, priced. It is not part of
+    /// the press or the drag; it is the delta event handler paying once, however many drag
+    /// events follow.
+    ///
+    /// Fastest-of-`ROUNDS` rather than a mean, for the reason `measure_frame` gives: a loaded
+    /// laptop only ever makes a round slower, so the mean measures the machine and the minimum
+    /// measures the code. Each round rebuilds the fixture from scratch, because a press and a
+    /// drag are not idempotent the way a render is — repeating them on one dashboard would
+    /// measure the second gesture, not the first, on every round after the first.
+    ///
+    /// **Run with `--test-threads=1`:** row 3 reads `ALLOCATED_BYTES`, a process-global, and a
+    /// benchmark sharing the process with another one reports the other one's allocations as
+    /// its own.
+    #[test]
+    #[ignore = "a measurement, not an assertion; cargo test --release measure_press_and_first_drag -- --ignored --nocapture --test-threads=1"]
+    fn measure_press_and_first_drag_on_an_unfocused_pane() {
+        const ROUNDS: u32 = 7;
+
+        let down = |area: Rect| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 2,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drag = |area: Rect| MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 8,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let mut press_ms = f64::MAX;
+        let mut press_allocs = u64::MAX;
+        for _ in 0..ROUNDS {
+            let (mut dashboard, area) = unfocused_bound_pane();
+            assert_ne!(
+                dashboard.workspace().unwrap().focused_pane_id,
+                "b",
+                "the fixture must start unfocused for this to measure the unfocused path"
+            );
+            let before = ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            let command = std::hint::black_box(dashboard.mouse(down(area)));
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            press_ms = press_ms.min(elapsed);
+            press_allocs =
+                press_allocs.min(ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed) - before);
+            assert!(
+                matches!(command, UiCommand::Send(_)),
+                "an unfocused press must paint and post rather than block: {command:?}"
+            );
+        }
+
+        let mut idle_drag_ms = f64::MAX;
+        let mut idle_drag_allocs = u64::MAX;
+        for _ in 0..ROUNDS {
+            let (mut dashboard, area) = unfocused_bound_pane();
+            dashboard.mouse(down(area));
+            let before = ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            std::hint::black_box(dashboard.mouse(drag(area)));
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            idle_drag_ms = idle_drag_ms.min(elapsed);
+            idle_drag_allocs = idle_drag_allocs
+                .min(ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed) - before);
+            assert_eq!(
+                copy_selection(&dashboard),
+                Some(((0, 1), (0, 7))),
+                "the drag must have produced a highlight for this to measure the felt gesture"
+            );
+            assert!(
+                matches!(
+                    dashboard.copy.as_ref().map(|mode| &mode.screen),
+                    Some(SelectionScreen::Live)
+                ),
+                "an idle pane's first drag must not clone the screen"
+            );
+        }
+
+        let mut delta_ms = f64::MAX;
+        let mut delta_allocs = u64::MAX;
+        let mut delta_bytes = u64::MAX;
+        for _ in 0..ROUNDS {
+            let (mut dashboard, area) = unfocused_bound_pane_with_history();
+            dashboard.mouse(down(area));
+            dashboard.mouse(drag(area));
+            let before = ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+            let before_bytes = ALLOCATED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            dashboard.apply_event(delta_event("run_2", 2, b"more output\r\n"));
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            delta_ms = delta_ms.min(elapsed);
+            delta_allocs =
+                delta_allocs.min(ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed) - before);
+            delta_bytes = delta_bytes
+                .min(ALLOCATED_BYTES.load(std::sync::atomic::Ordering::Relaxed) - before_bytes);
+            assert!(
+                matches!(
+                    dashboard.copy.as_ref().map(|mode| &mode.screen),
+                    Some(SelectionScreen::Frozen(_))
+                ),
+                "output arriving mid-gesture must freeze the selection, exactly once"
+            );
+        }
+
+        println!();
+        println!("press and first drag on an unfocused pane; a delta landing mid-gesture");
+        println!(
+            "{:>32}  {:>10}  {:>10}  {:>12}",
+            "gesture", "ms", "allocs", "bytes"
+        );
+        println!(
+            "{:>32}  {press_ms:>10.4}  {press_allocs:>10}  {:>12}",
+            "press (unfocused, Send)", "n/a"
+        );
+        println!(
+            "{:>32}  {idle_drag_ms:>10.4}  {idle_drag_allocs:>10}  {:>12}",
+            "first drag (idle pane, Live)", "n/a"
+        );
+        println!(
+            "{:>32}  {delta_ms:>10.4}  {delta_allocs:>10}  {delta_bytes:>12}",
+            "delta mid-gesture (1 clone)"
+        );
+    }
+
     /// A menu is never drawn partly off-screen: it flips rather than clipping, and clamps rather
     /// than flipping when it cannot fit either way. All four corners, because each one exercises
     /// a different pair of branches.

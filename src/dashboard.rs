@@ -5713,6 +5713,79 @@ const NARROW_CARD: usize = 20;
 /// the glyph and its colour to carry the state, which they are there to do.
 const ONE_LINE_CARD: usize = 13;
 
+/// An empty column keeps enough width to name itself and no more.
+const STUB_MIN: u16 = 8;
+const STUB_MAX: u16 = 12;
+/// A column with cards in it is not worth drawing below this, so if the arithmetic cannot
+/// give every occupied column this much, the whole board falls back to equal columns.
+const FILLED_MIN: u16 = 18;
+
+/// Widths for each board column, left to right, summing to exactly `total`.
+///
+/// Equal columns were the bug: five statuses meant `DONE` got a fifth of the pane however
+/// many of the other four were empty, which on a half-screen board left about fourteen cells
+/// for a title and ellipsised every card. Width goes where the cards are instead.
+///
+/// An empty column keeps a stub rather than disappearing. It is still a column — the cursor
+/// walks into it, `<` and `>` move cards into it — and a board whose shape changes as cards
+/// move is harder to aim at than one whose columns merely breathe.
+fn column_widths(total: u16, labels: &[&str], counts: &[usize]) -> Vec<u16> {
+    let columns = labels.len();
+    if columns == 0 {
+        return Vec::new();
+    }
+    debug_assert_eq!(columns, counts.len(), "one count per column");
+    let equal_split = || {
+        let each = total / columns as u16;
+        let mut widths = vec![each; columns];
+        // The remainder lands on the last column rather than being lost, which is what keeps
+        // the sum exact for a width that does not divide evenly.
+        widths[columns - 1] += total - each * columns as u16;
+        widths
+    };
+    let filled: Vec<usize> = (0..columns).filter(|index| counts[*index] > 0).collect();
+    if filled.is_empty() || filled.len() == columns {
+        return equal_split();
+    }
+    let stub = |index: usize| -> u16 {
+        u16::try_from(labels[index].chars().count() + 1)
+            .unwrap_or(STUB_MAX)
+            .clamp(STUB_MIN, STUB_MAX)
+    };
+    let stubs: u16 = (0..columns)
+        .filter(|index| counts[*index] == 0)
+        .map(stub)
+        .sum();
+    let Some(remainder) = total.checked_sub(stubs) else {
+        return equal_split();
+    };
+    let floors = FILLED_MIN.saturating_mul(filled.len() as u16);
+    let Some(surplus) = remainder.checked_sub(floors) else {
+        return equal_split();
+    };
+    let cards: usize = filled.iter().map(|index| counts[*index]).sum();
+    let mut widths = vec![0u16; columns];
+    for index in 0..columns {
+        if counts[index] == 0 {
+            widths[index] = stub(index);
+        }
+    }
+    // Floor division on every column but the last, which takes whatever is left. Each share
+    // is at most `surplus * count / cards` and the counts sum to `cards`, so the running
+    // total can never overrun the surplus and the subtraction below cannot underflow.
+    let mut handed = 0u16;
+    for (position, index) in filled.iter().enumerate() {
+        let extra = if position + 1 == filled.len() {
+            surplus - handed
+        } else {
+            u16::try_from(u32::from(surplus) * counts[*index] as u32 / cards as u32).unwrap_or(0)
+        };
+        handed += extra;
+        widths[*index] = FILLED_MIN + extra;
+    }
+    widths
+}
+
 /// The board's columns and the cards in them, over whatever rectangle it is handed.
 ///
 /// A free function rather than a method because it is the one thing the board overlay and the
@@ -5758,45 +5831,72 @@ fn render_board_columns(
         );
         return;
     }
-    let column_width = area.width / statuses.len() as u16;
-    let width = usize::from(column_width.saturating_sub(1));
     let card_rows = usize::from(area.height.saturating_sub(2));
 
+    // The allocator needs every column's label and count at once — it cannot decide one
+    // column's width without knowing what the others hold — so both are built ahead of the
+    // loop instead of inline. `ACTIVE`'s count comes from `active_entries`, not from
+    // `view.cards`, because that column also holds every live agent with no card of its own.
+    let mut counts = Vec::with_capacity(statuses.len());
+    let mut labels = Vec::with_capacity(statuses.len());
+    // Cached alongside the count, rather than recomputed inside the loop below, so a column
+    // with a live agent in it does not pay for `active_entries` — a sort over every run and
+    // every card in progress — twice per frame.
+    let mut active = None;
+    for status in statuses.iter() {
+        let count = if status == ACTIVE_STATUS {
+            let entries = active_entries(view, live);
+            let count = entries.len();
+            active = Some(entries);
+            count
+        } else {
+            view.cards(status).len()
+        };
+        labels.push(format!("{} · {count}", column_heading(status)));
+        counts.push(count);
+    }
+    let borrowed: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let widths = column_widths(area.width, &borrowed, &counts);
+    let mut x = area.x;
+
     for (index, status) in statuses.iter().enumerate() {
-        let x = area.x + column_width * index as u16;
-        let active = index == cursor.0;
+        let column_width = widths[index];
+        let width = usize::from(column_width.saturating_sub(1));
+        let active_column = index == cursor.0;
         // A column taller than the space scrolls to keep the cursor visible, rather than hiding
         // the selected card behind the bottom edge — so the selected row is passed down to
         // whichever of the two card shapes this column draws.
-        let selected = active.then_some(cursor.1);
-        let (count, lines) = if status == ACTIVE_STATUS {
-            let entries = active_entries(view, live);
-            (
-                entries.len(),
-                active_lines(theme, &entries, width, card_rows, selected),
-            )
+        let selected = active_column.then_some(cursor.1);
+        let lines = if status == ACTIVE_STATUS {
+            let entries = active.take().unwrap_or_default();
+            active_lines(theme, &entries, width, card_rows, selected)
         } else {
             let cards = view.cards(status);
-            (
-                cards.len(),
-                card_lines(theme, &cards, live, width, card_rows, selected),
-            )
+            card_lines(theme, &cards, live, width, card_rows, selected)
         };
         // A rule under each heading gives the columns edges without spending a column of
         // width on borders, which at five columns would cost a fifth of the card text.
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "─".repeat(usize::from(column_width.saturating_sub(2))),
-                Style::default().fg(if active { theme.accent } else { theme.border }),
+                Style::default().fg(if active_column {
+                    theme.accent
+                } else {
+                    theme.border
+                }),
             )),
             Rect::new(x, area.y + 1, column_width.saturating_sub(1), 1),
         );
         frame.render_widget(
             Paragraph::new(Line::styled(
-                ellipsise(&format!("{} · {count}", column_heading(status)), width),
+                ellipsise(&labels[index], width),
                 Style::default()
-                    .fg(if active { theme.accent } else { theme.muted })
-                    .add_modifier(if active {
+                    .fg(if active_column {
+                        theme.accent
+                    } else {
+                        theme.muted
+                    })
+                    .add_modifier(if active_column {
                         Modifier::BOLD
                     } else {
                         Modifier::empty()
@@ -5817,6 +5917,7 @@ fn render_board_columns(
                 area.bottom().saturating_sub(area.y + 2),
             ),
         );
+        x += column_width;
     }
 }
 
@@ -5877,11 +5978,18 @@ fn card_lines<'a>(
         let here = selected == Some(first + row);
         let style = card_style(theme, here, true);
         let marker = if here { "›" } else { " " };
+        let identifier = task.id.to_string();
+        // One budget for both shapes. The badge branch spends its width on three extra cells
+        // — a space, the glyph, a space — and the plain branch does not, but the *title* must
+        // ellipsise at the same place either way or an agent attaching to a card silently
+        // shortens its title.
+        let prefix = marker.len() + 2 + identifier.len();
+        let title_budget = width.saturating_sub(prefix + 2);
         // The badge is its own span so it keeps the state's colour against a selected card's
         // inverted background, where a single styled line would have lost it.
         lines.push(match live.by_task.get(&task.id) {
             Some(run) => Line::from(vec![
-                Span::styled(format!("{marker} #{} ", task.id), style),
+                Span::styled(format!("{marker} #{identifier} "), style),
                 Span::styled(
                     run.state.glyph().to_string(),
                     if here {
@@ -5890,16 +5998,13 @@ fn card_lines<'a>(
                         Style::default().fg(theme.agent(run.state))
                     },
                 ),
-                Span::styled(
-                    ellipsise(
-                        &format!(" {}", task.title),
-                        width.saturating_sub(marker.len() + 3 + task.id.to_string().len()),
-                    ),
-                    style,
-                ),
+                Span::styled(ellipsise(&format!(" {}", task.title), title_budget), style),
             ]),
             None => Line::styled(
-                ellipsise(&format!("{marker} #{} {}", task.id, task.title), width),
+                format!(
+                    "{marker} #{identifier} {}",
+                    ellipsise(&task.title, title_budget)
+                ),
                 style,
             ),
         });
@@ -8091,6 +8196,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The allocator's three invariants, over every shape a board can take.
+    ///
+    /// The sum is the important one: `render_board_columns` lays columns out by accumulating
+    /// these widths into an x offset, so a vector that does not sum to the pane's width either
+    /// leaves a gap at the right edge or paints past it.
+    #[test]
+    fn column_widths_always_fill_the_pane_exactly() {
+        for total in [0u16, 1, 7, 40, 79, 80, 100, 137, 200, 400] {
+            for counts in [
+                vec![0, 0, 0, 0, 0],
+                vec![0, 0, 2, 0, 5],
+                vec![1, 1, 1, 1, 1],
+                vec![9, 0, 0, 0, 0],
+                vec![0, 0, 0, 0, 1],
+            ] {
+                let labels: Vec<String> = [
+                    "BACKLOG · 0",
+                    "TODO · 0",
+                    "ACTIVE · 2",
+                    "REVIEW · 0",
+                    "DONE · 5",
+                ]
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect();
+                let borrowed: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let widths = column_widths(total, &borrowed, &counts);
+                assert_eq!(widths.len(), counts.len(), "one width per column");
+                assert_eq!(
+                    widths.iter().map(|w| u32::from(*w)).sum::<u32>(),
+                    u32::from(total),
+                    "widths must fill {total} exactly for {counts:?}, got {widths:?}"
+                );
+            }
+        }
+    }
+
+    /// An empty column shrinks to a stub and a full one takes the room that frees.
+    #[test]
+    fn an_empty_column_stops_hoarding_width() {
+        let labels = [
+            "BACKLOG · 0",
+            "TODO · 0",
+            "ACTIVE · 2",
+            "REVIEW · 0",
+            "DONE · 5",
+        ];
+        let widths = column_widths(100, &labels, &[0, 0, 2, 0, 5]);
+        for empty in [0usize, 1, 3] {
+            assert!(
+                (8..=12).contains(&widths[empty]),
+                "an empty column is a stub, not a fifth of the pane: {widths:?}"
+            );
+        }
+        assert!(
+            widths[4] > 100 / 5,
+            "and DONE, which has the cards, gets more than its equal share: {widths:?}"
+        );
+        assert!(
+            widths[4] > widths[2],
+            "five cards should get more room than two: {widths:?}"
+        );
+    }
+
+    /// A pane too narrow for stubs degrades to today's equal division rather than to a panic.
+    #[test]
+    fn a_pane_too_narrow_for_stubs_falls_back_to_equal_columns() {
+        let labels = [
+            "BACKLOG · 0",
+            "TODO · 0",
+            "ACTIVE · 2",
+            "REVIEW · 0",
+            "DONE · 5",
+        ];
+        let widths = column_widths(30, &labels, &[0, 0, 2, 0, 5]);
+        assert_eq!(widths.iter().map(|w| u32::from(*w)).sum::<u32>(), 30);
+        assert!(
+            widths.iter().all(|width| *width <= 8),
+            "a narrow pane divides evenly rather than starving a column: {widths:?}"
+        );
+    }
+
     /// A dashboard whose visible workspace holds one terminal pane and one board pane, with a
     /// live agent in a second workspace so the runs lane has something to show.
     #[test]
@@ -8387,14 +8574,20 @@ mod tests {
     #[test]
     fn a_narrow_active_card_gives_up_a_line_rather_than_cutting_the_state_word_in_half() {
         // The second line is what a two-line card is *for*, so it degrades in deliberate steps
-        // rather than being left to the ellipsis. Five columns across 105 cells, less the
-        // sidebar, leave fourteen: too narrow for `claude · a · needs you · 0 queued`, wide
-        // enough for the word that matters.
+        // rather than being left to the ellipsis.
+        //
+        // The terminal widths below moved from 105/80 to 95/80 because columns no longer divide
+        // the pane equally (task 4): with one card apiece, `BACKLOG` and `ACTIVE` are now the
+        // only two filled columns and split the pane's surplus width between just themselves,
+        // so a terminal that used to land a column in the narrow bucket at 105 now needs 95 to
+        // land `ACTIVE` at the same eighteen cells (`FILLED_MIN`, the floor for an occupied
+        // column with no surplus left to hand out) — too narrow for
+        // `claude · a · needs you · 0 queued`, wide enough for the word that matters.
         let mut dashboard = dashboard_with_a_board_pane();
         dashboard.layout.workspaces[0].root = LayoutNode::Pane {
             pane_id: "b".into(),
         };
-        let terminal = render_terminal(&mut dashboard, 105, 24);
+        let terminal = render_terminal(&mut dashboard, 95, 24);
         let active = board_column(&terminal, "ACTIVE");
         assert!(
             active.contains("needs you"),
@@ -8405,9 +8598,12 @@ mod tests {
             "and everything that did not fit was dropped rather than cut: {active:?}"
         );
 
-        // At 80 the same five columns leave nine cells, where even the word would be cut. The
-        // card gives up its second line entirely: `nee…` is worse than nothing, and the glyph
-        // and its colour are there to carry the state on their own.
+        // At 80 there are too few cells even for stubs plus two eighteen-cell filled columns
+        // (the allocator's own fallback, exercised by `a_pane_too_narrow_for_stubs_falls_back_
+        // to_equal_columns` above), so the board falls back to five equal columns, each too
+        // narrow even for a one-line card. The card gives up its second line entirely: `nee…`
+        // is worse than nothing, and the glyph and its colour are there to carry the state on
+        // their own.
         let terminal = render_terminal(&mut dashboard, 80, 24);
         let active = board_column(&terminal, "ACTIVE");
         assert!(active.contains("#7"), "the card is still drawn: {active:?}");

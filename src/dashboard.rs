@@ -6953,10 +6953,18 @@ const ONE_LINE_CARD: usize = 13;
 
 /// An empty column keeps enough width to name itself and no more.
 const STUB_MIN: u16 = 8;
-const STUB_MAX: u16 = 12;
+const STUB_MAX: u16 = 14;
 /// A column with cards in it is not worth drawing below this, so if the arithmetic cannot
 /// give every occupied column this much, the whole board falls back to equal columns.
 const FILLED_MIN: u16 = 18;
+/// The width at which an equal share is already comfortable: a marker, `#NN `, and a couple of
+/// dozen characters of title.
+///
+/// Above this there is no scarcity to resolve, and sharing width by card count stops being a
+/// fix and becomes a disfigurement — a single occupied column takes everything the empty ones
+/// did not, which on a wide board means one column spanning the pane beside a blank gulf. The
+/// proportional rule earns its place only when an equal share would truncate.
+const COLUMN_COMFORTABLE: u16 = 28;
 
 /// Widths for each board column, left to right, summing to exactly `total`.
 ///
@@ -6976,17 +6984,33 @@ fn column_widths(total: u16, labels: &[&str], counts: &[usize]) -> Vec<u16> {
     let equal_split = || {
         let each = total / columns as u16;
         let mut widths = vec![each; columns];
-        // The remainder lands on the last column rather than being lost, which is what keeps
-        // the sum exact for a width that does not divide evenly.
-        widths[columns - 1] += total - each * columns as u16;
+        // The remainder is spread a cell at a time from the left rather than dumped on the last
+        // column, which is what keeps the sum exact *and* keeps the columns even. Dumping it
+        // made `DONE` three cells wider than its neighbours on a board that divides unevenly —
+        // a small thing, but a visibly lopsided one on the rightmost column.
+        let mut left = total - each * columns as u16;
+        let mut index = 0;
+        while left > 0 {
+            widths[index] += 1;
+            index += 1;
+            left -= 1;
+        }
         widths
     };
+    // Scarcity is the whole premise. When every column can have a comfortable share there is
+    // nothing to allocate, and an equal division is both what a board should look like and what
+    // it looked like before any of this existed.
+    if total / columns as u16 >= COLUMN_COMFORTABLE {
+        return equal_split();
+    }
     let filled: Vec<usize> = (0..columns).filter(|index| counts[*index] > 0).collect();
     if filled.is_empty() || filled.len() == columns {
         return equal_split();
     }
     let stub = |index: usize| -> u16 {
-        u16::try_from(labels[index].chars().count() + 1)
+        // Two cells of gutter, not one: at one, a row of stubs reads as a single run of text
+        // ("BACKLOG \u{b7} 0 TODO \u{b7} 0 ACTIVE \u{b7} 4") rather than as separate columns.
+        u16::try_from(labels[index].chars().count() + 2)
             .unwrap_or(STUB_MAX)
             .clamp(STUB_MIN, STUB_MAX)
     };
@@ -9598,6 +9622,58 @@ mod tests {
         assert_eq!(crate::board::load(&dir)[0].status, "backlog");
     }
 
+    /// Width sharing exists to resolve scarcity. When there is enough room for every column to
+    /// be comfortable, there is nothing to resolve — and the proportional rule, applied anyway,
+    /// hands a single busy column everything the empty ones did not take.
+    ///
+    /// This is what that looked like: four cards in ACTIVE on a 213-column board gave it 172
+    /// cells, the other four columns 41 between them, and a vast blank gulf where the board
+    /// should have been. A floor was specified for an occupied column and no ceiling.
+    #[test]
+    fn a_wide_board_divides_evenly_rather_than_letting_one_column_eat_it() {
+        let labels = [
+            "BACKLOG \u{b7} 0",
+            "TODO \u{b7} 0",
+            "ACTIVE \u{b7} 4",
+            "REVIEW \u{b7} 0",
+            "DONE \u{b7} 0",
+        ];
+        let widths = column_widths(213, &labels, &[0, 0, 4, 0, 0]);
+        assert_eq!(
+            widths.iter().map(|w| u32::from(*w)).sum::<u32>(),
+            213,
+            "the sum invariant still holds: {widths:?}"
+        );
+        let widest = widths.iter().copied().max().unwrap();
+        let narrowest = widths.iter().copied().min().unwrap();
+        assert!(
+            widest - narrowest <= 1,
+            "a board with room to spare divides evenly: {widths:?}"
+        );
+    }
+
+    /// The other half of the same rule: a board too narrow for every column to be comfortable
+    /// still gives its width to the columns holding cards, which is the truncation fix.
+    #[test]
+    fn a_cramped_board_still_gives_its_width_to_the_columns_holding_cards() {
+        let labels = [
+            "BACKLOG \u{b7} 0",
+            "TODO \u{b7} 0",
+            "ACTIVE \u{b7} 2",
+            "REVIEW \u{b7} 0",
+            "DONE \u{b7} 5",
+        ];
+        let widths = column_widths(100, &labels, &[0, 0, 2, 0, 5]);
+        assert!(
+            widths[4] > 100 / 5,
+            "DONE holds the cards and must beat an equal share: {widths:?}"
+        );
+        assert!(
+            widths[4] > widths[2],
+            "five cards deserve more room than two: {widths:?}"
+        );
+    }
+
     /// The allocator's three invariants, over every shape a board can take.
     ///
     /// The sum is the important one: `render_board_columns` lays columns out by accumulating
@@ -9648,7 +9724,7 @@ mod tests {
         let widths = column_widths(100, &labels, &[0, 0, 2, 0, 5]);
         for empty in [0usize, 1, 3] {
             assert!(
-                (8..=12).contains(&widths[empty]),
+                (STUB_MIN..=STUB_MAX).contains(&widths[empty]),
                 "an empty column is a stub, not a fifth of the pane: {widths:?}"
             );
         }
@@ -10123,7 +10199,13 @@ mod tests {
         dashboard.layout.workspaces[0].root = LayoutNode::Pane {
             pane_id: "b".into(),
         };
-        let terminal = render_terminal(&mut dashboard, 70, 24);
+        // And moved a fourth time, from 70/69 to 73/72, when a stub gained a second cell of
+        // gutter: four stubs now reserve eight more cells between them, so the width at which
+        // `ACTIVE` lands on `FILLED_MIN` with no surplus left is that much further up. The rung
+        // is the same one; only the width that reaches it moved. Measured, not reasoned: at 72
+        // the state line is gone entirely and at 73 it reads `needs you` with the agent name
+        // dropped, which is exactly the pair this case is written for.
+        let terminal = render_terminal(&mut dashboard, 73, 24);
         let active = board_column(&terminal, "ACTIVE");
         assert!(
             active.contains("needs you"),
@@ -10140,7 +10222,8 @@ mod tests {
         // narrow even for a one-line card. The card gives up its second line entirely: `nee…`
         // is worse than nothing, and the glyph and its colour are there to carry the state on
         // their own.
-        let terminal = render_terminal(&mut dashboard, 69, 24);
+        // 72, one column short of the landing above, for the same gutter reason.
+        let terminal = render_terminal(&mut dashboard, 72, 24);
         let active = board_column(&terminal, "ACTIVE");
         assert!(active.contains("#7"), "the card is still drawn: {active:?}");
         assert!(

@@ -672,6 +672,301 @@ struct PaneDrag {
     selected: bool,
 }
 
+/// What a right-click landed on. The menu's contents are a function of this and nothing else.
+// Every variant but `Pane` is only ever constructed where a right-click is resolved to a
+// target — the mouse handling Task 7 adds. The allow comes off once that call site lands.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MenuTarget {
+    Pane(String),
+    Tab(String),
+    SidebarWorkspace(String),
+    SidebarAgent(String),
+    BoardCard(u64),
+    Canvas,
+}
+
+/// What an item does when it is taken.
+///
+/// Every variant wraps something Dock already does. That is the rule this enum exists to
+/// enforce: a menu is a second route to existing behaviour, never a place where a feature
+/// lives that has no other way in — those are the features nobody finds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MenuAction {
+    Pane(PaneCommand),
+    CopySelection,
+    PasteLastCopy,
+    ArchiveCard(u64),
+    MoveCard(u64, isize),
+    DispatchCard(u64),
+    FocusPane(String),
+    SwitchWorkspace(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MenuItem {
+    label: &'static str,
+    /// The key that also does this, shown right-aligned. `None` for things only the pointer
+    /// can express.
+    key: Option<&'static str>,
+    action: MenuAction,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MenuEntry {
+    Item(MenuItem),
+    Separator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextMenu {
+    target: MenuTarget,
+    entries: Vec<MenuEntry>,
+    cursor: usize,
+}
+
+// Nothing constructs a `ContextMenu` outside its own tests until Task 7 wires it to the mouse,
+// the key router, and the render pass. The allow comes off there, when those call sites land.
+#[allow(dead_code)]
+impl ContextMenu {
+    /// The menu for one target. `has_selection` greys out the items that need one rather than
+    /// hiding them: an item that appears and disappears is one a person cannot learn.
+    fn for_target(target: MenuTarget, has_selection: bool) -> Self {
+        let entries = match &target {
+            MenuTarget::Pane(_) => vec![
+                MenuEntry::Item(MenuItem {
+                    label: "Copy selection",
+                    key: Some("y"),
+                    action: MenuAction::CopySelection,
+                    enabled: has_selection,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "Paste last copy",
+                    key: Some("middle-click"),
+                    action: MenuAction::PasteLastCopy,
+                    enabled: true,
+                }),
+                MenuEntry::Separator,
+                MenuEntry::Item(MenuItem {
+                    label: "Split right",
+                    key: Some("Ctrl+B v"),
+                    action: MenuAction::Pane(PaneCommand::Split(SplitAxis::Vertical)),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "Split down",
+                    key: Some("Ctrl+B h"),
+                    action: MenuAction::Pane(PaneCommand::Split(SplitAxis::Horizontal)),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "Zoom",
+                    key: Some("Ctrl+B z"),
+                    action: MenuAction::Pane(PaneCommand::Zoom),
+                    enabled: true,
+                }),
+                MenuEntry::Separator,
+                MenuEntry::Item(MenuItem {
+                    label: "Rename",
+                    key: Some("Ctrl+B r"),
+                    action: MenuAction::Pane(PaneCommand::Rename),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "Restart",
+                    key: Some("Ctrl+B R"),
+                    action: MenuAction::Pane(PaneCommand::Respawn),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "Close pane",
+                    key: Some("Ctrl+B x"),
+                    action: MenuAction::Pane(PaneCommand::Close),
+                    enabled: true,
+                }),
+            ],
+            MenuTarget::Tab(id) | MenuTarget::SidebarWorkspace(id) => vec![
+                MenuEntry::Item(MenuItem {
+                    label: "Switch to",
+                    key: None,
+                    action: MenuAction::SwitchWorkspace(id.clone()),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "New workspace",
+                    key: Some("Ctrl+B n"),
+                    action: MenuAction::Pane(PaneCommand::NewWorkspace),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "Rename",
+                    key: Some("Ctrl+B r"),
+                    action: MenuAction::Pane(PaneCommand::Rename),
+                    enabled: true,
+                }),
+                MenuEntry::Separator,
+                MenuEntry::Item(MenuItem {
+                    label: "Close workspace",
+                    key: Some("Ctrl+B X"),
+                    action: MenuAction::Pane(PaneCommand::CloseWorkspace),
+                    enabled: true,
+                }),
+            ],
+            MenuTarget::SidebarAgent(run_id) => vec![
+                MenuEntry::Item(MenuItem {
+                    label: "Focus its pane",
+                    key: None,
+                    action: MenuAction::FocusPane(run_id.clone()),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "Resume",
+                    key: Some("Ctrl+B a"),
+                    action: MenuAction::Pane(PaneCommand::ResumeAgent),
+                    enabled: true,
+                }),
+                MenuEntry::Separator,
+                MenuEntry::Item(MenuItem {
+                    label: "Restart",
+                    key: Some("Ctrl+B R"),
+                    action: MenuAction::Pane(PaneCommand::Respawn),
+                    enabled: true,
+                }),
+            ],
+            MenuTarget::BoardCard(id) => vec![
+                MenuEntry::Item(MenuItem {
+                    label: "Move left",
+                    key: Some("<"),
+                    action: MenuAction::MoveCard(*id, -1),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "Move right",
+                    key: Some(">"),
+                    action: MenuAction::MoveCard(*id, 1),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "Dispatch",
+                    key: Some("Enter"),
+                    action: MenuAction::DispatchCard(*id),
+                    enabled: true,
+                }),
+                MenuEntry::Separator,
+                MenuEntry::Item(MenuItem {
+                    label: "Archive",
+                    key: Some("a"),
+                    action: MenuAction::ArchiveCard(*id),
+                    enabled: true,
+                }),
+            ],
+            MenuTarget::Canvas => vec![
+                MenuEntry::Item(MenuItem {
+                    label: "New workspace",
+                    key: Some("Ctrl+B n"),
+                    action: MenuAction::Pane(PaneCommand::NewWorkspace),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "Task board",
+                    key: Some("Ctrl+B k"),
+                    action: MenuAction::Pane(PaneCommand::Board),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "What changed",
+                    key: Some("Ctrl+B g"),
+                    action: MenuAction::Pane(PaneCommand::Git),
+                    enabled: true,
+                }),
+                MenuEntry::Item(MenuItem {
+                    label: "Every key",
+                    key: Some("Ctrl+B ?"),
+                    action: MenuAction::Pane(PaneCommand::Help),
+                    enabled: true,
+                }),
+            ],
+        };
+        let mut menu = Self {
+            target,
+            entries,
+            cursor: 0,
+        };
+        // The first entry is an item in every menu above, but the cursor is normalised anyway
+        // so a menu edited later cannot open with Enter pointing at a rule.
+        if matches!(menu.entries.first(), Some(MenuEntry::Separator)) {
+            menu.move_cursor(1);
+        }
+        menu
+    }
+
+    /// Widest label plus its key, plus borders and the gap between the two columns.
+    fn width(&self) -> u16 {
+        let widest = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MenuEntry::Item(item) => Some(
+                    item.label.chars().count() + item.key.map_or(0, |key| key.chars().count() + 3),
+                ),
+                MenuEntry::Separator => None,
+            })
+            .max()
+            .unwrap_or(8);
+        u16::try_from(widest + 4).unwrap_or(u16::MAX)
+    }
+
+    fn height(&self) -> u16 {
+        u16::try_from(self.entries.len() + 2).unwrap_or(u16::MAX)
+    }
+
+    /// Where to draw, given where the pointer was and how big the frame is.
+    ///
+    /// Down-and-right of the pointer by default, because that is where every pointer menu
+    /// goes and where the hand expects it. Flipped to the other side when it would overflow,
+    /// which keeps the pointer on a corner of the menu rather than inside it; clamped when it
+    /// cannot fit on either side, because a menu drawn partly off-screen is a menu with items
+    /// nobody can reach.
+    fn place(&self, origin: (u16, u16), frame: Rect) -> Rect {
+        let width = self.width().min(frame.width.max(1));
+        let height = self.height().min(frame.height.max(1));
+        let x = if origin.0 + width <= frame.right() {
+            origin.0
+        } else {
+            origin.0.saturating_sub(width)
+        };
+        let y = if origin.1 + height <= frame.bottom() {
+            origin.1
+        } else {
+            origin.1.saturating_sub(height)
+        };
+        let x = x.clamp(frame.x, frame.right().saturating_sub(width));
+        let y = y.clamp(frame.y, frame.bottom().saturating_sub(height));
+        Rect::new(x, y, width, height)
+    }
+
+    /// Moves the cursor, stepping over separators and stopping at the ends.
+    fn move_cursor(&mut self, delta: isize) {
+        let count = self.entries.len();
+        if count == 0 {
+            return;
+        }
+        let mut index = self.cursor;
+        for _ in 0..count {
+            let next = index as isize + delta;
+            if next < 0 || next as usize >= count {
+                return;
+            }
+            index = next as usize;
+            if matches!(self.entries[index], MenuEntry::Item(_)) {
+                self.cursor = index;
+                return;
+            }
+        }
+    }
+}
+
 /// The previous left press, for deriving click counts.
 ///
 /// crossterm reports presses, never how many of them arrived in a row, so double and triple
@@ -13812,6 +14107,58 @@ mod tests {
                     .unwrap()
             );
             timed!("empty draw", terminal.draw(|_frame| {}).unwrap());
+        }
+    }
+
+    /// A menu is never drawn partly off-screen: it flips rather than clipping, and clamps rather
+    /// than flipping when it cannot fit either way. All four corners, because each one exercises
+    /// a different pair of branches.
+    #[test]
+    fn a_menu_stays_inside_the_frame_from_every_corner() {
+        let menu = ContextMenu::for_target(MenuTarget::Pane("a".into()), true);
+        let frame = Rect::new(0, 0, 80, 24);
+        for origin in [(1u16, 1u16), (78, 1), (1, 22), (78, 22), (40, 12)] {
+            let placed = menu.place(origin, frame);
+            assert!(
+                placed.x >= frame.x && placed.right() <= frame.right(),
+                "menu ran off the side from {origin:?}: {placed:?}"
+            );
+            assert!(
+                placed.y >= frame.y && placed.bottom() <= frame.bottom(),
+                "menu ran off the bottom from {origin:?}: {placed:?}"
+            );
+            assert!(placed.width > 0 && placed.height > 0, "{placed:?}");
+        }
+    }
+
+    /// A frame smaller than the menu still yields a rectangle inside it.
+    #[test]
+    fn a_menu_too_tall_for_the_frame_is_clamped_to_it() {
+        let menu = ContextMenu::for_target(MenuTarget::Pane("a".into()), true);
+        let frame = Rect::new(0, 0, 12, 5);
+        let placed = menu.place((6, 3), frame);
+        assert!(
+            placed.right() <= frame.right() && placed.bottom() <= frame.bottom(),
+            "{placed:?}"
+        );
+    }
+
+    /// The cursor skips separators in both directions and stops at the ends rather than wrapping
+    /// into one. A cursor that can land on a separator is a menu where Enter does nothing.
+    #[test]
+    fn the_menu_cursor_never_lands_on_a_separator() {
+        let mut menu = ContextMenu::for_target(MenuTarget::Pane("a".into()), true);
+        for _ in 0..40 {
+            menu.move_cursor(1);
+            assert!(
+                matches!(menu.entries[menu.cursor], MenuEntry::Item(_)),
+                "cursor landed on a separator at {}",
+                menu.cursor
+            );
+        }
+        for _ in 0..40 {
+            menu.move_cursor(-1);
+            assert!(matches!(menu.entries[menu.cursor], MenuEntry::Item(_)));
         }
     }
 }

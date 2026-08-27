@@ -7226,8 +7226,17 @@ const FILLED_MIN: u16 = 18;
 /// did not, which on a wide board means one column spanning the pane beside a blank gulf. The
 /// proportional rule earns its place only when an equal share would truncate.
 const COLUMN_COMFORTABLE: u16 = 28;
+/// The widest a column is ever worth drawing.
+///
+/// A card is a marker, `#NN `, a priority cell and a title; past about forty cells the title has
+/// room to spare and every further column is whitespace. Without a ceiling an ultrawide gave
+/// `ACTIVE` half a nineteen-hundred-column pane — nine hundred cells for four entries — and a
+/// board stretched across a monitor reads as broken rather than as spacious. Width a board
+/// cannot use is left to the right of it, so the columns stay a readable block instead of
+/// drifting apart.
+const COLUMN_MAX: u16 = 44;
 
-/// Widths for each board column, left to right, summing to exactly `total`.
+/// Widths for each board column, left to right, summing to at most `total`.
 ///
 /// Equal columns were the bug: five statuses meant `DONE` got a fifth of the pane however
 /// many of the other four were empty, which on a half-screen board left about fourteen cells
@@ -7243,19 +7252,26 @@ fn column_widths(total: u16, labels: &[&str], counts: &[usize], lead: Option<usi
     }
     debug_assert_eq!(columns, counts.len(), "one count per column");
     let equal_split = || {
-        let each = total / columns as u16;
+        let each = (total / columns as u16).min(COLUMN_MAX);
         let mut widths = vec![each; columns];
         // The remainder is spread a cell at a time from the left rather than dumped on the last
         // column, which is what keeps the sum exact *and* keeps the columns even. Dumping it
         // made `DONE` three cells wider than its neighbours on a board that divides unevenly —
         // a small thing, but a visibly lopsided one on the rightmost column.
         let mut left = total - each * columns as u16;
+        // Spread a cell at a time from the left, but never past the ceiling — whatever no column
+        // can use stays to the right of the board as margin.
         let mut index = 0;
-        while left > 0 {
-            widths[index] += 1;
+        while left > 0 && index < columns {
+            if widths[index] < COLUMN_MAX {
+                widths[index] += 1;
+                left -= 1;
+            }
             index += 1;
-            left -= 1;
         }
+        // `left` is deliberately discarded: it is the width no column can use, and it stays to
+        // the right of the board as margin rather than fattening whichever column happens to be
+        // last. `column_widths` may therefore return less than `total` — never more.
         widths
     };
     let filled: Vec<usize> = (0..columns).filter(|index| counts[*index] > 0).collect();
@@ -7269,13 +7285,13 @@ fn column_widths(total: u16, labels: &[&str], counts: &[usize], lead: Option<usi
         && counts.get(lead).is_some_and(|count| *count > 0)
         && filled.len() * 2 <= columns
     {
-        let share = (total / 2).max(COLUMN_COMFORTABLE);
+        let share = (total / 2).clamp(COLUMN_COMFORTABLE, COLUMN_MAX);
         let rest = total.saturating_sub(share);
         let others = columns - 1;
-        let each = rest / others as u16;
+        let each = (rest / others as u16).min(COLUMN_MAX);
         if each >= STUB_MIN {
             let mut widths = vec![each; columns];
-            widths[lead] = share + (rest - each * others as u16);
+            widths[lead] = share;
             return widths;
         }
     }
@@ -10257,6 +10273,60 @@ mod tests {
         );
     }
 
+    /// No column is ever wider than a card can use.
+    ///
+    /// An ultrawide gave `ACTIVE` half a 1900-column pane — nine hundred cells for a card whose
+    /// title needs forty. Sharing width by content was right; sharing *all* of it was not, and
+    /// a board stretched across a monitor reads as broken rather than as spacious.
+    #[test]
+    fn no_column_is_wider_than_a_card_can_use() {
+        let labels = [
+            "BACKLOG \u{b7} 0",
+            "IN-PROGRESS \u{b7} 4",
+            "NEEDS-INPUT \u{b7} 0",
+            "REVIEW \u{b7} 0",
+            "DONE \u{b7} 3",
+        ];
+        for (total, counts) in [
+            (1900_u16, [0_usize, 4, 0, 0, 3]),
+            (1900, [2, 2, 2, 2, 2]),
+            (900, [0, 4, 0, 0, 0]),
+        ] {
+            let widths = column_widths(total, &labels, &counts, Some(1));
+            assert!(
+                widths.iter().map(|w| u32::from(*w)).sum::<u32>() <= u32::from(total),
+                "the columns never paint past the pane: {widths:?}"
+            );
+            for (index, width) in widths.iter().enumerate() {
+                if counts[index] > 0 {
+                    assert!(
+                        *width <= COLUMN_MAX,
+                        "column {index} took {width} cells, more than a card can use: {widths:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The width no column claimed goes to the right of the board rather than being shared out,
+    /// so the columns stay a readable block instead of drifting apart across a monitor.
+    #[test]
+    fn width_a_board_cannot_use_is_left_as_margin() {
+        let labels = [
+            "A \u{b7} 1",
+            "B \u{b7} 1",
+            "C \u{b7} 1",
+            "D \u{b7} 1",
+            "E \u{b7} 1",
+        ];
+        let widths = column_widths(1200, &labels, &[1, 1, 1, 1, 1], Some(1));
+        let claimed: u32 = widths.iter().take(5).map(|w| u32::from(*w)).sum();
+        assert!(
+            claimed <= u32::from(COLUMN_MAX) * 5 + 1,
+            "no column hoards the leftover: {widths:?}"
+        );
+    }
+
     /// `ACTIVE` is what a person looks at, so it gets the room even when the board is quiet.
     ///
     /// An even division is right when every column has cards; it is wrong when the board is
@@ -10273,18 +10343,17 @@ mod tests {
             "DONE \u{b7} 0",
         ];
         let widths = column_widths(213, &labels, &[0, 0, 4, 0, 0], Some(2));
-        assert_eq!(
-            widths.iter().map(|w| u32::from(*w)).sum::<u32>(),
-            213,
-            "the sum invariant still holds: {widths:?}"
+        assert!(
+            widths.iter().map(|w| u32::from(*w)).sum::<u32>() <= 213,
+            "the columns never paint past the pane: {widths:?}"
         );
         assert!(
-            widths[2] >= 213 / 3,
+            widths[2] > widths[0],
             "the lead column takes a real share, not an equal one: {widths:?}"
         );
         assert!(
-            widths[2] <= 213 / 2 + 4,
-            "but never the whole pane, which is the bug this replaced: {widths:?}"
+            widths[2] <= COLUMN_MAX,
+            "but never more than a card can use, which is the bug this replaced: {widths:?}"
         );
         for other in [0usize, 1, 3, 4] {
             assert!(
@@ -10847,10 +10916,11 @@ mod tests {
     /// The allocator's three invariants, over every shape a board can take.
     ///
     /// The sum is the important one: `render_board_columns` lays columns out by accumulating
-    /// these widths into an x offset, so a vector that does not sum to the pane's width either
-    /// leaves a gap at the right edge or paints past it.
+    /// these widths into an x offset, so a vector summing to more than the pane's width paints
+    /// past its right edge. Summing to *less* is allowed and deliberate — width no column can
+    /// use is left as margin rather than fattening whichever column happens to be last.
     #[test]
-    fn column_widths_always_fill_the_pane_exactly() {
+    fn column_widths_never_paint_past_the_pane() {
         for total in [0u16, 1, 7, 40, 79, 80, 100, 137, 200, 400] {
             for counts in [
                 vec![0, 0, 0, 0, 0],
@@ -10872,10 +10942,9 @@ mod tests {
                 let borrowed: Vec<&str> = labels.iter().map(String::as_str).collect();
                 let widths = column_widths(total, &borrowed, &counts, None);
                 assert_eq!(widths.len(), counts.len(), "one width per column");
-                assert_eq!(
-                    widths.iter().map(|w| u32::from(*w)).sum::<u32>(),
-                    u32::from(total),
-                    "widths must fill {total} exactly for {counts:?}, got {widths:?}"
+                assert!(
+                    widths.iter().map(|w| u32::from(*w)).sum::<u32>() <= u32::from(total),
+                    "widths must never exceed {total} for {counts:?}, got {widths:?}"
                 );
             }
         }

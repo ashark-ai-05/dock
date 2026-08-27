@@ -197,11 +197,27 @@ pub const STATUSES: [&str; 5] = ["backlog", "todo", "in-progress", "review", "do
 /// known statuses keep their order and the unfamiliar ones are appended in the order
 /// [`status_rank`] already sorts cards by, which is where an unfamiliar column already sorted.
 pub fn statuses(tasks: &[BoardTask]) -> Vec<String> {
-    let mut columns: Vec<String> = STATUSES.iter().map(|status| (*status).to_owned()).collect();
+    statuses_declaring(tasks, &STATUSES.map(str::to_owned))
+}
+
+/// The columns a board has, given what it *declares* it has.
+///
+/// `declared` is the board's own `config.yml` list where there is one, and Dock's constant where
+/// there is not. Taking it from the board is the point: this repository declares
+/// `backlog, in-progress, needs-input, review, done` and Dock's constant declares
+/// `backlog, todo, in-progress, review, done`, so every board drew a `TODO` column that exists
+/// nowhere but in Dock's source, and could never move a card into `needs-input` — the one column
+/// an agent workflow most needs, because it is where an agent parks something it cannot finish
+/// without you.
+///
+/// A status a board *uses* but does not declare is still appended, exactly as before: a column
+/// somebody put a card in by hand must be visible and reachable, whatever the config says.
+pub fn statuses_declaring(tasks: &[BoardTask], declared: &[String]) -> Vec<String> {
+    let mut columns: Vec<String> = declared.to_vec();
     let mut extra: Vec<&str> = tasks
         .iter()
         .map(|task| task.status.as_str())
-        .filter(|status| !STATUSES.contains(status))
+        .filter(|status| !columns.iter().any(|known| known == status))
         .collect();
     extra.sort_by(|a, b| status_rank(a).cmp(&status_rank(b)).then_with(|| a.cmp(b)));
     extra.dedup();
@@ -447,6 +463,43 @@ mod tests {
         format!(
             "---\nid: {id}\ntitle: '{title}'\nstatus: {status}\npriority: high\ncreated: 2026-08-21T12:55:48+10:00\ntags:\n    - runtime\n    - tui\ndepends_on:\n    - 11\nclass: standard\n---\n\n# Outcome\n\nSomething.\n"
         )
+    }
+
+    /// End to end: a board that declares its own columns gets them, phantom column and all.
+    ///
+    /// `TODO` existed only in Dock's `STATUSES` constant. Every board drew it, empty, forever —
+    /// and `needs-input`, which this repository's config really does declare, could not be
+    /// reached at all, because a column only appeared once a card was already in it and `>`
+    /// could not move one there.
+    #[test]
+    fn a_board_that_declares_its_columns_gets_them_and_not_docks() {
+        let board = Board::new();
+        std::fs::write(
+            board.0.join("kanban/config.yml"),
+            "tasks_dir: tasks\nstatuses:\n    - name: backlog\n    - name: in-progress\n    - name: needs-input\n    - name: review\n    - name: done\ntui:\n    title_lines: 2\n",
+        )
+        .unwrap();
+        board.task("001-a.md", &task_file(1, "A card", "backlog"));
+        let dir = board.0.join("kanban/tasks");
+
+        let config = crate::board_config::load(&dir);
+        let view = BoardView::with_config(load(&dir), &config);
+
+        assert_eq!(
+            view.statuses(),
+            ["backlog", "in-progress", "needs-input", "review", "done"],
+            "the board's own columns, in its own order"
+        );
+        assert!(
+            !view.statuses().iter().any(|status| status == "todo"),
+            "the column that existed only in Dock is gone: {:?}",
+            view.statuses()
+        );
+        assert_eq!(
+            view.title_lines(),
+            2,
+            "and the card shape the board asked for came with them"
+        );
     }
 
     #[test]
@@ -957,6 +1010,10 @@ mod tests {
 #[derive(Debug, Clone)]
 pub struct BoardView {
     tasks: Vec<BoardTask>,
+    /// How many lines a card's title may take, from the board's own `tui.title_lines`.
+    title_lines: usize,
+    /// The board's age rungs, oldest last. Empty when it declares none.
+    age_thresholds: Vec<crate::board_config::AgeThreshold>,
     /// The columns this board has, from [`statuses`]. Held rather than recomputed per call so
     /// every cursor rule agrees about how many columns there are.
     statuses: Vec<String>,
@@ -979,7 +1036,16 @@ impl BoardView {
     /// Opens on the leftmost column that has anything in it, so a board whose backlog is empty
     /// does not open staring at nothing.
     pub fn new(tasks: Vec<BoardTask>) -> Self {
-        let statuses = statuses(&tasks);
+        Self::with_config(tasks, &crate::board_config::BoardConfig::default())
+    }
+
+    /// A view over a board that has told Dock what shape it is.
+    ///
+    /// The config carries the columns, how many lines a card's title may take, and the age rungs
+    /// a stale card is coloured by — all of which the board already declared in `config.yml` and
+    /// none of which reached the screen while Dock rendered from its own constants instead.
+    pub fn with_config(tasks: Vec<BoardTask>, config: &crate::board_config::BoardConfig) -> Self {
+        let statuses = statuses_declaring(&tasks, &config.statuses);
         // Membership by what would actually be visible, not by raw status: a column holding
         // only archived cards is empty to a board that opens un-revealed, and picking it as the
         // opening column left the cursor on a column `cards()` immediately reports as having
@@ -995,10 +1061,22 @@ impl BoardView {
         Self {
             tasks,
             statuses,
+            title_lines: config.title_lines,
+            age_thresholds: config.age_thresholds.clone(),
             column,
             row: 0,
             reveal: false,
         }
+    }
+
+    /// How many lines a card's title may take on this board.
+    pub fn title_lines(&self) -> usize {
+        self.title_lines
+    }
+
+    /// The board's age rungs, oldest last.
+    pub fn age_thresholds(&self) -> &[crate::board_config::AgeThreshold] {
+        &self.age_thresholds
     }
 
     pub fn tasks(&self) -> &[BoardTask] {

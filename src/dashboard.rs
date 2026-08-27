@@ -3958,7 +3958,11 @@ impl Dashboard {
     pub fn set_board_pane_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
         self.board_is_personal = crate::board::is_personal(&directory);
         let reveal = self.board_pane_view.as_ref().map(|view| view.revealing());
-        let mut view = BoardView::new(tasks.clone());
+        // Read from the board rather than assumed. Its `config.yml` is what says which columns
+        // exist, how many lines a card's title gets, and when a card is old enough to be
+        // coloured for it — all of which Dock used to answer for itself, and answer differently.
+        let config = crate::board_config::load(&directory);
+        let mut view = BoardView::with_config(tasks.clone(), &config);
         if let Some(reveal) = reveal {
             view.set_reveal(reveal);
         }

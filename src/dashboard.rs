@@ -29,7 +29,8 @@ use crate::{
     protocol::{
         BindingKind, DashboardProfile, DecideRequest, DispatchRequest, Event,
         LaunchIntoPaneRequest, PROTOCOL_VERSION, PaneHistoryRequest, PaneQueueSnapshot,
-        QueueRequest, Request, Response, RuntimeSnapshot, TerminalLaunchRequest, WorkspaceRequest,
+        ProcessState, QueueRequest, Request, Response, RuntimeSnapshot, TerminalLaunchRequest,
+        WorkspaceRequest,
     },
     terminal::{
         KeyEncoding, PANE_HISTORY_BYTES, PaneScreen, PaneSnapshot, encode_paste, row_text,
@@ -418,12 +419,21 @@ pub enum RenameTarget {
 /// run that ends must leave the board the moment its run does, and anything cached would keep a
 /// finished agent on screen until something thought to evict it. Borrowed from the dashboard's
 /// own state rather than owned, because this is built on a path that runs at 60fps.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveRun<'a> {
     pub run_id: &'a str,
     pub workspace_id: &'a str,
     pub pane_id: &'a str,
-    pub agent: AgentKind,
+    /// The agent Dock recognised, when it recognised one.
+    ///
+    /// `None` is a pane running something Dock has no fingerprint for — a shell, a build, an
+    /// agent it has not learned. Those used to be dropped from every board and roster, so a
+    /// column headed `ACTIVE` quietly meant "recognised agents" while it was read as "what is
+    /// running". A pane you launched is running whether or not Dock can name what is in it.
+    pub agent: Option<AgentKind>,
+    /// What the pane is running, for a pane with no agent to name it by. The command's own
+    /// name, not its path or its arguments: `cargo`, `zsh`, `vim`.
+    pub command: &'a str,
     pub state: AgentState,
     /// The board card this run is bound to, when the daemon's binding says so.
     pub task_id: Option<u64>,
@@ -436,6 +446,24 @@ pub struct LiveRun<'a> {
     /// Why auto-feed last declined to fire, in the daemon's own words. Borrowed, because it is
     /// the daemon's sentence and rewording it here would give a stalled queue two explanations.
     pub holding_because: Option<&'a str>,
+}
+
+impl<'a> LiveRun<'a> {
+    /// What to call this pane on screen: the agent Dock recognised, or failing that the
+    /// command it is running. One answer, so the board, the roster and any future surface
+    /// cannot disagree about a pane's name.
+    pub fn label(&self) -> &'a str {
+        match self.agent {
+            Some(kind) => kind.label(),
+            None => self.command,
+        }
+    }
+
+    /// Whether Dock recognised an agent here. Used for ranking: an agent outranks a pane that
+    /// is merely running, because only an agent can be waiting on the user.
+    pub fn is_agent(&self) -> bool {
+        self.agent.is_some()
+    }
 }
 
 /// The status whose column is drawn as `ACTIVE`.
@@ -495,15 +523,18 @@ impl<'a> ActiveEntry<'a> {
     /// Attention first, matching `attention_rank` — then the agent's name and its id, so two
     /// equally urgent entries do not swap places between frames. A card with no live run sorts
     /// last: there is nothing happening on it to look at.
-    fn rank(self) -> (u8, &'a str, u64, &'a str) {
+    fn rank(self) -> (u8, u8, &'a str, u64, &'a str) {
         match self.run() {
             Some(run) => (
                 run.state.attention_rank(),
-                run.agent.label(),
+                // An agent before a pane that is merely running, so a shell can never sit
+                // above the one entry that is waiting on the user.
+                u8::from(!run.is_agent()),
+                run.label(),
                 run.task_id.unwrap_or(u64::MAX),
                 run.pane_id,
             ),
-            None => (u8::MAX, "", self.target_id(), ""),
+            None => (u8::MAX, u8::MAX, "", self.target_id(), ""),
         }
     }
 
@@ -2629,24 +2660,41 @@ impl Dashboard {
         let mut rows: Vec<LiveRun<'_>> = self
             .runs
             .iter()
-            .filter_map(|run| {
-                let (agent, state) = self.agents.get(run.run_id.as_str())?;
+            .map(|run| {
+                // Falls back to the snapshot's own answer rather than dropping the run: the
+                // roster is a map of what Dock recognised, and a pane it has not recognised is
+                // still a pane. Its process state stands in for an agent state, which is honest
+                // — a shell is never blocked on you and never taking its turn.
+                let (agent, state) = self.agents.get(run.run_id.as_str()).copied().unwrap_or((
+                    run.agent,
+                    if run.state == ProcessState::Running {
+                        AgentState::Idle
+                    } else {
+                        AgentState::Done
+                    },
+                ));
                 // Keyed by the pane rather than the run, because that is how the daemon keys a
                 // queue: a queue outlives the run it was filled for, and a pane that is
                 // relaunched must not come back with somebody else's queue behind it.
                 let queue = self.queue_for(run.workspace_id.as_str(), run.pane_id.as_str());
-                Some(LiveRun {
+                LiveRun {
                     run_id: run.run_id.as_str(),
                     workspace_id: run.workspace_id.as_str(),
                     pane_id: run.pane_id.as_str(),
-                    agent: (*agent)?,
-                    state: *state,
+                    agent,
+                    command: run
+                        .command
+                        .first()
+                        .map(String::as_str)
+                        .and_then(|program| program.rsplit('/').next())
+                        .unwrap_or("(no command)"),
+                    state,
                     task_id: bound_task(run).and_then(|task| task.parse().ok()),
                     queued: queue.map_or(0, |queue| queue.entries.len()),
                     auto_feed: queue.is_some_and(|queue| queue.auto_feed),
                     awaiting_ack: queue.is_some_and(|queue| queue.awaiting_ack),
                     holding_because: queue.and_then(|queue| queue.holding_because.as_deref()),
-                })
+                }
             })
             .collect();
         // Blocked agents first, for the reason the sidebar sorts that way: they are the only ones
@@ -2655,7 +2703,8 @@ impl Dashboard {
             left.state
                 .attention_rank()
                 .cmp(&right.state.attention_rank())
-                .then_with(|| left.agent.label().cmp(right.agent.label()))
+                .then_with(|| left.is_agent().cmp(&right.is_agent()).reverse())
+                .then_with(|| left.label().cmp(right.label()))
                 .then_with(|| left.pane_id.cmp(right.pane_id))
         });
         rows
@@ -7010,7 +7059,7 @@ const COLUMN_COMFORTABLE: u16 = 28;
 /// An empty column keeps a stub rather than disappearing. It is still a column — the cursor
 /// walks into it, `<` and `>` move cards into it — and a board whose shape changes as cards
 /// move is harder to aim at than one whose columns merely breathe.
-fn column_widths(total: u16, labels: &[&str], counts: &[usize]) -> Vec<u16> {
+fn column_widths(total: u16, labels: &[&str], counts: &[usize], lead: Option<usize>) -> Vec<u16> {
     let columns = labels.len();
     if columns == 0 {
         return Vec::new();
@@ -7032,13 +7081,33 @@ fn column_widths(total: u16, labels: &[&str], counts: &[usize]) -> Vec<u16> {
         }
         widths
     };
+    let filled: Vec<usize> = (0..columns).filter(|index| counts[*index] > 0).collect();
+    // The lead column takes the larger share of a board that has room to spare and columns
+    // standing empty. `ACTIVE` is what a person looks at, and an even division across four
+    // headings reading `· 0` spends most of the pane saying nothing. It leads only while it is
+    // one of the few columns holding anything: once the board is busy the even division is
+    // right again, and a permanent thumb on the scale would just be a different distortion.
+    if let Some(lead) = lead
+        && total / columns as u16 >= COLUMN_COMFORTABLE
+        && counts.get(lead).is_some_and(|count| *count > 0)
+        && filled.len() * 2 <= columns
+    {
+        let share = (total / 2).max(COLUMN_COMFORTABLE);
+        let rest = total.saturating_sub(share);
+        let others = columns - 1;
+        let each = rest / others as u16;
+        if each >= STUB_MIN {
+            let mut widths = vec![each; columns];
+            widths[lead] = share + (rest - each * others as u16);
+            return widths;
+        }
+    }
     // Scarcity is the whole premise. When every column can have a comfortable share there is
     // nothing to allocate, and an equal division is both what a board should look like and what
     // it looked like before any of this existed.
     if total / columns as u16 >= COLUMN_COMFORTABLE {
         return equal_split();
     }
-    let filled: Vec<usize> = (0..columns).filter(|index| counts[*index] > 0).collect();
     if filled.is_empty() || filled.len() == columns {
         return equal_split();
     }
@@ -7154,7 +7223,10 @@ fn render_board_columns(
         counts.push(count);
     }
     let borrowed: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let widths = column_widths(area.width, &borrowed, &counts);
+    // `ACTIVE` leads, in its own place in the workflow order: it is the column with live work
+    // in it, and it is what a person opens the board to look at.
+    let lead = statuses.iter().position(|status| status == ACTIVE_STATUS);
+    let widths = column_widths(area.width, &borrowed, &counts, lead);
     let mut x = area.x;
 
     for (index, status) in statuses.iter().enumerate() {
@@ -7439,7 +7511,7 @@ fn active_lines(
             // on the line below, where a card id would have been.
             ActiveEntry::Loose(run) => {
                 identity.push(' ');
-                identity.push_str(run.agent.label());
+                identity.push_str(run.label());
             }
         }
         ellipsise_in_place(&mut identity, width.saturating_sub(2));
@@ -7466,7 +7538,7 @@ fn active_lines(
             Some(run) if width < NARROW_CARD => liveness.push_str(run.state.label()),
             Some(run) => {
                 match *entry {
-                    ActiveEntry::Card(..) => liveness.push_str(run.agent.label()),
+                    ActiveEntry::Card(..) => liveness.push_str(run.label()),
                     ActiveEntry::Loose(run) => write_card_reference(&mut liveness, run),
                 }
                 liveness.push_str(" · ");
@@ -7580,7 +7652,7 @@ fn board_pane_footer(
                     Some(run) => {
                         // Named here even though the card above says it too: this line is read
                         // on its own, as the answer to "what is `a` about to arm".
-                        let _ = write!(footer, " · {} · ", run.agent.label());
+                        let _ = write!(footer, " · {} · ", run.label());
                         write_liveness(&mut footer, run);
                     }
                     // The card a person has forgotten about: dispatched, and whatever was
@@ -7590,11 +7662,22 @@ fn board_pane_footer(
                 }
             }
             ActiveEntry::Loose(run) => {
-                footer.push_str(run.agent.label());
+                footer.push_str(run.label());
                 footer.push_str(" · ");
                 write_liveness(&mut footer, run);
             }
         }
+    } else if let Some(status) = view.statuses().get(column)
+        && let Some(task) = view.cards(status).get(index)
+    {
+        // The selected card's title, whole, at the full width of the pane.
+        //
+        // A column is narrow by design — four of them share whatever `ACTIVE` does not take —
+        // so a long title ellipsises in the grid however the width is shared out. This is the
+        // floor under that: the card the cursor is on can always be read in full somewhere,
+        // without opening it and without widening the pane.
+        separate(&mut footer);
+        let _ = write!(footer, "#{} {}", task.id, task.title);
     }
     if focused {
         separate(&mut footer);
@@ -9717,6 +9800,150 @@ mod tests {
         );
     }
 
+    /// The board must show every pane that is running, not only the ones Dock recognised.
+    ///
+    /// `live_runs` dropped any run whose agent could not be fingerprinted — a plain shell, a
+    /// `cargo run`, an agent Dock has not learned yet. So a board headed `ACTIVE` was really
+    /// showing "recognised agents", while a person reading it took it to mean "what is
+    /// running", and the two disagreed on every pane that was not an agent.
+    #[test]
+    fn a_pane_that_is_not_a_recognised_agent_still_appears_as_running() {
+        let mut dashboard = bound_dashboard();
+        let mut shell = snapshot();
+        shell.run_id = "run_shell".into();
+        shell.pane_id = "b".into();
+        shell.command = vec!["cargo".into(), "run".into()];
+        shell.agent = None;
+        dashboard.set_runs(vec![shell]);
+
+        let runs = dashboard.live_runs();
+        assert_eq!(
+            runs.len(),
+            1,
+            "an unrecognised pane is still a pane that is running: {runs:?}"
+        );
+        assert!(
+            runs[0].agent.is_none(),
+            "and it is honest about not being a known agent: {runs:?}"
+        );
+        assert_eq!(
+            runs[0].command, "cargo",
+            "so it names itself by what it is running: {runs:?}"
+        );
+    }
+
+    /// A shell must never outrank an agent that is waiting on the user.
+    ///
+    /// Coverage without ranking would be worse than no coverage: the column exists so a blocked
+    /// agent is the first thing seen, and a `zsh` sorted above it would bury the one entry that
+    /// costs the user throughput.
+    #[test]
+    fn a_running_shell_never_outranks_an_agent_that_needs_you() {
+        let mut dashboard = bound_dashboard();
+        let mut shell = snapshot();
+        shell.run_id = "run_shell".into();
+        shell.pane_id = "b".into();
+        shell.command = vec!["zsh".into()];
+        shell.agent = None;
+        let mut agent = snapshot();
+        agent.run_id = "run_agent".into();
+        agent.pane_id = "a".into();
+        agent.agent = Some(AgentKind::Claude);
+        dashboard.set_runs(vec![shell, agent]);
+        dashboard.agents.insert(
+            "run_agent".into(),
+            (Some(AgentKind::Claude), AgentState::Blocked),
+        );
+
+        let runs = dashboard.live_runs();
+        assert_eq!(runs.len(), 2, "both panes are running: {runs:?}");
+        assert_eq!(
+            runs[0].agent,
+            Some(AgentKind::Claude),
+            "the agent that needs you comes first: {runs:?}"
+        );
+    }
+
+    /// `ACTIVE` is what a person looks at, so it gets the room even when the board is quiet.
+    ///
+    /// An even division is right when every column has cards; it is wrong when the board is
+    /// four headings reading `\u{b7} 0` and one column with live work in it, which is most of the
+    /// time. The lead column keeps its place in the workflow order — `<` and `>` still move a
+    /// card the way the columns read — and simply takes the larger share.
+    #[test]
+    fn the_active_column_takes_the_lead_share_of_a_quiet_board() {
+        let labels = [
+            "BACKLOG \u{b7} 0",
+            "TODO \u{b7} 0",
+            "ACTIVE \u{b7} 4",
+            "REVIEW \u{b7} 0",
+            "DONE \u{b7} 0",
+        ];
+        let widths = column_widths(213, &labels, &[0, 0, 4, 0, 0], Some(2));
+        assert_eq!(
+            widths.iter().map(|w| u32::from(*w)).sum::<u32>(),
+            213,
+            "the sum invariant still holds: {widths:?}"
+        );
+        assert!(
+            widths[2] >= 213 / 3,
+            "the lead column takes a real share, not an equal one: {widths:?}"
+        );
+        assert!(
+            widths[2] <= 213 / 2 + 4,
+            "but never the whole pane, which is the bug this replaced: {widths:?}"
+        );
+        for other in [0usize, 1, 3, 4] {
+            assert!(
+                widths[other] >= 8,
+                "and every other column is still legible: {widths:?}"
+            );
+        }
+    }
+
+    /// A board with work in several columns divides evenly — the lead share is for a quiet
+    /// board, not a permanent thumb on the scale.
+    #[test]
+    fn a_busy_board_still_divides_evenly() {
+        let labels = [
+            "BACKLOG \u{b7} 3",
+            "TODO \u{b7} 2",
+            "ACTIVE \u{b7} 4",
+            "REVIEW \u{b7} 2",
+            "DONE \u{b7} 5",
+        ];
+        let widths = column_widths(213, &labels, &[3, 2, 4, 2, 5], Some(2));
+        let widest = widths.iter().copied().max().unwrap();
+        let narrowest = widths.iter().copied().min().unwrap();
+        assert!(
+            widest - narrowest <= 1,
+            "every column has cards, so none of them is the lead: {widths:?}"
+        );
+    }
+
+    /// A narrow column may ellipsise a title, but the board must never leave it unreadable.
+    #[test]
+    fn the_footer_reads_the_selected_cards_title_in_full() {
+        let mut dashboard = dashboard_with_a_board_pane();
+        dashboard.layout.workspaces[0].root = LayoutNode::Pane {
+            pane_id: "b".into(),
+        };
+        // Onto BACKLOG, whose column is narrow because ACTIVE leads, and onto its card.
+        dashboard.board_cursor = None;
+        let terminal = render_terminal(&mut dashboard, 120, 24);
+        let frame = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            frame.contains("wire the parser"),
+            "the selected card's title is readable somewhere on the pane: {frame:?}"
+        );
+    }
+
     /// Width sharing exists to resolve scarcity. When there is enough room for every column to
     /// be comfortable, there is nothing to resolve — and the proportional rule, applied anyway,
     /// hands a single busy column everything the empty ones did not take.
@@ -9733,7 +9960,7 @@ mod tests {
             "REVIEW \u{b7} 0",
             "DONE \u{b7} 0",
         ];
-        let widths = column_widths(213, &labels, &[0, 0, 4, 0, 0]);
+        let widths = column_widths(213, &labels, &[0, 0, 4, 0, 0], None);
         assert_eq!(
             widths.iter().map(|w| u32::from(*w)).sum::<u32>(),
             213,
@@ -9758,7 +9985,7 @@ mod tests {
             "REVIEW \u{b7} 0",
             "DONE \u{b7} 5",
         ];
-        let widths = column_widths(100, &labels, &[0, 0, 2, 0, 5]);
+        let widths = column_widths(100, &labels, &[0, 0, 2, 0, 5], None);
         assert!(
             widths[4] > 100 / 5,
             "DONE holds the cards and must beat an equal share: {widths:?}"
@@ -9795,7 +10022,7 @@ mod tests {
                 .map(|value| (*value).to_owned())
                 .collect();
                 let borrowed: Vec<&str> = labels.iter().map(String::as_str).collect();
-                let widths = column_widths(total, &borrowed, &counts);
+                let widths = column_widths(total, &borrowed, &counts, None);
                 assert_eq!(widths.len(), counts.len(), "one width per column");
                 assert_eq!(
                     widths.iter().map(|w| u32::from(*w)).sum::<u32>(),
@@ -9816,7 +10043,7 @@ mod tests {
             "REVIEW · 0",
             "DONE · 5",
         ];
-        let widths = column_widths(100, &labels, &[0, 0, 2, 0, 5]);
+        let widths = column_widths(100, &labels, &[0, 0, 2, 0, 5], None);
         for empty in [0usize, 1, 3] {
             assert!(
                 (STUB_MIN..=STUB_MAX).contains(&widths[empty]),
@@ -9843,7 +10070,7 @@ mod tests {
             "REVIEW · 0",
             "DONE · 5",
         ];
-        let widths = column_widths(30, &labels, &[0, 0, 2, 0, 5]);
+        let widths = column_widths(30, &labels, &[0, 0, 2, 0, 5], None);
         assert_eq!(widths.iter().map(|w| u32::from(*w)).sum::<u32>(), 30);
         assert!(
             widths.iter().all(|width| *width <= 8),
@@ -9879,7 +10106,8 @@ mod tests {
             run_id: "run_1",
             workspace_id: "w",
             pane_id: "a",
-            agent: AgentKind::Claude,
+            agent: Some(AgentKind::Claude),
+            command: "claude",
             state: AgentState::Blocked,
             task_id: Some(7),
             queued: 0,
@@ -10217,13 +10445,19 @@ mod tests {
             1,
             "one entry for one agent: {active:?}"
         );
-        assert!(
-            !active.contains("no card"),
-            "this agent has a card, and it is the entry it is drawn on: {active:?}"
+        assert_eq!(
+            active.matches("no card").count(),
+            1,
+            "exactly one `no card` entry — the fixture's plain shell. The agent has a card and \
+             must not also appear as one: {active:?}"
         );
         assert!(
-            active.contains("ACTIVE \u{b7} 1"),
-            "and the column counts what it draws: {active:?}"
+            active.contains("\u{25cb} sh"),
+            "and the shell is that entry, named by what it is running: {active:?}"
+        );
+        assert!(
+            active.contains("ACTIVE \u{b7} 2"),
+            "and the column counts what it draws — the carded agent and the shell: {active:?}"
         );
     }
 
@@ -10396,15 +10630,29 @@ mod tests {
     }
 
     #[test]
-    fn the_runs_lane_shows_one_row_per_live_agent_and_none_for_a_shell() {
-        // Derived, never stored: one row per live agent pane, assembled from the run list and the
-        // agent roster on each frame. A plain shell is a pane with no agent in it — `Idle` means
-        // "nothing was detected here", not "the agent is resting" — and a lane that listed those
-        // would list every pane on the canvas.
+    fn the_runs_lane_shows_a_row_for_every_running_pane_agent_or_not() {
+        // Derived, never stored: one row per running pane, assembled from the run list and the
+        // agent roster on each frame.
+        //
+        // This lane used to list only panes Dock had fingerprinted as a known agent, on the
+        // reasoning that "a lane that listed the rest would list every pane on the canvas".
+        // That is exactly what it should do. A column headed `ACTIVE` that quietly meant
+        // "recognised agents" disagreed with every person who read it as "what is running" —
+        // a shell, a build, an agent Dock has not learned yet are all things you started and
+        // may want to get back to. Ranking is what keeps that honest rather than noisy: an
+        // agent still sorts above a pane that is merely running, so the entry waiting on you
+        // is still the first one seen.
         let mut dashboard = dashboard_with_a_board_pane();
         let rows = dashboard.live_runs();
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(rows[0].run_id, "run_1");
+        assert_eq!(rows.len(), 2, "the agent and the fixture's shell: {rows:?}");
+        assert_eq!(
+            rows[0].run_id, "run_1",
+            "the agent that needs you comes first: {rows:?}"
+        );
+        assert!(
+            !rows[1].is_agent() && rows[1].command == "sh",
+            "and the shell is present, named by what it runs: {rows:?}"
+        );
         assert_eq!(rows[0].state, AgentState::Blocked);
         assert_eq!(rows[0].task_id, Some(7));
         assert_eq!(
@@ -10419,7 +10667,11 @@ mod tests {
             "the lane says what the state means, because a coloured glyph says only that \
              something changed: {frame:?}"
         );
-        assert!(!frame.contains("dock_sh_w_c"), "{frame:?}");
+        assert!(
+            frame.contains("\u{25cb} sh"),
+            "and the shell is drawn, hollow rather than stateful, because it is not asking for \
+             anything: {frame:?}"
+        );
     }
 
     #[test]
@@ -10550,7 +10802,8 @@ mod tests {
         );
 
         let rows = dashboard.live_runs();
-        assert_eq!(rows.len(), 2, "{rows:?}");
+        // Three, not two: the fixture's plain shell is a running pane and now says so.
+        assert_eq!(rows.len(), 3, "{rows:?}");
         assert_eq!(
             (rows[0].pane_id, rows[0].queued, rows[0].auto_feed),
             ("a", 3, true)

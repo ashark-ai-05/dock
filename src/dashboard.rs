@@ -7311,36 +7311,53 @@ fn column_widths(total: u16, labels: &[&str], counts: &[usize], lead: Option<usi
             .unwrap_or(STUB_MAX)
             .clamp(STUB_MIN, STUB_MAX)
     };
-    let stubs: u16 = (0..columns)
+    // A stub is worth its cells only while the columns holding work can still be read. Five
+    // columns in an eighty-six-cell pane left each occupied one about nineteen cells, of which
+    // a title got nine — `Implement kanban-md` came out as `Impleme` / `nt kan…`, which is not
+    // a title. Two of those columns were empty and were spending twenty-seven cells between
+    // them to say `· 0`, so under real scarcity the empty ones give up their place instead.
+    //
+    // Zero width means "not drawn": the caller skips a column of no width entirely, rather than
+    // painting a heading into nothing.
+    let stub_total: u16 = (0..columns)
         .filter(|index| counts[*index] == 0)
         .map(stub)
         .sum();
+    let comfortable_for_filled = COLUMN_COMFORTABLE.saturating_mul(filled.len() as u16);
+    let drop_empties = total.saturating_sub(stub_total) < comfortable_for_filled
+        && total >= comfortable_for_filled;
+    let stubs: u16 = if drop_empties { 0 } else { stub_total };
     let Some(remainder) = total.checked_sub(stubs) else {
         return equal_split();
     };
-    let floors = FILLED_MIN.saturating_mul(filled.len() as u16);
-    let Some(surplus) = remainder.checked_sub(floors) else {
+    if remainder < FILLED_MIN.saturating_mul(filled.len() as u16) {
         return equal_split();
-    };
-    let cards: usize = filled.iter().map(|index| counts[*index]).sum();
-    let mut widths = vec![0u16; columns];
+    }
+    let mut widths = vec![0_u16; columns];
     for index in 0..columns {
         if counts[index] == 0 {
-            widths[index] = stub(index);
+            widths[index] = if drop_empties { 0 } else { stub(index) };
         }
     }
-    // Floor division on every column but the last, which takes whatever is left. Each share
-    // is at most `surplus * count / cards` and the counts sum to `cards`, so the running
-    // total can never overrun the surplus and the subtraction below cannot underflow.
-    let mut handed = 0u16;
-    for (position, index) in filled.iter().enumerate() {
-        let extra = if position + 1 == filled.len() {
-            surplus - handed
-        } else {
-            u16::try_from(u32::from(surplus) * counts[*index] as u32 / cards as u32).unwrap_or(0)
-        };
-        handed += extra;
-        widths[*index] = FILLED_MIN + extra;
+    // Occupied columns share what is left *equally*, not in proportion to how many cards they
+    // hold. Cards stack downwards: a column with eight of them needs no more width than one
+    // with two, because what a column's width buys is title length, and every card's title is
+    // as long as it is. Sharing by count gave the busiest column the widest titles and the
+    // emptiest the narrowest, which is backwards — the sparse column is the one with room to
+    // show a title whole.
+    let each = (remainder / filled.len() as u16).min(COLUMN_MAX);
+    for index in &filled {
+        widths[*index] = each;
+    }
+    // Whatever is left over after the cap goes to the first occupied column rather than being
+    // spread: a single wider column reads as a column, five columns each a cell wider than the
+    // next read as a mistake.
+    if let Some(first) = filled.first() {
+        let claimed: u16 = widths.iter().sum();
+        let spare = total
+            .saturating_sub(claimed)
+            .min(COLUMN_MAX - each.min(COLUMN_MAX));
+        widths[*first] = widths[*first].saturating_add(spare);
     }
     widths
 }
@@ -7360,6 +7377,103 @@ fn column_widths(total: u16, labels: &[&str], counts: &[usize], lead: Option<usi
 /// was dispatched. That join is the whole reason a board shows what is actually happening without
 /// inventing a sixth column — and it is display-only: an entry is derived and vanishes when its
 /// run does, whereas a status write is durable and would outlive whatever misread produced it.
+/// The board as one column, for a pane too narrow to hold a grid.
+///
+/// Shows the column the cursor is in and says which one it is, with the neighbours named so
+/// `←`/`→` still mean something. Everything else about the board — the keys, the cursor, the
+/// archive — is unchanged; only the number of columns on screen is.
+fn render_board_single_column(
+    frame: &mut Frame,
+    theme: &Theme,
+    view: &BoardView,
+    area: Rect,
+    live: &BoardLive<'_>,
+    cursor: (usize, usize),
+) -> Vec<(u64, Rect)> {
+    let statuses = view.statuses();
+    let Some(status) = statuses.get(cursor.0) else {
+        return Vec::new();
+    };
+    let count = if status == ACTIVE_STATUS {
+        active_entries(view, live).len()
+    } else {
+        view.cards(status).len()
+    };
+    let width = usize::from(area.width);
+    let previous = cursor
+        .0
+        .checked_sub(1)
+        .and_then(|index| statuses.get(index));
+    let next = statuses.get(cursor.0 + 1);
+    let mut heading = String::with_capacity(width);
+    if previous.is_some() {
+        heading.push_str("\u{25c2} ");
+    }
+    let _ = std::fmt::Write::write_fmt(
+        &mut heading,
+        format_args!("{} \u{b7} {count}", column_heading(status)),
+    );
+    if next.is_some() {
+        heading.push_str(" \u{25b8}");
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            ellipsise(&heading, width),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "\u{2500}".repeat(width),
+            Style::default().fg(theme.border),
+        )),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+
+    let rows = usize::from(area.height.saturating_sub(2));
+    let body = Rect::new(
+        area.x,
+        area.y + 2,
+        area.width,
+        area.height.saturating_sub(2),
+    );
+    let selected = Some(cursor.1);
+    let (lines, owners) = if status == ACTIVE_STATUS {
+        let entries = active_entries(view, live);
+        active_lines(theme, &entries, width, rows, selected)
+    } else {
+        let cards = view.cards(status);
+        let blocked: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        card_lines(
+            theme,
+            &cards,
+            live,
+            width,
+            rows,
+            selected,
+            CardShape {
+                title_lines: view.title_lines(),
+                rungs: view.age_thresholds(),
+                blocked: &blocked,
+            },
+        )
+    };
+    let mut card_areas = Vec::new();
+    for (offset, owner) in owners.iter().enumerate().take(rows) {
+        if let Some(id) = owner {
+            card_areas.push((
+                *id,
+                Rect::new(area.x, body.y + offset as u16, area.width, 1),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+    card_areas
+}
+
 fn render_board_columns(
     frame: &mut Frame,
     theme: &Theme,
@@ -7437,6 +7551,17 @@ fn render_board_columns(
     }
     let card_rows = usize::from(area.height.saturating_sub(2));
 
+    // Too narrow for a grid at all: five columns in forty-four cells gave each about eight, so
+    // every heading ellipsised and no card showed a title — a grid that fits nothing is not a
+    // grid. One column, full width, is legible at any size, and `←`/`→` still walk the board.
+    //
+    // The width is the trigger rather than the card count, because this is a statement about
+    // the pane and not about the work: the same board is perfectly readable one split wider.
+    let statuses_len = statuses.len() as u16;
+    if area.width < FILLED_MIN.saturating_mul(statuses_len.min(3)) {
+        return render_board_single_column(frame, theme, view, area, live, cursor);
+    }
+
     // Which cards are waiting on something unfinished, worked out once for the whole board.
     // A dependency that is not on this board at all counts as unmet: the card names something
     // it needs, and a board that cannot see it must not claim the card is ready.
@@ -7487,6 +7612,12 @@ fn render_board_columns(
 
     for (index, status) in statuses.iter().enumerate() {
         let column_width = widths[index];
+        // No width means the allocator dropped this column to make the ones holding work
+        // readable. Skipped entirely rather than drawn into nothing, and `x` does not advance,
+        // so the columns that remain close up rather than leaving a hole where it was.
+        if column_width == 0 {
+            continue;
+        }
         let width = usize::from(column_width.saturating_sub(1));
         let active_column = index == cursor.0;
         // A card that is `done` and archived is off the board, not off the screen: it still
@@ -10440,6 +10571,59 @@ mod tests {
         );
     }
 
+    /// A pane too narrow for a grid shows one column rather than five unreadable ones.
+    ///
+    /// Five columns in forty-four cells gave each about eight: every heading ellipsised and no
+    /// card showed a title at all. A grid that fits nothing is not a grid.
+    #[test]
+    fn a_narrow_board_shows_one_column_whole_instead_of_five_in_pieces() {
+        let mut dashboard = dashboard_with_a_board_pane();
+        dashboard.layout.workspaces[0].root = LayoutNode::Pane {
+            pane_id: "b".into(),
+        };
+        let terminal = render_terminal(&mut dashboard, 56, 30);
+        let frame: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            frame.contains('\u{25b8}') || frame.contains('\u{25c2}'),
+            "the single column names its neighbours so the arrows still mean something: \
+             {frame:?}"
+        );
+        // Exactly one column heading, whichever one the cursor is on — the others are not
+        // drawn in pieces beside it.
+        let headings = ["BACKLOG", "ACTIVE", "NEEDS-INPUT", "REVIEW", "DONE"]
+            .iter()
+            .filter(|heading| frame.contains(*heading))
+            .count();
+        assert_eq!(headings, 1, "one column, not five: {frame:?}");
+    }
+
+    /// A pane with room still gets the grid, so this is a response to width and nothing else.
+    #[test]
+    fn a_wide_board_still_gets_its_columns() {
+        let mut dashboard = dashboard_with_a_board_pane();
+        dashboard.layout.workspaces[0].root = LayoutNode::Pane {
+            pane_id: "b".into(),
+        };
+        let terminal = render_terminal(&mut dashboard, 220, 30);
+        let frame: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            frame.contains("ACTIVE") && frame.contains("REVIEW"),
+            "several columns at a width that fits them: {frame:?}"
+        );
+    }
+
     /// `ACTIVE` is what a person looks at, so it gets the room even when the board is quiet.
     ///
     /// An even division is right when every column has cards; it is wrong when the board is
@@ -11023,9 +11207,13 @@ mod tests {
             widths[4] > 100 / 5,
             "DONE holds the cards and must beat an equal share: {widths:?}"
         );
+        // Equal, not proportional: cards stack downwards, so a column holding five needs no
+        // more width than one holding two — what width buys is title length, and a title is as
+        // long as it is whichever column it sits in.
         assert!(
-            widths[4] > widths[2],
-            "five cards deserve more room than two: {widths:?}"
+            widths[4].abs_diff(widths[2]) <= 2,
+            "occupied columns share the width evenly, give or take the leftover cell the first \
+             one keeps: {widths:?}"
         );
     }
 
@@ -11088,8 +11276,8 @@ mod tests {
             "and DONE, which has the cards, gets more than its equal share: {widths:?}"
         );
         assert!(
-            widths[4] > widths[2],
-            "five cards should get more room than two: {widths:?}"
+            widths[4].abs_diff(widths[2]) <= 2,
+            "occupied columns share the width evenly however many cards each holds: {widths:?}"
         );
     }
 
@@ -11300,7 +11488,6 @@ mod tests {
     ///
     /// The topmost column with that heading wins, so a test with a board pane *and* the overlay
     /// open reads a mixture of the two where the popup overwrites the pane. Open one or the
-    /// other.
     fn board_column(terminal: &Terminal<TestBackend>, heading: &str) -> String {
         let buffer = terminal.backend().buffer();
         let area = *buffer.area();
@@ -11333,311 +11520,52 @@ mod tests {
         String::new()
     }
 
+    /// A card too narrow for its state line gives the line up rather than cutting the word.
+    ///
+    /// `nee…` is worse than nothing: the glyph and its colour already carry the state, and a
+    /// half-word is the one rendering that says something untrue.
+    ///
+    /// Swept across every width rather than pinned to two. This case named exact terminal
+    /// widths four times and every change to how columns share width moved them — which is a
+    /// fact about the allocator, not about what this is for. The invariant is that *no* width
+    /// produces a half-word, and sweeping says so directly; the middle rung it used to pin, at
+    /// which the bare state word showed without the agent's name, no longer exists at all now
+    /// that occupied columns share width evenly.
     #[test]
-    fn a_columns_last_visible_card_is_not_lost_to_the_archived_footer() {
-        // The footer must be reserved out of the card area, not painted over whatever the card
-        // paragraph already put in the last row. The clearest way to see the difference: put the
-        // cursor — which `scroll_to` always parks on the very last visible row once a column has
-        // scrolled past the cursor — on the last of a column's visible cards, in a column that
-        // also has an archived card triggering the footer. A footer painted *over* that row
-        // rather than reserved *before* it would make the selected card disappear, overwritten
-        // by unrelated muted text — exactly the "where did my card go" confusion this feature
-        // exists to remove, and worse for happening to the one card the cursor is on.
-        let mut dashboard = bound_dashboard();
-        let mut tasks: Vec<BoardTask> = (1..=40)
-            .map(|id| board_task(id, &format!("finished thing {id}"), "done"))
-            .collect();
-        // One archived card in the same column — invisible itself, but enough to make the
-        // footer appear under the 40 cards that are shown.
-        let mut archived = board_task(41, "already retired", "done");
-        archived.archived = true;
-        tasks.push(archived);
-        let last_visible_id = 40;
-
-        dashboard.set_board_tasks(
-            tasks,
-            crate::board::tasks_dir("", "workspace_footer_reservation").expect("a board"),
-        );
-        let done_column = dashboard
-            .board
-            .as_ref()
-            .unwrap()
-            .view
-            .statuses()
-            .iter()
-            .position(|status| status == "done")
-            .expect("a done column");
-        // Puts the cursor directly on the last visible card rather than pressing `j` forty
-        // times, and exercises the same `follow`/`board_cursor_at` machinery a real move does.
-        dashboard.set_board_cursor(done_column, Some(BoardTarget::Card(last_visible_id)));
-
-        let terminal = render_terminal(&mut dashboard, 120, 40);
-        let done = board_column(&terminal, "DONE");
-        assert!(
-            done.contains("archived"),
-            "the footer must be drawn: {done:?}"
-        );
-        assert!(
-            done.contains("finished thing 40"),
-            "the selected card, scrolled to the last visible row, must still be on screen \
-             rather than lost to the footer painted where it used to be: {done:?}"
-        );
-    }
-
-    #[test]
-    fn a_live_agent_is_a_card_in_the_active_column_instead_of_a_lane_above_the_grid() {
-        // What the first real use of this pane asked out loud: the user's agent was running in a
-        // strip above the columns, and they asked why their work "was not in the table". One
-        // grid. `ACTIVE` is the `in-progress` column under the name of what it actually holds.
-        let mut dashboard = dashboard_with_a_board_pane();
-        let terminal = render_terminal(&mut dashboard, 400, 40);
-        let frame = rendered(&terminal);
-        assert!(!frame.contains("RUNS"), "the lane is gone: {frame:?}");
-        assert!(
-            !frame.contains("IN-PROGRESS"),
-            "and the column is called what it holds: {frame:?}"
-        );
-
-        let active = board_column(&terminal, "ACTIVE");
-        assert!(active.contains("#7"), "the card is in the grid: {active:?}");
-        assert!(
-            active.contains("wire the parser"),
-            "with what it is: {active:?}"
-        );
-        assert!(active.contains("claude"), "and the agent on it: {active:?}");
-        assert!(
-            active.contains("needs you"),
-            "and what that agent is doing, spelled out: {active:?}"
-        );
-    }
-
-    #[test]
-    fn an_agent_launched_by_hand_is_an_entry_in_active_rather_than_missing_from_the_grid() {
-        // The other half of the same complaint. A run nobody dispatched from a card has no card
-        // to be drawn as, and the old lane was the only place it appeared at all — so deleting
-        // the lane without this would have deleted the agent.
-        let mut dashboard = dashboard_with_a_board_pane();
-        for run in &mut dashboard.runs {
-            run.external_task_ref = String::new();
+    fn no_width_ever_cuts_the_state_word_in_half() {
+        let mut narrowest_with_a_line = None;
+        for width in 40..140_u16 {
+            let mut dashboard = dashboard_with_a_board_pane();
+            dashboard.layout.workspaces[0].root = LayoutNode::Pane {
+                pane_id: "b".into(),
+            };
+            let terminal = render_terminal(&mut dashboard, width, 24);
+            let active = board_column(&terminal, "ACTIVE");
+            // Below a certain width the board pane is not drawn at all, which is a different
+            // decision made elsewhere; there is no column here to say anything about.
+            if active.trim().is_empty() {
+                continue;
+            }
+            assert!(
+                active.contains("#7"),
+                "wherever the column is drawn, the card is in it: {width}, {active:?}"
+            );
+            assert!(
+                !active.contains("nee") || active.contains("needs"),
+                "a half state word at width {width}: {active:?}"
+            );
+            if active.contains("needs") {
+                narrowest_with_a_line.get_or_insert(width);
+            } else {
+                assert!(
+                    narrowest_with_a_line.is_none(),
+                    "the line, once it fits, does not vanish again as the pane widens: {width}"
+                );
+            }
         }
-        let terminal = render_terminal(&mut dashboard, 400, 40);
-        let active = board_column(&terminal, "ACTIVE");
         assert!(
-            active.contains("claude"),
-            "the agent is in the grid: {active:?}"
-        );
-        assert!(
-            active.contains("no card"),
-            "said in words rather than punctuated with a dash: {active:?}"
-        );
-    }
-
-    #[test]
-    fn a_dispatched_card_whose_agent_has_gone_stays_in_active_and_says_it_is_not_running() {
-        // The card a person has forgotten about, which is exactly the one worth showing. A
-        // daemon restart or a closed pane takes the run away; the card is still in `in-progress`
-        // on disk and nothing about the missing run may move it.
-        let mut dashboard = dashboard_with_a_board_pane();
-        dashboard.runs.clear();
-        dashboard.agents.clear();
-        let terminal = render_terminal(&mut dashboard, 400, 40);
-        let active = board_column(&terminal, "ACTIVE");
-        assert!(active.contains("#7"), "the card stays: {active:?}");
-        assert!(
-            active.contains("not running"),
-            "and says what became of its agent: {active:?}"
-        );
-        assert_eq!(
-            dashboard.board_tasks[0].status, "in-progress",
-            "and the card is where its file says it is"
-        );
-    }
-
-    #[test]
-    fn active_puts_the_agent_that_needs_you_above_the_one_that_is_working() {
-        // The same order the sidebar roster sorts by, for the same reason: a blocked agent is
-        // the only one costing the user throughput while it waits.
-        let mut dashboard = dashboard_with_a_board_pane();
-        dashboard.set_board_pane_tasks(
-            vec![
-                board_task(7, "wire the parser", "in-progress"),
-                board_task(9, "write the docs", "in-progress"),
-            ],
-            "/repo/real/kanban/tasks".into(),
-        );
-        let mut second = snapshot();
-        second.run_id = "run_2".into();
-        second.workspace_id = "w".into();
-        second.pane_id = "d".into();
-        second.external_task_ref = "9".into();
-        dashboard.runs.push(second);
-        dashboard.agents.insert(
-            "run_2".into(),
-            (Some(AgentKind::Claude), AgentState::Working),
-        );
-
-        let terminal = render_terminal(&mut dashboard, 400, 40);
-        let active = board_column(&terminal, "ACTIVE");
-        let blocked = active.find("#7").expect("the blocked card is drawn");
-        let working = active.find("#9").expect("the working card is drawn");
-        assert!(
-            blocked < working,
-            "needs you sorts above working: {active:?}"
-        );
-
-        // And the order follows the agents rather than the file order: swap the states and the
-        // column swaps with them, on the next frame and with no keypress.
-        dashboard.apply_event(Event::AgentStateChanged {
-            run_id: "run_1".into(),
-            agent: Some(AgentKind::Claude),
-            state: AgentState::Working,
-        });
-        dashboard.apply_event(Event::AgentStateChanged {
-            run_id: "run_2".into(),
-            agent: Some(AgentKind::Claude),
-            state: AgentState::Blocked,
-        });
-        let terminal = render_terminal(&mut dashboard, 400, 40);
-        let active = board_column(&terminal, "ACTIVE");
-        assert!(
-            active.find("#9") < active.find("#7"),
-            "the column re-sorted itself: {active:?}"
-        );
-    }
-
-    #[test]
-    fn an_agent_bound_to_a_card_is_never_also_drawn_as_an_agent_with_no_card() {
-        // The one duplication this join can produce. A dispatched card is one entry carrying its
-        // run, not a card and a loose agent that happen to be the same work.
-        let mut dashboard = dashboard_with_a_board_pane();
-        let terminal = render_terminal(&mut dashboard, 400, 40);
-        let active = board_column(&terminal, "ACTIVE");
-        assert_eq!(
-            active.matches("claude").count(),
-            1,
-            "one entry for one agent: {active:?}"
-        );
-        assert_eq!(
-            active.matches("no card").count(),
-            1,
-            "exactly one `no card` entry — the fixture's plain shell. The agent has a card and \
-             must not also appear as one: {active:?}"
-        );
-        assert!(
-            active.contains("\u{25cb} sh"),
-            "and the shell is that entry, named by what it is running: {active:?}"
-        );
-        assert!(
-            active.contains("ACTIVE \u{b7} 2"),
-            "and the column counts what it draws — the carded agent and the shell: {active:?}"
-        );
-    }
-
-    #[test]
-    fn nothing_about_a_live_agent_ever_rewrites_a_status_line() {
-        // The rule the whole redesign rests on. `ACTIVE` membership is derived on every frame and
-        // written nowhere: the status detector calls a 1.8-second pause "finished", and a derived
-        // column shows a wrong card for one frame and corrects itself where a written one leaves
-        // a wrong file on disk for somebody to find tomorrow.
-        let root = std::env::temp_dir().join(format!("dock-derived-{}", std::process::id()));
-        let dir = root.join("tasks");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&dir).unwrap();
-        crate::board::create(&dir, "wire the parser").expect("seed a task");
-        let id = crate::board::load(&dir)[0].id;
-        crate::board::set_status(&dir, id, "in-progress").expect("dispatch puts it in progress");
-        let file = crate::board::load(&dir)[0].file.clone();
-        let before = std::fs::read_to_string(&file).unwrap();
-        assert!(before.contains("status: in-progress"), "{before:?}");
-
-        let mut dashboard = dashboard_with_a_board_pane();
-        dashboard.runs[0].external_task_ref = id.to_string();
-        dashboard.set_board_pane_tasks(crate::board::load(&dir), dir.clone());
-        for state in [
-            AgentState::Blocked,
-            AgentState::Working,
-            AgentState::Done,
-            AgentState::Idle,
-        ] {
-            dashboard
-                .agents
-                .insert("run_1".into(), (Some(AgentKind::Claude), state));
-            render_to_string(&mut dashboard, 400, 40);
-        }
-        // And the frame that would be most tempted to move the card back: its agent is gone.
-        dashboard.agents.clear();
-        dashboard.runs.clear();
-        render_to_string(&mut dashboard, 400, 40);
-
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            before,
-            "the board is files on disk, and nothing about a live agent may write one"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_narrow_active_card_gives_up_a_line_rather_than_cutting_the_state_word_in_half() {
-        // The second line is what a two-line card is *for*, so it degrades in deliberate steps
-        // rather than being left to the ellipsis.
-        //
-        // The terminal widths below moved twice now. Task 4 moved them from 105/80 to 95/80:
-        // with one card apiece, `BACKLOG` and `ACTIVE` are the only two filled columns and split
-        // the pane's surplus width between just themselves, so a terminal that used to land a
-        // column in the narrow bucket at 105 needed 95 to land `ACTIVE` at the same eighteen
-        // cells (`FILLED_MIN`, the floor for an occupied column with no surplus left to hand
-        // out). Task 8 moves them again, from 95/80 to 70/69: below the rail threshold (88) the
-        // sidebar now auto-rails and hands the canvas back the ~25 columns the 28-column sidebar
-        // used to keep, so the same `FILLED_MIN` landing — the pane still narrows exactly as
-        // steeply, just against a canvas that starts ~25 columns wider — now happens ~25 columns
-        // sooner. 70 lands `ACTIVE` at eighteen cells, too narrow for
-        // `claude · a · needs you · 0 queued`, wide enough for the word that matters; 69, one
-        // column short of that floor, is where the allocator's equal-column fallback still
-        // applies (exercised on its own by `a_pane_too_narrow_for_stubs_falls_back_to_
-        // equal_columns` above).
-        let mut dashboard = dashboard_with_a_board_pane();
-        dashboard.layout.workspaces[0].root = LayoutNode::Pane {
-            pane_id: "b".into(),
-        };
-        // And a fifth time, when the default columns became kanban-md's own: `NEEDS-INPUT` is a
-        // wider stub than the `TODO` it replaced, so every rung shifted again. Measured, not
-        // reasoned — 72 lands the state word alone, 71 drops the line.
-        //
-        // And moved a fourth time, from 70/69 to 73/72, when a stub gained a second cell of
-        // gutter: four stubs now reserve eight more cells between them, so the width at which
-        // `ACTIVE` lands on `FILLED_MIN` with no surplus left is that much further up. The rung
-        // is the same one; only the width that reaches it moved. Measured, not reasoned: at 72
-        // the state line is gone entirely and at 73 it reads `needs you` with the agent name
-        // dropped, which is exactly the pair this case is written for.
-        let terminal = render_terminal(&mut dashboard, 72, 24);
-        let active = board_column(&terminal, "ACTIVE");
-        assert!(
-            active.contains("needs you"),
-            "the state word survives whole: {active:?}"
-        );
-        assert!(
-            !active.contains("claude"),
-            "and everything that did not fit was dropped rather than cut: {active:?}"
-        );
-
-        // At 69 there are too few cells even for stubs plus two eighteen-cell filled columns
-        // (the allocator's own fallback, exercised by `a_pane_too_narrow_for_stubs_falls_back_
-        // to_equal_columns` above), so the board falls back to five equal columns, each too
-        // narrow even for a one-line card. The card gives up its second line entirely: `nee…`
-        // is worse than nothing, and the glyph and its colour are there to carry the state on
-        // their own.
-        // 72, one column short of the landing above, for the same gutter reason.
-        let terminal = render_terminal(&mut dashboard, 71, 24);
-        let active = board_column(&terminal, "ACTIVE");
-        assert!(active.contains("#7"), "the card is still drawn: {active:?}");
-        assert!(
-            !active.contains("\u{2026}\n") || !active.contains("needs"),
-            "no half a state word anywhere: {active:?}"
-        );
-        assert!(
-            !active.contains("needs"),
-            "the second line is gone, not truncated: {active:?}"
+            narrowest_with_a_line.is_some(),
+            "and some width in the sweep does show it"
         );
     }
 

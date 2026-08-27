@@ -2000,22 +2000,107 @@ impl Dashboard {
         Line::styled(summary.to_owned(), Style::default().fg(self.theme.muted))
     }
 
+    /// The one line that is always on screen, spent on what changes what you do next.
+    ///
+    /// It used to read `runtime · <workspace> · protocol v13`: a word that means nothing to
+    /// anyone using Dock, the workspace name, and the wire version — which belongs in `Ctrl+B ?`
+    /// beside the other facts about the build, not on every frame. None of it answered a
+    /// question a person actually had.
+    ///
+    /// What does: where this workspace is, how much is in it, and which agents are waiting on
+    /// you. The last of those is right-aligned and is the last thing dropped when the terminal
+    /// narrows, because it is the only part that costs you anything by being missed.
     fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let workspace = self.workspace().map(|w| w.name.as_str()).unwrap_or("empty");
+        let workspace = self.workspace();
+        let name = workspace.map_or("no workspace", |w| w.name.as_str());
+        let panes = workspace.map_or(0, |w| w.panes.len());
+        // The repository's own name, not its path: the path is long, mostly shared between every
+        // project, and the last component is the part anybody uses to tell them apart.
+        let repository = self
+            .repository_root
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .unwrap_or_default();
+
+        let (mut blocked, mut waiting) = (0_usize, 0_usize);
+        for (_, state) in self.agents.values() {
+            match state {
+                AgentState::Blocked => blocked += 1,
+                AgentState::Done => waiting += 1,
+                _ => {}
+            }
+        }
+        let mut attention: Vec<Span<'_>> = Vec::new();
+        if blocked > 0 {
+            attention.push(Span::styled(
+                format!("{} {blocked} needs you", AgentState::Blocked.glyph()),
+                Style::default()
+                    .fg(self.theme.blocked)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if waiting > 0 {
+            if !attention.is_empty() {
+                attention.push(Span::styled(" · ", Style::default().fg(self.theme.border)));
+            }
+            attention.push(Span::styled(
+                format!("{} {waiting} your turn", AgentState::Done.glyph()),
+                Style::default().fg(self.theme.done),
+            ));
+        }
+        let attention_width: usize = attention
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum();
+
+        // Built widest-first and dropped in order of what a person can most afford to lose: the
+        // pane count, then the repository, then the workspace's own name. The attention summary
+        // is never dropped — it is the only part of this line that costs something to miss.
+        let width = usize::from(area.width);
+        let brand = " d·ock ";
+        // Joined from the parts that exist, so a dashboard opened outside a repository does not
+        // render a dangling separator where the repository's name would have been.
+        let joined = |parts: &[&str]| -> String {
+            let text = parts
+                .iter()
+                .filter(|part| !part.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            if text.is_empty() {
+                text
+            } else {
+                format!("  {text}")
+            }
+        };
+        let pane_count = format!("{panes} panes");
+        let candidates = [
+            joined(&[repository, name, &pane_count]),
+            joined(&[repository, name]),
+            joined(&[name]),
+            String::new(),
+        ];
+        let context = candidates
+            .into_iter()
+            .find(|text| {
+                brand.chars().count() + text.chars().count() + attention_width + 2 <= width
+            })
+            .unwrap_or_default();
+
+        let used = brand.chars().count() + context.chars().count() + attention_width;
+        let mut spans = vec![
+            Span::styled(
+                brand,
+                Style::default()
+                    .fg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(context, Style::default().fg(self.theme.muted)),
+            Span::raw(" ".repeat(width.saturating_sub(used).saturating_sub(1))),
+        ];
+        spans.extend(attention);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " d·ock ",
-                    Style::default()
-                        .fg(self.theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" runtime · {workspace} · protocol v{PROTOCOL_VERSION}"),
-                    Style::default().fg(self.theme.text),
-                ),
-            ]))
-            .block(
+            Paragraph::new(Line::from(spans)).block(
                 Block::default()
                     .borders(Borders::BOTTOM)
                     .border_style(Style::default().fg(self.theme.border)),
@@ -3405,6 +3490,14 @@ impl Dashboard {
             Line::from("Focused pane's lower border: ⇋ ⇵ split   ✎ rename   × close"),
             Line::from("Sidebar: ‹ at its top collapses it   click the rail to bring it back"),
             Line::from("Drag a divider to resize   drag inside a pane to select text"),
+            // The wire version lives here rather than on the header, where it sat on every
+            // frame answering a question nobody had. This is where the other facts about the
+            // build are, and where somebody actually goes looking for one.
+            Line::styled("ABOUT", heading),
+            Line::from(format!(
+                "Dock {} · daemon protocol v{PROTOCOL_VERSION}",
+                env!("CARGO_PKG_VERSION")
+            )),
             Line::styled("FORMS AND PICKERS", heading),
             Line::from("type to filter/edit   ↑/↓ or j/k select   Enter review/confirm"),
             Line::from("Esc cancels a form rather than reaching the pane while one is open."),
@@ -10603,6 +10696,52 @@ mod tests {
         );
     }
 
+    /// The one line that is always on screen should say something worth reading.
+    ///
+    /// It said `runtime · workspace 17 · protocol v13`: a word that means nothing to anybody
+    /// using Dock, the workspace name, and an internal wire version. None of it changes what a
+    /// person does next. What does is where they are and which agents are waiting on them.
+    #[test]
+    fn the_header_says_where_you_are_and_who_needs_you() {
+        let mut dashboard = bound_dashboard();
+        dashboard.repository_root = "/Users/someone/Development/dock".into();
+        dashboard.agents.insert(
+            "run_1".into(),
+            (Some(AgentKind::Claude), AgentState::Blocked),
+        );
+        dashboard
+            .agents
+            .insert("run_2".into(), (Some(AgentKind::Codex), AgentState::Done));
+        let frame = render_to_string(&mut dashboard, 160, 30);
+        let header: String = frame.chars().take(160).collect();
+
+        assert!(
+            header.contains("dock") && header.contains("needs you"),
+            "the header names the place and the agent waiting on you: {header:?}"
+        );
+        assert!(
+            !header.contains("protocol") && !header.contains("runtime"),
+            "and drops the wire version and the word `runtime`: {header:?}"
+        );
+    }
+
+    /// A narrow terminal drops the least useful part first, not the most.
+    #[test]
+    fn a_narrow_header_keeps_who_needs_you_over_where_you_are() {
+        let mut dashboard = bound_dashboard();
+        dashboard.repository_root = "/Users/someone/Development/a-very-long-repository".into();
+        dashboard.agents.insert(
+            "run_1".into(),
+            (Some(AgentKind::Claude), AgentState::Blocked),
+        );
+        let frame = render_to_string(&mut dashboard, 60, 30);
+        let header: String = frame.chars().take(60).collect();
+        assert!(
+            header.contains("needs you"),
+            "the thing costing you throughput survives a narrow terminal: {header:?}"
+        );
+    }
+
     /// Width sharing exists to resolve scarcity. When there is enough room for every column to
     /// be comfortable, there is nothing to resolve — and the proportional rule, applied anyway,
     /// hands a single busy column everything the empty ones did not take.
@@ -13590,8 +13729,13 @@ mod tests {
         );
         // No sidebar row may carry a wrapped remainder of the workspace name: an over-long
         // label is truncated in place rather than stealing the row below it.
+        // Counted over the sidebar's own rows, not the whole frame: the header names the
+        // workspace too, and this assertion is about the sidebar not stealing the row below it.
         assert_eq!(
-            rows.iter().filter(|row| row.contains("long work")).count(),
+            rows.iter()
+                .skip(2)
+                .filter(|row| row.contains("long work"))
+                .count(),
             1,
             "{rows:#?}"
         );

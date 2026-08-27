@@ -26,6 +26,12 @@ pub struct BoardTask {
     /// acceptance criteria, what was ruled out. Dispatching a card sent an agent the title and
     /// nothing else, which asked it to do work nobody had described to it.
     pub body: String,
+    /// The cards this one is waiting on, from `depends_on`.
+    ///
+    /// A card whose dependencies are not finished is not ready to pick up, and read like any
+    /// other card it looks exactly as ready as one that is — which is the mistake a board is
+    /// supposed to prevent.
+    pub depends_on: Vec<u64>,
     /// When the card was last touched, as seconds since the Unix epoch.
     ///
     /// From `updated` where the file has one and `created` otherwise, which is what kanban-md
@@ -190,6 +196,7 @@ pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
         body,
         archived: false,
         touched: stamp.map(|(seconds, _)| seconds),
+        depends_on: Vec::new(),
     })
 }
 
@@ -394,6 +401,11 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
     let (mut id, mut title, mut status, mut priority, mut archived) =
         (None, None, None, None, false);
     let (mut created, mut updated) = (None, None);
+    let mut depends_on: Vec<u64> = Vec::new();
+    // Which list, if any, the indented lines below currently belong to. The front matter also
+    // carries `tags`, whose items are words rather than ids, so the key has to be remembered
+    // rather than every indented `- item` being read as a dependency.
+    let mut list: Option<&str> = None;
     let mut body_start = text.len();
     let mut offset = opening.len();
     for line in lines {
@@ -403,8 +415,16 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
             break;
         }
         if line.starts_with(char::is_whitespace) {
+            if list == Some("depends_on")
+                && let Some(item) = line.trim().strip_prefix("- ")
+                && let Ok(id) = unquote(item.trim()).parse::<u64>()
+            {
+                depends_on.push(id);
+            }
             continue;
         }
+        // An unindented line ends whatever list was open, whether or not it opens another.
+        list = line.split_once(':').map(|(key, _)| key.trim());
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
@@ -429,6 +449,7 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
         body: text[body_start..].trim().to_owned(),
         archived,
         touched: updated.or(created),
+        depends_on,
     })
 }
 
@@ -578,6 +599,35 @@ mod tests {
         format!(
             "---\nid: {id}\ntitle: '{title}'\nstatus: {status}\npriority: high\ncreated: 2026-08-21T12:55:48+10:00\ntags:\n    - runtime\n    - tui\ndepends_on:\n    - 11\nclass: standard\n---\n\n# Outcome\n\nSomething.\n"
         )
+    }
+
+    /// `depends_on` is read; `tags`, which sits beside it in the same shape, is not mistaken
+    /// for it.
+    #[test]
+    fn a_cards_dependencies_are_read_and_its_tags_are_not() {
+        let board = Board::new();
+        board.task(
+            "001-a.md",
+            "---\nid: 1\ntitle: 'Blocked'\nstatus: backlog\ntags:\n    - runtime\n    - tui\ndepends_on:\n    - 10\n    - 11\nclass: standard\n---\n\n# Outcome\n\nbody\n",
+        );
+        let tasks = load(&board.0.join("kanban/tasks"));
+        assert_eq!(
+            tasks[0].depends_on,
+            [10, 11],
+            "both dependencies, and nothing from `tags`"
+        );
+    }
+
+    /// A card with no `depends_on` waits on nothing, rather than on whatever list came last.
+    #[test]
+    fn a_card_with_no_dependencies_waits_on_nothing() {
+        let board = Board::new();
+        board.task(
+            "001-a.md",
+            "---\nid: 1\ntitle: 'Free'\nstatus: backlog\ntags:\n    - runtime\n---\n\n# Outcome\n\nbody\n",
+        );
+        let tasks = load(&board.0.join("kanban/tasks"));
+        assert!(tasks[0].depends_on.is_empty(), "{:?}", tasks[0].depends_on);
     }
 
     /// Both stamp shapes these files actually use, checked against known epoch seconds.
@@ -1343,6 +1393,7 @@ mod view_tests {
             body: format!("# Outcome\n\ntask {id}"),
             archived,
             touched: None,
+            depends_on: Vec::new(),
         }
     }
 

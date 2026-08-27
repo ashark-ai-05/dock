@@ -7437,6 +7437,25 @@ fn render_board_columns(
     }
     let card_rows = usize::from(area.height.saturating_sub(2));
 
+    // Which cards are waiting on something unfinished, worked out once for the whole board.
+    // A dependency that is not on this board at all counts as unmet: the card names something
+    // it needs, and a board that cannot see it must not claim the card is ready.
+    let done: std::collections::HashSet<u64> = view
+        .tasks()
+        .iter()
+        .filter(|task| task.status == "done")
+        .map(|task| task.id)
+        .collect();
+    let blocked: std::collections::HashSet<u64> = view
+        .tasks()
+        .iter()
+        .filter(|task| {
+            !task.depends_on.is_empty()
+                && task.depends_on.iter().any(|needed| !done.contains(needed))
+        })
+        .map(|task| task.id)
+        .collect();
+
     // The allocator needs every column's label and count at once — it cannot decide one
     // column's width without knowing what the others hold — so both are built ahead of the
     // loop instead of inline. `ACTIVE`'s count comes from `active_entries`, not from
@@ -7513,6 +7532,7 @@ fn render_board_columns(
                 CardShape {
                     title_lines: view.title_lines(),
                     rungs: view.age_thresholds(),
+                    blocked: &blocked,
                 },
             )
         };
@@ -7741,6 +7761,12 @@ struct CardShape<'a> {
     title_lines: usize,
     /// The age rungs the board declares, oldest last.
     rungs: &'a [crate::board_config::AgeThreshold],
+    /// Cards waiting on something that has not finished, by id.
+    ///
+    /// Computed once per frame rather than per card: answering "is this one blocked" means
+    /// asking after every dependency's status, and a board has hundreds of cards on a path that
+    /// repaints at 60fps.
+    blocked: &'a std::collections::HashSet<u64>,
 }
 
 fn card_lines<'a>(
@@ -7799,7 +7825,16 @@ fn card_lines<'a>(
         // its card is urgent — a mark that shifted the title would make a column look ragged
         // for the sake of the two cards wearing one.
         let mark = priority_mark(&task.priority);
-        let title_budget = title_budget.saturating_sub(mark.len());
+        // One more fixed cell for "waiting on something else". A blocked card reads exactly as
+        // ready as a free one otherwise, which is the mistake a board exists to prevent — and a
+        // fixed cell rather than a conditional one, so a column of cards keeps its titles in a
+        // straight line whether or not any of them is waiting.
+        let waiting = if shape.blocked.contains(&task.id) {
+            "\u{21e3}"
+        } else {
+            " "
+        };
+        let title_budget = title_budget.saturating_sub(mark.len() + waiting.len());
         let wrapped = wrap_title(&task.title, title_budget, per);
         let head = wrapped.first().map(String::as_str).unwrap_or_default();
         // The id carries the card's age, in the colours the board declared for it. A card
@@ -7810,6 +7845,11 @@ fn card_lines<'a>(
             // muted: both say something the age cannot override.
             (false, false, Some(colour)) => Style::default().fg(colour),
             _ => style,
+        };
+        let waiting_style = if here {
+            style
+        } else {
+            Style::default().fg(theme.muted)
         };
         let mark_style = if !here && priority_is_critical(&task.priority) {
             Style::default().fg(theme.blocked)
@@ -7830,11 +7870,13 @@ fn card_lines<'a>(
                     },
                 ),
                 Span::styled(mark.to_owned(), mark_style),
+                Span::styled(waiting.to_owned(), waiting_style),
                 Span::styled(format!(" {head}"), style),
             ]),
             None => Line::from(vec![
                 Span::styled(format!("{marker} #{identifier} "), identity),
                 Span::styled(mark.to_owned(), mark_style),
+                Span::styled(waiting.to_owned(), waiting_style),
                 Span::styled(format!(" {head}"), style),
             ]),
         });
@@ -10059,6 +10101,7 @@ mod tests {
             body: format!("# Outcome\n\n{title}"),
             archived: false,
             touched: None,
+            depends_on: Vec::new(),
         }
     }
 
@@ -10327,6 +10370,76 @@ mod tests {
         );
     }
 
+    /// A card waiting on unfinished work says so; one whose dependencies are done does not.
+    #[test]
+    fn a_card_waiting_on_another_is_marked_and_a_freed_one_is_not() {
+        let theme = Theme::cool();
+        let waiting = BoardTask {
+            id: 2,
+            title: "second".into(),
+            status: "backlog".into(),
+            priority: "medium".into(),
+            file: std::path::PathBuf::from("2.md"),
+            body: String::new(),
+            archived: false,
+            touched: None,
+            depends_on: vec![1],
+        };
+        let cards: Vec<&BoardTask> = vec![&waiting];
+        let live = BoardLive::new(&[]);
+
+        let mut blocked = std::collections::HashSet::new();
+        blocked.insert(2_u64);
+        let (marked, _) = card_lines(
+            &theme,
+            &cards,
+            &live,
+            40,
+            4,
+            None,
+            CardShape {
+                title_lines: 1,
+                rungs: &[],
+                blocked: &blocked,
+            },
+        );
+        let (freed, _) = card_lines(
+            &theme,
+            &cards,
+            &live,
+            40,
+            4,
+            None,
+            CardShape {
+                title_lines: 1,
+                rungs: &[],
+                blocked: &Default::default(),
+            },
+        );
+        let text = |lines: &[Line<'_>]| -> String {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        assert!(
+            text(&marked).contains('\u{21e3}'),
+            "a blocked card is marked: {:?}",
+            text(&marked)
+        );
+        assert!(
+            !text(&freed).contains('\u{21e3}'),
+            "and one whose dependencies are done is not: {:?}",
+            text(&freed)
+        );
+        assert_eq!(
+            text(&marked).chars().count(),
+            text(&freed).chars().count(),
+            "the cell is there either way, so titles stay in a straight line"
+        );
+    }
+
     /// `ACTIVE` is what a person looks at, so it gets the room even when the board is quiet.
     ///
     /// An even division is right when every column has cards; it is wrong when the board is
@@ -10491,6 +10604,7 @@ mod tests {
             body: String::new(),
             archived: false,
             touched: None,
+            depends_on: Vec::new(),
         };
         let cards: Vec<&BoardTask> = vec![&task];
         let live = BoardLive::new(&[]);
@@ -10505,6 +10619,7 @@ mod tests {
             CardShape {
                 title_lines: 1,
                 rungs: &[],
+                blocked: &Default::default(),
             },
         );
         let (two, _) = card_lines(
@@ -10517,6 +10632,7 @@ mod tests {
             CardShape {
                 title_lines: 2,
                 rungs: &[],
+                blocked: &Default::default(),
             },
         );
         assert_eq!(one.len(), 1, "one line when the board asks for one");
@@ -11027,6 +11143,7 @@ mod tests {
             CardShape {
                 title_lines: 1,
                 rungs: &[],
+                blocked: &Default::default(),
             },
         );
 
@@ -11054,6 +11171,7 @@ mod tests {
             CardShape {
                 title_lines: 1,
                 rungs: &[],
+                blocked: &Default::default(),
             },
         );
 

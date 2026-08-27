@@ -7262,22 +7262,32 @@ fn render_board_columns(
             "  nothing on this board yet · n adds a card",
             Style::default().fg(theme.muted),
         )];
-        let entries = active_entries(view, live);
-        if !entries.is_empty() {
+        // Agents and plain panes are different kinds of thing and get different sections.
+        //
+        // One list mixed them, and that let a `zsh` somebody happens to have open sit next to
+        // an agent that is waiting on a reply — so the entry that costs the user throughput
+        // competed for attention with one that costs nothing. Ranking alone could not fix it:
+        // a shell is `Idle`, an idle agent is `Idle`, and by the time the sort has put them in
+        // an order there is nothing on the row to say which kind you are looking at.
+        let runs: Vec<&LiveRun<'_>> = active_entries(view, live)
+            .into_iter()
+            .filter_map(ActiveEntry::run)
+            .collect();
+        let (agents, panes): (Vec<_>, Vec<_>) = runs.into_iter().partition(|run| run.is_agent());
+        // Full width and one line each, because there is nothing here to share the width with —
+        // the state word and the pane both fit whole, which they never did in a fifth of a pane.
+        let section = |lines: &mut Vec<Line<'static>>, heading: &str, runs: &[&LiveRun<'_>]| {
+            if runs.is_empty() {
+                return;
+            }
             lines.push(Line::from(""));
             lines.push(Line::styled(
-                "  RUNNING",
+                format!("  {heading} · {}", runs.len()),
                 Style::default()
                     .fg(theme.muted)
                     .add_modifier(Modifier::BOLD),
             ));
-            // Full width and one line each, because there is nothing here to share the width
-            // with — the state word and the pane both fit whole, which they never did in a
-            // fifth of a pane.
-            for entry in entries {
-                let Some(run) = entry.run() else {
-                    continue;
-                };
+            for run in runs {
                 let mut liveness = String::with_capacity(48);
                 write_liveness(&mut liveness, run);
                 lines.push(Line::from(vec![
@@ -7295,7 +7305,9 @@ fn render_board_columns(
                     ),
                 ]));
             }
-        }
+        };
+        section(&mut lines, "AGENTS", &agents);
+        section(&mut lines, "PANES", &panes);
         frame.render_widget(Paragraph::new(lines), area);
         return card_areas;
     }
@@ -10527,6 +10539,70 @@ mod tests {
         );
     }
 
+    /// An agent and a shell are different kinds of thing and get different sections.
+    ///
+    /// One list let a `zsh` somebody happens to have open sit beside an agent waiting on a
+    /// reply, so the entry costing the user throughput competed with one costing nothing.
+    /// Ranking could not fix it on its own: a shell is `Idle` and so is an idle agent, and once
+    /// the sort has ordered them there is nothing on the row saying which kind it is.
+    #[test]
+    fn a_board_with_no_cards_separates_agents_from_plain_panes() {
+        let mut dashboard = dashboard_with_a_board_pane();
+        let mut shell = snapshot();
+        shell.run_id = "run_shell".into();
+        shell.pane_id = "b".into();
+        shell.command = vec!["zsh".into()];
+        shell.agent = None;
+        let mut runs = dashboard.runs.clone();
+        runs.push(shell);
+        dashboard.set_runs(runs);
+        dashboard.set_board_pane_tasks(Vec::new(), std::path::PathBuf::from("/tmp/none"));
+
+        let whole = render_to_string(&mut dashboard, 160, 40);
+        // From the board's own first line onward: the sidebar lists agents too, and searching
+        // the whole frame would match its rows rather than the board's.
+        let board = &whole[whole
+            .find("nothing on this board yet")
+            .expect("the board pane is drawn")..];
+        let agents = board.find("AGENTS").expect("an agents section");
+        let panes = board.find("PANES").expect("a panes section");
+        assert!(
+            agents < panes,
+            "agents come first, because only an agent can be waiting on you: {board:?}"
+        );
+        let claude = board.find("claude").expect("the agent is listed");
+        let zsh = board.find("zsh").expect("and so is the shell");
+        assert!(
+            agents < claude && claude < panes && panes < zsh,
+            "each under its own heading, not interleaved: {board:?}"
+        );
+    }
+
+    /// A board with agents and no plain panes draws no empty `PANES` heading, and vice versa.
+    #[test]
+    fn an_absent_kind_draws_no_heading_of_its_own() {
+        let mut dashboard = dashboard_with_a_board_pane();
+        // The fixture carries a plain shell as well as its agent; drop it, so there is one kind
+        // of thing running and only one heading to draw.
+        let agents_only: Vec<_> = dashboard
+            .runs
+            .iter()
+            .filter(|run| run.agent.is_some())
+            .cloned()
+            .collect();
+        dashboard.set_runs(agents_only);
+        dashboard.set_board_pane_tasks(Vec::new(), std::path::PathBuf::from("/tmp/none"));
+        let whole = render_to_string(&mut dashboard, 160, 40);
+        let board = &whole[whole
+            .find("nothing on this board yet")
+            .expect("the board pane is drawn")..];
+        assert!(board.contains("AGENTS"), "the fixture's agent: {board:?}");
+        assert!(
+            !board.contains("PANES"),
+            "and no heading over nothing: {board:?}"
+        );
+    }
+
     /// Width sharing exists to resolve scarcity. When there is enough room for every column to
     /// be comfortable, there is nothing to resolve — and the proportional rule, applied anyway,
     /// hands a single busy column everything the empty ones did not take.
@@ -10813,8 +10889,8 @@ mod tests {
             "the agent is still shown, and in words: {frame:?}"
         );
         assert!(
-            frame.contains("RUNNING"),
-            "under a heading that says what it is: {frame:?}"
+            frame.contains("AGENTS"),
+            "under a heading that says what kind of thing it is: {frame:?}"
         );
         assert!(
             !frame.contains("BACKLOG") && !frame.contains("REVIEW"),

@@ -2203,7 +2203,10 @@ impl Dashboard {
                     .fg(self.theme.surface)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(self.theme.muted)
+                // A chip rather than bare text: the `panel` surface gives an inactive tab an
+                // edge of its own, so the strip reads as several things rather than one line
+                // of words with numbers scattered through it.
+                Style::default().fg(self.theme.text).bg(self.theme.panel)
             };
             frame.render_widget(Paragraph::new(Line::styled(label.clone(), style)), tab);
             self.tab_areas.push((workspace.workspace_id.clone(), tab));
@@ -2255,6 +2258,18 @@ impl Dashboard {
                     self.confirm_close_workspace_area = Some(confirm);
                     x = x.saturating_add(3);
                 }
+            }
+            // The reserved gap, drawn rather than left blank. It was always one blank column
+            // between tabs, which is a gap you cannot see — so the strip had no delineation at
+            // all and one tab ran into the next.
+            if x < right_edge {
+                frame.render_widget(
+                    Paragraph::new(Line::styled(
+                        "\u{2502}",
+                        Style::default().fg(self.theme.border),
+                    )),
+                    Rect::new(x, area.y, 1, 1),
+                );
             }
             x = x.saturating_add(1);
             last_drawn = Some(index);
@@ -10743,6 +10758,37 @@ mod tests {
         assert!(
             header.contains("needs you"),
             "the thing costing you throughput survives a narrow terminal: {header:?}"
+        );
+    }
+
+    /// One tab must be visibly one tab, not a run of words sharing a row.
+    ///
+    /// The strip left a single blank column between tabs and drew nothing in it, so
+    /// `1 workspace 27  2 workspace 34  3 workspace 37` read as one line of text with numbers
+    /// scattered through it. The gap was already reserved; it was simply empty.
+    #[test]
+    fn the_tab_strip_draws_a_separator_between_tabs() {
+        let mut dashboard = two_workspace_dashboard();
+        let terminal = render_terminal(&mut dashboard, 120, 30);
+        let strip = dashboard.tab_strip_area.expect("the strip is drawn");
+        let row = row_text(&terminal, strip, strip.y);
+        assert!(
+            row.contains('\u{2502}'),
+            "a rule stands between one tab and the next: {row:?}"
+        );
+        // And it sits after a tab rather than leading the strip, checked against the rectangle
+        // the strip actually recorded rather than against any particular workspace's name.
+        let first = dashboard
+            .tab_areas
+            .first()
+            .map(|(_, area)| area.right())
+            .expect("a tab was drawn");
+        let bar =
+            u16::try_from(row.find('\u{2502}').expect("the separator")).unwrap_or(0) + strip.x;
+        assert!(
+            bar >= first,
+            "the separator follows the first tab rather than leading the strip: \
+             bar at {bar}, first tab ends at {first}, row {row:?}"
         );
     }
 

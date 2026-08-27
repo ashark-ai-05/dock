@@ -196,7 +196,9 @@ pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
 /// The statuses a task moves through, in the order work moves through them.
 ///
 /// Not the whole truth about any particular board, and deliberately not treated as such: this
-/// repository's own `kanban/config.yml` declares `needs-input`, which is not in here. Use
+/// repository's own `kanban/config.yml` declares `needs-input`, which is not in here, and does
+/// not declare `todo`, which is. A board with a config gets its own columns through
+/// [`statuses_declaring`]; this is only what a board that has said nothing falls back to. Use
 /// [`statuses`] for the columns a board actually has.
 pub const STATUSES: [&str; 5] = ["backlog", "todo", "in-progress", "review", "done"];
 

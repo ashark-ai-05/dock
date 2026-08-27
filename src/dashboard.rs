@@ -5393,10 +5393,23 @@ impl Dashboard {
             .get(&pane_id)
             .and_then(|pane| pane.run_id.clone())?;
         let screen = self.screens.get(&run_id)?.screen();
+        // The alternate screen is the gate, not the mouse mode alone.
+        //
+        // Mouse mode is sticky: a TUI that exits without resetting it leaves the replica saying
+        // its program wants the mouse long after that program is gone. Forwarding on the mode
+        // alone typed `ESC [ < 65 ; … M` into a plain shell on every wheel notch, and the shell
+        // echoed each one as text — a real terminal filled with garbage. A program that wants
+        // the mouse runs on the alternate screen; a shell at a prompt does not, so a stuck mode
+        // there is harmless because nothing is forwarded to it at all.
+        let mode = if screen.alternate_screen() {
+            screen.mouse_protocol_mode()
+        } else {
+            vt100::MouseProtocolMode::None
+        };
         Some((
             run_id,
             MouseEncoding {
-                mode: screen.mouse_protocol_mode(),
+                mode,
                 encoding: screen.mouse_protocol_encoding(),
             },
             cell.1,
@@ -7236,22 +7249,54 @@ fn render_board_columns(
     if statuses.is_empty() || area.width < statuses.len() as u16 || area.height < 3 {
         return card_areas;
     }
-    // A board with nothing on it drew five headings reading `· 0` above four dashes and filled
-    // the pane with them, which reads as broken rather than as empty. A board with an agent on it
-    // is not empty whatever its files say — that agent is an entry in `ACTIVE`, which is the
-    // whole point of this pass, so the grid is drawn for it.
-    if view.tasks().is_empty() && live.runs.is_empty() {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled("  no tasks on this board", Style::default().fg(theme.muted)),
-                Line::from(""),
-                Line::styled(
-                    "  Ctrl+B k opens it · n adds a task",
-                    Style::default().fg(theme.muted),
-                ),
-            ]),
-            area,
-        );
+    // A board with no cards is not a board, and a grid drawn to hold none of them is five
+    // headings reading `· 0` over an empty pane.
+    //
+    // The previous rule was `tasks.is_empty() && runs.is_empty()`, on the reasoning that a live
+    // agent is something to show and the grid is what shows it. The first half is right and the
+    // second is not: what the agent needs is a line, and it was getting a column — so a board
+    // with two agents and no cards spent a pane on four empty headings to say two things. The
+    // columns come back the moment there is a card to put in one.
+    if view.tasks().is_empty() {
+        let mut lines = vec![Line::styled(
+            "  nothing on this board yet · n adds a card",
+            Style::default().fg(theme.muted),
+        )];
+        let entries = active_entries(view, live);
+        if !entries.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                "  RUNNING",
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            // Full width and one line each, because there is nothing here to share the width
+            // with — the state word and the pane both fit whole, which they never did in a
+            // fifth of a pane.
+            for entry in entries {
+                let Some(run) = entry.run() else {
+                    continue;
+                };
+                let mut liveness = String::with_capacity(48);
+                write_liveness(&mut liveness, run);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", run.state.glyph()),
+                        Style::default().fg(theme.agent(run.state)),
+                    ),
+                    Span::styled(
+                        format!("{:<12}", run.label()),
+                        Style::default().fg(theme.text),
+                    ),
+                    Span::styled(
+                        format!(" {} · {liveness}", run.pane_id),
+                        Style::default().fg(theme.muted),
+                    ),
+                ]));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines), area);
         return card_areas;
     }
     let card_rows = usize::from(area.height.saturating_sub(2));
@@ -10304,9 +10349,16 @@ mod tests {
     #[test]
     fn the_wheel_reaches_a_program_that_asked_for_the_mouse() {
         let mut dashboard = bound_dashboard();
+        // Through a delta rather than the seed: an attach frame carries a screen's *contents*,
+        // and the alternate-screen switch is a mode the program sets with bytes that follow.
         // `?1049h` is the alternate screen, `?1000h` mouse reporting, `?1006h` SGR encoding —
         // the three an agent TUI sends on startup.
-        dashboard.apply_event(attach_event("run_1", b"\x1b[?1049h\x1b[?1000h\x1b[?1006h"));
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
+        dashboard.apply_event(delta_event(
+            "run_1",
+            2,
+            b"\x1b[?1049h\x1b[?1000h\x1b[?1006h",
+        ));
         let terminal = render_terminal(&mut dashboard, 100, 30);
         let a = *dashboard.pane_areas.get("a").expect("pane a is rendered");
         drop(terminal);
@@ -10332,7 +10384,12 @@ mod tests {
     #[test]
     fn shift_keeps_the_wheel_for_dock_even_when_a_program_wants_it() {
         let mut dashboard = bound_dashboard();
-        dashboard.apply_event(attach_event("run_1", b"\x1b[?1049h\x1b[?1000h\x1b[?1006h"));
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
+        dashboard.apply_event(delta_event(
+            "run_1",
+            2,
+            b"\x1b[?1049h\x1b[?1000h\x1b[?1006h",
+        ));
         let terminal = render_terminal(&mut dashboard, 100, 30);
         let a = *dashboard.pane_areas.get("a").expect("pane a is rendered");
         drop(terminal);
@@ -10430,6 +10487,44 @@ mod tests {
             "the resting state is unmarked"
         );
         assert!(priority_is_critical("critical") && !priority_is_critical("high"));
+    }
+
+    /// A shell must never be typed into by the wheel, whatever its replica reports.
+    ///
+    /// This shipped and corrupted a real terminal: a scroll over a plain `zsh` pane wrote
+    /// `\u{1b}[<65;51;14M` into it over and over, and the shell echoed every one as text. Mouse
+    /// mode is sticky — a TUI that exits without resetting it leaves the replica saying the
+    /// program wants the mouse long after that program is gone — so "the mode is on" is not
+    /// enough to justify typing escape sequences into someone's shell.
+    ///
+    /// The alternate screen is the honest test. A program that wants the mouse runs on it; a
+    /// shell at a prompt does not, and a stuck mode on the primary screen is harmless because
+    /// nothing is forwarded there at all.
+    #[test]
+    fn a_shell_is_never_typed_into_by_the_wheel_even_with_mouse_mode_stuck_on() {
+        let mut dashboard = bound_dashboard();
+        // Mouse reporting turned on and the alternate screen then left — exactly what a TUI
+        // that exits without resetting leaves behind.
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
+        dashboard.apply_event(delta_event(
+            "run_1",
+            2,
+            b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?1049l",
+        ));
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        let a = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        drop(terminal);
+
+        let scrolled = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: a.x + 2,
+            row: a.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            !matches!(scrolled, UiCommand::PaneInput(_)),
+            "nothing may be typed into a pane at a shell prompt: {scrolled:?}"
+        );
     }
 
     /// Width sharing exists to resolve scarcity. When there is enough room for every column to
@@ -10680,18 +10775,18 @@ mod tests {
         // agent running above it is not in one of the columns.
         let mut dashboard = dashboard_with_a_board_pane();
         dashboard.set_board_pane_tasks(Vec::new(), std::path::PathBuf::from("/tmp/none"));
-        // Nothing on the board and nothing running: the fixture's agent is cleared, because an
-        // agent *is* something to show and the grid is what shows it — see below.
+        // Nothing on the board and nothing running, so there is not even a `RUNNING` list to
+        // draw — the emptiest a board gets, and the case this test is for.
         dashboard.runs.clear();
         dashboard.agents.clear();
         let frame = render_to_string(&mut dashboard, 160, 40);
 
         assert!(
-            frame.contains("no tasks on this board"),
+            frame.contains("nothing on this board yet"),
             "an empty board must say it is empty: {frame:?}"
         );
         assert!(
-            frame.contains("Ctrl+B k"),
+            frame.contains("n adds a card"),
             "and name the way to add one: {frame:?}"
         );
         // The columns are what made it look broken, so they must not be drawn at all.
@@ -10702,19 +10797,29 @@ mod tests {
     }
 
     #[test]
-    fn a_board_with_no_cards_but_an_agent_running_draws_the_grid_rather_than_saying_it_is_empty() {
-        // The other half of the same judgement, and the half the runs lane used to cover. A
-        // board whose files are empty is not an empty board while an agent is working: that
-        // agent is an entry in `ACTIVE`, and the "no tasks" page would be the board hiding the
-        // one thing on it.
+    fn a_board_with_no_cards_lists_what_is_running_instead_of_drawing_empty_columns() {
+        // This used to draw the whole grid, on the reasoning that a board with an agent on it is
+        // not empty and the grid is what shows the agent. The first half is right and the second
+        // was not: what the agent needs is a line, and it was getting a column — so a board with
+        // no cards spent a pane on five headings reading `· 0` to say one thing.
+        //
+        // The agent must still be there, in full, and the columns must not.
         let mut dashboard = dashboard_with_a_board_pane();
         dashboard.set_board_pane_tasks(Vec::new(), std::path::PathBuf::from("/tmp/none"));
         let terminal = render_terminal(&mut dashboard, 400, 40);
         let frame = rendered(&terminal);
-        assert!(!frame.contains("no tasks on this board"), "{frame:?}");
-        let active = board_column(&terminal, "ACTIVE");
-        assert!(active.contains("claude"), "{active:?}");
-        assert!(active.contains("needs you"), "{active:?}");
+        assert!(
+            frame.contains("claude") && frame.contains("needs you"),
+            "the agent is still shown, and in words: {frame:?}"
+        );
+        assert!(
+            frame.contains("RUNNING"),
+            "under a heading that says what it is: {frame:?}"
+        );
+        assert!(
+            !frame.contains("BACKLOG") && !frame.contains("REVIEW"),
+            "and no column headings over a board with no cards: {frame:?}"
+        );
     }
 
     #[test]
@@ -13012,7 +13117,7 @@ mod tests {
     #[test]
     fn output_arriving_under_a_scrolled_pane_does_not_slide_it_downwards() {
         let mut dashboard = bound_dashboard();
-        dashboard.apply_event(attach_event("run_1", b""));
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
         for line in 0..50 {
             dashboard.apply_event(delta_event(
                 "run_1",
@@ -13523,7 +13628,7 @@ mod tests {
     #[test]
     fn a_delta_of_the_childs_own_bytes_gives_the_wheel_history_to_scroll_into() {
         let mut dashboard = bound_dashboard();
-        dashboard.apply_event(attach_event("run_1", b""));
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
         let mut written = Vec::new();
         for index in 1..=60 {
             written.extend_from_slice(format!("line {index}\r\n").as_bytes());
@@ -13601,7 +13706,7 @@ mod tests {
     #[test]
     fn the_wheel_scrolls_the_pane_under_the_pointer_and_returning_to_live_resumes_following() {
         let mut dashboard = bound_dashboard();
-        dashboard.apply_event(attach_event("run_1", b""));
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
         if let Some(screen) = dashboard.screens.get_mut("run_1") {
             for index in 1..=60 {
                 screen.feed(format!("line {index}\r\n").as_bytes());
@@ -13656,7 +13761,7 @@ mod tests {
             .run_id = Some("run_2".into());
         assert_eq!(dashboard.layout.workspaces[0].focused_pane_id, "a");
 
-        dashboard.apply_event(attach_event("run_1", b""));
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
         dashboard.apply_event(attach_event("run_2", b""));
         for run_id in ["run_1", "run_2"] {
             if let Some(screen) = dashboard.screens.get_mut(run_id) {
@@ -13775,7 +13880,7 @@ mod tests {
     #[test]
     fn the_prefix_and_page_keys_scroll_the_focused_pane() {
         let mut dashboard = bound_dashboard();
-        dashboard.apply_event(attach_event("run_1", b""));
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
         for line in 0..100 {
             dashboard.apply_event(delta_event(
                 "run_1",
@@ -13801,7 +13906,7 @@ mod tests {
     #[test]
     fn a_scrolled_pane_says_so_rather_than_looking_hung() {
         let mut dashboard = bound_dashboard();
-        dashboard.apply_event(attach_event("run_1", b""));
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
         for line in 0..100 {
             dashboard.apply_event(delta_event(
                 "run_1",
@@ -13831,7 +13936,7 @@ mod tests {
     #[test]
     fn the_bare_glyph_marker_survives_a_divider_dragged_to_the_minimum_pane_width() {
         let mut dashboard = bound_dashboard();
-        dashboard.apply_event(attach_event("run_1", b""));
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
         for line in 0..100 {
             dashboard.apply_event(delta_event(
                 "run_1",
@@ -13880,7 +13985,7 @@ mod tests {
     fn the_bare_glyph_marker_is_present_at_widths_where_it_previously_vanished() {
         for width in [4u16, 6, 8, 10, 12] {
             let mut dashboard = bound_dashboard();
-            dashboard.apply_event(attach_event("run_1", b""));
+            dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
             for line in 0..100 {
                 dashboard.apply_event(delta_event(
                     "run_1",
@@ -13920,7 +14025,7 @@ mod tests {
         // automatic rule from undoing the pin on this render.
         let scrolled_dashboard_at = |width: u16, pin_sidebar_full: bool| {
             let mut dashboard = bound_dashboard();
-            dashboard.apply_event(attach_event("run_1", b""));
+            dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
             for line in 0..100 {
                 dashboard.apply_event(delta_event(
                     "run_1",
@@ -13988,7 +14093,7 @@ mod tests {
     #[test]
     fn ctrl_b_page_down_scrolls_the_focused_pane_forward_toward_live_output() {
         let mut dashboard = bound_dashboard();
-        dashboard.apply_event(attach_event("run_1", b""));
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
         for line in 0..100 {
             dashboard.apply_event(delta_event(
                 "run_1",
@@ -14509,7 +14614,7 @@ mod tests {
     #[test]
     fn scrolling_inside_a_frozen_pane_reaches_the_history_the_clone_carried_with_it() {
         let mut dashboard = bound_dashboard();
-        dashboard.apply_event(attach_event("run_1", b""));
+        dashboard.apply_event(attach_event("run_1", b"a line\r\n"));
         // Through a delta rather than the attach snapshot: a snapshot carries the screen only,
         // so a replica seeded from one has no history to be cloned along with it.
         let mut written = Vec::new();

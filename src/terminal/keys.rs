@@ -406,3 +406,142 @@ mod tests {
         assert_eq!(up_app, b"\x1bOA");
     }
 }
+
+/// What a pane's program has asked to be told about the mouse.
+///
+/// Read off the pane's own replica rather than assumed, exactly as `application_cursor` is. An
+/// alt-screen TUI — Amp, Copilot, an editor — turns mouse reporting on and scrolls *itself*;
+/// Dock was keeping every wheel notch for its own scrollback, which that pane does not have
+/// (`vt100` gives the alternate grid no scrollback at all), so the wheel did nothing at all in
+/// exactly the panes a person most wants to scroll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseEncoding {
+    pub mode: vt100::MouseProtocolMode,
+    pub encoding: vt100::MouseProtocolEncoding,
+}
+
+impl MouseEncoding {
+    /// Whether the program wants to hear about the mouse at all.
+    pub fn wanted(self) -> bool {
+        self.mode != vt100::MouseProtocolMode::None
+    }
+
+    /// Whether it wants motion reported for this event, which most do not.
+    fn wants_motion(self, dragging: bool) -> bool {
+        match self.mode {
+            vt100::MouseProtocolMode::None | vt100::MouseProtocolMode::Press => false,
+            vt100::MouseProtocolMode::PressRelease => false,
+            vt100::MouseProtocolMode::ButtonMotion => dragging,
+            vt100::MouseProtocolMode::AnyMotion => true,
+        }
+    }
+
+    /// Whether it wants button releases. X10 mode reports presses only.
+    fn wants_release(self) -> bool {
+        !matches!(
+            self.mode,
+            vt100::MouseProtocolMode::None | vt100::MouseProtocolMode::Press
+        )
+    }
+}
+
+/// Encodes a mouse event for a pane's program, in the protocol that program asked for.
+///
+/// `column` and `row` are zero-based cells *within the pane*, which the caller resolves; the
+/// wire format is one-based, so both are incremented here — one place, rather than at each of
+/// the two encodings.
+///
+/// Returns `None` when the program does not want this event, which the caller must treat as
+/// "keep it for Dock" rather than as "send nothing": a wheel notch a program has not asked for
+/// is a notch that should scroll Dock's own scrollback.
+pub fn encode_mouse(
+    kind: crossterm::event::MouseEventKind,
+    modifiers: KeyModifiers,
+    column: u16,
+    row: u16,
+    encoding: MouseEncoding,
+) -> Option<Vec<u8>> {
+    use crossterm::event::MouseEventKind;
+
+    if !encoding.wanted() {
+        return None;
+    }
+    // Button numbers are xterm's: 0/1/2 for left/middle/right, +32 for motion, 64/65 for the
+    // wheel. Modifiers are a bitfield above that — shift 4, alt 8, control 16.
+    let (mut button, release) = match kind {
+        MouseEventKind::Down(button) => (mouse_button(button), false),
+        MouseEventKind::Up(button) => {
+            if !encoding.wants_release() {
+                return None;
+            }
+            (mouse_button(button), true)
+        }
+        MouseEventKind::Drag(button) => {
+            if !encoding.wants_motion(true) {
+                return None;
+            }
+            (mouse_button(button) + 32, false)
+        }
+        MouseEventKind::Moved => {
+            if !encoding.wants_motion(false) {
+                return None;
+            }
+            (35, false)
+        }
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+    };
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        button += 4;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        button += 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        button += 16;
+    }
+    let (column, row) = (column.saturating_add(1), row.saturating_add(1));
+    Some(match encoding.encoding {
+        // `CSI < button ; col ; row M` for a press, `m` for a release. The only encoding with
+        // no coordinate ceiling, which is why every modern program asks for it.
+        vt100::MouseProtocolEncoding::Sgr => format!(
+            "\x1b[<{button};{column};{row}{}",
+            if release { 'm' } else { 'M' }
+        )
+        .into_bytes(),
+        // X10 and its UTF-8 extension both bias by 32. A release is button 3 rather than a
+        // distinct terminator, so the button is replaced rather than flagged.
+        vt100::MouseProtocolEncoding::Default | vt100::MouseProtocolEncoding::Utf8 => {
+            let button = if release { 3 } else { button };
+            let mut bytes = b"\x1b[M".to_vec();
+            for value in [
+                button + 32,
+                column.min(223) as u32 + 32,
+                row.min(223) as u32 + 32,
+            ] {
+                if encoding.encoding == vt100::MouseProtocolEncoding::Utf8 && value > 127 {
+                    let mut buffer = [0_u8; 4];
+                    bytes.extend_from_slice(
+                        char::from_u32(value)
+                            .unwrap_or('\u{fffd}')
+                            .encode_utf8(&mut buffer)
+                            .as_bytes(),
+                    );
+                } else {
+                    bytes.push(value.min(255) as u8);
+                }
+            }
+            bytes
+        }
+    })
+}
+
+fn mouse_button(button: crossterm::event::MouseButton) -> u32 {
+    match button {
+        crossterm::event::MouseButton::Left => 0,
+        crossterm::event::MouseButton::Middle => 1,
+        crossterm::event::MouseButton::Right => 2,
+    }
+}

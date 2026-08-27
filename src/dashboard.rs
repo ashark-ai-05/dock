@@ -33,8 +33,8 @@ use crate::{
         WorkspaceRequest,
     },
     terminal::{
-        KeyEncoding, PANE_HISTORY_BYTES, PaneScreen, PaneSnapshot, encode_paste, row_text,
-        text_between,
+        KeyEncoding, MouseEncoding, PANE_HISTORY_BYTES, PaneScreen, PaneSnapshot, encode_mouse,
+        encode_paste, row_text, text_between,
     },
     theme::Theme,
 };
@@ -5378,6 +5378,46 @@ impl Dashboard {
             .unwrap_or_default()
     }
 
+    /// What the pane under the pointer has asked to be told about the mouse, and where.
+    ///
+    /// Answered for the pane the pointer is *over* rather than the focused one: a wheel notch
+    /// belongs to whatever is under it, which is how every terminal behaves and how Dock's own
+    /// pane scrolling already worked.
+    fn mouse_target(&self, column: u16, row: u16) -> Option<(String, MouseEncoding, u16, u16)> {
+        let pane_id = self.pane_at(column, row)?;
+        let inner = self.pane_inner_areas.get(&pane_id).copied()?;
+        let cell = grid_cell(inner, column, row)?;
+        let run_id = self
+            .workspace()?
+            .panes
+            .get(&pane_id)
+            .and_then(|pane| pane.run_id.clone())?;
+        let screen = self.screens.get(&run_id)?.screen();
+        Some((
+            run_id,
+            MouseEncoding {
+                mode: screen.mouse_protocol_mode(),
+                encoding: screen.mouse_protocol_encoding(),
+            },
+            cell.1,
+            cell.0,
+        ))
+    }
+
+    /// The bytes a pane's program wants for this mouse event, if it wants it at all.
+    ///
+    /// `None` means "keep it for Dock" rather than "send nothing": a notch a program has not
+    /// asked for is a notch that should scroll Dock's own scrollback. Focusing the pane first
+    /// is deliberate — a program cannot sensibly receive a click it has no keyboard focus for,
+    /// and every terminal focuses on press.
+    fn forwarded_mouse(&mut self, event: MouseEvent) -> Option<Vec<u8>> {
+        let (_, encoding, column, row) = self.mouse_target(event.column, event.row)?;
+        if !encoding.wanted() {
+            return None;
+        }
+        encode_mouse(event.kind, event.modifiers, column, row, encoding)
+    }
+
     /// The agent a dispatch will put on a task.
     ///
     /// Never the fixture. It is a test stub that prints one line and exits, and it sat at the
@@ -6783,6 +6823,18 @@ impl Dashboard {
                         self.tab_scroll = self.tab_scroll.saturating_sub(1);
                     }
                     return UiCommand::None;
+                }
+                // A program that asked for the mouse gets it. An alt-screen TUI — Amp, Copilot,
+                // an editor — turns mouse reporting on and scrolls its own viewport, and the
+                // alternate grid has no scrollback for Dock to scroll instead, so keeping the
+                // notch made the wheel inert in exactly the panes most worth scrolling.
+                //
+                // Shift takes it back, which is the escape hatch every terminal offers: Dock's
+                // own scrollback and selection stay reachable over a pane that owns the mouse.
+                if !event.modifiers.contains(KeyModifiers::SHIFT)
+                    && let Some(bytes) = self.forwarded_mouse(event)
+                {
+                    return UiCommand::PaneInput(bytes);
                 }
                 // Three rows per notch matches what terminals send for a single wheel click.
                 let back = event.kind == MouseEventKind::ScrollUp;
@@ -10130,6 +10182,60 @@ mod tests {
         assert!(
             rendered.contains("replica"),
             "a word the one-line card had to cut now survives: {rendered:?}"
+        );
+    }
+
+    /// A program that asked for the mouse gets it, or the wheel does nothing at all.
+    ///
+    /// Amp, Copilot and every other alt-screen TUI turn mouse reporting on and scroll their own
+    /// viewport. Dock kept every notch for its own scrollback — which `vt100` gives the
+    /// alternate grid none of — so the wheel was inert in exactly the panes a person most wants
+    /// to scroll, and the program never heard a thing.
+    #[test]
+    fn the_wheel_reaches_a_program_that_asked_for_the_mouse() {
+        let mut dashboard = bound_dashboard();
+        // `?1049h` is the alternate screen, `?1000h` mouse reporting, `?1006h` SGR encoding —
+        // the three an agent TUI sends on startup.
+        dashboard.apply_event(attach_event("run_1", b"\x1b[?1049h\x1b[?1000h\x1b[?1006h"));
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        let a = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        drop(terminal);
+
+        let scrolled = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: a.x + 2,
+            row: a.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        let UiCommand::PaneInput(bytes) = &scrolled else {
+            panic!("the wheel must reach the program: {scrolled:?}");
+        };
+        let sequence = String::from_utf8_lossy(bytes);
+        assert!(
+            sequence.starts_with("\u{1b}[<64;") && sequence.ends_with('M'),
+            "as an SGR wheel-up report at the cell under the pointer: {sequence:?}"
+        );
+    }
+
+    /// Shift is the escape hatch every terminal offers: it takes the mouse back from the
+    /// program so Dock's own scrollback and selection stay reachable.
+    #[test]
+    fn shift_keeps_the_wheel_for_dock_even_when_a_program_wants_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(attach_event("run_1", b"\x1b[?1049h\x1b[?1000h\x1b[?1006h"));
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        let a = *dashboard.pane_areas.get("a").expect("pane a is rendered");
+        drop(terminal);
+
+        let scrolled = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: a.x + 2,
+            row: a.y + 2,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        assert!(
+            !matches!(scrolled, UiCommand::PaneInput(_)),
+            "shift keeps the notch for Dock: {scrolled:?}"
         );
     }
 

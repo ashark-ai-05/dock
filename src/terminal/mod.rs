@@ -6,7 +6,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub use keys::{KeyEncoding, encode_key, encode_paste};
+pub use keys::{KeyEncoding, MouseEncoding, encode_key, encode_mouse, encode_paste};
 pub use vt::{PaneSnapshot, ShellSignals, VtTerminal};
 // The two grid readers, re-exported so the dashboard can point them at whichever screen an
 // open selection resolves to — the live parser's until output forces a clone, the clone after.

@@ -7270,7 +7270,15 @@ fn render_board_columns(
             active_lines(theme, &entries, width, rows, selected)
         } else {
             let cards = view.cards(status);
-            card_lines(theme, &cards, live, width, rows, selected)
+            card_lines(
+                theme,
+                &cards,
+                live,
+                width,
+                rows,
+                selected,
+                view.title_lines(),
+            )
         };
         for (offset, owner) in owners.iter().enumerate().take(rows) {
             if let Some(id) = owner {
@@ -7393,6 +7401,53 @@ fn column_targets(view: &BoardView, live: &BoardLive<'_>, column: usize) -> Vec<
 /// One line, not two. A backlog card has nothing to say on a second line, and vertical room is
 /// what limits how many cards a person can see at once — so the asymmetry is itself the
 /// information: a two-line card means this one is live.
+/// Splits a title across at most `lines` rows of `width`, breaking on spaces where it can.
+///
+/// Breaks at a space when one is in reach and mid-word when none is, because a long unbroken
+/// token — a path, a branch name — must still make progress rather than yield an empty row.
+/// Only the final row ellipsises: every row above it is a clean break, so an ellipsis appears
+/// once and means "there was more", never "this row ran out".
+fn wrap_title(title: &str, width: usize, lines: usize) -> Vec<String> {
+    if width == 0 || lines == 0 {
+        return vec![String::new()];
+    }
+    let mut rows = Vec::with_capacity(lines);
+    let mut rest = title.trim();
+    for row in 0..lines {
+        if rest.is_empty() {
+            break;
+        }
+        if rest.chars().count() <= width {
+            rows.push(rest.to_owned());
+            return rows;
+        }
+        if row + 1 == lines {
+            rows.push(ellipsise(rest, width));
+            return rows;
+        }
+        // The last space that still fits, so the break lands between words. `width + 1` because
+        // a space sitting exactly on the boundary is a break point rather than an overflow.
+        let split = rest
+            .char_indices()
+            .take(width + 1)
+            .filter(|(_, character)| *character == ' ')
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or_else(|| {
+                rest.char_indices()
+                    .nth(width)
+                    .map_or(rest.len(), |(index, _)| index)
+            });
+        let (head, tail) = rest.split_at(split);
+        rows.push(head.trim_end().to_owned());
+        rest = tail.trim_start();
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
 fn card_lines<'a>(
     theme: &Theme,
     cards: &[&'a BoardTask],
@@ -7400,6 +7455,7 @@ fn card_lines<'a>(
     width: usize,
     rows: usize,
     selected: Option<usize>,
+    title_lines: usize,
 ) -> (Vec<Line<'a>>, Vec<Option<u64>>) {
     if cards.is_empty() {
         return (
@@ -7407,10 +7463,14 @@ fn card_lines<'a>(
             vec![None],
         );
     }
-    let first = scroll_to(selected, rows, 1);
-    let mut lines = Vec::with_capacity(rows.min(cards.len()));
-    let mut owners = Vec::with_capacity(rows.min(cards.len()));
-    for (row, task) in cards.iter().skip(first).take(rows).enumerate() {
+    // A card is as tall as the board says its title may be, so the scroll window counts cards
+    // rather than lines — otherwise a two-line card would scroll half a card at a time.
+    let per = title_lines.max(1);
+    let visible = (rows / per).max(1);
+    let first = scroll_to(selected, rows, per);
+    let mut lines = Vec::with_capacity(visible * per);
+    let mut owners = Vec::with_capacity(visible * per);
+    for (row, task) in cards.iter().skip(first).take(visible).enumerate() {
         let here = selected == Some(first + row);
         owners.push(Some(task.id));
         // Archived cards only ever appear here while revealed, and a revealed archived card
@@ -7436,6 +7496,12 @@ fn card_lines<'a>(
         // relative to an identical unbadged card.
         let prefix = marker.len() + 2 + identifier.len();
         let title_budget = width.saturating_sub(prefix + 3);
+        // Wrapped rather than ellipsised, across however many rows the board declared. A title
+        // longer than a column used to be cut on its only line, which no amount of sharing the
+        // width out could fix — the board had already said in `tui.title_lines` how tall a card
+        // is, and Dock drew one line regardless.
+        let wrapped = wrap_title(&task.title, title_budget, per);
+        let head = wrapped.first().map(String::as_str).unwrap_or_default();
         // The badge is its own span so it keeps the state's colour against a selected card's
         // inverted background, where a single styled line would have lost it.
         lines.push(match live.by_task.get(&task.id) {
@@ -7449,16 +7515,19 @@ fn card_lines<'a>(
                         Style::default().fg(theme.agent(run.state))
                     },
                 ),
-                Span::styled(format!(" {}", ellipsise(&task.title, title_budget)), style),
+                Span::styled(format!(" {head}"), style),
             ]),
-            None => Line::styled(
-                format!(
-                    "{marker} #{identifier} {}",
-                    ellipsise(&task.title, title_budget)
-                ),
-                style,
-            ),
+            None => Line::styled(format!("{marker} #{identifier} {head}"), style),
         });
+        // Continuation rows, indented to sit under the title rather than under the id, so a
+        // wrapped remainder reads as one card's title and not as a second card.
+        for continued in wrapped.iter().skip(1) {
+            lines.push(Line::styled(
+                format!("{:indent$}{continued}", "", indent = prefix + 1),
+                style,
+            ));
+            owners.push(Some(task.id));
+        }
     }
     (lines, owners)
 }
@@ -9998,6 +10067,72 @@ mod tests {
         }
     }
 
+    /// The board declares how many lines a card's title gets; Dock drew one regardless, so a
+    /// title longer than a column was cut however the width was shared out.
+    #[test]
+    fn a_title_wraps_across_the_lines_the_board_asked_for() {
+        let rows = wrap_title("wire the parser into the replica path", 14, 2);
+        assert_eq!(rows.len(), 2, "two rows, as asked: {rows:?}");
+        assert!(
+            rows.iter().all(|row| row.chars().count() <= 14),
+            "and neither overflows the column: {rows:?}"
+        );
+        assert!(
+            !rows[0].contains('\u{2026}'),
+            "the first row breaks cleanly rather than ellipsising: {rows:?}"
+        );
+        assert!(
+            rows[0].starts_with("wire the"),
+            "and it carries the title's own words, in order: {rows:?}"
+        );
+    }
+
+    /// A title that fits needs no second row, and an unbreakable token must still make progress
+    /// rather than yield an empty one.
+    #[test]
+    fn wrapping_handles_a_short_title_and_an_unbreakable_one() {
+        assert_eq!(wrap_title("short", 20, 2), ["short"]);
+        let long = wrap_title("/a/very/long/path/with/no/spaces", 10, 2);
+        assert_eq!(long.len(), 2, "it still uses both rows: {long:?}");
+        assert!(
+            long.iter().all(|row| !row.is_empty()),
+            "and neither row is empty: {long:?}"
+        );
+    }
+
+    /// End to end: a board declaring two-line cards draws a long title over two rows instead of
+    /// cutting it on one.
+    #[test]
+    fn a_two_line_board_draws_a_long_title_whole() {
+        let theme = Theme::cool();
+        let task = BoardTask {
+            id: 7,
+            title: "wire the parser into the replica path".into(),
+            status: "backlog".into(),
+            priority: "medium".into(),
+            file: std::path::PathBuf::from("7.md"),
+            body: String::new(),
+            archived: false,
+        };
+        let cards: Vec<&BoardTask> = vec![&task];
+        let live = BoardLive::new(&[]);
+
+        let (one, _) = card_lines(&theme, &cards, &live, 26, 6, None, 1);
+        let (two, _) = card_lines(&theme, &cards, &live, 26, 6, None, 2);
+        assert_eq!(one.len(), 1, "one line when the board asks for one");
+        assert_eq!(two.len(), 2, "two when it asks for two: {two:?}");
+
+        let rendered: String = two
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            rendered.contains("replica"),
+            "a word the one-line card had to cut now survives: {rendered:?}"
+        );
+    }
+
     /// Width sharing exists to resolve scarcity. When there is enough room for every column to
     /// be comfortable, there is nothing to resolve — and the proportional rule, applied anyway,
     /// hands a single busy column everything the empty ones did not take.
@@ -10154,7 +10289,7 @@ mod tests {
         let width = 30;
 
         let no_run = BoardLive::new(&[]);
-        let unbadged = card_lines(&theme, &cards, &no_run, width, 5, None);
+        let unbadged = card_lines(&theme, &cards, &no_run, width, 5, None, 1);
 
         let run = LiveRun {
             run_id: "run_1",
@@ -10170,7 +10305,7 @@ mod tests {
             holding_because: None,
         };
         let with_run = BoardLive::new(std::slice::from_ref(&run));
-        let badged = card_lines(&theme, &cards, &with_run, width, 5, None);
+        let badged = card_lines(&theme, &cards, &with_run, width, 5, None, 1);
 
         let line_text = |line: &Line<'_>| -> String {
             line.spans

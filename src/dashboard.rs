@@ -6620,7 +6620,7 @@ impl Dashboard {
                 if let Some(divider) = self
                     .dividers
                     .iter()
-                    .find(|divider| contains(divider.area, event.column, event.row))
+                    .find(|divider| near(divider.area, event.column, event.row))
                 {
                     self.dragging = Some(DragTarget {
                         pane_id: divider.pane_id.clone(),
@@ -7808,6 +7808,18 @@ fn word_bounds(row: &str, column: u16) -> Option<(u16, u16)> {
 fn line_bounds(row: &str) -> Option<(u16, u16)> {
     let last = row.trim_end().chars().count().checked_sub(1)?;
     Some((0, u16::try_from(last).ok()?))
+}
+
+/// Whether a press is on a rectangle or within one cell of it.
+///
+/// For dividers only, and only for the hit test — what is *drawn* is still the single cell
+/// `split_rect` allots. A divider sits between two pane borders, so on screen it is one
+/// invisible row or column flanked by two rounded lines that look exactly like it; aiming a
+/// mouse at it means hitting a border instead, which focuses a pane and resizes nothing. Since
+/// those borders belong to the very panes the divider separates, a drag starting on one of them
+/// cannot sensibly mean anything else.
+fn near(area: Rect, x: u16, y: u16) -> bool {
+    x + 1 >= area.x && x <= area.right() && y + 1 >= area.y && y <= area.bottom()
 }
 
 fn drag_ratio(divider: &Divider, x: u16, y: u16) -> u16 {
@@ -9942,6 +9954,44 @@ mod tests {
             frame.contains("wire the parser"),
             "the selected card's title is readable somewhere on the pane: {frame:?}"
         );
+    }
+
+    /// A divider must be grabbable, not merely present.
+    ///
+    /// `split_rect` gives it exactly one cell, and it sits between two pane borders — so the
+    /// target is a single invisible row that looks no different from the rounded border either
+    /// side of it. Aiming at it with a mouse means hitting a border instead, which focuses a
+    /// pane and does not resize anything, and reads as "panes cannot be resized".
+    ///
+    /// The drawn divider stays one cell. What widens is the *hit test*: a press within one row
+    /// or column of it arms the drag, because the borders it is between belong to the panes it
+    /// separates and dragging from either of them can only mean the divider.
+    #[test]
+    fn a_divider_can_be_grabbed_from_the_border_either_side_of_it() {
+        let mut dashboard = bound_dashboard();
+        let terminal = render_terminal(&mut dashboard, 100, 30);
+        drop(terminal);
+        let divider = dashboard
+            .dividers
+            .first()
+            .cloned()
+            .expect("the fixture splits, so it has a divider");
+        for offset in [-1_i32, 0, 1] {
+            let mut dashboard = bound_dashboard();
+            let terminal = render_terminal(&mut dashboard, 100, 30);
+            drop(terminal);
+            let column = u16::try_from(i32::from(divider.area.x) + offset).unwrap();
+            dashboard.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: divider.area.y + 1,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(
+                dashboard.dragging.is_some(),
+                "a press {offset} from the divider must arm a resize, not focus a pane"
+            );
+        }
     }
 
     /// Width sharing exists to resolve scarcity. When there is enough room for every column to

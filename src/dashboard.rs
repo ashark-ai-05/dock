@@ -10101,11 +10101,15 @@ mod tests {
 
         // `>` is the one thing a board does that a list cannot do at all.
         dashboard.key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
-        assert_eq!(crate::board::load(&dir)[0].status, "todo", "the file moved");
+        assert_eq!(
+            crate::board::load(&dir)[0].status,
+            "in-progress",
+            "the file moved"
+        );
         let board = dashboard.board.as_ref().unwrap();
         assert_eq!(
             board.view.status(),
-            Some("todo"),
+            Some("in-progress"),
             "the cursor follows the card rather than staying over a column position"
         );
         assert_eq!(board.view.selected().map(|task| task.id), Some(1));
@@ -11363,13 +11367,17 @@ mod tests {
         dashboard.layout.workspaces[0].root = LayoutNode::Pane {
             pane_id: "b".into(),
         };
+        // And a fifth time, when the default columns became kanban-md's own: `NEEDS-INPUT` is a
+        // wider stub than the `TODO` it replaced, so every rung shifted again. Measured, not
+        // reasoned — 72 lands the state word alone, 71 drops the line.
+        //
         // And moved a fourth time, from 70/69 to 73/72, when a stub gained a second cell of
         // gutter: four stubs now reserve eight more cells between them, so the width at which
         // `ACTIVE` lands on `FILLED_MIN` with no surplus left is that much further up. The rung
         // is the same one; only the width that reaches it moved. Measured, not reasoned: at 72
         // the state line is gone entirely and at 73 it reads `needs you` with the agent name
         // dropped, which is exactly the pair this case is written for.
-        let terminal = render_terminal(&mut dashboard, 73, 24);
+        let terminal = render_terminal(&mut dashboard, 72, 24);
         let active = board_column(&terminal, "ACTIVE");
         assert!(
             active.contains("needs you"),
@@ -11387,7 +11395,7 @@ mod tests {
         // is worse than nothing, and the glyph and its colour are there to carry the state on
         // their own.
         // 72, one column short of the landing above, for the same gutter reason.
-        let terminal = render_terminal(&mut dashboard, 72, 24);
+        let terminal = render_terminal(&mut dashboard, 71, 24);
         let active = board_column(&terminal, "ACTIVE");
         assert!(active.contains("#7"), "the card is still drawn: {active:?}");
         assert!(
@@ -11566,13 +11574,37 @@ mod tests {
     /// column arming happens in. This is what deleting the lane changed about these tests: the
     /// target is the grid cursor now rather than a lane row.
     fn cursor_into_active(dashboard: &mut Dashboard) {
-        for _ in 0..2 {
+        // Walks to `ACTIVE` by name rather than pressing `l` a fixed number of times. The
+        // column's index is a property of whatever the board declares, and a helper that
+        // counted keystrokes broke on every board whose columns changed — which is a fact
+        // about the board, not about arming.
+        for _ in 0..8 {
+            // The pane's own cursor, not the overlay's: these tests put a Board *pane* on the
+            // canvas, so `self.board` is `None` and the column lives in `board_cursor`.
+            let here = dashboard.board_cursor.as_ref().map_or_else(
+                || {
+                    dashboard
+                        .board_pane_view
+                        .as_ref()
+                        .and_then(|view| view.status().map(str::to_owned))
+                },
+                |(column, _)| {
+                    dashboard
+                        .board_pane_view
+                        .as_ref()
+                        .and_then(|view| view.statuses().get(*column).cloned())
+                },
+            );
+            if here.as_deref() == Some(ACTIVE_STATUS) {
+                return;
+            }
             assert_eq!(
                 dashboard.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
                 UiCommand::None,
                 "moving the cursor costs the daemon nothing"
             );
         }
+        panic!("never reached ACTIVE");
     }
 
     /// One pane's queue as the daemon would report it.
@@ -12085,13 +12117,14 @@ mod tests {
             dashboard.board.as_ref().unwrap().view.status(),
             Some("needs-input")
         );
-        // `<` moves it back into a column the constant does know, which is the half that was
-        // impossible: the card could be put here by hand and never taken out again.
+        // `<` moves it back off, which is the half that was impossible while `needs-input` was
+        // a column only a card already in it could conjure: it could be put here by hand and
+        // never taken out again.
         dashboard.key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
-        assert_eq!(crate::board::load(&dir)[0].status, "done");
+        assert_eq!(crate::board::load(&dir)[0].status, "in-progress");
         assert_eq!(
             dashboard.board.as_ref().unwrap().view.status(),
-            Some("done"),
+            Some("in-progress"),
             "the cursor follows the card it just moved"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -12114,7 +12147,7 @@ mod tests {
         // `ACTIVE` rather than `IN-PROGRESS`: the heading is the one thing that changed, because
         // the column holds live agents with no card as well as the cards that are in progress.
         // The status on disk and in `board::STATUSES` is still `in-progress`.
-        for column in ["BACKLOG", "TODO", "ACTIVE", "REVIEW", "DONE"] {
+        for column in ["BACKLOG", "ACTIVE", "NEEDS-INPUT", "REVIEW", "DONE"] {
             assert!(frame.contains(column), "missing column {column}: {frame:?}");
         }
         assert!(!frame.contains("IN-PROGRESS"), "{frame:?}");
@@ -12327,8 +12360,8 @@ mod tests {
         let frame = render_to_string(&mut dashboard, 130, 32);
         assert!(frame.contains("ACTIVE"), "{frame:?}");
 
-        // Backlog to todo to in-progress, which is two columns to the right of where it started.
-        dashboard.key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
+        // Backlog to in-progress, which is one column to the right of where it started — and
+        // `ACTIVE` is the heading over `in-progress`, which is the point of this test.
         dashboard.key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
         assert_eq!(crate::board::load(&dir)[0].status, "in-progress");
         assert_eq!(

@@ -45,7 +45,7 @@ pub struct BoardTask {
 ///
 /// A status the board uses but this list does not know is not dropped; it sorts after these, so an
 /// unfamiliar column is still visible rather than silently missing.
-const STATUS_ORDER: [&str; 5] = ["in-progress", "review", "backlog", "todo", "done"];
+const STATUS_ORDER: [&str; 5] = ["in-progress", "needs-input", "review", "backlog", "done"];
 
 /// Where the board a dashboard should show actually lives.
 ///
@@ -193,14 +193,13 @@ pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
     })
 }
 
-/// The statuses a task moves through, in the order work moves through them.
+/// The statuses a task moves through on a board that has not declared its own.
 ///
-/// Not the whole truth about any particular board, and deliberately not treated as such: this
-/// repository's own `kanban/config.yml` declares `needs-input`, which is not in here, and does
-/// not declare `todo`, which is. A board with a config gets its own columns through
-/// [`statuses_declaring`]; this is only what a board that has said nothing falls back to. Use
-/// [`statuses`] for the columns a board actually has.
-pub const STATUSES: [&str; 5] = ["backlog", "todo", "in-progress", "review", "done"];
+/// One list, shared with [`crate::board_config::BoardConfig::default`], because two defaults
+/// that disagree is how `todo` came to be drawn on every board while no kanban-md config
+/// declared it. A board with a `config.yml` still overrides this through [`statuses_declaring`];
+/// use [`statuses`] for the columns a board actually has.
+pub const STATUSES: [&str; 5] = crate::board_config::KANBAN_MD_STATUSES;
 
 /// The columns one board actually has: the statuses Dock knows, plus any the board itself uses.
 ///
@@ -1363,9 +1362,9 @@ mod view_tests {
     fn an_all_archived_column_does_not_capture_the_opening_cursor() {
         let view = BoardView::new(vec![
             task_with(1, "backlog", true),
-            task_with(2, "todo", false),
+            task_with(2, "review", false),
         ]);
-        assert_eq!(STATUSES[view.column()], "todo");
+        assert_eq!(STATUSES[view.column()], "review");
         assert_eq!(view.selected().map(|task| task.id), Some(2));
     }
 
@@ -1433,12 +1432,12 @@ mod view_tests {
 
     #[test]
     fn a_status_the_constant_does_not_know_is_still_a_column_the_cursor_can_reach() {
-        // This repository's own `config.yml` declares `needs-input`, which `STATUSES` has never
-        // heard of, and the view filtered by the constant — so a card a person had moved there by
-        // hand was invisible on the board and could not be moved back off it either.
-        let mut view = BoardView::new(vec![task(1, "backlog"), task(2, "needs-input")]);
+        // A status no default list knows. `blocked` is nobody's column: the view must still
+        // show it and let the cursor reach it, or a card somebody moved there by hand would be
+        // invisible on the board and impossible to move back off.
+        let mut view = BoardView::new(vec![task(1, "backlog"), task(2, "blocked")]);
         view.move_column(9);
-        assert_eq!(view.status(), Some("needs-input"));
+        assert_eq!(view.status(), Some("blocked"));
         assert_eq!(view.selected().map(|task| task.id), Some(2));
         // And back off it again, which is the half `<` could not do.
         view.move_column(-9);
@@ -1451,18 +1450,18 @@ mod view_tests {
         // The union must not move a column anybody is used to: the known statuses keep the order
         // work moves through them, and whatever else the board uses lands after them, in the
         // order `status_rank` already sorts cards by.
-        let view = BoardView::new(vec![task(1, "needs-input"), task(2, "blocked")]);
+        let view = BoardView::new(vec![task(1, "todo"), task(2, "blocked")]);
         let columns: Vec<&str> = view.statuses().iter().map(String::as_str).collect();
         assert_eq!(
             columns,
             [
                 "backlog",
-                "todo",
                 "in-progress",
+                "needs-input",
                 "review",
                 "done",
                 "blocked",
-                "needs-input"
+                "todo",
             ]
         );
     }

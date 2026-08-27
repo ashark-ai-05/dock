@@ -36,19 +36,57 @@ pub struct BoardConfig {
 }
 
 impl Default for BoardConfig {
-    /// What a board with no readable config gets: Dock's own long-standing answer, so a board
-    /// that has never seen kanban-md renders exactly as it always did.
+    /// What a board with no `config.yml` of its own gets: the shape kanban-md gives every board
+    /// it creates.
+    ///
+    /// This used to be Dock's own answer — `todo` as a column, one-line cards, no age colouring
+    /// — and that answer only ever agreed with a board that had a config to override it. Every
+    /// *personal* board has none, so a workspace board drew a `TODO` column that exists in no
+    /// kanban-md config, cut every title on one line, and coloured nothing by age. Reading the
+    /// config fixed repository boards and left personal ones exactly as they were.
+    ///
+    /// The rungs are kanban-md's own defaults: grey while fresh, green after an hour, yellow
+    /// after a day, orange after three, red after a week.
     fn default() -> Self {
         Self {
             statuses: crate::board::STATUSES
                 .iter()
                 .map(|status| (*status).to_owned())
                 .collect(),
-            title_lines: 1,
-            age_thresholds: Vec::new(),
+            title_lines: 2,
+            age_thresholds: vec![
+                AgeThreshold {
+                    after: 0,
+                    colour: 242,
+                },
+                AgeThreshold {
+                    after: 3_600,
+                    colour: 34,
+                },
+                AgeThreshold {
+                    after: 86_400,
+                    colour: 226,
+                },
+                AgeThreshold {
+                    after: 259_200,
+                    colour: 208,
+                },
+                AgeThreshold {
+                    after: 604_800,
+                    colour: 196,
+                },
+            ],
         }
     }
 }
+
+/// The columns kanban-md puts on a board it creates.
+///
+/// Note what is *not* here: `todo`. No kanban-md config declares it, and Dock's own constant did
+/// — so every board without a config drew an empty column that exists nowhere else. `needs-input`
+/// is here instead, which is where an agent parks work it cannot finish without you.
+pub const KANBAN_MD_STATUSES: [&str; 5] =
+    ["backlog", "in-progress", "needs-input", "review", "done"];
 
 /// Reads the config that governs `tasks_dir`, which sits beside it.
 ///
@@ -102,6 +140,9 @@ fn duration_seconds(value: &str) -> Option<u64> {
 pub fn parse(text: &str) -> BoardConfig {
     let mut config = BoardConfig::default();
     let mut statuses = Vec::new();
+    // Collected apart from the defaults and swapped in whole, exactly as the statuses are: a
+    // board that declares its own rungs means *these* rungs, not these on top of ours.
+    let mut rungs: Vec<AgeThreshold> = Vec::new();
     // Which top-level block the scanner is inside. A block ends at the next line whose
     // indentation returns to zero, which is what keeps `statuses:` from swallowing `tui:`.
     let mut section: Option<&str> = None;
@@ -149,7 +190,7 @@ pub fn parse(text: &str) -> BoardConfig {
                             if let (Some(after), Ok(colour)) =
                                 (pending_after.take(), unquote(value).parse::<u8>())
                             {
-                                config.age_thresholds.push(AgeThreshold { after, colour });
+                                rungs.push(AgeThreshold { after, colour });
                             }
                         }
                         _ => {}
@@ -161,6 +202,9 @@ pub fn parse(text: &str) -> BoardConfig {
     }
     if !statuses.is_empty() {
         config.statuses = statuses;
+    }
+    if !rungs.is_empty() {
+        config.age_thresholds = rungs;
     }
     config.age_thresholds.sort_by_key(|rung| rung.after);
     config
@@ -274,13 +318,14 @@ next_id: 11
         assert_eq!(config.title_lines, 2, "`classes` did not end the scan");
     }
 
-    /// A board with no config renders exactly as Dock always rendered it.
+    /// A board with no config of its own gets the shape kanban-md gives every board it makes,
+    /// which is what a personal board — which never has one — must look like.
     #[test]
     fn a_board_with_no_config_keeps_docks_own_answer() {
         let config = parse("");
-        assert_eq!(config.statuses, crate::board::STATUSES);
-        assert_eq!(config.title_lines, 1);
-        assert!(config.age_thresholds.is_empty());
+        assert_eq!(config.statuses, KANBAN_MD_STATUSES);
+        assert_eq!(config.title_lines, 2);
+        assert_eq!(config.age_thresholds.len(), 5);
     }
 
     /// A half-written rung drops itself rather than pairing with the next rung's colour, which

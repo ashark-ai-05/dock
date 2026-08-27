@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
     buffer::{Buffer, Cell},
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
@@ -7329,7 +7329,10 @@ fn render_board_columns(
                 width,
                 rows,
                 selected,
-                view.title_lines(),
+                CardShape {
+                    title_lines: view.title_lines(),
+                    rungs: view.age_thresholds(),
+                },
             )
         };
         for (offset, owner) in owners.iter().enumerate().take(rows) {
@@ -7459,6 +7462,53 @@ fn column_targets(view: &BoardView, live: &BoardLive<'_>, column: usize) -> Vec<
 /// token — a path, a branch name — must still make progress rather than yield an empty row.
 /// Only the final row ellipsises: every row above it is a clean break, so an ellipsis appears
 /// once and means "there was more", never "this row ran out".
+/// The colour the board itself declares for a card of this age, if it declares any.
+///
+/// The rungs and their colours come from `tui.age_thresholds` in the board's own `config.yml` —
+/// this repository asks for grey when fresh, green after an hour, yellow after a day, orange
+/// after three and red after a week. They are the board's colours, not Dock's, which is why an
+/// indexed colour appears here rather than a `Theme` token: `theme.rs` owns Dock's palette, and
+/// this is data read off a file the user controls.
+///
+/// `None` for a board that declares no rungs, or a card with no readable date — an undated card
+/// keeps the ordinary card colour rather than being coloured as though it were fresh.
+fn age_colour(rungs: &[crate::board_config::AgeThreshold], touched: Option<i64>) -> Option<Color> {
+    let touched = touched?;
+    if rungs.is_empty() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let age = now.saturating_sub(touched).max(0) as u64;
+    // The rungs are sorted ascending, so the last one this card has reached is its colour.
+    rungs
+        .iter()
+        .take_while(|rung| rung.after <= age)
+        .last()
+        .map(|rung| Color::Indexed(rung.colour))
+}
+
+/// The one-cell mark a card wears for its priority.
+///
+/// One cell, always, so titles line up whether or not a card is urgent — a mark that changed
+/// the title's start column would make a column of cards look ragged for the sake of two of
+/// them. Only the two priorities that change what you do next get a mark: `low` and `medium`
+/// are the resting state of nearly every card, and marking them would mark everything.
+fn priority_mark(priority: &str) -> &'static str {
+    match priority.trim().to_ascii_lowercase().as_str() {
+        "critical" => "!",
+        "high" => "!",
+        _ => " ",
+    }
+}
+
+/// Whether a priority is the one worth colouring as well as marking.
+fn priority_is_critical(priority: &str) -> bool {
+    priority.trim().eq_ignore_ascii_case("critical")
+}
+
 fn wrap_title(title: &str, width: usize, lines: usize) -> Vec<String> {
     if width == 0 || lines == 0 {
         return vec![String::new()];
@@ -7500,6 +7550,18 @@ fn wrap_title(title: &str, width: usize, lines: usize) -> Vec<String> {
     rows
 }
 
+/// How a board says its cards should look.
+///
+/// Grouped because they arrive together, out of the same `config.yml`, and are read together on
+/// every card — and because passing them separately pushed `card_lines` past the argument count
+/// clippy is willing to read in one signature.
+struct CardShape<'a> {
+    /// How many rows a title may take, from `tui.title_lines`.
+    title_lines: usize,
+    /// The age rungs the board declares, oldest last.
+    rungs: &'a [crate::board_config::AgeThreshold],
+}
+
 fn card_lines<'a>(
     theme: &Theme,
     cards: &[&'a BoardTask],
@@ -7507,7 +7569,7 @@ fn card_lines<'a>(
     width: usize,
     rows: usize,
     selected: Option<usize>,
-    title_lines: usize,
+    shape: CardShape<'_>,
 ) -> (Vec<Line<'a>>, Vec<Option<u64>>) {
     if cards.is_empty() {
         return (
@@ -7517,7 +7579,7 @@ fn card_lines<'a>(
     }
     // A card is as tall as the board says its title may be, so the scroll window counts cards
     // rather than lines — otherwise a two-line card would scroll half a card at a time.
-    let per = title_lines.max(1);
+    let per = shape.title_lines.max(1);
     let visible = (rows / per).max(1);
     let first = scroll_to(selected, rows, per);
     let mut lines = Vec::with_capacity(visible * per);
@@ -7552,13 +7614,32 @@ fn card_lines<'a>(
         // longer than a column used to be cut on its only line, which no amount of sharing the
         // width out could fix — the board had already said in `tui.title_lines` how tall a card
         // is, and Dock drew one line regardless.
+        // One cell for the priority mark, so a title starts in the same column whether or not
+        // its card is urgent — a mark that shifted the title would make a column look ragged
+        // for the sake of the two cards wearing one.
+        let mark = priority_mark(&task.priority);
+        let title_budget = title_budget.saturating_sub(mark.len());
         let wrapped = wrap_title(&task.title, title_budget, per);
         let head = wrapped.first().map(String::as_str).unwrap_or_default();
+        // The id carries the card's age, in the colours the board declared for it. A card
+        // untouched for a week reads red without anything else on the card having to move, and
+        // a board that declares no rungs keeps the ordinary card colour.
+        let identity = match (task.archived, here, age_colour(shape.rungs, task.touched)) {
+            // A selected card keeps its inverted background, and a revealed archived one stays
+            // muted: both say something the age cannot override.
+            (false, false, Some(colour)) => Style::default().fg(colour),
+            _ => style,
+        };
+        let mark_style = if !here && priority_is_critical(&task.priority) {
+            Style::default().fg(theme.blocked)
+        } else {
+            style
+        };
         // The badge is its own span so it keeps the state's colour against a selected card's
         // inverted background, where a single styled line would have lost it.
         lines.push(match live.by_task.get(&task.id) {
             Some(run) => Line::from(vec![
-                Span::styled(format!("{marker} #{identifier} "), style),
+                Span::styled(format!("{marker} #{identifier} "), identity),
                 Span::styled(
                     run.state.glyph().to_string(),
                     if here {
@@ -7567,9 +7648,14 @@ fn card_lines<'a>(
                         Style::default().fg(theme.agent(run.state))
                     },
                 ),
+                Span::styled(mark.to_owned(), mark_style),
                 Span::styled(format!(" {head}"), style),
             ]),
-            None => Line::styled(format!("{marker} #{identifier} {head}"), style),
+            None => Line::from(vec![
+                Span::styled(format!("{marker} #{identifier} "), identity),
+                Span::styled(mark.to_owned(), mark_style),
+                Span::styled(format!(" {head}"), style),
+            ]),
         });
         // Continuation rows, indented to sit under the title rather than under the id, so a
         // wrapped remainder reads as one card's title and not as a second card.
@@ -9791,6 +9877,7 @@ mod tests {
             file: std::path::PathBuf::from(format!("kanban/tasks/{id}.md")),
             body: format!("# Outcome\n\n{title}"),
             archived: false,
+            touched: None,
         }
     }
 
@@ -10165,12 +10252,35 @@ mod tests {
             file: std::path::PathBuf::from("7.md"),
             body: String::new(),
             archived: false,
+            touched: None,
         };
         let cards: Vec<&BoardTask> = vec![&task];
         let live = BoardLive::new(&[]);
 
-        let (one, _) = card_lines(&theme, &cards, &live, 26, 6, None, 1);
-        let (two, _) = card_lines(&theme, &cards, &live, 26, 6, None, 2);
+        let (one, _) = card_lines(
+            &theme,
+            &cards,
+            &live,
+            26,
+            6,
+            None,
+            CardShape {
+                title_lines: 1,
+                rungs: &[],
+            },
+        );
+        let (two, _) = card_lines(
+            &theme,
+            &cards,
+            &live,
+            26,
+            6,
+            None,
+            CardShape {
+                title_lines: 2,
+                rungs: &[],
+            },
+        );
         assert_eq!(one.len(), 1, "one line when the board asks for one");
         assert_eq!(two.len(), 2, "two when it asks for two: {two:?}");
 
@@ -10237,6 +10347,89 @@ mod tests {
             !matches!(scrolled, UiCommand::PaneInput(_)),
             "shift keeps the notch for Dock: {scrolled:?}"
         );
+    }
+
+    /// A card wears the colour its own board declares for its age.
+    ///
+    /// The rungs come from `tui.age_thresholds` in `config.yml`; this repository asks for grey
+    /// when fresh, green after an hour, yellow after a day, orange after three and red after a
+    /// week. The board declares them, so they are the board's colours to choose, not Dock's.
+    #[test]
+    fn a_card_takes_the_colour_its_board_declares_for_its_age() {
+        use crate::board_config::AgeThreshold;
+        let rungs = [
+            AgeThreshold {
+                after: 0,
+                colour: 242,
+            },
+            AgeThreshold {
+                after: 3_600,
+                colour: 34,
+            },
+            AgeThreshold {
+                after: 86_400,
+                colour: 226,
+            },
+            AgeThreshold {
+                after: 604_800,
+                colour: 196,
+            },
+        ];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(
+            age_colour(&rungs, Some(now)),
+            Some(Color::Indexed(242)),
+            "just touched"
+        );
+        assert_eq!(
+            age_colour(&rungs, Some(now - 7_200)),
+            Some(Color::Indexed(34)),
+            "two hours old"
+        );
+        assert_eq!(
+            age_colour(&rungs, Some(now - 90_000)),
+            Some(Color::Indexed(226)),
+            "a day old"
+        );
+        assert_eq!(
+            age_colour(&rungs, Some(now - 1_000_000)),
+            Some(Color::Indexed(196)),
+            "over a week untouched"
+        );
+        assert_eq!(
+            age_colour(&rungs, None),
+            None,
+            "an undated card keeps the ordinary card colour rather than reading as fresh"
+        );
+        assert_eq!(
+            age_colour(&[], Some(now)),
+            None,
+            "and a board that declares no rungs colours nothing"
+        );
+    }
+
+    /// The mark is one cell whatever the priority, so a title starts in the same column on
+    /// every card in a column.
+    #[test]
+    fn the_priority_mark_is_always_one_cell() {
+        for priority in ["critical", "high", "medium", "low", "", "nonsense"] {
+            assert_eq!(
+                priority_mark(priority).chars().count(),
+                1,
+                "{priority:?} must not shift the title"
+            );
+        }
+        assert_eq!(priority_mark("high"), "!");
+        assert_eq!(priority_mark("CRITICAL"), "!", "and it is case-insensitive");
+        assert_eq!(
+            priority_mark("medium"),
+            " ",
+            "the resting state is unmarked"
+        );
+        assert!(priority_is_critical("critical") && !priority_is_critical("high"));
     }
 
     /// Width sharing exists to resolve scarcity. When there is enough room for every column to
@@ -10395,7 +10588,18 @@ mod tests {
         let width = 30;
 
         let no_run = BoardLive::new(&[]);
-        let unbadged = card_lines(&theme, &cards, &no_run, width, 5, None, 1);
+        let unbadged = card_lines(
+            &theme,
+            &cards,
+            &no_run,
+            width,
+            5,
+            None,
+            CardShape {
+                title_lines: 1,
+                rungs: &[],
+            },
+        );
 
         let run = LiveRun {
             run_id: "run_1",
@@ -10411,7 +10615,18 @@ mod tests {
             holding_because: None,
         };
         let with_run = BoardLive::new(std::slice::from_ref(&run));
-        let badged = card_lines(&theme, &cards, &with_run, width, 5, None, 1);
+        let badged = card_lines(
+            &theme,
+            &cards,
+            &with_run,
+            width,
+            5,
+            None,
+            CardShape {
+                title_lines: 1,
+                rungs: &[],
+            },
+        );
 
         let line_text = |line: &Line<'_>| -> String {
             line.spans
@@ -10429,14 +10644,19 @@ mod tests {
         // `marker` fixed at `" "`, which is what an unselected row always gets.
         let marker = " ";
         let prefix = format!("{marker} #{} ", task.id);
-        let unbadged_title = unbadged_text
+        // Both lines then carry the one-cell priority mark, which is the same cell on both and
+        // so is stripped from both — it is fixed-width precisely so it cannot shift a title.
+        let unbadged_title: String = unbadged_text
             .strip_prefix(prefix.as_str())
-            .expect("the plain line starts with the marker and id");
+            .expect("the plain line starts with the marker and id")
+            .chars()
+            .skip(1)
+            .collect();
         let after_prefix = badged_text
             .strip_prefix(prefix.as_str())
             .expect("the badge line starts with the same marker and id");
-        // One glyph — always a single `char`, per `AgentState::glyph` — then the space this
-        // fix moved outside the budgeted title, then the title itself.
+        // One glyph — always a single `char`, per `AgentState::glyph` — then the priority mark,
+        // then the space this fix moved outside the budgeted title, then the title itself.
         let badged_title: String = after_prefix.chars().skip(2).collect();
 
         assert!(

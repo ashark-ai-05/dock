@@ -26,6 +26,13 @@ pub struct BoardTask {
     /// acceptance criteria, what was ruled out. Dispatching a card sent an agent the title and
     /// nothing else, which asked it to do work nobody had described to it.
     pub body: String,
+    /// When the card was last touched, as seconds since the Unix epoch.
+    ///
+    /// From `updated` where the file has one and `created` otherwise, which is what kanban-md
+    /// writes and what its own `tui.age_thresholds` are measured against. `None` for a card with
+    /// neither, or with a stamp Dock could not read — an undated card is shown undated rather
+    /// than shown as freshly touched, which would be a lie in the direction that hides work.
+    pub touched: Option<i64>,
     /// Retired from the board without being deleted from the repository.
     ///
     /// The board had no terminal state: a card moved to `done` stayed in that column
@@ -159,6 +166,7 @@ pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
         .collect::<Vec<_>>()
         .join("-");
     let file = directory.join(format!("{id:03}-{slug}.md"));
+    let stamp = rfc3339_now();
     // Single quotes around the title, matching the front matter these files already use, with any
     // quote of its own removed rather than escaped: a title is not worth a YAML quoting dialect.
     let safe_title = title.replace('\'', "");
@@ -166,7 +174,11 @@ pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
     // will read back rather than a second description of the same file.
     let body = format!("# Outcome\n\n{safe_title}");
     let contents = format!(
-        "---\nid: {id}\ntitle: '{safe_title}'\nstatus: backlog\npriority: medium\nclass: standard\n---\n\n{body}\n"
+        "---\nid: {id}\ntitle: '{safe_title}'\nstatus: backlog\npriority: medium\nclass: standard{}\n---\n\n{body}\n",
+        stamp
+            .as_ref()
+            .map(|(_, text)| format!("\ncreated: {text}"))
+            .unwrap_or_default()
     );
     fs::write(&file, contents).map_err(|error| format!("could not write the task: {error}"))?;
     Ok(BoardTask {
@@ -177,6 +189,7 @@ pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
         file,
         body,
         archived: false,
+        touched: stamp.map(|(seconds, _)| seconds),
     })
 }
 
@@ -379,6 +392,7 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
     }
     let (mut id, mut title, mut status, mut priority, mut archived) =
         (None, None, None, None, false);
+    let (mut created, mut updated) = (None, None);
     let mut body_start = text.len();
     let mut offset = opening.len();
     for line in lines {
@@ -400,6 +414,8 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
             "status" => status = Some(value.to_owned()),
             "priority" => priority = Some(value.to_owned()),
             "archived" => archived = value.eq_ignore_ascii_case("true"),
+            "created" => created = rfc3339_seconds(value),
+            "updated" => updated = rfc3339_seconds(value),
             _ => {}
         }
     }
@@ -411,7 +427,105 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
         file: path.to_path_buf(),
         body: text[body_start..].trim().to_owned(),
         archived,
+        touched: updated.or(created),
     })
+}
+
+/// Seconds since the Unix epoch, from an RFC 3339 stamp like kanban-md writes.
+///
+/// `2026-08-21T08:04:40+10:00` and `2026-08-21T02:32:41Z` are both the shape these files use.
+/// Parsed rather than pulled in as a dependency, for the same reason the front matter around it
+/// is: the format is fixed, only one field is wanted, and a malformed stamp must cost that one
+/// card its age rather than the whole board its render.
+///
+/// Returns `None` for anything it does not fully understand, which the caller treats as "this
+/// card has no age" — a card that cannot be dated is better shown undated than shown wrong.
+fn rfc3339_seconds(value: &str) -> Option<i64> {
+    let value = unquote(value.trim());
+    let (date, rest) = value.split_once('T')?;
+    let mut date = date.split('-');
+    let year: i64 = date.next()?.parse().ok()?;
+    let month: i64 = date.next()?.parse().ok()?;
+    let day: i64 = date.next()?.parse().ok()?;
+    // The offset is whatever follows the time, and its sign decides which way to correct.
+    let (clock, offset) = match rest.find(['Z', 'z', '+']) {
+        Some(index) => rest.split_at(index),
+        // A `-` inside the time is impossible, so the last one can only start a negative offset.
+        None => match rest.rfind('-') {
+            Some(index) => rest.split_at(index),
+            None => (rest, ""),
+        },
+    };
+    let mut clock = clock.split(':');
+    let hour: i64 = clock.next()?.parse().ok()?;
+    let minute: i64 = clock.next()?.parse().ok()?;
+    // Seconds may carry a fraction, which is precision this does not need.
+    let second: i64 = clock
+        .next()
+        .unwrap_or("0")
+        .split('.')
+        .next()?
+        .parse()
+        .ok()?;
+    let offset_seconds = match offset.chars().next() {
+        None | Some('Z' | 'z') => 0,
+        Some(sign) => {
+            let mut parts = offset[1..].split(':');
+            let hours: i64 = parts.next()?.parse().ok()?;
+            let minutes: i64 = parts.next().unwrap_or("0").parse().ok()?;
+            let magnitude = hours * 3_600 + minutes * 60;
+            if sign == '-' { -magnitude } else { magnitude }
+        }
+    };
+    // Days from the civil date, by the shift-the-year-to-March algorithm: with March as month
+    // one, the leap day lands at the end of the year and the month-length pattern repeats every
+    // five months, which is what makes the whole thing a handful of integer operations with no
+    // table and no branches.
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second - offset_seconds)
+}
+
+/// The current instant as the RFC 3339 UTC stamp these files carry.
+///
+/// The inverse of [`rfc3339_seconds`], and written for the same reason: a card Dock creates
+/// must age like a card kanban-md creates, and an undated card would sit at whatever the board
+/// calls "fresh" forever — the one direction of error that hides work rather than surfacing it.
+fn rfc3339_now() -> Option<(i64, String)> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    // Civil date from days, the mirror of the shift-to-March arithmetic in `rfc3339_seconds`.
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_shifted = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_shifted + 2) / 5 + 1;
+    let month = month_shifted + if month_shifted < 10 { 3 } else { -9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    Some((
+        seconds,
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            rest / 3_600,
+            (rest % 3_600) / 60,
+            rest % 60
+        ),
+    ))
 }
 
 fn unquote(value: &str) -> &str {
@@ -463,6 +577,37 @@ mod tests {
         format!(
             "---\nid: {id}\ntitle: '{title}'\nstatus: {status}\npriority: high\ncreated: 2026-08-21T12:55:48+10:00\ntags:\n    - runtime\n    - tui\ndepends_on:\n    - 11\nclass: standard\n---\n\n# Outcome\n\nSomething.\n"
         )
+    }
+
+    /// Both stamp shapes these files actually use, checked against known epoch seconds.
+    #[test]
+    fn an_rfc3339_stamp_reads_as_epoch_seconds() {
+        assert_eq!(rfc3339_seconds("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_seconds("2026-08-21T02:32:41Z"), Some(1_787_279_561));
+        // The same instant, written with an offset instead of `Z`.
+        assert_eq!(
+            rfc3339_seconds("2026-08-21T12:32:41+10:00"),
+            Some(1_787_279_561),
+            "an offset is corrected for, not ignored"
+        );
+        assert_eq!(
+            rfc3339_seconds("2026-08-20T21:32:41-05:00"),
+            Some(1_787_279_561),
+            "in both directions"
+        );
+        assert_eq!(
+            rfc3339_seconds("2026-08-21T02:32:41.123Z"),
+            Some(1_787_279_561),
+            "a fraction is precision this does not need"
+        );
+    }
+
+    /// A stamp Dock cannot read costs that card its age, not the board its render.
+    #[test]
+    fn an_unreadable_stamp_is_no_age_rather_than_a_wrong_one() {
+        assert_eq!(rfc3339_seconds("yesterday"), None);
+        assert_eq!(rfc3339_seconds("2026-08-21"), None);
+        assert_eq!(rfc3339_seconds(""), None);
     }
 
     /// End to end: a board that declares its own columns gets them, phantom column and all.
@@ -1196,6 +1341,7 @@ mod view_tests {
             file: PathBuf::from(format!("{id}.md")),
             body: format!("# Outcome\n\ntask {id}"),
             archived,
+            touched: None,
         }
     }
 

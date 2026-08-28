@@ -220,8 +220,10 @@ impl StateTracker {
         } else if output_looks_like_work(self.quiet_for(now), self.growing_for()) {
             // Output has been streaming rather than twitching, which is generation.
             Some(AgentState::Working)
-        } else if self.quiet_for(now) >= WORKING_SILENCE {
-            // Nothing has been written for long enough that nothing is being written.
+        } else if self.quiet_for(now) >= SILENT_HANDOVER {
+            // Nothing has been written for long enough that nothing is being written. Measured
+            // against `SILENT_HANDOVER` rather than `WORKING_SILENCE`: ceasing to stream and
+            // having finished are different claims, and the second needs far more evidence.
             Some(AgentState::Done)
         } else {
             // The ambiguous middle: something wrote recently, but not for long enough to be work,
@@ -4239,6 +4241,27 @@ const WORKING_SILENCE: Duration = Duration::from_millis(1200);
 /// moment later is generation, and one that was over as soon as it started was a clock.
 const SUSTAINED_OUTPUT: Duration = Duration::from_millis(400);
 
+/// How long a pane must be silent before silence *alone* is read as the turn coming back.
+///
+/// A separate number from [`WORKING_SILENCE`], because the two answer different questions and
+/// one constant was answering both. "Is this pane still streaming" is a question about the last
+/// moment, and 1.2 seconds is right for it. "Has this agent finished" is a claim, and 1.2
+/// seconds is nowhere near enough evidence for it: agents pause far longer than that inside a
+/// single turn — waiting on a tool call, on the model's first token, between reasoning steps —
+/// so a working agent flipped to "your turn" and back on every pause.
+///
+/// It matters most for the agents Dock cannot read: an agent whose input chrome is recognised
+/// says "between turns" through [`AgentState::Done`] from its screen and never reaches this
+/// rule, but Copilot and Amp have no such pattern, and for them silence is the only evidence
+/// there is. This is the number that decides what they look like.
+///
+/// Six seconds is the shortest span that outlasts a model's first token on a slow day, and
+/// short enough that a finished answer settles while the reader is still looking at the pane.
+/// The cost of being wrong is asymmetric and this errs on the safe side: an agent reported busy
+/// a moment too long is a small lie that resolves itself, while one reported finished mid-turn
+/// invites a person to type into a session that is still running.
+const SILENT_HANDOVER: Duration = Duration::from_secs(6);
+
 /// How long a pane must stop writing before the next byte counts as a fresh burst.
 ///
 /// This is what makes "sustained" mean anything. It has to sit in the gap between two rhythms:
@@ -4880,6 +4903,53 @@ mod tests {
             .collect()
     }
 
+    /// An agent thinking between tool calls must not be reported as having handed the turn back.
+    ///
+    /// Silence is the only evidence Dock has for agents whose input chrome it cannot match —
+    /// Copilot and Amp have no awaiting patterns at all — and it was believing that evidence
+    /// after 1.2 seconds. Agents pause far longer than that mid-turn: waiting on a tool call, on
+    /// the model's first token, between reasoning steps. So a working agent flipped to "your
+    /// turn" and back on every pause, which is the flicker this was reported as.
+    ///
+    /// Two seconds of quiet is a pause. It is not a handover.
+    #[test]
+    fn an_agent_pausing_between_tool_calls_is_not_reported_as_finished() {
+        // A burst of generation, then two seconds of thought, then more generation — one turn,
+        // with a gap in the middle of it.
+        let frames = 200;
+        let states = replay(
+            frames,
+            |frame| {
+                if (30..=155).contains(&frame) { 0 } else { 64 }
+            },
+            |_| AgentState::Idle,
+        );
+        // The quiet stretch is frames 30..155 — about two seconds at sixteen milliseconds a
+        // frame. Nothing in it may claim the agent has finished.
+        let during_the_pause = &states[30..156];
+        assert!(
+            !during_the_pause.contains(&AgentState::Done),
+            "a pause mid-turn is not a handover: {during_the_pause:?}"
+        );
+    }
+
+    /// The other half: an agent that really has stopped is still reported as finished, or the
+    /// fix above would simply have traded one wrong answer for another.
+    #[test]
+    fn an_agent_that_has_genuinely_stopped_is_still_reported_as_finished() {
+        let states = replay(
+            700,
+            |frame| if frame < 30 { 64 } else { 0 },
+            |_| AgentState::Idle,
+        );
+        assert_eq!(
+            states.last().copied(),
+            Some(AgentState::Done),
+            "silence long enough really is a handover: {:?}",
+            &states[states.len().saturating_sub(4)..]
+        );
+    }
+
     #[test]
     fn an_idle_pane_redrawing_its_clock_once_a_second_never_flickers_back_to_working() {
         // The defect, at the timings that produced it. Claude's footer counts the elapsed seconds,
@@ -4923,8 +4993,10 @@ mod tests {
         // rhythm — not the mere fact that something was written — is what separates it from a
         // clock ticking once a second.
         let stops_at = 250usize;
+        // Long enough to contain the handover: the stream stops at four seconds, and silence
+        // alone is not read as a handover until `SILENT_HANDOVER` has passed on top of that.
         let states = replay(
-            375,
+            800,
             |frame| u64::from(frame < stops_at as u64) * 40,
             // Mid-turn chrome that none of the rules recognise, so the stream is the only witness.
             |_| AgentState::Idle,
@@ -4939,10 +5011,12 @@ mod tests {
             .expect("the pane was working");
         assert_eq!(states[states.len() - 1], AgentState::Done);
         // And the turn comes back promptly once the stream stops: silence long enough to mean it,
-        // plus the dwell, and no longer.
+        // plus the dwell, and no longer. Measured against `SILENT_HANDOVER` rather than
+        // `WORKING_SILENCE` — ceasing to stream and having finished are different claims, and
+        // this test is about the second.
         assert!(
             FRAME * (handed_back - stops_at) as u32
-                <= WORKING_SILENCE + STATE_DWELL + Duration::from_millis(50),
+                <= SILENT_HANDOVER + STATE_DWELL + Duration::from_millis(50),
             "the handover took {:?}",
             FRAME * (handed_back - stops_at) as u32
         );

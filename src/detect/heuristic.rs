@@ -177,6 +177,40 @@ pub(crate) fn built_in(
 /// second as the first was tried, and it makes every finished agent shout for attention until
 /// nothing in the roster means anything. Unknown output stays `Idle`, since a wrong call to
 /// attention is worse than a missed one the next tick will catch.
+/// What one look at a pane's screen established.
+///
+/// Two answers rather than one because they are not worth the same. `state` is read from chrome
+/// anywhere on the screen, and the screen keeps whatever the last turn left on it — so it is
+/// trusted to say an agent has *stopped* and never that it is going. `title_working` is read from
+/// the one line the agent actively rewrites as it changes state, which makes it the only part of
+/// a screen whose *absence* is evidence too. [`crate::dispatch`] treats them accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenRead {
+    /// The state the screen's chrome argues for, or `Idle` when no rule matched — which means
+    /// "nothing recognised", not "nothing happening".
+    pub state: AgentState,
+    /// The agent's terminal title carries a spinner, so the agent says it is mid-turn.
+    pub title_working: bool,
+}
+
+impl From<AgentState> for ScreenRead {
+    /// A screen that said only this, with nothing known about its title.
+    fn from(state: AgentState) -> Self {
+        Self {
+            state,
+            title_working: false,
+        }
+    }
+}
+
+/// Everything one pass over a screen can establish. See [`classify_screen`] for the ordering.
+pub fn read_screen(agent: AgentKind, tail: &str) -> ScreenRead {
+    ScreenRead {
+        state: classify_screen(agent, tail),
+        title_working: title_says_working(tail),
+    }
+}
+
 pub fn classify_screen(agent: AgentKind, tail: &str) -> AgentState {
     static DONE: OnceLock<RegexSet> = OnceLock::new();
     // Through the manifest, so a rule someone edited is the rule that runs.
@@ -234,15 +268,15 @@ mod classification_cost {
             let text = screen.classifiable_text();
             built.push(started.elapsed());
             let started = Instant::now();
-            let state = classify_screen(AgentKind::Claude, &text);
+            let read = read_screen(AgentKind::Claude, &text);
             classified.push(started.elapsed());
-            assert_eq!(state, AgentState::Done);
+            assert_eq!(read.state, AgentState::Done);
         }
         let mean = |samples: &[std::time::Duration]| {
             samples.iter().map(|s| s.as_secs_f64()).sum::<f64>() / samples.len() as f64 * 1_000.0
         };
         println!(
-            "classifiable_text() {:.4}ms + classify_screen() {:.4}ms = {:.4}ms per pane per pass, \
+            "classifiable_text() {:.4}ms + read_screen() {:.4}ms = {:.4}ms per pane per pass, \
              {} bytes of screen",
             mean(&built),
             mean(&classified),

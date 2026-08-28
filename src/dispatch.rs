@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     adapter::AdapterSelection,
-    detect::{AgentKind, AgentState, classify_screen, process::ProcessTree},
+    detect::{AgentKind, AgentState, ScreenRead, process::ProcessTree, read_screen},
     git::GitAdapter,
     layout::{LayoutRegistry, LayoutSnapshot, PaneKind, PaneRuntime, WorkspaceLayout},
     model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
@@ -76,7 +76,7 @@ struct ClassifiedAgent {
     /// The output mark and pane geometry the screen was read at. A resize reflows the screen
     /// without appending a byte, so the mark alone would not notice it.
     screen: (OutputMark, (u16, u16)),
-    from_screen: AgentState,
+    from_screen: ScreenRead,
 }
 
 /// Everything one run's state inference remembers between polls.
@@ -99,6 +99,13 @@ struct StateTracker {
     resolved: Option<AgentState>,
     /// A different answer waiting out [`STATE_DWELL`], and when it first appeared.
     pending: Option<(AgentState, Instant)>,
+    /// Whether this run has ever been seen with a spinner in its terminal title.
+    ///
+    /// Latching this is what turns the title from evidence of work into evidence of its end. A
+    /// title with no spinner means nothing on its own — most panes never have one. A title with no
+    /// spinner *on an agent that was spinning it a moment ago* is that agent saying its turn is
+    /// over, which is the positive claim [`SILENT_HANDOVER`] exists to guess at.
+    title_spoke: bool,
 }
 
 impl StateTracker {
@@ -109,6 +116,7 @@ impl StateTracker {
             growing_since: now,
             resolved: None,
             pending: None,
+            title_spoke: false,
         }
     }
 
@@ -191,7 +199,7 @@ impl StateTracker {
         &mut self,
         now: Instant,
         agent: Option<AgentKind>,
-        from_screen: AgentState,
+        screen: ScreenRead,
         reported: Option<AgentState>,
     ) -> AgentState {
         // What the agent said about itself beats anything read off its screen. A hook fires on the
@@ -204,22 +212,40 @@ impl StateTracker {
         }
         // A question outranks everything: an agent asking one has stopped, however recently it
         // printed the question itself.
-        if from_screen == AgentState::Blocked {
+        if screen.state == AgentState::Blocked {
             return self.commit(AgentState::Blocked);
         }
         if agent.is_none() {
             return self.commit(AgentState::Idle);
         }
+        // Latches for the rest of the run: an agent that has spun its title once is an agent that
+        // maintains it, and that is what makes its later stillness mean something.
+        self.title_spoke |= screen.title_working;
         // Every arm below has to be a positive claim, because `classify_screen` returning `Idle`
         // means "no rule matched", which is "no idea" and not "not working". Letting a shrug fall
         // through to a state was the whole defect: an idle pane that failed to match its own
         // chrome for one frame was reported as working on that frame.
-        let candidate = if from_screen == AgentState::Done {
+        let candidate = if screen.title_working {
+            // The agent's own title says it is mid-turn. This is the only "is going" claim on the
+            // screen that is trustworthy, and the reason is that the agent rewrites the title
+            // itself on every state change — unlike body chrome, which simply stays where it was
+            // printed. It outranks the output clock below because it is a statement rather than an
+            // inference: an agent waiting on a slow first token is silent and still working, and
+            // this is the case the clock cannot see.
+            Some(AgentState::Working)
+        } else if screen.state == AgentState::Done {
             // The agent is painting its own input chrome, which is it saying it is between turns.
             Some(AgentState::Done)
         } else if output_looks_like_work(self.quiet_for(now), self.growing_for()) {
             // Output has been streaming rather than twitching, which is generation.
             Some(AgentState::Working)
+        } else if self.title_spoke && self.quiet_for(now) >= WORKING_SILENCE {
+            // An agent that spins its title has stopped spinning it, and the pane has stopped
+            // writing. Two independent signals agreeing is far better evidence than either alone,
+            // which is why this settles in [`WORKING_SILENCE`] rather than waiting out the whole
+            // of [`SILENT_HANDOVER`] — that number is the price of having no evidence at all, and
+            // here there is some.
+            Some(AgentState::Done)
         } else if self.quiet_for(now) >= SILENT_HANDOVER {
             // Nothing has been written for long enough that nothing is being written. Measured
             // against `SILENT_HANDOVER` rather than `WORKING_SILENCE`: ceasing to stream and
@@ -231,7 +257,7 @@ impl StateTracker {
             // dwell, since a frame that says nothing is not a frame that argues against it.
             None
         };
-        // Deliberately absent: an arm reading `from_screen == Working` as Working.
+        // Deliberately absent: an arm reading `screen.state == Working` as Working.
         // `WORKING_PATTERNS` is matched against the whole visible screen and the terminal title,
         // both of which keep whatever the last turn left there — a "Running…" line scrolled up but
         // still on screen would pin a finished agent to working forever. Screen text is trusted to
@@ -2267,9 +2293,9 @@ impl RuntimeRegistry {
             // matched against one was unreachable.
             _ => match agent {
                 Some(kind) => {
-                    runtime.with_screen(|screen| classify_screen(kind, &screen.classifiable_text()))
+                    runtime.with_screen(|screen| read_screen(kind, &screen.classifiable_text()))
                 }
-                None => AgentState::Idle,
+                None => AgentState::Idle.into(),
             },
         };
         cached.insert(
@@ -2297,7 +2323,7 @@ impl RuntimeRegistry {
         &self,
         run_id: &str,
         agent: Option<AgentKind>,
-        from_screen: AgentState,
+        from_screen: ScreenRead,
         mark: OutputMark,
     ) -> AgentState {
         // Read before the output marks are locked: this is a leaf lock and taking the two in one
@@ -4887,8 +4913,17 @@ mod tests {
     /// test that waits out six seconds of a one-hertz animation is a test nobody runs.
     fn replay(
         frames: u64,
-        mut output: impl FnMut(u64) -> u64,
+        output: impl FnMut(u64) -> u64,
         mut screen: impl FnMut(u64) -> AgentState,
+    ) -> Vec<AgentState> {
+        replay_read(frames, output, move |frame| screen(frame).into())
+    }
+
+    /// [`replay`], for a pane whose terminal title is part of the evidence.
+    fn replay_read(
+        frames: u64,
+        mut output: impl FnMut(u64) -> u64,
+        mut screen: impl FnMut(u64) -> ScreenRead,
     ) -> Vec<AgentState> {
         let start = Instant::now();
         let mut tracker = StateTracker::new((1, 0), start);
@@ -4901,6 +4936,87 @@ mod tests {
                 tracker.decide(now, Some(AgentKind::Claude), screen(frame), None)
             })
             .collect()
+    }
+
+    /// A pane writing nothing, with a spinner up the whole time.
+    fn spinning(frames: u64) -> Vec<AgentState> {
+        replay_read(
+            frames,
+            |_| 0,
+            |_| ScreenRead {
+                state: AgentState::Idle,
+                title_working: true,
+            },
+        )
+    }
+
+    /// The frame the roster first said the turn had come back, and how long after the pane went
+    /// still that was.
+    fn handover(states: &[AgentState], stopped_at: u64) -> Duration {
+        let frame = states
+            .iter()
+            .position(|state| *state == AgentState::Done)
+            .expect("the turn has to come back eventually");
+        FRAME * (frame as u64 - stopped_at) as u32
+    }
+
+    /// The case the silence clock is structurally unable to see: an agent that is thinking, has
+    /// written nothing for ten seconds, and is saying so in its title the entire time.
+    ///
+    /// Before the title was evidence this pane read as finished after six seconds, and six seconds
+    /// was chosen precisely because it is the longest anyone was willing to wait for an answer
+    /// that was only ever a guess. A spinning title is not a guess.
+    #[test]
+    fn an_agent_that_spins_its_title_while_silent_is_working_rather_than_finished() {
+        let states = spinning(625);
+        assert!(
+            states.iter().all(|state| *state == AgentState::Working),
+            "ten silent seconds with the spinner up is still one turn: {:?}",
+            states.iter().find(|state| **state != AgentState::Working)
+        );
+    }
+
+    /// …and when the spinner stops, that is the agent saying the turn is over — which is better
+    /// evidence than silence, and so is believed sooner.
+    #[test]
+    fn the_title_going_still_hands_the_turn_back_sooner_than_silence_alone_can() {
+        let stopped_at = 100;
+        let states = replay_read(
+            700,
+            |frame| if frame < stopped_at { 60 } else { 0 },
+            |frame| ScreenRead {
+                state: AgentState::Idle,
+                title_working: frame < stopped_at,
+            },
+        );
+        let took = handover(&states, stopped_at);
+        assert!(
+            took <= WORKING_SILENCE + STATE_DWELL + FRAME * 2,
+            "two agreeing signals should settle in {:?}, took {took:?}",
+            WORKING_SILENCE + STATE_DWELL
+        );
+        assert!(
+            took < SILENT_HANDOVER,
+            "and must beat the number that exists for having no evidence at all"
+        );
+    }
+
+    /// The fast handover is earned by evidence, not granted to everyone. A pane that never spun a
+    /// title has told Dock nothing, and still waits out the full silence — this is what keeps the
+    /// arm above from quietly becoming a shorter `SILENT_HANDOVER` for every agent.
+    #[test]
+    fn a_pane_that_never_spun_a_title_still_waits_out_the_whole_silence() {
+        let stopped_at = 100;
+        let states = replay(
+            700,
+            |frame| if frame < stopped_at { 60 } else { 0 },
+            |_| AgentState::Idle,
+        );
+        let took = handover(&states, stopped_at);
+        assert!(
+            took >= SILENT_HANDOVER,
+            "no title, no shortcut: took {took:?}"
+        );
     }
 
     /// An agent thinking between tool calls must not be reported as having handed the turn back.
@@ -5031,7 +5147,12 @@ mod tests {
         let start = Instant::now();
         let mut tracker = StateTracker::new((1, 0), start);
         assert_eq!(
-            tracker.decide(start, Some(AgentKind::Claude), AgentState::Done, None),
+            tracker.decide(
+                start,
+                Some(AgentKind::Claude),
+                AgentState::Done.into(),
+                None
+            ),
             AgentState::Done,
             "the first answer for a run commits at once: there is nothing yet to change from"
         );
@@ -5044,7 +5165,7 @@ mod tests {
             written += 60;
             let now = start + Duration::from_millis(ms);
             tracker.observe((1, written), now);
-            let state = tracker.decide(now, Some(AgentKind::Claude), AgentState::Idle, None);
+            let state = tracker.decide(now, Some(AgentKind::Claude), AgentState::Idle.into(), None);
             if state == AgentState::Working && first_working.is_none() {
                 first_working = Some(Duration::from_millis(ms - began));
             }
@@ -5072,15 +5193,20 @@ mod tests {
             written += 60;
             now += FRAME;
             tracker.observe((1, written), now);
-            tracker.decide(now, Some(AgentKind::Claude), AgentState::Idle, None);
+            tracker.decide(now, Some(AgentKind::Claude), AgentState::Idle.into(), None);
         }
         assert_eq!(
-            tracker.decide(now, Some(AgentKind::Claude), AgentState::Idle, None),
+            tracker.decide(now, Some(AgentKind::Claude), AgentState::Idle.into(), None),
             AgentState::Working
         );
         now += FRAME;
         assert_eq!(
-            tracker.decide(now, Some(AgentKind::Claude), AgentState::Blocked, None),
+            tracker.decide(
+                now,
+                Some(AgentKind::Claude),
+                AgentState::Blocked.into(),
+                None
+            ),
             AgentState::Blocked,
             "a permission prompt is not something to sit on for half a second"
         );
@@ -5098,7 +5224,7 @@ mod tests {
         let reported = tracker.decide(
             start + FRAME,
             Some(AgentKind::Claude),
-            AgentState::Idle,
+            AgentState::Idle.into(),
             Some(AgentState::Done),
         );
         assert_eq!(reported, AgentState::Done);
@@ -5106,7 +5232,7 @@ mod tests {
             tracker.decide(
                 start + FRAME * 2,
                 Some(AgentKind::Claude),
-                AgentState::Idle,
+                AgentState::Idle.into(),
                 None
             ),
             AgentState::Done,

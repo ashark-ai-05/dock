@@ -1,7 +1,7 @@
 pub(crate) mod heuristic;
 pub mod process;
 
-pub use heuristic::classify_screen;
+pub use heuristic::{ScreenRead, classify_screen, read_screen};
 pub mod manifest;
 pub use process::agent_in_process_table;
 

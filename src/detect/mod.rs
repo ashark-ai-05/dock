@@ -166,6 +166,32 @@ mod tests {
         assert_eq!(AgentKind::from_executable("bash"), None);
     }
 
+    /// End to end, through the escape sequence an agent actually emits: OSC 2 sets the title, the
+    /// title leads `classifiable_text`, and the spinner in it is read as work.
+    ///
+    /// This is the path that fixes Amp, which has no body patterns of its own. Before it, an Amp
+    /// pane mid-turn classified as `Idle` — the roster showed nothing happening while it worked.
+    #[test]
+    fn an_agent_that_only_says_it_is_working_in_its_title_is_read_as_working() {
+        let mut screen = VtTerminal::new(24, 100, 100);
+        screen.feed("\x1b]2;\u{2839} amp\x07".as_bytes());
+        screen.feed("╰  gpt-5 thinking ─\r\n".as_bytes());
+        assert_eq!(
+            classify_screen(AgentKind::Amp, &screen.classifiable_text()),
+            AgentState::Working,
+            "the title is the only evidence there is, and it is enough"
+        );
+
+        // When the turn ends the agent rewrites the title without the spinner, and the same screen
+        // stops reading as work.
+        screen.feed(b"\x1b]2;amp\x07");
+        assert_ne!(
+            classify_screen(AgentKind::Amp, &screen.classifiable_text()),
+            AgentState::Working,
+            "the spinner going away is what says the turn ended"
+        );
+    }
+
     /// The bug this guards: every chooser pattern was matched against a cursor-anchored tail, and
     /// a chooser leaves the cursor on the highlighted option with its instructions underneath. The
     /// patterns were correct and unreachable, so the roster said "idle" while the agent waited.

@@ -24,16 +24,66 @@ const BLOCKED_PATTERNS: &[&str] = &[
     // Matching the numbered options themselves was the alternative and would fire on any prose
     // list an agent happened to print, which is the false call to attention this file exists to
     // avoid.
-    r"(?i)enter to select",
+    //
+    // The *submission* affordance, never the cancellation one. An agent offers a way to submit
+    // exactly while it is holding a question open; it offers a way to cancel whenever there is
+    // anything at all to cancel, which includes its own turn. "esc to cancel" used to sit in this
+    // list and was the single worst rule in the file: GitHub Copilot prints it for the whole
+    // duration of a response, so a Copilot pane read `Blocked` — "needs you" — from the moment it
+    // started generating until it stopped, and no chooser could be told apart from ordinary work
+    // because one rule answered both. It now lives under `WORKING_PATTERNS`, where the affordance
+    // it actually describes belongs.
+    //
+    // The four spellings are the ones real agents paint: "enter to select", "enter to confirm",
+    // "enter to submit", "enter accept".
+    r"(?i)enter\s+(?:to\s+)?(?:select|confirm|submit|accept)\b",
     r"(?i)(↑/↓|up/down) to navigate",
-    r"(?i)esc to cancel",
 ];
 
 const WORKING_PATTERNS: &[&str] = &[
-    r"(?i)esc to interrupt",
+    // The interrupt affordance, which is the most broadly true thing an agent's screen says about
+    // itself: it advertises a way to interrupt exactly while there is something to interrupt.
+    // Widened from a literal "esc to interrupt" to the family, because the intervening words are
+    // the only part that varies between agents — "esc to cancel", "esc cancel", "esc again to
+    // cancel", "esc interrupt". `\s` rather than a literal space so the phrase survives being
+    // wrapped by a narrow pane, which `visible_text` joins with a newline.
+    r"(?i)\besc\b(?:\s+\w+){0,3}\s+(?:cancel|interrupt)\b",
     r"(?i)\b(thinking|working|running|generating|compiling|analyzing)\b\s*[.…]",
     r"(?i)tokens?\s*·",
+    // The title spinner is deliberately *not* here; see `title_says_working`.
 ];
+
+/// Whether the agent's terminal title carries a spinner, which is the one piece of evidence here
+/// that does not depend on reading chrome off the screen at all: it survives scrolling, survives
+/// the footer being off-screen, and survives an agent whose body Dock has no patterns for — which
+/// is how Amp, which has no rules of its own, gets a working state.
+///
+/// Code rather than a pattern in `WORKING_PATTERNS`, and the reason is measured. Written as a
+/// regex this is `\A[ \t]*[…]\s` — anchored, so it should cost nothing. In a `RegexSet` it costs
+/// a great deal: the set matches every alternative at once against one haystack, and a pattern
+/// with no literal to search for denies the whole set its literal prefilter. Adding it took
+/// `WORKING_PATTERNS` from 0.0031ms to 0.1057ms per pane per pass — a 34x rise paid on every
+/// screen, to run an anchored test that reads at most three characters. Here it reads those three
+/// characters and stops.
+///
+/// The `\A` anchor was also doing a second job badly. It meant "the title" only because
+/// [`classifiable_text`](crate::terminal::VtTerminal::classifiable_text) happens to put the title
+/// first; on a pane with no title it silently anchored to the top screen row instead. This asks
+/// the question it means to ask.
+///
+/// Both glyph families are spinners and nothing else — braille for most agents, the quarter
+/// circles Claude Code moved to in 2.1.228. Claude's other title glyph, `✳`, is deliberately
+/// absent because it marks the *finished* title, and `·` is absent because it is ordinary
+/// punctuation in agent output, as the token-count rule above shows.
+fn title_says_working(tail: &str) -> bool {
+    let first = tail.lines().next().unwrap_or_default();
+    let mut glyphs = first.trim_start_matches([' ', '\t']).chars();
+    let Some('\u{2800}'..='\u{28FF}' | '\u{25D0}'..='\u{25D3}') = glyphs.next() else {
+        return false;
+    };
+    // A spinner is a glyph the title leads with, not one that happens to open a word.
+    glyphs.next().is_none_or(char::is_whitespace)
+}
 
 // Deliberately conservative: `Done` and `Idle` are adjacent low-attention ranks, so missing
 // a completion costs the user almost nothing, while a false `Done` on a busy pane (e.g. any
@@ -134,7 +184,7 @@ pub fn classify_screen(agent: AgentKind, tail: &str) -> AgentState {
     if rules.blocked.is_match(tail) {
         return AgentState::Blocked;
     }
-    if rules.working.is_match(tail) {
+    if title_says_working(tail) || rules.working.is_match(tail) {
         return AgentState::Working;
     }
     if rules.awaiting.is_match(tail) {
@@ -399,5 +449,114 @@ mod awaiting_input_tests {
             classify_screen(AgentKind::Claude, "cargo build\n   Compiling dock v0.1.0\n"),
             AgentState::Idle
         );
+    }
+}
+
+#[cfg(test)]
+mod affordance_tests {
+    use super::*;
+
+    /// The bug: "esc to cancel" was a `Blocked` rule, and GitHub Copilot prints it for the entire
+    /// duration of a response. A Copilot pane therefore read "needs you" from the moment it began
+    /// generating until it stopped — and because the same rule also fired on its chooser, nothing
+    /// downstream could tell the two apart. Both halves are asserted here; the second is the one
+    /// that makes the first safe to change.
+    #[test]
+    fn an_interrupt_offer_is_work_and_a_submit_offer_is_a_question() {
+        let generating = "Working on it\n  esc to cancel\n";
+        assert_eq!(
+            classify_screen(AgentKind::Copilot, generating),
+            AgentState::Working,
+            "an agent offering to be interrupted has something to interrupt"
+        );
+
+        let choosing = "Allow this edit?\n  enter to select · esc to cancel\n";
+        assert_eq!(
+            classify_screen(AgentKind::Copilot, choosing),
+            AgentState::Blocked,
+            "the submission affordance is what says a question is open"
+        );
+    }
+
+    /// Every spelling of the interrupt offer that a real agent paints, including the wrapped form
+    /// a narrow pane produces, where `visible_text` has joined the rows with a newline.
+    #[test]
+    fn the_interrupt_offer_is_recognised_however_it_is_spelled() {
+        for footer in [
+            "esc to interrupt",
+            "esc to cancel",
+            "esc cancel",
+            "esc again to cancel",
+            "esc interrupt",
+            "(esc\nto interrupt)",
+        ] {
+            assert_eq!(
+                classify_screen(AgentKind::Copilot, footer),
+                AgentState::Working,
+                "{footer:?} offers an interrupt"
+            );
+        }
+    }
+
+    /// …and every spelling of the submission offer, which outranks it.
+    #[test]
+    fn the_submission_offer_is_recognised_however_it_is_spelled() {
+        for footer in [
+            "enter to select",
+            "enter to confirm",
+            "enter to submit",
+            "enter accept",
+        ] {
+            assert_eq!(
+                classify_screen(AgentKind::Copilot, footer),
+                AgentState::Blocked,
+                "{footer:?} holds a question open"
+            );
+        }
+    }
+
+    /// The signal that needs no per-agent chrome at all. Amp has no body patterns in this file and
+    /// never will have every agent's; the spinner it writes into its terminal title is enough on
+    /// its own, and `classifiable_text` already puts that title on the first line.
+    #[test]
+    fn a_spinner_in_the_title_is_work_for_an_agent_with_no_rules_of_its_own() {
+        // Amp's real working title, and the body Dock cannot read anything from.
+        let working = "⠹ amp\n╰  gpt-5 thinking ─\n";
+        assert_eq!(
+            classify_screen(AgentKind::Amp, working),
+            AgentState::Working,
+            "the title answers when the body cannot"
+        );
+
+        // Claude Code's 2.1.228 spinner is a quarter circle rather than braille.
+        assert_eq!(
+            classify_screen(AgentKind::Claude, "◐ dock\nsome output\n"),
+            AgentState::Working
+        );
+    }
+
+    /// The anchor is the whole safety argument for the title rule. A spinner glyph is only
+    /// evidence when it is *the title*, and `·` — Claude's other title glyph — is ordinary
+    /// punctuation everywhere else.
+    #[test]
+    fn a_glyph_that_is_not_the_title_is_not_a_spinner() {
+        // Braille further down the screen is somebody's output, not a title.
+        assert_eq!(
+            classify_screen(AgentKind::Amp, "amp\nsome output ⠹ here\n"),
+            AgentState::Idle
+        );
+        // Claude's idle title glyph must not read as work.
+        assert_eq!(
+            classify_screen(AgentKind::Amp, "✳ amp\nidle\n"),
+            AgentState::Idle,
+            "`✳` marks the finished title, not a spinner"
+        );
+        // A spinner leads the title; it does not open a word in it.
+        assert_eq!(
+            classify_screen(AgentKind::Amp, "⠹amp\nidle\n"),
+            AgentState::Idle
+        );
+        // A title that is nothing but the spinner is still the spinner.
+        assert_eq!(classify_screen(AgentKind::Amp, "⠹"), AgentState::Working);
     }
 }

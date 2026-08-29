@@ -2022,9 +2022,14 @@ impl Dashboard {
             .find(|part| !part.is_empty())
             .unwrap_or_default();
 
+        // Counted off the runs lane rather than `self.agents`, for the reason
+        // [`agent_roster`](Self::agent_roster) is: a roster entry whose run has departed is not
+        // pruned until the next refresh, and counting one here put a number in the header that
+        // no row in the sidebar accounted for — the hardest kind of wrong to notice, because
+        // there is nothing on screen to check it against.
         let (mut blocked, mut waiting) = (0_usize, 0_usize);
-        for (_, state) in self.agents.values() {
-            match state {
+        for run in self.live_runs().iter().filter(|run| run.is_agent()) {
+            match run.state {
                 AgentState::Blocked => blocked += 1,
                 AgentState::Done => waiting += 1,
                 _ => {}
@@ -2654,7 +2659,7 @@ impl Dashboard {
     /// Live agents ordered by how much they are costing the user: blocked first, then by
     /// label so the list does not reshuffle between frames for equally urgent agents.
     ///
-    /// Only a run whose agent was actually detected is an agent. `self.agents` also carries
+    /// Only a run whose agent was actually detected is an agent. The runs lane also carries
     /// every pane's ambient shell, which reports no kind at all; listing those turned the
     /// roster into a list of run ids for processes that are not agents.
     ///
@@ -2662,6 +2667,20 @@ impl Dashboard {
     /// turns out to have no room for costs nothing beyond the comparison that sorted it. Only
     /// a task this dashboard dispatched itself has to be built, because that one is held as a
     /// number rather than as text.
+    ///
+    /// Derived from [`live_runs`](Self::live_runs) — the same list the board pane draws — and
+    /// never from `self.agents` directly. That map is fed by pushed `AgentStateChanged` events,
+    /// which carry a run id and are not checked against the run list, and it is pruned only by
+    /// [`set_runs`](Self::set_runs). So an event that lands after its run has departed puts an
+    /// entry back that nothing is scheduled to remove: `AgentStateChanged` is the one event arm
+    /// that does not ask for a refresh. A roster read straight from the map then drew a row for
+    /// a run that no longer existed, holding whatever state that run died in, while the board —
+    /// which walks the run list — drew the run that had replaced it. One pane, one agent, and
+    /// the sidebar saying `working` beside a board saying `your turn`.
+    ///
+    /// Both surfaces now answer from one list, so they cannot disagree, and a stale map entry
+    /// is simply never reached. `set_runs` still prunes, to stop the map growing for a session's
+    /// lifetime, but nothing is drawn from it that the run list has not vouched for.
     fn agent_roster(&self) -> Vec<RosterEntry<'_>> {
         // Indexed once, not asked once per agent. Answering "which workspace" for a single run
         // means walking every pane of every workspace, and answering "which task" means walking
@@ -2672,21 +2691,16 @@ impl Dashboard {
         // Joined to the run so the roster can say which task each agent is on. Three agents all
         // reading "claude" tell you only that three agents are running.
         let mut roster: Vec<RosterEntry<'_>> = self
-            .agents
-            .iter()
-            .filter_map(|(run_id, (kind, state))| {
+            .live_runs()
+            .into_iter()
+            .filter(LiveRun::is_agent)
+            .map(|run| {
                 // The workspace rides alongside the task for the same reason the task rides
                 // with the name: this list spans every workspace, so "needs you" is actionable
                 // only once you know where to go.
-                let task = tasks.get(run_id.as_str()).cloned();
-                let workspace = workspaces.get(run_id.as_str()).copied();
-                Some((
-                    *state,
-                    kind.as_ref()?.label(),
-                    task,
-                    workspace,
-                    run_id.as_str(),
-                ))
+                let task = tasks.get(run.run_id).cloned();
+                let workspace = workspaces.get(run.run_id).copied();
+                (run.state, run.label(), task, workspace, run.run_id)
             })
             .collect();
         roster.sort_by(|left, right| {
@@ -8762,6 +8776,36 @@ mod tests {
         dashboard
     }
 
+    /// Reports an agent state the way the daemon actually does: for a run the run list already
+    /// carries.
+    ///
+    /// Both halves matter, and a fixture that supplies only the event is describing a pane that
+    /// does not exist. An agent is detected *inside* a pane, so by the time its state is
+    /// reported the daemon has been listing that pane's run for as long as the pane has been
+    /// open. The one moment the two disagree is between a run departing and the next refresh —
+    /// which is the bug [`Dashboard::agent_roster`] exists to be immune to, not a state any
+    /// other test should be asserting against.
+    fn observe_agent(
+        dashboard: &mut Dashboard,
+        run_id: &str,
+        agent: Option<AgentKind>,
+        state: AgentState,
+    ) {
+        let mut run = snapshot();
+        run.run_id = run_id.to_owned();
+        run.agent = agent;
+        // An agent somebody started by typing its name into a pane, which is the ordinary case
+        // and the one that carries no card. A fixture that wants a dispatched agent says so by
+        // setting the reference itself, rather than inheriting one from the snapshot template.
+        run.external_task_ref = String::new();
+        dashboard.runs.push(run);
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: run_id.to_owned(),
+            agent,
+            state,
+        });
+    }
+
     fn bound_dashboard() -> Dashboard {
         let mut dashboard = dashboard();
         dashboard.layout.workspaces[0]
@@ -9521,16 +9565,18 @@ mod tests {
     #[test]
     fn sidebar_lists_agents_with_blocked_first() {
         let mut dashboard = dashboard();
-        dashboard.apply_event(Event::AgentStateChanged {
-            run_id: "run_idle".into(),
-            agent: Some(AgentKind::Amp),
-            state: AgentState::Idle,
-        });
-        dashboard.apply_event(Event::AgentStateChanged {
-            run_id: "run_blocked".into(),
-            agent: Some(AgentKind::Claude),
-            state: AgentState::Blocked,
-        });
+        observe_agent(
+            &mut dashboard,
+            "run_idle",
+            Some(AgentKind::Amp),
+            AgentState::Idle,
+        );
+        observe_agent(
+            &mut dashboard,
+            "run_blocked",
+            Some(AgentKind::Claude),
+            AgentState::Blocked,
+        );
         let rendered = render_to_string(&mut dashboard, 100, 30);
         let claude = rendered.find("claude").expect("claude listed");
         let amp = rendered.find("amp").expect("amp listed");
@@ -11093,13 +11139,18 @@ mod tests {
     fn the_header_says_where_you_are_and_who_needs_you() {
         let mut dashboard = bound_dashboard();
         dashboard.repository_root = "/Users/someone/Development/dock".into();
-        dashboard.agents.insert(
-            "run_1".into(),
-            (Some(AgentKind::Claude), AgentState::Blocked),
+        observe_agent(
+            &mut dashboard,
+            "run_1",
+            Some(AgentKind::Claude),
+            AgentState::Blocked,
         );
-        dashboard
-            .agents
-            .insert("run_2".into(), (Some(AgentKind::Codex), AgentState::Done));
+        observe_agent(
+            &mut dashboard,
+            "run_2",
+            Some(AgentKind::Codex),
+            AgentState::Done,
+        );
         let frame = render_to_string(&mut dashboard, 160, 30);
         let header: String = frame.chars().take(160).collect();
 
@@ -11118,9 +11169,11 @@ mod tests {
     fn a_narrow_header_keeps_who_needs_you_over_where_you_are() {
         let mut dashboard = bound_dashboard();
         dashboard.repository_root = "/Users/someone/Development/a-very-long-repository".into();
-        dashboard.agents.insert(
-            "run_1".into(),
-            (Some(AgentKind::Claude), AgentState::Blocked),
+        observe_agent(
+            &mut dashboard,
+            "run_1",
+            Some(AgentKind::Claude),
+            AgentState::Blocked,
         );
         let frame = render_to_string(&mut dashboard, 60, 30);
         let header: String = frame.chars().take(60).collect();
@@ -11607,6 +11660,98 @@ mod tests {
             "/repo/real/kanban/tasks".into(),
         );
         dashboard
+    }
+
+    /// A run the sidebar and the board both show has to be shown the same way.
+    ///
+    /// They are two renderings of one fact, drawn on one screen, read side by side. A person who
+    /// finds them contradicting each other cannot use either: the question "is this agent
+    /// waiting on me" now has two answers and no way to choose between them.
+    #[test]
+    fn the_sidebar_and_the_board_never_disagree_about_one_agents_state() {
+        for state in [
+            AgentState::Blocked,
+            AgentState::Working,
+            AgentState::Done,
+            AgentState::Idle,
+        ] {
+            for process in [
+                ProcessState::Running,
+                ProcessState::Exited { code: Some(0) },
+            ] {
+                let mut dashboard = bound_dashboard();
+                let mut run = snapshot();
+                run.run_id = "run_1".into();
+                run.agent = Some(AgentKind::Codex);
+                run.state = process.clone();
+                dashboard.runs.push(run);
+                dashboard
+                    .agents
+                    .insert("run_1".into(), (Some(AgentKind::Codex), state));
+
+                let sidebar = dashboard
+                    .agent_roster()
+                    .into_iter()
+                    .find(|entry| entry.4 == "run_1")
+                    .map(|entry| entry.0);
+                let board = dashboard
+                    .live_runs()
+                    .into_iter()
+                    .find(|live| live.run_id == "run_1")
+                    .map(|live| live.state);
+
+                assert_eq!(
+                    sidebar, board,
+                    "sidebar says {sidebar:?} and the board says {board:?} \
+                     for a {state:?} agent whose process is {process:?}"
+                );
+            }
+        }
+    }
+
+    /// The reported failure: the sidebar said `working` while the board said `your turn`.
+    ///
+    /// Reaching it needs `self.agents` to hold an entry under a run id the run list no longer
+    /// carries. That is not hypothetical: `AgentStateChanged` names a run id, is not checked
+    /// against the run list, and is the one event arm that does not ask for a refresh — while
+    /// the only thing that prunes the map is `set_runs`. So an event landing after its run has
+    /// departed puts an entry back that nothing is scheduled to remove.
+    ///
+    /// The entry may still sit in the map; what it may never do is reach the screen. Before the
+    /// roster was derived from the runs lane, the sidebar walked the map and drew the dead run
+    /// in the state it died in, while the board walked the run list and drew the run that had
+    /// replaced it — one agent, one pane, and two different words on one screen.
+    #[test]
+    fn a_roster_entry_whose_run_has_departed_is_never_drawn_beside_the_run_that_replaced_it() {
+        let mut dashboard = bound_dashboard();
+        // The run the pane is actually on now. Its process has gone, which is what makes the
+        // board's fallback say `Done`.
+        let mut current = snapshot();
+        current.run_id = "run_2".into();
+        current.agent = Some(AgentKind::Codex);
+        current.state = ProcessState::Exited { code: Some(0) };
+        dashboard.runs.push(current);
+        // The roster entry from the run before it, never pruned.
+        dashboard.agents.insert(
+            "run_1".into(),
+            (Some(AgentKind::Codex), AgentState::Working),
+        );
+
+        let sidebar: Vec<_> = dashboard
+            .agent_roster()
+            .into_iter()
+            .map(|entry| (entry.4.to_owned(), entry.0))
+            .collect();
+        let board: Vec<_> = dashboard
+            .live_runs()
+            .into_iter()
+            .map(|live| (live.run_id.to_owned(), live.state))
+            .collect();
+
+        assert_eq!(
+            sidebar, board,
+            "the sidebar shows {sidebar:?} and the board shows {board:?}"
+        );
     }
 
     #[test]
@@ -12968,13 +13113,17 @@ mod tests {
     #[test]
     fn the_roster_says_which_agent_wants_you_rather_than_only_colouring_it() {
         let mut dashboard = bound_dashboard();
-        dashboard.agents.insert(
-            "run_1".into(),
-            (Some(AgentKind::Claude), AgentState::Blocked),
+        observe_agent(
+            &mut dashboard,
+            "run_1",
+            Some(AgentKind::Claude),
+            AgentState::Blocked,
         );
-        dashboard.agents.insert(
-            "run_2".into(),
-            (Some(AgentKind::Codex), AgentState::Working),
+        observe_agent(
+            &mut dashboard,
+            "run_2",
+            Some(AgentKind::Codex),
+            AgentState::Working,
         );
         let rows = sidebar_rows(&mut dashboard, 100, 30).join("\n");
         // A coloured glyph says something is true of this agent without saying what. The word is
@@ -13598,11 +13747,12 @@ mod tests {
     fn a_roster_longer_than_the_sidebar_draws_the_rows_a_taller_terminal_would_have_drawn() {
         let mut dashboard = dashboard();
         for index in 0..40 {
-            dashboard.apply_event(Event::AgentStateChanged {
-                run_id: format!("run_{index}"),
-                agent: Some(AgentKind::Claude),
-                state: AgentState::Idle,
-            });
+            observe_agent(
+                &mut dashboard,
+                &format!("run_{index}"),
+                Some(AgentKind::Claude),
+                AgentState::Idle,
+            );
         }
         let short = sidebar_rows(&mut dashboard, 100, 30);
         let tall = sidebar_rows(&mut dashboard, 100, 60);
@@ -13630,9 +13780,11 @@ mod tests {
     #[test]
     fn the_sidebar_collapses_to_a_rail_that_still_shows_who_needs_you() {
         let mut dashboard = dashboard();
-        dashboard.agents.insert(
-            "run_a".into(),
-            (Some(AgentKind::Claude), AgentState::Blocked),
+        observe_agent(
+            &mut dashboard,
+            "run_a",
+            Some(AgentKind::Claude),
+            AgentState::Blocked,
         );
         let terminal = render_terminal(&mut dashboard, 100, 30);
         let wide = dashboard.pane_areas["a"].width;
@@ -13952,11 +14104,12 @@ mod tests {
     fn a_sidebar_control_pushed_past_the_last_row_records_no_click_target() {
         let mut dashboard = dashboard();
         for index in 0..40 {
-            dashboard.apply_event(Event::AgentStateChanged {
-                run_id: format!("run_{index}"),
-                agent: Some(AgentKind::Claude),
-                state: AgentState::Idle,
-            });
+            observe_agent(
+                &mut dashboard,
+                &format!("run_{index}"),
+                Some(AgentKind::Claude),
+                AgentState::Idle,
+            );
         }
         let rows = sidebar_rows(&mut dashboard, 100, 30);
         assert!(
@@ -13982,11 +14135,12 @@ mod tests {
     #[test]
     fn the_agent_roster_lists_only_runs_whose_agent_was_detected() {
         let mut dashboard = dashboard();
-        dashboard.apply_event(Event::AgentStateChanged {
-            run_id: "dock_sh_workspace_1_pane_2".into(),
-            agent: None,
-            state: AgentState::Idle,
-        });
+        observe_agent(
+            &mut dashboard,
+            "dock_sh_workspace_1_pane_2",
+            None,
+            AgentState::Idle,
+        );
         let rows = sidebar_rows(&mut dashboard, 100, 30);
         assert!(
             !rows.iter().any(|row| row.contains("dock_sh_")),
@@ -13997,11 +14151,12 @@ mod tests {
             "{rows:#?}"
         );
 
-        dashboard.apply_event(Event::AgentStateChanged {
-            run_id: "run_1".into(),
-            agent: Some(AgentKind::Claude),
-            state: AgentState::Blocked,
-        });
+        observe_agent(
+            &mut dashboard,
+            "run_1",
+            Some(AgentKind::Claude),
+            AgentState::Blocked,
+        );
         assert_eq!(dashboard.agents.len(), 2);
         assert_eq!(
             dashboard.agent_roster(),
@@ -17188,9 +17343,11 @@ mod tests {
     #[test]
     fn a_right_click_names_whatever_surface_it_landed_on() {
         let mut dashboard = two_workspace_dashboard();
-        dashboard.agents.insert(
-            "run_1".into(),
-            (Some(AgentKind::Claude), AgentState::Working),
+        observe_agent(
+            &mut dashboard,
+            "run_1",
+            Some(AgentKind::Claude),
+            AgentState::Working,
         );
         render_terminal(&mut dashboard, 120, 34);
 

@@ -55,11 +55,11 @@ if target/debug/dock dispatch --socket="$socket" --repo="$repo_b" --task=B-2 \
 fi
 [ ! -e "$state/dispatches/dock_global_refused.json" ]
 
-target/debug/dock-programme --socket="$socket" --upstream-run-id=dock_upstream \
+target/debug/dock programme --socket="$socket" --upstream-run-id=dock_upstream \
     --required-route=accept-scope --repo="$repo_b" --task=B-1 \
     --run-id=dock_downstream --worktree="$repo_b" |
     jq -e '.state == "awaiting_handoff"' >/dev/null
-target/debug/dock-programme --socket="$socket" | jq -e '
+target/debug/dock programme --socket="$socket" | jq -e '
     .global_active == 2 and
     ([.repositories[].active_run_ids[]] | sort) == ["dock_blocker", "dock_upstream"] and
     ([.repositories[].queued_run_ids[]] | sort) == ["dock_downstream"] and
@@ -68,13 +68,13 @@ if target/debug/dock dispatch --socket="$socket" --repo="$repo_b" --task=B-1 \
     --run-id=dock_downstream --worktree="$repo_b" --adapter=fixture >/dev/null 2>&1; then
     echo "direct dispatch bypassed a queued dependency gate" >&2; exit 1
 fi
-if target/debug/dock-programme --socket="$socket" --release=dock_downstream >/dev/null 2>&1; then
+if target/debug/dock programme --socket="$socket" --release=dock_downstream >/dev/null 2>&1; then
     echo "gate released without handoff" >&2; exit 1
 fi
 
 printf '%s\n' "$upstream" | jq '{schema_version:1,run_id,task_id:.external_task_ref,workspace_id,pane_id,worktree,branch,base_sha,summary:"explicit fixture handoff",question:"release downstream?",checks:[{name:"fixture check",passed:true}]}' >"$smoke_dir/handoff.json"
 target/debug/dock-handoff --socket="$socket" --submit="$smoke_dir/handoff.json" >/dev/null
-target/debug/dock-programme --socket="$socket" | jq -e '.gates[0].state == "awaiting_decision"' >/dev/null
+target/debug/dock programme --socket="$socket" | jq -e '.gates[0].state == "awaiting_decision"' >/dev/null
 target/debug/dock-handoff --socket="$socket" --run-id=dock_upstream --route=accept-scope --note='release declared edge' >/dev/null
 target/debug/dock agent --socket="$socket" --run-id=dock_upstream --operation=stop >/dev/null
 target/debug/dock agent --socket="$socket" --run-id=dock_blocker --operation=stop >/dev/null
@@ -92,13 +92,13 @@ wait_terminal() {
 }
 wait_terminal dock_upstream
 wait_terminal dock_blocker
-target/debug/dock-programme --socket="$socket" | jq -e '
+target/debug/dock programme --socket="$socket" | jq -e '
     .global_active == 0 and
     ([.repositories[].active_run_ids[]] | sort) == [] and
     ([.repositories[].queued_run_ids[]] | sort) == ["dock_downstream"] and
     ([.repositories[].active_capacity] | sort) == [0]' >/dev/null
-target/debug/dock-programme --socket="$socket" --release=dock_downstream | jq -e '.run_id == "dock_downstream" and .state == "running"' >/dev/null
-target/debug/dock-programme --socket="$socket" | jq -e '
+target/debug/dock programme --socket="$socket" --release=dock_downstream | jq -e '.run_id == "dock_downstream" and .state == "running"' >/dev/null
+target/debug/dock programme --socket="$socket" | jq -e '
     .global_active == 1 and
     ([.repositories[].active_run_ids[]] | sort) == ["dock_downstream"] and
     ([.repositories[].queued_run_ids[]] | sort) == [] and
@@ -106,7 +106,7 @@ target/debug/dock-programme --socket="$socket" | jq -e '
     (.gates | length) == 0' >/dev/null
 target/debug/dock agent --socket="$socket" --run-id=dock_downstream --operation=stop >/dev/null
 wait_terminal dock_downstream
-target/debug/dock-programme --socket="$socket" | jq -e '
+target/debug/dock programme --socket="$socket" | jq -e '
     .global_active == 0 and
     ([.repositories[].active_run_ids[]] | sort) == [] and
     ([.repositories[].queued_run_ids[]] | sort) == [] and

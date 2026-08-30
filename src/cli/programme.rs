@@ -1,27 +1,16 @@
-use std::{
-    io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
-    path::PathBuf,
-};
+use std::path::PathBuf;
 
-use dock::{
+use crate::{
     adapter::{AdapterId, AdapterSelection},
+    cli::wire::{Connection, print_json},
     model::ReviewRoute,
-    paths,
     protocol::{
-        DispatchRequest, HelloRequest, InspectProgrammeRequest, PROTOCOL_VERSION,
-        QueueGatedRequest, ReleaseGateRequest, Request, Response,
+        DispatchRequest, InspectProgrammeRequest, QueueGatedRequest, ReleaseGateRequest, Request,
+        Response,
     },
 };
 
-fn main() -> Result<(), String> {
-    let (socket, request) = parse_arguments(std::env::args().skip(1))?;
-    run(socket, request)
-}
-
-fn parse_arguments(
-    arguments: impl IntoIterator<Item = String>,
-) -> Result<(Option<PathBuf>, Request), String> {
+pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), String> {
     let mut socket = None;
     let mut release = None;
     let mut upstream = None;
@@ -32,11 +21,11 @@ fn parse_arguments(
     let mut worktree = None;
     let mut command = Vec::new();
     let mut queue_flag_seen = false;
-    let mut args = arguments.into_iter();
-    while let Some(arg) = args.next() {
+    let mut arguments = args.iter();
+    while let Some(arg) = arguments.next() {
         if arg == "--" {
             queue_flag_seen = true;
-            command.extend(args);
+            command.extend(arguments.cloned());
             break;
         }
         if let Some(v) = arg.strip_prefix("--socket=") {
@@ -96,26 +85,10 @@ fn parse_arguments(
     Ok((socket, request))
 }
 
-fn run(socket: Option<PathBuf>, request: Request) -> Result<(), String> {
-    let socket = socket.map_or_else(paths::default_socket_path, Ok)?;
-    let mut stream = UnixStream::connect(&socket)
-        .map_err(|e| format!("could not connect to {}: {e}", socket.display()))?;
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-    send(
-        &mut stream,
-        &Request::Hello(HelloRequest {
-            version: PROTOCOL_VERSION,
-        }),
-    )?;
-    match receive(&mut reader)? {
-        Response::Hello {
-            version: PROTOCOL_VERSION,
-        } => {}
-        Response::Error { message, .. } => return Err(message),
-        r => return Err(format!("unexpected handshake response: {r:?}")),
-    }
-    send(&mut stream, &request)?;
-    match receive(&mut reader)? {
+/// Render the daemon's response the way each of `programme`'s three requests wants it shown:
+/// the portfolio, a freshly queued gate, or the snapshot a release just unblocked.
+pub fn render(response: Response) -> Result<(), String> {
+    match response {
         Response::Programme { portfolio } => print_json(&portfolio),
         Response::GateQueued { gate } => print_json(&gate),
         Response::GateReleased { snapshot } => print_json(&snapshot),
@@ -124,23 +97,10 @@ fn run(socket: Option<PathBuf>, request: Request) -> Result<(), String> {
     }
 }
 
-fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).map_err(|e| e.to_string())?
-    );
-    Ok(())
-}
-fn send(stream: &mut UnixStream, request: &Request) -> Result<(), String> {
-    serde_json::to_writer(&mut *stream, request).map_err(|e| e.to_string())?;
-    stream.write_all(b"\n").map_err(|e| e.to_string())
-}
-fn receive(reader: &mut impl BufRead) -> Result<Response, String> {
-    let mut line = String::new();
-    if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-        return Err("daemon closed the connection".into());
-    }
-    serde_json::from_str(&line).map_err(|e| format!("invalid daemon response: {e}"))
+pub fn run(args: &[String]) -> Result<(), String> {
+    let (socket, request) = parse_arguments(args)?;
+    let response = Connection::open(socket)?.request(&request)?;
+    render(response)
 }
 
 #[cfg(test)]
@@ -157,15 +117,18 @@ mod tests {
             "--worktree=/repo",
             "--required-route=request-change",
         ] {
-            let error = parse_arguments(["--release=dock_downstream".into(), queue_flag.into()])
-                .unwrap_err();
+            let error = parse_arguments(&[
+                "--release=dock_downstream".to_owned(),
+                queue_flag.to_owned(),
+            ])
+            .unwrap_err();
             assert!(error.contains("mutually exclusive"));
         }
         assert!(
-            parse_arguments([
-                "--release=dock_downstream".into(),
-                "--".into(),
-                "unexpected-command".into(),
+            parse_arguments(&[
+                "--release=dock_downstream".to_owned(),
+                "--".to_owned(),
+                "unexpected-command".to_owned(),
             ])
             .unwrap_err()
             .contains("mutually exclusive")
@@ -174,7 +137,7 @@ mod tests {
 
     #[test]
     fn release_alone_is_valid() {
-        let (_, request) = parse_arguments(["--release=dock_downstream".into()]).unwrap();
+        let (_, request) = parse_arguments(&["--release=dock_downstream".to_owned()]).unwrap();
         assert!(matches!(request, Request::ReleaseGate(_)));
     }
 }

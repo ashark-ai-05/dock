@@ -629,7 +629,7 @@ pub struct ProgrammeSnapshot {
     pub human_review_reserved: usize,
     pub repositories: Vec<RepositoryPortfolioSnapshot>,
     pub gates: Vec<DependencyGateSnapshot>,
-    /// Every pane queue, beside the gates, so `dock-programme` shows both rather than making an
+    /// Every pane queue, beside the gates, so `dock programme` shows both rather than making an
     /// operator hold two mental models of "queued work".
     pub queues: Vec<PaneQueueSnapshot>,
 }

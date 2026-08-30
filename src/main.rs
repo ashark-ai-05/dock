@@ -121,6 +121,11 @@ const VERBS: &[Verb] = &[
         run: dock::cli::inspect::run,
     },
     Verb {
+        name: "programme",
+        summary: "multi-repository capacity and dependency gates",
+        run: dock::cli::programme::run,
+    },
+    Verb {
         name: "workspace",
         summary: "create, split, focus, rename and close panes",
         run: dock::cli::workspace::run,

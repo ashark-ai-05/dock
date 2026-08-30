@@ -126,6 +126,11 @@ const VERBS: &[Verb] = &[
         run: dock::cli::programme::run,
     },
     Verb {
+        name: "review",
+        summary: "read the handoff inbox and record a decision",
+        run: dock::cli::review::run,
+    },
+    Verb {
         name: "workspace",
         summary: "create, split, focus, rename and close panes",
         run: dock::cli::workspace::run,

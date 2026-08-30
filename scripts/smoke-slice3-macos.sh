@@ -41,8 +41,8 @@ jq -n --arg root "$root" --arg branch "$branch" --arg base "$base" '{
   checks: [{name: "fixture smoke", passed: true}]
 }' >"$packet"
 
-target/debug/dock-handoff --socket="$socket" --submit="$packet" >/dev/null
-target/debug/dock-handoff --socket="$socket" --inbox
-target/debug/dock-handoff --socket="$socket" --run-id=dock_smoke3 \
+target/debug/dock review --socket="$socket" --submit="$packet" >/dev/null
+target/debug/dock review --socket="$socket" --inbox
+target/debug/dock review --socket="$socket" --run-id=dock_smoke3 \
     --route=accept-scope --note='Smoke scope accepted; no Git or task mutation.'
-target/debug/dock-handoff --socket="$socket" --inbox
+target/debug/dock review --socket="$socket" --inbox

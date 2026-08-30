@@ -73,9 +73,9 @@ if target/debug/dock programme --socket="$socket" --release=dock_downstream >/de
 fi
 
 printf '%s\n' "$upstream" | jq '{schema_version:1,run_id,task_id:.external_task_ref,workspace_id,pane_id,worktree,branch,base_sha,summary:"explicit fixture handoff",question:"release downstream?",checks:[{name:"fixture check",passed:true}]}' >"$smoke_dir/handoff.json"
-target/debug/dock-handoff --socket="$socket" --submit="$smoke_dir/handoff.json" >/dev/null
+target/debug/dock review --socket="$socket" --submit="$smoke_dir/handoff.json" >/dev/null
 target/debug/dock programme --socket="$socket" | jq -e '.gates[0].state == "awaiting_decision"' >/dev/null
-target/debug/dock-handoff --socket="$socket" --run-id=dock_upstream --route=accept-scope --note='release declared edge' >/dev/null
+target/debug/dock review --socket="$socket" --run-id=dock_upstream --route=accept-scope --note='release declared edge' >/dev/null
 target/debug/dock agent --socket="$socket" --run-id=dock_upstream --operation=stop >/dev/null
 target/debug/dock agent --socket="$socket" --run-id=dock_blocker --operation=stop >/dev/null
 wait_terminal() {

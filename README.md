@@ -208,7 +208,9 @@ and the diff, coloured with Dock's own palette. No `delta` or `lazygit` needed;
 `j`/`k` scroll and `g`/`G` jump to either end.
 
 `Ctrl+B i` opens the review queue: the handoffs agents submitted with
-`dock-handoff --submit` and are waiting on a person for. Each shows what the
+`dock handoff`, waiting on a person. The same queue is readable from a shell
+with `dock review --inbox`, and a decision recorded with
+`dock review --run-id=… --route=… --note=…`. Each shows what the
 agent claimed beside what Dock measured — changed files, insertions, deletions,
 branch — so a claim and the evidence for it are read together. `a` accepts the
 scope, `c` requests changes, and either needs a note saying why. **A decision is

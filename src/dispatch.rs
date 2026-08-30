@@ -2252,6 +2252,40 @@ impl RuntimeRegistry {
     ///
     /// Shared by `inspect` and `pulse` so the two cannot drift: they answer the same question and
     /// a difference between them would show as a state that changed when nothing did.
+    /// Which agent a poll should report for one pane, given what the last poll concluded.
+    ///
+    /// Memoised against the process-table generation: an answer read from the snapshot this poll
+    /// is already looking at is still that snapshot's answer, so a quiet pane costs a hash lookup
+    /// rather than a walk. Detection itself walks *down* from the pane's process-group leader by
+    /// parentage, because a job-control shell puts every command the user starts into a new
+    /// process group of its own.
+    ///
+    /// The arm worth naming is the one with no table at all. A poll that could not read the
+    /// process table has not looked, which is a different claim from having looked and found
+    /// nothing — and the difference is not cosmetic, because [`StateTracker::decide`] treats the
+    /// absence of an agent as a *fact* and commits it with no dwell at all, on the reasoning that
+    /// delaying a fact would be holding a guess over it. Answering "no agent" out of the daemon's
+    /// own blindness therefore did not merely report one pane wrongly for one poll: it reset
+    /// every agent on the canvas to idle at once, instantly, with none of the hysteresis that
+    /// protects every other transition. Holding the previous answer keeps the claim honest —
+    /// this pane last had that agent in it and nothing has been seen since to say otherwise.
+    fn resolved_agent(
+        previous: Option<ClassifiedAgent>,
+        generation: u64,
+        table: Option<&ProcessTree>,
+        process_group_id: Option<i32>,
+    ) -> Option<AgentKind> {
+        if let Some(previous) = previous
+            && previous.generation == generation
+        {
+            return previous.agent;
+        }
+        let Some(tree) = table else {
+            return previous.and_then(|previous| previous.agent);
+        };
+        process_group_id.and_then(|leader_pid| tree.agent_under(leader_pid))
+    }
+
     fn resolve_agent(
         &self,
         runtime: &OwnedRuntime,
@@ -2274,15 +2308,7 @@ impl RuntimeRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = cached.get(run_id).copied();
-        let agent = match previous {
-            Some(previous) if previous.generation == generation => previous.agent,
-            // Detection walks *down* from the pane's process-group leader by parentage, because a
-            // job-control shell puts every command the user starts into a new process group of
-            // its own.
-            _ => process_group_id
-                .zip(table)
-                .and_then(|(leader_pid, tree)| tree.agent_under(leader_pid)),
-        };
+        let agent = Self::resolved_agent(previous, generation, table, process_group_id);
         let from_screen = match previous {
             Some(previous) if previous.agent == agent && previous.screen == (mark, size) => {
                 previous.from_screen
@@ -4938,6 +4964,59 @@ mod tests {
             .collect()
     }
 
+    /// A poll that could not read the process table must not answer "there is no agent here".
+    ///
+    /// `decide` commits the absence of an agent with no dwell, so this answer is not one wrong
+    /// pane for one poll — it is every agent on the canvas reset to idle at once.
+    #[test]
+    fn a_poll_with_no_process_table_holds_the_agent_it_last_saw() {
+        // Two panes: one shell with codex started inside it, and one shell with nothing in it.
+        let table = ProcessTree::parse(
+            "\
+  501   1  501 zsh
+  902 501  902 codex
+  777   1  777 zsh
+",
+        );
+        let seen = ClassifiedAgent {
+            generation: 7,
+            agent: Some(AgentKind::Codex),
+            screen: ((1, 0), (24, 80)),
+            from_screen: AgentState::Working.into(),
+        };
+
+        // The table this poll is already looking at: memoised, no walk.
+        assert_eq!(
+            RuntimeRegistry::resolved_agent(Some(seen), 7, Some(&table), Some(902)),
+            Some(AgentKind::Codex)
+        );
+        // A newer table, walked afresh.
+        assert_eq!(
+            RuntimeRegistry::resolved_agent(Some(seen), 8, Some(&table), Some(902)),
+            Some(AgentKind::Codex)
+        );
+        // No table at all — the daemon could not look, so the pane keeps the agent it had. The
+        // generation is deliberately one no snapshot carries, which is what a missing table is
+        // reported as, so the memo above cannot be what answers here.
+        assert_eq!(
+            RuntimeRegistry::resolved_agent(Some(seen), u64::MAX, None, Some(902)),
+            Some(AgentKind::Codex),
+            "a poll that could not read the process table has not looked, \
+             which is not the same as having looked and found nothing"
+        );
+        // …and with nothing previously seen there is genuinely nothing to hold.
+        assert_eq!(
+            RuntimeRegistry::resolved_agent(None, u64::MAX, None, Some(902)),
+            None
+        );
+        // A table that really does say this pane has no agent in it still says so, and the held
+        // answer above must not become a reason to keep reporting one that has exited.
+        assert_eq!(
+            RuntimeRegistry::resolved_agent(Some(seen), 8, Some(&table), Some(777)),
+            None
+        );
+    }
+
     /// A pane writing nothing, with a spinner up the whole time.
     fn spinning(frames: u64) -> Vec<AgentState> {
         replay_read(
@@ -4958,6 +5037,75 @@ mod tests {
             .position(|state| *state == AgentState::Done)
             .expect("the turn has to come back eventually");
         FRAME * (frame as u64 - stopped_at) as u32
+    }
+
+    /// [`replay_read`], with extra reads landing between the event stream's own polls.
+    ///
+    /// `inspect` resolves state through the same tracker the stream does, so every client
+    /// refresh and every `dock inspect` from another terminal adds calls the stream did not
+    /// make. They arrive at their own instants and nobody reads their answers.
+    fn replay_read_interleaved(
+        frames: u64,
+        extra_per_frame: u32,
+        mut output: impl FnMut(u64) -> u64,
+        mut screen: impl FnMut(u64) -> ScreenRead,
+    ) -> Vec<AgentState> {
+        let start = Instant::now();
+        let mut tracker = StateTracker::new((1, 0), start);
+        let mut written = 0;
+        (0..frames)
+            .map(|frame| {
+                let now = start + FRAME * frame as u32;
+                written += output(frame);
+                tracker.observe((1, written), now);
+                let reported = tracker.decide(now, Some(AgentKind::Claude), screen(frame), None);
+                // The interlopers, spread across the gap before the next poll. Same pane, same
+                // screen, later instants — and their answers thrown away, exactly as a snapshot
+                // request's are as far as the stream is concerned.
+                for step in 1..=extra_per_frame {
+                    let later = now + (FRAME / (extra_per_frame + 1)) * step;
+                    tracker.observe((1, written), later);
+                    tracker.decide(later, Some(AgentKind::Claude), screen(frame), None);
+                }
+                reported
+            })
+            .collect()
+    }
+
+    /// A snapshot request must not be able to change what the roster says.
+    ///
+    /// `inspect` and the event stream both drive one `StateTracker`, so a read-shaped call
+    /// mutates the hysteresis that decides when a turn is reported as handed back. That is only
+    /// safe because every arm of the decision is written against the clock rather than against a
+    /// count of calls: an extra poll re-asks a question whose answer depends on elapsed time, so
+    /// it can observe a transition sooner within a frame but can never invent one, shorten
+    /// [`STATE_DWELL`], or leave two callers trading a `pending` neither of them ever commits.
+    ///
+    /// Asserted rather than assumed, because the alternative — threading a read-only path
+    /// through the registry — is a great deal of machinery to buy a property the design already
+    /// has, and nothing but a test can say whether it still has it.
+    #[test]
+    fn a_snapshot_request_between_polls_never_moves_when_the_turn_comes_back() {
+        let stopped_at = 100;
+        let output = |frame: u64| if frame < stopped_at { 60 } else { 0 };
+        let screen = |frame: u64| ScreenRead {
+            state: AgentState::Idle,
+            title_working: frame < stopped_at,
+        };
+
+        let alone = replay_read(700, output, screen);
+        for extra in [1, 3, 7] {
+            let crowded = replay_read_interleaved(700, extra, output, screen);
+            let (quiet, busy) = (handover(&alone, stopped_at), handover(&crowded, stopped_at));
+            // Within one frame: an interloper landing mid-gap can see the dwell elapse before
+            // the next poll would have, which is the poll being early rather than being wrong.
+            let drift = quiet.abs_diff(busy);
+            assert!(
+                drift <= FRAME,
+                "{extra} extra reads per frame moved the handover by {drift:?} \
+                 ({quiet:?} alone, {busy:?} crowded)"
+            );
+        }
     }
 
     /// The case the silence clock is structurally unable to see: an agent that is thinking, has

@@ -40,16 +40,16 @@ head_b=$(git -C "$repo_b" rev-parse HEAD)
 status_a=$(git -C "$repo_a" status --porcelain)
 status_b=$(git -C "$repo_b" status --porcelain)
 
-upstream=$(target/debug/dock-dispatch --socket="$socket" --repo="$repo_a" --task=A-1 \
+upstream=$(target/debug/dock dispatch --socket="$socket" --repo="$repo_a" --task=A-1 \
     --run-id=dock_upstream --worktree="$repo_a" --adapter=fixture -- -c 'sleep 30')
-if target/debug/dock-dispatch --socket="$socket" --repo="$repo_a" --task=A-2 \
+if target/debug/dock dispatch --socket="$socket" --repo="$repo_a" --task=A-2 \
     --run-id=dock_repo_refused --worktree="$repo_a" --adapter=fixture -- -c 'sleep 30' >/dev/null 2>&1; then
     echo "per-repository capacity unexpectedly admitted a second run" >&2; exit 1
 fi
 [ ! -e "$state/dispatches/dock_repo_refused.json" ]
-target/debug/dock-dispatch --socket="$socket" --repo="$repo_b" --task=B-0 \
+target/debug/dock dispatch --socket="$socket" --repo="$repo_b" --task=B-0 \
     --run-id=dock_blocker --worktree="$repo_b" --adapter=fixture -- -c 'sleep 30' >/dev/null
-if target/debug/dock-dispatch --socket="$socket" --repo="$repo_b" --task=B-2 \
+if target/debug/dock dispatch --socket="$socket" --repo="$repo_b" --task=B-2 \
     --run-id=dock_global_refused --worktree="$repo_b" --adapter=fixture -- -c 'sleep 30' >/dev/null 2>&1; then
     echo "global capacity unexpectedly admitted a second run" >&2; exit 1
 fi
@@ -64,7 +64,7 @@ target/debug/dock-programme --socket="$socket" | jq -e '
     ([.repositories[].active_run_ids[]] | sort) == ["dock_blocker", "dock_upstream"] and
     ([.repositories[].queued_run_ids[]] | sort) == ["dock_downstream"] and
     ([.repositories[].active_capacity] | sort) == [1, 1]' >/dev/null
-if target/debug/dock-dispatch --socket="$socket" --repo="$repo_b" --task=B-1 \
+if target/debug/dock dispatch --socket="$socket" --repo="$repo_b" --task=B-1 \
     --run-id=dock_downstream --worktree="$repo_b" --adapter=fixture >/dev/null 2>&1; then
     echo "direct dispatch bypassed a queued dependency gate" >&2; exit 1
 fi

@@ -111,6 +111,11 @@ const VERBS: &[Verb] = &[
         run: dock::cli::agent::run,
     },
     Verb {
+        name: "dispatch",
+        summary: "start an agent run without the dashboard",
+        run: dock::cli::dispatch::run,
+    },
+    Verb {
         name: "inspect",
         summary: "what the daemon knows about a run",
         run: dock::cli::inspect::run,

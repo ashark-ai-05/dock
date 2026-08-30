@@ -28,14 +28,14 @@ git -C "$root" commit -qm fixture
 root=$(cd "$root" && pwd -P)
 
 # Missing discovery must precede every durable/runtime artifact.
-if target/debug/dock-dispatch --socket="$socket" --repo="$root" --task=SMOKE-MISSING \
+if target/debug/dock dispatch --socket="$socket" --repo="$root" --task=SMOKE-MISSING \
     --run-id=dock_missing --worktree="$root" --adapter=generic \
     --executable=/definitely/not/a/dock-agent >/dev/null 2>&1; then
     echo "missing adapter unexpectedly launched" >&2; exit 1
 fi
 [ ! -e "$state/dispatches/dock_missing.json" ]
 
-target/debug/dock-dispatch --socket="$socket" --repo="$root" --task=SMOKE-4 \
+target/debug/dock dispatch --socket="$socket" --repo="$root" --task=SMOKE-4 \
     --run-id=dock_smoke4 --worktree="$root" --adapter=fixture -- -c 'sleep 30' |
     jq -e '.adapter == "fixture" and .provider_state == "unknown"' >/dev/null
 target/debug/dock agent --socket="$socket" --run-id=dock_smoke4 --operation=focus >/dev/null

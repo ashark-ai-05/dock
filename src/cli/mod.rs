@@ -5,5 +5,6 @@
 //! deciding what to print.
 
 pub mod agent;
+pub mod dispatch;
 pub mod inspect;
 pub mod wire;

@@ -312,7 +312,7 @@ Dock's runtime is scriptable without the dashboard. Prove it with the `fixture`
 adapter first:
 
 ```bash
-cargo run --bin dock-dispatch -- \
+cargo run --bin dock -- dispatch \
   --repo="$(pwd)" --task=TRY-1 --run-id=dock_try_1 \
   --worktree="$(pwd)" --adapter=fixture -- -c 'sleep 30'
 cargo run --bin dock -- inspect --run-id=dock_try_1

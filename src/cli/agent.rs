@@ -10,7 +10,7 @@ use crate::{
 const USAGE: &str = "usage: dock agent --run-id=dock_ID \
                      --operation=attach|focus|interrupt|stop|restart [--socket=PATH]";
 
-pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), String> {
+pub(crate) fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), String> {
     let mut socket = None;
     let mut run_id = None;
     let mut operation = None;
@@ -41,11 +41,11 @@ pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), St
     ))
 }
 
-pub fn render(response: Response) -> Result<(), String> {
+pub(crate) fn render(response: Response) -> Result<(), String> {
     match response {
         Response::LifecycleApplied { snapshot, .. } => print_json(&snapshot),
         Response::Error { message, .. } => Err(message),
-        response => Err(format!("unexpected lifecycle response: {response:?}")),
+        response => Err(format!("unexpected agent response: {response:?}")),
     }
 }
 

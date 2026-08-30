@@ -8,6 +8,7 @@ repository = "https://github.com/ashark-ai-05/dock"
 readme = "README.md"
 keywords = ["tmux", "terminal", "multiplexer", "tui", "agents"]
 categories = ["command-line-utilities", "development-tools"]
+autobins = false
 
 [lib]
 name = "dock"

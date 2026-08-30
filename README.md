@@ -388,7 +388,7 @@ scripts/smoke-slice61-macos.sh
 scripts/smoke-slice62-nongit-macos.sh
 ```
 
-Dock speaks protocol v10 — stop any older daemon before connecting.
+Dock speaks protocol v13 — stop any older daemon before connecting.
 
 CI runs the same three gates plus a build on Linux and macOS. Many tests drive
 real PTYs, subprocesses, and signals, so they wait on a wall clock; those

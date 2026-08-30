@@ -22,13 +22,13 @@ const USAGE: &str = "usage: dock review [--socket=PATH] (--inbox | --submit=PACK
 /// requests have three different right answers, and pairing them is a claim worth asserting.
 /// Deleting it would take its test with it.
 #[derive(Debug, Clone, Copy)]
-pub enum ExpectedResponse {
+pub(crate) enum ExpectedResponse {
     Submit,
     Inbox,
     Decision,
 }
 
-pub fn parse_arguments(
+pub(crate) fn parse_arguments(
     args: &[String],
 ) -> Result<(Option<PathBuf>, Request, ExpectedResponse), String> {
     let mut socket = None;
@@ -105,14 +105,14 @@ fn require_expected_response(
     if matches {
         Ok(())
     } else {
-        Err(format!("unexpected operation response: {response:?}"))
+        Err(format!("unexpected review response: {response:?}"))
     }
 }
 
 /// The whole response, not a field of it. Each of the three carries a different payload and
 /// the original printed the envelope; narrowing to an inner field here would quietly change
 /// what every existing script reads.
-pub fn render(expected: ExpectedResponse, response: Response) -> Result<(), String> {
+pub(crate) fn render(expected: ExpectedResponse, response: Response) -> Result<(), String> {
     require_expected_response(expected, &response)?;
     print_json(&response)
 }

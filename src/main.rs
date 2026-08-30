@@ -104,6 +104,37 @@ struct Verb {
     run: fn(&[String]) -> Result<(), String>,
 }
 
+// The six wrappers below exist only to adapt pre-existing `io::Result<()>` functions to
+// `Verb::run`'s `Result<(), String>` — a plain `fn` pointer can't be a closure, so each gets a
+// name. The error's `Display` is what reaches the terminal either way: converting to `String`
+// here and letting the table's shared arm `eprintln!` it is the same text `dock queue` already
+// printed, and it replaces the Debug-formatted `Error: ...` that `main`'s default reporting used
+// to print for the other five.
+
+fn run_detect(args: &[String]) -> Result<(), String> {
+    detect_command(args).map_err(|error| error.to_string())
+}
+
+fn run_agent_state(args: &[String]) -> Result<(), String> {
+    agent_state_command(args).map_err(|error| error.to_string())
+}
+
+fn run_hooks(args: &[String]) -> Result<(), String> {
+    hooks_command(args).map_err(|error| error.to_string())
+}
+
+fn run_handoff(args: &[String]) -> Result<(), String> {
+    handoff_command(args).map_err(|error| error.to_string())
+}
+
+fn run_task(args: &[String]) -> Result<(), String> {
+    task_command(args).map_err(|error| error.to_string())
+}
+
+fn run_queue(args: &[String]) -> Result<(), String> {
+    queue_command(args).map_err(|error| error.to_string())
+}
+
 const VERBS: &[Verb] = &[
     Verb {
         name: "agent",
@@ -111,9 +142,29 @@ const VERBS: &[Verb] = &[
         run: dock::cli::agent::run,
     },
     Verb {
+        name: "agent-state",
+        summary: "report working, blocked, done or idle from a hook",
+        run: run_agent_state,
+    },
+    Verb {
+        name: "detect",
+        summary: "the rules in force, and what they make of a screen",
+        run: run_detect,
+    },
+    Verb {
         name: "dispatch",
         summary: "start an agent run without the dashboard",
         run: dock::cli::dispatch::run,
+    },
+    Verb {
+        name: "handoff",
+        summary: "file a result in the review queue",
+        run: run_handoff,
+    },
+    Verb {
+        name: "hooks",
+        summary: "print or install the hooks that make agent state exact",
+        run: run_hooks,
     },
     Verb {
         name: "inspect",
@@ -126,9 +177,19 @@ const VERBS: &[Verb] = &[
         run: dock::cli::programme::run,
     },
     Verb {
+        name: "queue",
+        summary: "list, add to, or arm and disarm a pane's prompt queue",
+        run: run_queue,
+    },
+    Verb {
         name: "review",
         summary: "read the handoff inbox and record a decision",
         run: dock::cli::review::run,
+    },
+    Verb {
+        name: "task",
+        summary: "list, add, move or show tasks on the board",
+        run: run_task,
     },
     Verb {
         name: "workspace",
@@ -139,7 +200,7 @@ const VERBS: &[Verb] = &[
 
 fn help_text() -> String {
     let mut text = String::from("dock — a terminal multiplexer that understands coding agents\n\n");
-    text.push_str("  dock                 open the dashboard here\n\n");
+    text.push_str("  dock                open the dashboard here\n\n");
     for verb in VERBS {
         text.push_str(&format!("  dock {:<14} {}\n", verb.name, verb.summary));
     }
@@ -162,43 +223,9 @@ fn run_noninteractive_legacy(args: &[String]) -> Result<bool, Box<dyn Error>> {
         .first()
         .and_then(|name| VERBS.iter().find(|verb| verb.name == name))
     {
-        // Printed and exited rather than returned, for the reason `dock queue` already is at
-        // `main.rs:127`: `main` renders an error with `{:?}`, and a scripting surface should not
-        // sign off in Debug format.
-        if let Err(error) = (verb.run)(&args[1..]) {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-        return Ok(true);
-    }
-    if args.first().is_some_and(|first| first == "detect") {
-        detect_command(&args[1..])?;
-        return Ok(true);
-    }
-    if args.first().is_some_and(|first| first == "agent-state") {
-        agent_state_command(&args[1..])?;
-        return Ok(true);
-    }
-    if args.first().is_some_and(|first| first == "hooks") {
-        hooks_command(&args[1..])?;
-        return Ok(true);
-    }
-    if args.first().is_some_and(|first| first == "handoff") {
-        handoff_command(&args[1..])?;
-        return Ok(true);
-    }
-    if args.first().is_some_and(|first| first == "task") {
-        task_command(&args[1..])?;
-        return Ok(true);
-    }
-    // Unlike every other arm here, `dock queue` talks to the daemon rather than to files —
-    // `dock task` writes the board, the queue lives in dockd. Parsing is pure and tested
-    // (`parse_queue_command`); the socket call is a separate change and is not here yet.
-    if args.first().is_some_and(|first| first == "queue") {
         // Printed and exited rather than returned: `main` renders an error with `{:?}`, and a
-        // command whose whole job is to tell somebody what their queues are doing should not
-        // sign off in Debug format. `dock hooks --check` does the same for the same reason.
-        if let Err(error) = queue_command(&args[1..]) {
+        // scripting surface should not sign off in Debug format.
+        if let Err(error) = (verb.run)(&args[1..]) {
             eprintln!("{error}");
             std::process::exit(1);
         }
@@ -3091,6 +3118,21 @@ mod terminal_tests {
         assert!(
             VERBS.windows(2).all(|pair| pair[0].name < pair[1].name),
             "VERBS is listed in the order --help prints, so it is kept sorted"
+        );
+        // Twelve, not six: the folded scripting verbs and the six commands a person actually
+        // types are one table now, so a command dispatched outside it would move this count.
+        assert_eq!(
+            VERBS.len(),
+            12,
+            "a verb was added to or removed from dispatch without this count following"
+        );
+        assert!(
+            VERBS.iter().any(|verb| verb.name == "task"),
+            "task is dispatched outside the table"
+        );
+        assert!(
+            VERBS.iter().any(|verb| verb.name == "inspect"),
+            "inspect is dispatched outside the table"
         );
     }
 }

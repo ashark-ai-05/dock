@@ -9,7 +9,7 @@ use crate::{
 
 const USAGE: &str = "usage: dock inspect [--run-id=dock_ID] [--socket=PATH]";
 
-pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), String> {
+pub(crate) fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), String> {
     let mut socket = None;
     let mut run_id = None;
     for argument in args {
@@ -24,7 +24,7 @@ pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), St
     Ok((socket, Request::Inspect(InspectRequest { run_id })))
 }
 
-pub fn render(response: Response) -> Result<(), String> {
+pub(crate) fn render(response: Response) -> Result<(), String> {
     match response {
         Response::Snapshot { snapshot } => print_json(&snapshot),
         Response::Snapshots { snapshots } => print_json(&snapshots),

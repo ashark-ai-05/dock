@@ -3,6 +3,11 @@
 //! Six binaries each carried a private copy of these twenty lines, which meant six places for
 //! the framing to drift and six places a handshake could be forgotten. One copy, and a verb is
 //! left with the only two things that are actually its own: what it parses, and what it prints.
+//!
+//! `Connection::open` reads like `Client::connect` in `crate::client` because it is doing the
+//! same handshake over the same kind of socket. They stay two types on purpose: `Client` also
+//! carries the unread-reply draining and subscription bookkeeping a long-lived dashboard session
+//! needs, none of which a verb that sends one request and exits has any use for.
 
 use std::{
     io::{BufRead, BufReader, Write},
@@ -17,13 +22,13 @@ use crate::{
 
 /// One request, newline-framed. Generic over the sink so the framing is testable without a
 /// socket, which is the whole reason a codec is worth separating from a connection.
-pub fn encode(request: &Request, out: &mut impl Write) -> Result<(), String> {
+pub(crate) fn encode(request: &Request, out: &mut impl Write) -> Result<(), String> {
     serde_json::to_writer(&mut *out, request).map_err(|error| error.to_string())?;
     out.write_all(b"\n").map_err(|error| error.to_string())
 }
 
 /// One response, read back from a line.
-pub fn decode(reader: &mut impl BufRead) -> Result<Response, String> {
+pub(crate) fn decode(reader: &mut impl BufRead) -> Result<Response, String> {
     let mut line = String::new();
     if reader
         .read_line(&mut line)
@@ -39,13 +44,13 @@ pub fn decode(reader: &mut impl BufRead) -> Result<Response, String> {
 ///
 /// Opening one performs the `Hello` exchange, because a connection that has not agreed a
 /// protocol version is not usable and every caller did it identically anyway.
-pub struct Connection {
+pub(crate) struct Connection {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
 }
 
 impl Connection {
-    pub fn open(socket: Option<PathBuf>) -> Result<Self, String> {
+    pub(crate) fn open(socket: Option<PathBuf>) -> Result<Self, String> {
         let socket = socket.map_or_else(paths::default_socket_path, Ok)?;
         let stream = UnixStream::connect(&socket)
             .map_err(|error| format!("could not connect to {}: {error}", socket.display()))?;
@@ -62,14 +67,14 @@ impl Connection {
         }
     }
 
-    pub fn request(&mut self, request: &Request) -> Result<Response, String> {
+    pub(crate) fn request(&mut self, request: &Request) -> Result<Response, String> {
         encode(request, &mut self.stream)?;
         decode(&mut self.reader)
     }
 }
 
 /// What every one of these verbs does with the answer it got.
-pub fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
+pub(crate) fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
     println!(
         "{}",
         serde_json::to_string_pretty(value).map_err(|error| error.to_string())?

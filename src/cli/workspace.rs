@@ -13,7 +13,7 @@ const USAGE: &str = "usage: dock workspace [--socket=PATH] inspect | create ID N
     resize WORKSPACE PANE RATIO_MILLI | rename-workspace WORKSPACE NAME | \
     rename-pane WORKSPACE PANE NAME | close WORKSPACE PANE | respawn WORKSPACE PANE";
 
-pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), String> {
+pub(crate) fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), String> {
     // Taken out first: the operation is matched on position, so a flag left among the
     // positionals would be read as part of the operation's name.
     let mut rest: Vec<String> = Vec::with_capacity(args.len());
@@ -86,7 +86,7 @@ pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), St
     Ok((socket, Request::Workspace(operation)))
 }
 
-pub fn render(response: Response) -> Result<(), String> {
+pub(crate) fn render(response: Response) -> Result<(), String> {
     match response {
         Response::Layout { layout } => print_json(&layout),
         Response::WorkspaceChanged { workspace } => print_json(&workspace),

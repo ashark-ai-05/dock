@@ -16,7 +16,7 @@ const USAGE: &str = "usage: dock dispatch --repo=PATH --task=REF --worktree=PATH
                      [--adapter=fixture|amp|claude-code|codex-cli|github-copilot-cli|generic] \
                      [--executable=PATH] [--socket=PATH] -- [ARG ...]";
 
-pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), String> {
+pub(crate) fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), String> {
     let mut socket = None;
     let mut repository_root = None;
     let mut task = None;
@@ -76,7 +76,7 @@ pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), St
 }
 
 /// Unique without coordinating with anything: this process, and the moment it asked.
-pub fn generate_run_id() -> String {
+fn generate_run_id() -> String {
     format!(
         "dock_{}_{}",
         std::process::id(),
@@ -87,7 +87,7 @@ pub fn generate_run_id() -> String {
     )
 }
 
-pub fn render(response: Response) -> Result<(), String> {
+pub(crate) fn render(response: Response) -> Result<(), String> {
     match response {
         Response::Dispatched { snapshot } => print_json(&snapshot),
         Response::Error { message, .. } => Err(message),

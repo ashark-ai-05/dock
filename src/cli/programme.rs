@@ -1,3 +1,9 @@
+//! `dock programme` — capacity and dependency gates across more than one repository.
+//!
+//! The other verbs each ask one daemon about one run; a programme spans repositories a single
+//! `dock` cannot see at once, so this is the one place a downstream run is queued gated on an
+//! upstream one, and released once that gate clears.
+
 use std::path::PathBuf;
 
 use crate::{
@@ -10,7 +16,11 @@ use crate::{
     },
 };
 
-pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), String> {
+const USAGE: &str = "usage: dock programme [--socket=PATH] (--release=dock_ID | \
+                     [--upstream-run-id=dock_ID --required-route=accept-scope|request-change \
+                     --repo=PATH --task=REF --run-id=dock_ID --worktree=PATH])";
+
+pub(crate) fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), String> {
     let mut socket = None;
     let mut release = None;
     let mut upstream = None;
@@ -55,7 +65,7 @@ pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), St
             queue_flag_seen = true;
             worktree = Some(v.to_owned());
         } else {
-            return Err(format!("unknown option {arg:?}"));
+            return Err(format!("unknown option {arg:?}; {USAGE}"));
         }
     }
     if release.is_some() && queue_flag_seen {
@@ -87,7 +97,7 @@ pub fn parse_arguments(args: &[String]) -> Result<(Option<PathBuf>, Request), St
 
 /// Render the daemon's response the way each of `programme`'s three requests wants it shown:
 /// the portfolio, a freshly queued gate, or the snapshot a release just unblocked.
-pub fn render(response: Response) -> Result<(), String> {
+pub(crate) fn render(response: Response) -> Result<(), String> {
     match response {
         Response::Programme { portfolio } => print_json(&portfolio),
         Response::GateQueued { gate } => print_json(&gate),

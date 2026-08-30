@@ -583,7 +583,7 @@ fn stream_events(
                 StreamFrame::Delta(bytes) if bytes.is_empty() => {}
                 StreamFrame::Delta(bytes) => {
                     let revision = revisions.get(&snapshot.run_id).copied().unwrap_or(0) + 1;
-                    write_response(
+                    if !push_response(
                         stream,
                         &Response::Stream {
                             event: Event::PaneDelta {
@@ -592,14 +592,17 @@ fn stream_events(
                                 bytes: STANDARD.encode(&bytes),
                             },
                         },
-                    )?;
+                    )? {
+                        // The subscriber left. That is the end of the stream, not a failure of it.
+                        return Ok(());
+                    }
                     revisions.insert(snapshot.run_id.clone(), revision);
                 }
                 StreamFrame::Seed(seed) => {
                     let (view, history_from, bytes) = *seed;
                     let revision = revisions.get(&snapshot.run_id).copied().unwrap_or(0) + 1;
                     let epoch = view.epoch;
-                    write_response(
+                    if !push_response(
                         stream,
                         &Response::Stream {
                             event: Event::PaneAttached {
@@ -628,7 +631,10 @@ fn stream_events(
                                 screen: STANDARD.encode(&bytes),
                             },
                         },
-                    )?;
+                    )? {
+                        // The subscriber left. That is the end of the stream, not a failure of it.
+                        return Ok(());
+                    }
                     // Recorded only once the seed is on the wire, so a failed write cannot
                     // leave this loop believing the subscriber is attached.
                     syncs.insert(snapshot.run_id.clone(), view);
@@ -636,7 +642,7 @@ fn stream_events(
                 }
             }
             if process_states.get(&snapshot.run_id) != Some(&snapshot.state) {
-                write_response(
+                if !push_response(
                     stream,
                     &Response::Stream {
                         event: Event::PaneState {
@@ -644,14 +650,17 @@ fn stream_events(
                             state: snapshot.state.clone(),
                         },
                     },
-                )?;
+                )? {
+                    // The subscriber left. That is the end of the stream, not a failure of it.
+                    return Ok(());
+                }
                 // Recorded only after the write succeeded, so a failed write cannot convince
                 // this loop that the subscriber already knows.
                 process_states.insert(snapshot.run_id.clone(), snapshot.state.clone());
             }
             let current = (snapshot.agent, snapshot.agent_state);
             if states.get(&snapshot.run_id) != Some(&current) {
-                write_response(
+                if !push_response(
                     stream,
                     &Response::Stream {
                         event: Event::AgentStateChanged {
@@ -660,7 +669,10 @@ fn stream_events(
                             state: current.1,
                         },
                     },
-                )?;
+                )? {
+                    // The subscriber left. That is the end of the stream, not a failure of it.
+                    return Ok(());
+                }
                 states.insert(snapshot.run_id, current);
             }
         }
@@ -670,7 +682,7 @@ fn stream_events(
                 if queue_revisions.get(&key) == Some(&revision) {
                     continue;
                 }
-                write_response(
+                if !push_response(
                     stream,
                     &Response::Stream {
                         event: Event::QueueChanged {
@@ -678,7 +690,10 @@ fn stream_events(
                             pane_id: key.1.clone(),
                         },
                     },
-                )?;
+                )? {
+                    // The subscriber left. That is the end of the stream, not a failure of it.
+                    return Ok(());
+                }
                 // Recorded only once the frame is on the wire, exactly as every other change
                 // above is, so a failed write cannot convince this loop the client already knows.
                 queue_revisions.insert(key, revision);
@@ -940,25 +955,73 @@ fn read_request(
 /// write makes the message all-or-nothing, and a departed daemon reads as the clean end of a
 /// connection, which callers already handle and can explain.
 fn write_response(stream: &mut UnixStream, response: &Response) -> Result<(), String> {
+    let message = frame_response(response)?;
+    stream.write_all(&message).map_err(describe_write_failure)
+}
+
+/// One response, serialised and newline-framed, ready for a single write.
+fn frame_response(response: &Response) -> Result<Vec<u8>, String> {
     let mut message = serde_json::to_vec(response).map_err(|error| error.to_string())?;
     message.push(b'\n');
-    stream.write_all(&message).map_err(|error| {
-        // A client that stops reading is worth naming, because the shape of the failure hides
-        // it: replies it never collects fill the socket, this write blocks, the write timeout
-        // ends it, and the connection closes. The client then fails on whatever it sent next,
-        // which is never the thing at fault. "Broken pipe" told nobody any of that.
-        if matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        ) {
-            return format!(
-                "client stopped reading its replies, so a {}s write timed out and the \
-                 connection was closed; it will see this as a broken pipe on its next request",
-                CLIENT_WRITE_TIMEOUT.as_secs()
-            );
-        }
-        error.to_string()
-    })
+    Ok(message)
+}
+
+/// Whether a failed write means the peer closed rather than the write itself going wrong.
+///
+/// Three kinds rather than one because which of them a departure surfaces as is not ours to
+/// choose: it depends on how far the peer got through its own teardown, and on the platform.
+fn client_departed(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
+/// One pushed frame. `Ok(false)` is a client that has gone.
+///
+/// A subscriber's departure is the clean end of a stream, and [`stream_events`] already reaches
+/// that verdict through [`subscriber_is_present`]. A write that discovers the same departure has
+/// discovered the same fact and must reach the same verdict — and before this it did not: the
+/// probe returned `Ok(())` while the write returned `Err`, so which of the two noticed first
+/// decided whether a client walking away was reported as a clean end or as a failure.
+///
+/// That race ran on every pass of the loop, and the write usually won it. The probe is a
+/// zero-length `send`, which a peer that has just closed generally accepts — so the loop
+/// carried on and failed on the first real frame it tried to push. It surfaced as an
+/// intermittent `Err("Broken pipe (os error 32)")`, about twice in a hundred runs locally and
+/// once in CI on Linux.
+///
+/// Deliberately separate from [`write_response`]: on the request/reply path a broken pipe really
+/// is a failure — there is a reply nobody received — and only a *pushed* frame is one nobody
+/// asked for and nobody is owed.
+fn push_response(stream: &mut UnixStream, response: &Response) -> Result<bool, String> {
+    let message = frame_response(response)?;
+    match stream.write_all(&message) {
+        Ok(()) => Ok(true),
+        Err(error) if client_departed(&error) => Ok(false),
+        Err(error) => Err(describe_write_failure(error)),
+    }
+}
+
+/// What a failed write to a client is called, when it is genuinely a failure.
+fn describe_write_failure(error: std::io::Error) -> String {
+    // A client that stops reading is worth naming, because the shape of the failure hides
+    // it: replies it never collects fill the socket, this write blocks, the write timeout
+    // ends it, and the connection closes. The client then fails on whatever it sent next,
+    // which is never the thing at fault. "Broken pipe" told nobody any of that.
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) {
+        return format!(
+            "client stopped reading its replies, so a {}s write timed out and the \
+             connection was closed; it will see this as a broken pipe on its next request",
+            CLIENT_WRITE_TIMEOUT.as_secs()
+        );
+    }
+    error.to_string()
 }
 
 #[cfg(test)]
@@ -1442,6 +1505,49 @@ mod tests {
             "and say what the client will see, got {reason:?}"
         );
         drop(client.take_error());
+    }
+
+    /// A push that finds its client gone is the clean end of a stream, not a failure of one.
+    ///
+    /// `a_subscriber_whose_client_has_gone_stops_being_polled` asserts the same property, but it
+    /// can only assert it about whichever discovery path happens to win the race — and for a
+    /// long time the losing path was wrong, which showed up as that test failing about twice in
+    /// a hundred runs. This one removes the race: the peer is already gone before the first
+    /// write, so the write is certainly the discoverer.
+    #[test]
+    fn a_push_to_a_departed_client_is_the_clean_end_of_a_stream() {
+        let (client, mut server) = UnixStream::pair().expect("socket pair");
+        drop(client);
+        let frame = Response::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        // A departure can take a write or two to surface, depending on how much the socket will
+        // still accept; what it may never do is surface as an error.
+        for _ in 0..8 {
+            match push_response(&mut server, &frame) {
+                Ok(true) => continue,
+                Ok(false) => return,
+                Err(error) => panic!("a departed client must not fail the stream: {error}"),
+            }
+        }
+        panic!("the push never noticed its client had gone");
+    }
+
+    /// …and the reply path still calls it a failure, because there it is one: a reply was owed
+    /// to a request and nobody received it. Only a pushed frame is one nobody asked for.
+    #[test]
+    fn a_reply_to_a_departed_client_is_still_a_failure() {
+        let (client, mut server) = UnixStream::pair().expect("socket pair");
+        drop(client);
+        let frame = Response::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        for _ in 0..8 {
+            if write_response(&mut server, &frame).is_err() {
+                return;
+            }
+        }
+        panic!("a reply to a departed client must eventually be reported as a failure");
     }
 
     #[test]

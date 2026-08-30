@@ -990,6 +990,69 @@ fn dispatch_prompt(task_id: u64, title: &str, body: &str) -> String {
 }
 
 #[cfg(test)]
+mod handoff_response_tests {
+    use super::*;
+    use dock::protocol::PROTOCOL_VERSION;
+
+    fn line(response: &Response) -> String {
+        serde_json::to_string(response).expect("a response serialises")
+    }
+
+    /// The two answers the exchange is actually owed, and nothing else.
+    #[test]
+    fn each_step_accepts_only_the_answer_it_asked_for() {
+        assert_eq!(
+            require_handoff_response(
+                &line(&Response::Hello {
+                    version: PROTOCOL_VERSION
+                }),
+                HandoffStep::Handshake
+            ),
+            Ok(())
+        );
+        // …and a handshake is not an answer to a submission, however well-formed it is.
+        assert!(
+            require_handoff_response(
+                &line(&Response::Hello {
+                    version: PROTOCOL_VERSION
+                }),
+                HandoffStep::Submit
+            )
+            .is_err()
+        );
+    }
+
+    /// Every one of these used to print `handed off for review`.
+    #[test]
+    fn nothing_that_is_not_the_owed_answer_passes_for_success() {
+        // A line the daemon never sent, which is what an EOF leaves behind.
+        assert!(require_handoff_response("", HandoffStep::Submit).is_err());
+        // A line that is not a response at all.
+        assert!(require_handoff_response("{\"nonsense\":1}\n", HandoffStep::Submit).is_err());
+        // A daemon speaking a protocol this dock does not.
+        let mismatch = require_handoff_response(
+            &line(&Response::Hello {
+                version: PROTOCOL_VERSION + 1,
+            }),
+            HandoffStep::Handshake,
+        )
+        .expect_err("a protocol mismatch must not read as a filed handoff");
+        assert!(mismatch.contains("was not filed"), "{mismatch}");
+        // The daemon's own refusal, passed through in its own words.
+        assert_eq!(
+            require_handoff_response(
+                &line(&Response::Error {
+                    code: dock::protocol::ErrorCode::RunNotFound,
+                    message: "no Dock-owned run dock_7".into(),
+                }),
+                HandoffStep::Submit
+            ),
+            Err("no Dock-owned run dock_7".into())
+        );
+    }
+}
+
+#[cfg(test)]
 mod hook_check_tests {
     use super::{Verdict, hook_events, missing_hook_events, resolve_on_path, verdict};
 
@@ -1841,24 +1904,94 @@ fn handoff_command(args: &[String]) -> io::Result<()> {
             .try_clone()
             .map_err(|error| io::Error::other(format!("could not read the daemon: {error}")))?,
     );
-    for request in [
-        serde_json::to_string(&Request::Hello(dock::protocol::HelloRequest {
-            version: dock::protocol::PROTOCOL_VERSION,
-        }))?,
-        serde_json::to_string(&Request::SubmitHandoff(
-            dock::protocol::SubmitHandoffRequest { packet },
-        ))?,
+    for (request, owed) in [
+        (
+            serde_json::to_string(&Request::Hello(dock::protocol::HelloRequest {
+                version: dock::protocol::PROTOCOL_VERSION,
+            }))?,
+            HandoffStep::Handshake,
+        ),
+        (
+            serde_json::to_string(&Request::SubmitHandoff(
+                dock::protocol::SubmitHandoffRequest { packet },
+            ))?,
+            HandoffStep::Submit,
+        ),
     ] {
         stream.write_all(request.as_bytes())?;
         stream.write_all(b"\n")?;
         let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if let Ok(Response::Error { message, .. }) = serde_json::from_str::<Response>(&line) {
-            return Err(io::Error::other(message));
+        // A read of zero bytes is the daemon having gone, not an empty answer. It arrives as
+        // `Ok(0)` rather than as an error, which is exactly how it used to pass for success:
+        // the empty line failed to parse, the parse failure was discarded, and the loop went on
+        // to print that the handoff had been filed.
+        if reader.read_line(&mut line)? == 0 {
+            return Err(io::Error::other(
+                "the daemon closed the connection before answering; the handoff was not filed",
+            ));
         }
+        require_handoff_response(&line, owed).map_err(io::Error::other)?;
     }
     println!("handed off for review");
     Ok(())
+}
+
+/// Which answer the daemon owes one step of the handoff exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffStep {
+    Handshake,
+    Submit,
+}
+
+/// Whether the daemon gave the answer this step was owed.
+///
+/// Anything else is an error, and that is the whole point. This exchange used to look only for
+/// `Response::Error` and treat everything else as success — an unparseable line, a handshake at a
+/// protocol this dock does not speak, an answer to somebody else's question — and then print
+/// `handed off for review`.
+///
+/// Telling an agent its work was filed when it was not is the one wrong answer this command
+/// cannot afford to give. The agent has finished; it will not check again; and the person the
+/// handoff was for never learns there was anything to look at. A refusal the agent can read is
+/// recoverable, and silence dressed as success is not.
+fn require_handoff_response(line: &str, owed: HandoffStep) -> Result<(), String> {
+    let response: Response = serde_json::from_str(line).map_err(|error| {
+        format!("the daemon sent something this dock could not read ({error}); the handoff was not filed")
+    })?;
+    match (owed, response) {
+        // The daemon's own refusal, in its own words: it is already the clearest thing available.
+        (_, Response::Error { message, .. }) => Err(message),
+        (HandoffStep::Handshake, Response::Hello { version })
+            if version == dock::protocol::PROTOCOL_VERSION =>
+        {
+            Ok(())
+        }
+        (HandoffStep::Handshake, Response::Hello { version }) => Err(format!(
+            "the daemon speaks protocol {version} and this dock speaks {}; \
+             the handoff was not filed",
+            dock::protocol::PROTOCOL_VERSION
+        )),
+        (HandoffStep::Submit, Response::HandoffSubmitted { .. }) => Ok(()),
+        (owed, response) => Err(format!(
+            "the daemon answered with {} where the {} step expected its own reply; \
+             the handoff was not filed",
+            response_name(&response),
+            match owed {
+                HandoffStep::Handshake => "handshake",
+                HandoffStep::Submit => "submit",
+            }
+        )),
+    }
+}
+
+/// A response's variant, for saying which one turned up where another was owed.
+fn response_name(response: &Response) -> &'static str {
+    match response {
+        Response::Hello { .. } => "a handshake",
+        Response::HandoffSubmitted { .. } => "a handoff receipt",
+        Response::Error { .. } => "an error",
+        _ => "an unrelated reply",
+    }
 }
 
 /// `dock task` — the board, from a shell or from an agent.

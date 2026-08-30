@@ -2165,7 +2165,7 @@ fn queue_command(args: &[String]) -> io::Result<()> {
     let command = parse_queue_command(args).map_err(io::Error::other)?;
     // The first arm of `run_noninteractive_legacy` that talks to the daemon. Every other one
     // reads or writes files; a queue lives in the daemon because the daemon is what feeds it, so
-    // this opens a client the way `dock-dispatch` does rather than touching the state directory.
+    // this opens a client the way `dock dispatch` does rather than touching the state directory.
     let runtime_directory = std::env::current_dir()?;
     let (default_socket, _) =
         paths::runtime_paths_for(&runtime_directory).map_err(io::Error::other)?;

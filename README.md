@@ -323,7 +323,7 @@ Swap `fixture` for `amp`, `claude-code`, `codex-cli`, or `github-copilot-cli`.
 Dock checks the binary exists before creating a run; agent authentication stays
 with that agent's own setup.
 
-`dock-workspace` manages panes non-interactively, and `dock-programme` inspects
+`dock workspace` manages panes non-interactively, and `dock-programme` inspects
 multi-repository capacity and dependency gates.
 
 ## Safety

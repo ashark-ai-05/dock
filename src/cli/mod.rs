@@ -8,3 +8,4 @@ pub mod agent;
 pub mod dispatch;
 pub mod inspect;
 pub mod wire;
+pub mod workspace;

@@ -23,5 +23,5 @@ termios field through the retained slave descriptor without masking any flag in 
 comparison. On explicit `q` quit, Dock restores the complete entry termios snapshot. The harness drives
 safe debug test keys through create/launch/quit, reconnects via the dashboard, checks
 alternate-screen enter/leave bytes in the PTY transcript, and checks restricted socket and Git
-immutability evidence. Direct headless and `dock-workspace` commands remain compatible but are
+immutability evidence. Direct headless and `dock workspace` commands remain compatible but are
 deliberately absent from this user-path smoke.

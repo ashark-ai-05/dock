@@ -20,9 +20,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$root"
-cargo build --quiet --bin dockd --bin dock-workspace
+cargo build --quiet --bin dockd --bin dock
 dockd="$root/target/debug/dockd"
-workspace="$root/target/debug/dock-workspace"
+dock="$root/target/debug/dock"
 
 git init -q "$repo"
 git -C "$repo" config user.email dock@example.invalid
@@ -56,17 +56,17 @@ start() {
 
 cd "$repo"
 start
-"$workspace" --socket="$socket" create daily "Daily runtime" pane_one >/dev/null
-"$workspace" --socket="$socket" split daily pane_one pane_two vertical >/dev/null
-"$workspace" --socket="$socket" resize daily pane_two 650 >/dev/null
-"$workspace" --socket="$socket" focus daily pane_one >/dev/null
-"$workspace" --socket="$socket" rename-pane daily pane_one editor >/dev/null
+"$dock" workspace --socket="$socket" create daily "Daily runtime" pane_one >/dev/null
+"$dock" workspace --socket="$socket" split daily pane_one pane_two vertical >/dev/null
+"$dock" workspace --socket="$socket" resize daily pane_two 650 >/dev/null
+"$dock" workspace --socket="$socket" focus daily pane_one >/dev/null
+"$dock" workspace --socket="$socket" rename-pane daily pane_one editor >/dev/null
 kill "$daemon_pid"
 wait "$daemon_pid" 2>/dev/null || true
 daemon_pid=
 rm -f "$socket"
 start
-output=$("$workspace" --socket="$socket" inspect)
+output=$("$dock" workspace --socket="$socket" inspect)
 echo "$output" | grep -q '"workspace_id": "daily"'
 # The pane name set before the restart proves this is a restore, not a fresh create.
 echo "$output" | grep -q '"name": "editor"'

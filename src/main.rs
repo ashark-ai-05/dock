@@ -120,6 +120,11 @@ const VERBS: &[Verb] = &[
         summary: "what the daemon knows about a run",
         run: dock::cli::inspect::run,
     },
+    Verb {
+        name: "workspace",
+        summary: "create, split, focus, rename and close panes",
+        run: dock::cli::workspace::run,
+    },
 ];
 
 fn help_text() -> String {

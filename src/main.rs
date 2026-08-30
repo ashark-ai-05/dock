@@ -94,11 +94,56 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// One non-interactive verb: how it is spelled, what `--help` says about it, and what runs.
+///
+/// A single table read by both dispatch and `--help`, so the two cannot disagree about which
+/// verbs exist. Kept sorted, because that is the order `--help` prints.
+struct Verb {
+    name: &'static str,
+    summary: &'static str,
+    run: fn(&[String]) -> Result<(), String>,
+}
+
+const VERBS: &[Verb] = &[Verb {
+    name: "inspect",
+    summary: "what the daemon knows about a run",
+    run: dock::cli::inspect::run,
+}];
+
+fn help_text() -> String {
+    let mut text = String::from("dock — a terminal multiplexer that understands coding agents\n\n");
+    text.push_str("  dock                 open the dashboard here\n\n");
+    for verb in VERBS {
+        text.push_str(&format!("  dock {:<14} {}\n", verb.name, verb.summary));
+    }
+    text
+}
+
 fn run_noninteractive_legacy(args: &[String]) -> Result<bool, Box<dyn Error>> {
     let dock_dir = args
         .iter()
         .find_map(|argument| argument.strip_prefix("--dock-dir=").map(str::to_owned))
         .unwrap_or_else(|| ".dock/local".into());
+    if args
+        .first()
+        .is_some_and(|first| first == "--help" || first == "-h")
+    {
+        println!("{}", help_text());
+        return Ok(true);
+    }
+    if let Some(verb) = args
+        .first()
+        .and_then(|name| VERBS.iter().find(|verb| verb.name == name))
+    {
+        // Printed and exited rather than returned, for the reason `dock queue` already is at
+        // `main.rs:127`: `main` renders an error with `{:?}`, and a scripting surface should not
+        // sign off in Debug format.
+        if let Err(error) = (verb.run)(&args[1..]) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return Ok(true);
+    }
     if args.first().is_some_and(|first| first == "detect") {
         detect_command(&args[1..])?;
         return Ok(true);
@@ -2996,5 +3041,29 @@ mod terminal_tests {
         assert_eq!(unsafe { libc::cfgetospeed(&restored.termios) }, unsafe {
             libc::cfgetospeed(&original.termios)
         });
+    }
+
+    #[test]
+    fn every_verb_is_dispatchable_and_documented() {
+        // Two lists of the same verbs is how a command comes to exist without appearing in
+        // `--help`, or appear in `--help` without existing. There is one list, and this is what
+        // holds it to being one.
+        let help = help_text();
+        for verb in VERBS {
+            assert!(
+                help.contains(verb.name),
+                "{} is dispatchable but absent from --help:\n{help}",
+                verb.name
+            );
+            assert!(
+                !verb.summary.is_empty(),
+                "{} has no summary to print",
+                verb.name
+            );
+        }
+        assert!(
+            VERBS.windows(2).all(|pair| pair[0].name < pair[1].name),
+            "VERBS is listed in the order --help prints, so it is kept sorted"
+        );
     }
 }

@@ -4,4 +4,5 @@
 //! them is what makes a verb testable at all — parsing needs no daemon, and neither does
 //! deciding what to print.
 
+pub mod inspect;
 pub mod wire;

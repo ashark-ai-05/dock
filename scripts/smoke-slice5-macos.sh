@@ -82,7 +82,7 @@ wait_terminal() {
     stopped_run=$1
     attempts=0
     while [ "$attempts" -lt 100 ]; do
-        state=$(target/debug/dock-inspect --socket="$socket" --run-id="$stopped_run" | jq -r '.state | if type == "string" then . else keys[0] end')
+        state=$(target/debug/dock inspect --socket="$socket" --run-id="$stopped_run" | jq -r '.state | if type == "string" then . else keys[0] end')
         [ "$state" = exited ] && return 0
         attempts=$((attempts + 1))
         sleep 0.05

@@ -315,7 +315,7 @@ adapter first:
 cargo run --bin dock-dispatch -- \
   --repo="$(pwd)" --task=TRY-1 --run-id=dock_try_1 \
   --worktree="$(pwd)" --adapter=fixture -- -c 'sleep 30'
-cargo run --bin dock-inspect  -- --run-id=dock_try_1
+cargo run --bin dock -- inspect --run-id=dock_try_1
 cargo run --bin dock-agent    -- --run-id=dock_try_1 --operation=stop
 ```
 

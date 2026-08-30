@@ -38,9 +38,9 @@ fi
 target/debug/dock-dispatch --socket="$socket" --repo="$root" --task=SMOKE-4 \
     --run-id=dock_smoke4 --worktree="$root" --adapter=fixture -- -c 'sleep 30' |
     jq -e '.adapter == "fixture" and .provider_state == "unknown"' >/dev/null
-target/debug/dock-agent --socket="$socket" --run-id=dock_smoke4 --operation=focus >/dev/null
-target/debug/dock-agent --socket="$socket" --run-id=dock_smoke4 --operation=interrupt >/dev/null
-target/debug/dock-agent --socket="$socket" --run-id=dock_smoke4 --operation=restart |
+target/debug/dock agent --socket="$socket" --run-id=dock_smoke4 --operation=focus >/dev/null
+target/debug/dock agent --socket="$socket" --run-id=dock_smoke4 --operation=interrupt >/dev/null
+target/debug/dock agent --socket="$socket" --run-id=dock_smoke4 --operation=restart |
     jq -e '.state == "running"' >/dev/null
-target/debug/dock-agent --socket="$socket" --run-id=dock_smoke4 --operation=stop >/dev/null
+target/debug/dock agent --socket="$socket" --run-id=dock_smoke4 --operation=stop >/dev/null
 echo "Slice 4 fixture adapter lifecycle smoke passed"

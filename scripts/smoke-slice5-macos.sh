@@ -76,8 +76,8 @@ printf '%s\n' "$upstream" | jq '{schema_version:1,run_id,task_id:.external_task_
 target/debug/dock-handoff --socket="$socket" --submit="$smoke_dir/handoff.json" >/dev/null
 target/debug/dock-programme --socket="$socket" | jq -e '.gates[0].state == "awaiting_decision"' >/dev/null
 target/debug/dock-handoff --socket="$socket" --run-id=dock_upstream --route=accept-scope --note='release declared edge' >/dev/null
-target/debug/dock-agent --socket="$socket" --run-id=dock_upstream --operation=stop >/dev/null
-target/debug/dock-agent --socket="$socket" --run-id=dock_blocker --operation=stop >/dev/null
+target/debug/dock agent --socket="$socket" --run-id=dock_upstream --operation=stop >/dev/null
+target/debug/dock agent --socket="$socket" --run-id=dock_blocker --operation=stop >/dev/null
 wait_terminal() {
     stopped_run=$1
     attempts=0
@@ -104,7 +104,7 @@ target/debug/dock-programme --socket="$socket" | jq -e '
     ([.repositories[].queued_run_ids[]] | sort) == [] and
     ([.repositories[].active_capacity] | sort) == [1] and
     (.gates | length) == 0' >/dev/null
-target/debug/dock-agent --socket="$socket" --run-id=dock_downstream --operation=stop >/dev/null
+target/debug/dock agent --socket="$socket" --run-id=dock_downstream --operation=stop >/dev/null
 wait_terminal dock_downstream
 target/debug/dock-programme --socket="$socket" | jq -e '
     .global_active == 0 and

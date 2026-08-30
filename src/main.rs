@@ -104,11 +104,18 @@ struct Verb {
     run: fn(&[String]) -> Result<(), String>,
 }
 
-const VERBS: &[Verb] = &[Verb {
-    name: "inspect",
-    summary: "what the daemon knows about a run",
-    run: dock::cli::inspect::run,
-}];
+const VERBS: &[Verb] = &[
+    Verb {
+        name: "agent",
+        summary: "attach, interrupt, stop or restart a run",
+        run: dock::cli::agent::run,
+    },
+    Verb {
+        name: "inspect",
+        summary: "what the daemon knows about a run",
+        run: dock::cli::inspect::run,
+    },
+];
 
 fn help_text() -> String {
     let mut text = String::from("dock — a terminal multiplexer that understands coding agents\n\n");

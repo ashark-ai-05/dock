@@ -36,6 +36,8 @@ cargo run --bin dock
 That's it. Run it from any directory, Git or not. Dock connects to that
 directory's private daemon, or starts one for you.
 
+> Once the first release is cut, this becomes `brew install dock` or `cargo install dock-tui` — the crate is `dock-tui`, the binary is `dock`.
+
 Every pane launches `$SHELL` the moment it exists, so you can type immediately.
 Start an agent the way you always do — `claude`, `codex`, `amp` — and Dock picks
 it up.

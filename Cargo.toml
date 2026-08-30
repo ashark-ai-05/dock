@@ -1,9 +1,25 @@
 [package]
-name = "dock"
+name = "dock-tui"
 version = "0.1.0"
 edition = "2024"
-description = "A local-first runtime and control plane for coding agents"
+description = "A terminal multiplexer that understands coding agents"
 license = "MIT"
+repository = "https://github.com/ashark-ai-05/dock"
+readme = "README.md"
+keywords = ["tmux", "terminal", "multiplexer", "tui", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "dock"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dock"
+path = "src/main.rs"
+
+[[bin]]
+name = "dockd"
+path = "src/bin/dockd.rs"
 
 [dependencies]
 base64 = "0.23"

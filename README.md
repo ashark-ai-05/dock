@@ -23,12 +23,14 @@ Prefix is `Ctrl+B`. Unprefixed keys go to the pane. `Esc` is never intercepted. 
 | `,` `.` | prev / next workspace | `r` | rename |
 | `w` | pick workspace | `f` | type a file path into the pane |
 | `a` | resume agent in this pane | `i` | review handoffs |
-| `k` | task board | `g` / `G` | git overlay / lazygit if on PATH |
+| `k` | task board overlay | `B` | split a board pane |
+| `s` | sidebar | `X` | close workspace |
 | `1`–`9` | jump workspace | `l` | launch an agent |
 | `h` `v` | split | `R` | restart exited pane |
 | arrows, Tab | focus | `x` | close pane |
 | `+` `-` | resize | `[` | copy mode |
 | `d` | detach (daemon keeps running) | `q` | prompt queue |
+| `g` / `G` | git overlay / lazygit if on PATH | | |
 
 Mouse: tabs, split/close on the pane border, drag dividers, drag to select.
 
@@ -39,22 +41,22 @@ Dock only tracks PTYs it launched.
 | | State |
 |---|---|
 | `◆` | needs you |
-| `◉` | working |
-| `◐` | done (your turn) |
+| `◐` | working |
+| `◉` | done (your turn) |
 | `○` | idle |
 
-Screen scrape is the fallback. For Claude Code, install hooks so state is reported:
+Screen scrape is the fallback. Hooks exist only for Claude Code (`dock hooks --install` merges into `.claude/settings.json`). Amp and GitHub Copilot CLI have no hook install; their state stays on the screen (and OSC title). Codex can use the same printed events by hand — `dock hooks` does not write Codex or Amp/Copilot configs.
 
 ```bash
 dock hooks              # print config
-dock hooks --install    # merge into .claude/settings.json
+dock hooks --install    # Claude Code: merge into .claude/settings.json
 ```
 
-`Ctrl+B a` resumes the last agent in this pane (`claude --continue`, `codex resume --last`, `amp threads continue --last`). Unknown resume flags are refused, not guessed.
+`Ctrl+B a` resumes only when Dock has read that CLI's flags: `claude --continue`, `codex resume --last`, `amp threads continue --last`. GitHub Copilot CLI is refused — those flags were never read, so Dock does not guess them.
 
 ## Board
 
-`Ctrl+B k` is markdown tasks in the repo (`kanban/tasks/`). Watch updates the TUI when files change. `Enter` dispatches (claims `in-progress`, `git worktree add` on `dock/task-<id>` in a repo). Dock never closes a card from a screen heuristic.
+`Ctrl+B k` is markdown tasks in the repo (`kanban/tasks/`). Unbound panes get the same `DOCK_BOARD` path. Watch updates the TUI when files change. `Enter` dispatches (claims `in-progress`, `git worktree add` on `dock/task-<id>` in a repo). Dock never closes a card from a screen heuristic.
 
 ```bash
 dock task list
@@ -87,6 +89,8 @@ dock read
 dock wait --until=blocked
 dock workspace inspect
 ```
+
+`dock inspect` / `dock agent` talk to the daemon about a run. `dock --help` lists every verb; `dock programme` is extra multi-repo work, not 0.1.
 
 SSH: no `--remote`. Forward the unix socket:
 

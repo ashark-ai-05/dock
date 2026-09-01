@@ -1299,9 +1299,8 @@ mod claim_tests {
 
     #[test]
     fn a_claim_is_written_onto_the_markdown_board_in_the_repo() {
-        // The claim moved to after the daemon accepts, and the rule it has to keep on the way is
-        // this one: a repository's board belongs to kanban-md and to whoever commits to it, and
-        // Dock moving a card there is that tool's business rather than this one's.
+        // The claim moved to after the daemon accepts. The store is native markdown in the
+        // repo; Dock writes status and claimed_by onto that board.
         let directory = std::env::temp_dir().join(format!("dock-claim-{}", std::process::id()));
         fs::create_dir_all(&directory).expect("a board that is not under ~/.dock/boards");
         fs::write(
@@ -1454,8 +1453,7 @@ fn dispatch_task(
 /// move a task is no reason to disown a run the daemon has already begun; it is just no longer
 /// speculative.
 ///
-/// Only on Dock's own board: a repository's belongs to `kanban-md` and to whoever commits to it,
-/// and moving a task there is that tool's business, not this one's.
+/// Writes the claim onto the markdown board (repo `kanban/tasks`). Native Dock owns those files.
 fn claim_task(board: Option<&Path>, task_id: u64) {
     if let Some(directory) = board {
         let _ = dock::board::set_status(directory, task_id, "in-progress");
@@ -1935,6 +1933,10 @@ fn hooks_command(args: &[String]) -> io::Result<()> {
         eprintln!(
             "Amp: not supported — its lifecycle is a plugin system with different event names, so \
              it stays on Dock's output-and-screen detection."
+        );
+        eprintln!(
+            "GitHub Copilot CLI: not supported — no hook schema has been verified, and Dock will \
+             not invent one."
         );
         return Ok(());
     }

@@ -718,12 +718,14 @@ fn dock_environment(binding: &RunBinding) -> Vec<(String, String)> {
         ("DOCK_PANE".to_owned(), binding.pane_id.clone()),
         ("DOCK_RUN".to_owned(), binding.run_id.clone()),
     ];
-    // A repository-bound run shares its repository's board; an unbound one gets the workspace's,
-    // which is the same rule the dashboard's own board key follows.
-    let board = match binding.binding_kind {
-        BindingKind::Repository => Some(binding.repository_root.join("kanban").join("tasks")),
-        BindingKind::Terminal => crate::board::workspace_tasks_dir(&binding.workspace_id),
-    };
+    // Same path as the dashboard board: markdown in the repo (`kanban/tasks`), via
+    // `resolve_tasks_dir`. Unbound panes still have a cwd in `repository_root` / `worktree`.
+    // Personal `~/.dock/boards` is not the default and is not written into DOCK_BOARD.
+    let candidates = [
+        binding.repository_root.to_str().unwrap_or(""),
+        binding.worktree.to_str().unwrap_or(""),
+    ];
+    let board = crate::board::resolve_tasks_dir(&candidates);
     if let Some(board) = board {
         variables.push(("DOCK_BOARD".to_owned(), board.display().to_string()));
     }
@@ -1905,15 +1907,24 @@ mod tests {
     }
 
     #[test]
-    fn an_unbound_pane_gets_its_workspace_board_and_no_task() {
+    fn an_unbound_pane_gets_the_repo_kanban_not_a_personal_board() {
+        let root = std::env::temp_dir().join(format!(
+            "dock-env-board-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let tasks = root.join("kanban").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
         let binding = RunBinding {
             binding_kind: BindingKind::Terminal,
-            // A terminal launch records its directory here; it is not a repository, so the board
-            // must not be looked for inside it.
-            repository_root: PathBuf::from("/tmp/somewhere"),
+            repository_root: root.clone(),
             external_task_ref: String::new(),
             run_id: "dock_ui_1".into(),
-            worktree: PathBuf::from("/tmp/somewhere"),
+            worktree: root.clone(),
             branch: String::new(),
             base_sha: String::new(),
             workspace_id: "workspace_9".into(),
@@ -1922,9 +1933,13 @@ mod tests {
         let variables: std::collections::HashMap<String, String> =
             dock_environment(&binding).into_iter().collect();
         let board = variables.get("DOCK_BOARD").expect("a board");
-        assert!(board.ends_with("boards/workspace_9/tasks"), "{board}");
-        assert!(!board.contains("/tmp/somewhere"), "{board}");
+        assert_eq!(board, &tasks.display().to_string(), "{board}");
+        assert!(
+            !board.contains(".dock/boards"),
+            "personal ~/.dock/boards must not feed DOCK_BOARD when a repo root exists: {board}"
+        );
         assert_eq!(variables.get("DOCK_TASK"), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::{
     terminal::{KeyEncoding, encode_key},
 };
 
-/// `Ctrl+B`, matching tmux and Herdr so the binding is the least surprising available.
+/// `Ctrl+B`, matching tmux so the binding is the least surprising available.
 const PREFIX: u8 = 0x02;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

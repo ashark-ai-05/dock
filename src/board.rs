@@ -33,8 +33,7 @@ pub struct BoardTask {
     pub claimed_by: Option<String>,
     /// When the card was last touched, as seconds since the Unix epoch.
     ///
-    /// From `updated` where the file has one and `created` otherwise, which is what kanban-md
-    /// writes and what its own `tui.age_thresholds` are measured against. `None` for a card with
+    /// From `updated` where the file has one and `created` otherwise. `None` for a card with
     /// neither, or with a stamp Dock could not read — an undated card is shown undated rather
     /// than shown as freshly touched, which would be a lie in the direction that hides work.
     pub touched: Option<i64>,
@@ -54,11 +53,7 @@ const STATUS_ORDER: [&str; 5] = ["in-progress", "needs-input", "review", "backlo
 
 /// Where the board a dashboard should show actually lives.
 ///
-/// A repository's own board comes first: tasks belonging to a project belong beside it, and that is
-/// where `kanban-md` already looks. But work exists that no repository owns — the user's own, and
-/// whatever their agents are doing for them — and a dashboard opened outside a repository had
-/// nothing to show at all. So it falls back to a personal board under the home directory, which
-/// survives moving between projects and belongs to no project in particular.
+/// A repository's own board comes first: tasks belonging to a project live in its `kanban/tasks`.
 ///
 /// Returns `None` when Dock is not sitting in a repository: there is no default under
 /// `~/.dock/boards`. The board is markdown in the repo, or it is not a board Dock will open.
@@ -134,10 +129,10 @@ pub fn dock_boards_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".dock").join("boards"))
 }
 
-/// Whether this directory is one of Dock's own boards rather than a repository's.
+/// Whether this directory is a leftover personal board under `~/.dock/boards`.
 ///
-/// Dock writes tasks only to its own. A repository's board is owned by `kanban-md` and by whoever
-/// else commits to it, and creating files in someone else's board is not Dock's to do.
+/// Repo markdown is the store Dock writes. This helper only identifies the old personal path;
+/// it does not gate writes (the overlay is writable on a repository board).
 pub fn is_personal(directory: &Path) -> bool {
     dock_boards_dir().is_some_and(|root| directory.starts_with(root))
 }
@@ -164,12 +159,9 @@ pub fn boards() -> Vec<(String, PathBuf)> {
 
 /// Writes a new task onto a board and returns it.
 ///
-/// Only ever called for Dock's own personal board. A repository's board belongs to `kanban-md` and
-/// to whoever else commits to it, and creating files in someone else's board is not Dock's to do.
-///
-/// The id is one past the highest already present, so it stays stable against a board that other
-/// tools also write to: reusing a free gap would collide with a task that was archived rather than
-/// deleted.
+/// Dock writes the markdown board in the repo. The id is one past the highest already present,
+/// so it stays stable against a board other tools also write to: reusing a free gap would collide
+/// with a task that was archived rather than deleted.
 pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
     let title = title.trim();
     if title.is_empty() {
@@ -277,9 +269,9 @@ pub fn statuses_declaring(tasks: &[BoardTask], declared: &[String]) -> Vec<Strin
 /// Moves a task to a new status, rewriting only that line of its front matter.
 ///
 /// Only the `status:` line is touched. Everything else in the file — the body, the tags, whatever
-/// another tool wrote there — is preserved byte for byte, because a board is shared with
-/// `kanban-md`, with editors, and with whoever commits to it, and a tool that reformats other
-/// people's files on the way past is a tool nobody keeps.
+/// another tool wrote there — is preserved byte for byte, because a board is shared with editors
+/// and whoever commits to it, and a tool that reformats other people's files on the way past is a
+/// tool nobody keeps.
 ///
 /// The destination is checked against [`statuses`] rather than the constant, so a column this
 /// board plainly has is a place a card can be put; a typo is still refused, which is what the
@@ -354,8 +346,8 @@ pub fn set_status(directory: &Path, id: u64, status: &str) -> Result<BoardTask, 
 
 /// Retires a task from the board, or brings it back, rewriting only its `archived:` line.
 ///
-/// Follows `set_status`'s shape and for the same reason — a board is shared with `kanban-md`,
-/// with editors, and with whoever commits to it — with one difference: the field may not be
+/// Follows `set_status`'s shape and for the same reason — a board is shared with editors and
+/// whoever commits to it — with one difference: the field may not be
 /// there at all, since every task written before this existed has no `archived:` line. So an
 /// absent field is *inserted* immediately before the closing fence rather than treated as an
 /// error, which is what `set_status` does with a missing `status:`.
@@ -1050,9 +1042,8 @@ mod tests {
         assert_eq!(moved.status, "in-progress");
         assert_eq!(load(&dir)[0].status, "in-progress");
 
-        // A board is shared with kanban-md, with editors, and with whoever commits to it. Only
-        // the one line may change; a tool that reformats other people's files is not one anybody
-        // keeps pointed at their repository.
+        // Only the one line may change; a tool that reformats other people's files is not one
+        // anybody keeps pointed at their repository.
         let after = fs::read_to_string(dir.join("001-a.md")).unwrap();
         let changed: Vec<(&str, &str)> = before
             .lines()

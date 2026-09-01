@@ -11,7 +11,7 @@ dock
 
 Same thing: `./scripts/install.sh`. Run from any directory. Dock starts a per-directory daemon or attaches to one. Each new pane is `$SHELL`. Type `claude`, `codex`, or `amp` as usual.
 
-Protocol is v16 — kill an older `dockd` before connecting.
+Protocol is v17 — kill an older `dockd` before connecting.
 
 ## Keys
 
@@ -36,7 +36,7 @@ Mouse: tabs, split/close on the pane border, drag dividers, drag to select.
 
 ## Roster
 
-Dock only tracks PTYs it launched.
+Dock only tracks PTYs it launched. Detected by foreground binary: pi, omp, copilot, devin, kimi, hermes, qoder, qwen, droid, opencode, kilo, mastra, claude, codex, cursor-agent, amp, grok, antigravity, kiro, maki (plus gemini/aider). Launch those names if they are on PATH. Resume only: `claude --continue`, `codex resume --last`, `amp threads continue --last`. Anything else: Ctrl+B a refuses with a reason, same as Copilot.
 
 | | State |
 |---|---|

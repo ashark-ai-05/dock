@@ -32,6 +32,9 @@ pub enum AgentKind {
     Devin,
     Kilo,
     Qoder,
+    Grok,
+    Maki,
+    Mastra,
 }
 
 impl AgentKind {
@@ -60,6 +63,11 @@ impl AgentKind {
             "devin" => Self::Devin,
             "kilo" => Self::Kilo,
             "qoder" | "qodercli" => Self::Qoder,
+            "grok" => Self::Grok,
+            "maki" => Self::Maki,
+            "mastra" | "mastracode" => Self::Mastra,
+            "kimi-code" => Self::Kimi,
+            "qwen-code" => Self::Qwen,
             _ => return None,
         })
     }
@@ -86,6 +94,9 @@ impl AgentKind {
             Self::Devin => "devin",
             Self::Kilo => "kilo",
             Self::Qoder => "qoder",
+            Self::Grok => "grok",
+            Self::Maki => "maki",
+            Self::Mastra => "mastra",
         }
     }
 }
@@ -179,6 +190,10 @@ mod tests {
             ("kilo", AgentKind::Kilo),
             ("qoder", AgentKind::Qoder),
             ("qodercli", AgentKind::Qoder),
+            ("grok", AgentKind::Grok),
+            ("maki", AgentKind::Maki),
+            ("mastra", AgentKind::Mastra),
+            ("mastracode", AgentKind::Mastra),
         ] {
             assert_eq!(
                 AgentKind::from_executable(executable),

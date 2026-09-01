@@ -79,6 +79,23 @@ fn snapshot_matches(snapshot: &RuntimeSnapshot, run_id: Option<&str>, until: Age
     snapshot.agent_state == until
 }
 
+const PROMPT_STALL: Duration = Duration::from_secs(5);
+
+fn wait_satisfied(
+    until: AgentState,
+    matched: bool,
+    held_since: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !matched {
+        return false;
+    }
+    if until == AgentState::Blocked {
+        return true;
+    }
+    held_since.is_some_and(|since| now.saturating_duration_since(since) >= PROMPT_STALL)
+}
+
 pub fn run(args: &[String]) -> Result<(), String> {
     let args = parse_arguments(args)?;
     let run_id = args.run_id.ok_or_else(|| {
@@ -87,6 +104,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let until = args.until;
     let deadline = args.timeout.map(|d| Instant::now() + d);
     let mut connection = Connection::open(args.socket)?;
+    let mut held_since = None;
     loop {
         if deadline.is_some_and(|at| Instant::now() >= at) {
             return Err(format!(
@@ -104,7 +122,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Response::Error { message, .. } => return Err(message),
             other => return Err(format!("unexpected wait response: {other:?}")),
         };
+        let now = Instant::now();
         if hit {
+            if held_since.is_none() {
+                held_since = Some(now);
+            }
+        } else {
+            held_since = None;
+        }
+        if wait_satisfied(until, hit, held_since, now) {
             println!("{run_id}\t{until:?}");
             return Ok(());
         }
@@ -134,6 +160,19 @@ mod tests {
         .expect("parse");
         assert_eq!(parsed.until, AgentState::Done);
         assert_eq!(parsed.timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn already_blocked_is_immediate_and_done_stalls() {
+        let now = Instant::now();
+        assert!(wait_satisfied(AgentState::Blocked, true, Some(now), now));
+        assert!(!wait_satisfied(AgentState::Done, true, Some(now), now));
+        assert!(wait_satisfied(
+            AgentState::Done,
+            true,
+            Some(now),
+            now + Duration::from_secs(5)
+        ));
     }
 
     #[test]

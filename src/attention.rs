@@ -54,6 +54,13 @@ pub fn rank_attention<'a>(
 }
 
 /// Next pane in the cycle after `current`, wrapping. Empty list means nobody.
+/// Worst agent state in a workspace: blocked beats working beats done beats idle.
+pub fn worst_state(states: impl IntoIterator<Item = AgentState>) -> Option<AgentState> {
+    states
+        .into_iter()
+        .min_by_key(|state| state.attention_rank())
+}
+
 pub fn next_attention(
     ranked: &[(String, String)],
     current: Option<(&str, &str)>,
@@ -182,6 +189,15 @@ mod tests {
             }],
         );
         assert!(ranked.is_empty());
+    }
+
+    #[test]
+    fn worst_state_is_blocked_then_working() {
+        assert_eq!(
+            worst_state([AgentState::Idle, AgentState::Working, AgentState::Blocked]),
+            Some(AgentState::Blocked)
+        );
+        assert_eq!(worst_state(Vec::<AgentState>::new()), None);
     }
 
     #[test]

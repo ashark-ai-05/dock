@@ -2178,7 +2178,20 @@ impl Dashboard {
             .workspaces
             .iter()
             .enumerate()
-            .map(|(index, workspace)| format!(" {} {} ", index + 1, workspace.name))
+            .map(|(index, workspace)| {
+                let worst = crate::attention::worst_state(
+                    self.live_runs()
+                        .iter()
+                        .filter(|run| run.workspace_id == workspace.workspace_id && run.is_agent())
+                        .map(|run| run.state),
+                );
+                match worst {
+                    Some(state) => {
+                        format!(" {} {} {} ", index + 1, workspace.name, state.glyph())
+                    }
+                    None => format!(" {} {} ", index + 1, workspace.name),
+                }
+            })
             .collect();
         let widths: Vec<u16> = labels
             .iter()
@@ -3910,7 +3923,25 @@ impl Dashboard {
             .map(|(index, workspace)| PickerItem {
                 key: workspace.workspace_id.clone(),
                 label: workspace.name.clone(),
-                detail: format!("{}  ·  {}", index + 1, pane_count(workspace.panes.len())),
+                detail: {
+                    let worst = crate::attention::worst_state(
+                        self.live_runs()
+                            .iter()
+                            .filter(|run| {
+                                run.workspace_id == workspace.workspace_id && run.is_agent()
+                            })
+                            .map(|run| run.state),
+                    );
+                    match worst {
+                        Some(state) => format!(
+                            "{}  ·  {}  ·  {}",
+                            index + 1,
+                            state.glyph(),
+                            pane_count(workspace.panes.len())
+                        ),
+                        None => format!("{}  ·  {}", index + 1, pane_count(workspace.panes.len())),
+                    }
+                },
             })
             .collect();
         self.picker = Some((PickerPurpose::Workspace, Picker::new(items)));
@@ -4857,6 +4888,26 @@ impl Dashboard {
         self.error = None;
     }
 
+    fn complete_accepted_card(&mut self, task_ref: &str) {
+        let Some(id) = task_ref.parse::<u64>().ok().or_else(|| {
+            task_ref
+                .rsplit(|c: char| !c.is_ascii_digit())
+                .find(|part| !part.is_empty())
+                .and_then(|part| part.parse().ok())
+        }) else {
+            return;
+        };
+        let Some(directory) = self.board_dir.clone() else {
+            return;
+        };
+        let _ = crate::board::set_status(&directory, id, "done");
+        if self.board.is_some() {
+            self.set_board_tasks(crate::board::load(&directory), directory);
+        } else {
+            self.set_board_pane_tasks(crate::board::load(&directory), directory);
+        }
+    }
+
     fn review_key(&mut self, key: KeyEvent) -> UiCommand {
         let Some(review) = self.review.as_mut() else {
             return UiCommand::None;
@@ -4878,9 +4929,11 @@ impl Dashboard {
                     }
                     let route = *route;
                     let note = note.clone();
-                    let run_id = review.items[review.selected].0.packet.run_id.clone();
-                    // The overlay closes on send. Whether the decision stuck is the daemon's to
-                    // say, and it is re-read from the inbox rather than assumed here.
+                    let packet = review.items[review.selected].0.packet.clone();
+                    let run_id = packet.run_id.clone();
+                    if route == ReviewRoute::AcceptScope {
+                        self.complete_accepted_card(&packet.task_id);
+                    }
                     self.review = None;
                     return UiCommand::Request(Box::new(Request::Decide(DecideRequest {
                         run_id,

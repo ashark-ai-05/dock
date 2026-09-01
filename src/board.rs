@@ -390,6 +390,79 @@ pub fn set_archived(directory: &Path, id: u64, archived: bool) -> Result<BoardTa
     Ok(BoardTask { archived, ..task })
 }
 
+/// Whether this column is the one a ready card sits in before anyone claims it.
+///
+/// `backlog` is the usual name. `todo` is accepted as the same thing: some boards still use it,
+/// and a card sitting there is not less ready than one sitting in `backlog`.
+pub fn is_ready_status(status: &str) -> bool {
+    matches!(status.trim(), "backlog" | "todo")
+}
+
+fn dependency_is_clear(tasks: &[BoardTask], dep: u64) -> bool {
+    match tasks.iter().find(|task| task.id == dep) {
+        // Nothing left on the board to wait for — the same reading `set_status` uses.
+        None => true,
+        Some(other) => other.status == "done" || other.archived,
+    }
+}
+
+fn wip_allows_in_progress(directory: &Path, tasks: &[BoardTask]) -> bool {
+    match crate::board_config::load(directory).wip_limit_for("in-progress") {
+        None => true,
+        Some(limit) => {
+            tasks
+                .iter()
+                .filter(|task| task.status == "in-progress" && !task.archived)
+                .count()
+                < limit
+        }
+    }
+}
+
+fn priority_rank(priority: &str) -> u8 {
+    match priority.trim() {
+        "critical" => 0,
+        "high" => 1,
+        "medium" | "" => 2,
+        "low" => 3,
+        _ => 4,
+    }
+}
+
+/// A card that can be claimed: not archived, in backlog (or `todo`), every `depends_on` done or
+/// archived, and the in-progress column still has room.
+pub fn is_ready(directory: &Path, task: &BoardTask, tasks: &[BoardTask]) -> bool {
+    !task.archived
+        && is_ready_status(&task.status)
+        && task
+            .depends_on
+            .iter()
+            .all(|dep| dependency_is_clear(tasks, *dep))
+        && wip_allows_in_progress(directory, tasks)
+}
+
+/// The next ready card, highest priority first, then lowest id.
+pub fn next_ready(directory: &Path) -> Option<BoardTask> {
+    let tasks = load(directory);
+    if !wip_allows_in_progress(directory, &tasks) {
+        return None;
+    }
+    let mut ready: Vec<BoardTask> = tasks
+        .iter()
+        .filter(|task| is_ready(directory, task, &tasks))
+        .cloned()
+        .collect();
+    ready.sort_by_key(|task| (priority_rank(&task.priority), task.id));
+    ready.into_iter().next()
+}
+
+/// Claims the next ready card and returns it.
+pub fn claim_next(directory: &Path, who: &str) -> Result<BoardTask, String> {
+    let task = next_ready(directory).ok_or_else(|| "no ready task".to_owned())?;
+    set_status(directory, task.id, "in-progress")?;
+    set_claimed_by(directory, task.id, who)
+}
+
 /// Records who claimed the card, rewriting only `claimed_by`.
 pub fn set_claimed_by(directory: &Path, id: u64, claim: &str) -> Result<BoardTask, String> {
     let claim = claim.trim();
@@ -1016,6 +1089,98 @@ mod tests {
             load(&dir).iter().find(|t| t.id == 2).unwrap().status,
             "backlog"
         );
+    }
+
+    #[test]
+    fn next_ready_picks_the_highest_priority_unblocked_backlog_card() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        board.task(
+            "001-a.md",
+            "---\nid: 1\ntitle: 'Low'\nstatus: backlog\npriority: low\n---\n",
+        );
+        board.task(
+            "002-b.md",
+            "---\nid: 2\ntitle: 'Blocked'\nstatus: backlog\npriority: high\ndepends_on:\n  - 1\n---\n",
+        );
+        board.task(
+            "003-c.md",
+            "---\nid: 3\ntitle: 'High'\nstatus: backlog\npriority: high\n---\n",
+        );
+        board.task(
+            "004-d.md",
+            "---\nid: 4\ntitle: 'Archived'\nstatus: backlog\npriority: critical\narchived: true\n---\n",
+        );
+        board.task(
+            "005-e.md",
+            "---\nid: 5\ntitle: 'Review'\nstatus: review\npriority: critical\n---\n",
+        );
+        let next = next_ready(&dir).expect("a ready card");
+        assert_eq!(next.id, 3);
+        assert_eq!(next.title, "High");
+    }
+
+    #[test]
+    fn a_todo_card_is_ready_the_way_a_backlog_card_is() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        board.task(
+            "001-a.md",
+            "---\nid: 1\ntitle: 'Todo'\nstatus: todo\npriority: medium\n---\n",
+        );
+        assert_eq!(next_ready(&dir).map(|task| task.id), Some(1));
+    }
+
+    #[test]
+    fn a_done_or_archived_dependency_unblocks_the_card() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        board.task("001-a.md", "---\nid: 1\ntitle: 'A'\nstatus: done\n---\n");
+        board.task(
+            "002-b.md",
+            "---\nid: 2\ntitle: 'B'\nstatus: backlog\narchived: true\n---\n",
+        );
+        board.task(
+            "003-c.md",
+            "---\nid: 3\ntitle: 'C'\nstatus: backlog\ndepends_on:\n  - 1\n  - 2\n---\n",
+        );
+        assert_eq!(next_ready(&dir).map(|task| task.id), Some(3));
+    }
+
+    #[test]
+    fn a_full_wip_column_means_nothing_is_ready() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        fs::write(
+            dir.parent().unwrap().join("config.yml"),
+            "statuses:\n    - name: backlog\n    - name: in-progress\n      wip_limit: 1\n    - name: done\n",
+        )
+        .unwrap();
+        board.task(
+            "001-a.md",
+            "---\nid: 1\ntitle: 'Busy'\nstatus: in-progress\n---\n",
+        );
+        board.task(
+            "002-b.md",
+            "---\nid: 2\ntitle: 'Waiting'\nstatus: backlog\n---\n",
+        );
+        assert!(next_ready(&dir).is_none());
+    }
+
+    #[test]
+    fn claim_next_moves_the_ready_card_to_in_progress() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        board.task(
+            "001-a.md",
+            "---\nid: 1\ntitle: 'Do it'\nstatus: backlog\npriority: high\n---\n",
+        );
+        let claimed = claim_next(&dir, "dock").expect("claim");
+        assert_eq!(claimed.id, 1);
+        assert_eq!(claimed.status, "in-progress");
+        assert_eq!(claimed.claimed_by.as_deref(), Some("dock"));
+        assert_eq!(load(&dir)[0].status, "in-progress");
     }
 
     #[test]

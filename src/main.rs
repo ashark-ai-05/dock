@@ -202,7 +202,7 @@ const VERBS: &[Verb] = &[
     },
     Verb {
         name: "task",
-        summary: "list, add, claim, move or show tasks on the board",
+        summary: "list, add, claim, next, move or show tasks on the board",
         run: run_task,
     },
     Verb {
@@ -2279,6 +2279,15 @@ fn task_command(args: &[String]) -> io::Result<()> {
             let task = dock::board::set_status(&board, id, status).map_err(io::Error::other)?;
             println!("{}\t{}\t{}", task.id, task.status, task.title);
         }
+        "next" => {
+            let who = positional
+                .get(1)
+                .map(|name| (*name).clone())
+                .or_else(|| std::env::var("DOCK_RUN").ok().filter(|id| !id.is_empty()))
+                .unwrap_or_else(|| "dock".into());
+            let task = dock::board::claim_next(&board, &who).map_err(io::Error::other)?;
+            println!("{}	{}	{}	{}", task.id, task.status, who, task.title);
+        }
         "claim" => {
             let id: u64 = positional
                 .get(1)
@@ -2308,7 +2317,7 @@ fn task_command(args: &[String]) -> io::Result<()> {
         }
         other => {
             return Err(io::Error::other(format!(
-                "unknown task command {other:?}; expected list, add, claim, move or show"
+                "unknown task command {other:?}; expected list, add, claim, next, move or show"
             )));
         }
     }

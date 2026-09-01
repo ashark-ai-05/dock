@@ -116,4 +116,19 @@ mod tests {
     fn argv_only_hooks_have_nothing_to_parse() {
         assert_eq!(parse_stdin("\n"), None);
     }
+
+    #[test]
+    fn a_codex_pre_tool_use_payload_is_read_the_same_way() {
+        // Extra Codex fields (turn_id, model, permission_mode, tool_use_id) must be ignored, not
+        // rejected: the stdin document is Claude-like, and additionalProperties often apply to
+        // *responses*, not this payload.
+        let payload = parse_stdin(
+            r#"{"session_id":"s1","turn_id":"t1","transcript_path":"/tmp/t.jsonl","cwd":"/repo","hook_event_name":"PreToolUse","model":"gpt-test","permission_mode":"default","tool_name":"Bash","tool_input":{"command":"ls"},"tool_use_id":"tool-1"}"#,
+        )
+        .expect("valid Codex hook JSON");
+        assert_eq!(payload.session_id.as_deref(), Some("s1"));
+        assert_eq!(payload.hook_event_name.as_deref(), Some("PreToolUse"));
+        assert_eq!(payload.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(activity_summary(&payload).as_deref(), Some("Bash ls"));
+    }
 }

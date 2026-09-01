@@ -162,7 +162,7 @@ const VERBS: &[Verb] = &[
     },
     Verb {
         name: "hooks",
-        summary: "print or install the hooks that make agent state exact",
+        summary: "print or install Claude and Codex hooks that make agent state exact",
         run: run_hooks,
     },
     Verb {
@@ -1157,7 +1157,10 @@ mod handoff_response_tests {
 
 #[cfg(test)]
 mod hook_check_tests {
-    use super::{Verdict, hook_events, missing_hook_events, resolve_on_path, verdict};
+    use super::{
+        Verdict, claude_hook_events, codex_hook_events, hook_events, merge_hook_events,
+        missing_hook_events, resolve_on_path, verdict,
+    };
 
     #[test]
     fn a_check_that_could_not_reach_a_pane_has_not_thereby_failed() {
@@ -1175,7 +1178,7 @@ mod hook_check_tests {
         // The state this bug actually presented in: hooks never installed, so nothing was ever
         // reported, so every pane sat on screen-scraped state and nothing said why.
         let missing = missing_hook_events(&serde_json::json!({}), &hook_events());
-        assert_eq!(missing.len(), 6, "{missing:?}");
+        assert_eq!(missing.len(), 7, "{missing:?}");
         assert!(missing.contains(&"Stop".to_owned()), "{missing:?}");
     }
 
@@ -1214,6 +1217,28 @@ mod hook_check_tests {
         let dir = std::env::current_dir().expect("cwd");
         let found = resolve_on_path(Some(&format!(":{}", dir.display())), "Cargo.toml");
         assert_eq!(found, Some(dir.join("Cargo.toml")));
+    }
+
+    #[test]
+    fn merging_hooks_keeps_somebody_elses_handler() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{"hooks": [{"type": "command", "command": "make lint"}]}]
+            }
+        });
+        merge_hook_events(&mut settings, &codex_hook_events()).expect("merge");
+        let list = settings["hooks"]["PreToolUse"].as_array().expect("list");
+        assert_eq!(list.len(), 2, "{list:?}");
+        assert_eq!(list[0]["hooks"][0]["command"].as_str(), Some("make lint"));
+        assert!(
+            list.iter().any(|entry| {
+                entry["hooks"][0]["command"].as_str() == Some("dock agent-state working")
+            }),
+            "{list:?}"
+        );
+        assert!(settings["hooks"].get("Notification").is_none());
+        assert!(claude_hook_events()["hooks"].get("Notification").is_some());
+        assert!(codex_hook_events()["hooks"].get("PostToolUse").is_some());
     }
 }
 
@@ -1718,36 +1743,50 @@ fn hooks_check(expected: &serde_json::Value) -> io::Result<()> {
         println!("{} {detail}", if ok { "ok  " } else { "FAIL" });
     };
 
-    let settings_path = PathBuf::from(".claude").join("settings.json");
-    match fs::read_to_string(&settings_path) {
-        Ok(text) if !text.trim().is_empty() => match serde_json::from_str(&text) {
-            Ok(settings) => {
-                let missing = missing_hook_events(&settings, expected);
-                report(
-                    missing.is_empty(),
-                    if missing.is_empty() {
-                        format!("all {} hooks wired in {}", 6, settings_path.display())
-                    } else {
-                        format!(
-                            "{} is missing Dock's entry for: {} — run `dock hooks --install`",
-                            settings_path.display(),
-                            missing.join(", ")
-                        )
-                    },
-                );
-            }
-            Err(error) => report(
-                false,
-                format!("{} is not valid JSON: {error}", settings_path.display()),
-            ),
-        },
-        _ => report(
-            false,
-            format!(
-                "no hooks found at {} — run `dock hooks --install`",
-                settings_path.display()
-            ),
+    let mut any_hooks = false;
+    for (path, document) in [
+        (
+            PathBuf::from(".claude").join("settings.json"),
+            expected.clone(),
         ),
+        (
+            PathBuf::from(".codex").join("hooks.json"),
+            codex_hook_events(),
+        ),
+    ] {
+        match fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => match serde_json::from_str(&text) {
+                Ok(settings) => {
+                    any_hooks = true;
+                    let missing = missing_hook_events(&settings, &document);
+                    let count = document["hooks"].as_object().map(|o| o.len()).unwrap_or(0);
+                    report(
+                        missing.is_empty(),
+                        if missing.is_empty() {
+                            format!("all {count} hooks wired in {}", path.display())
+                        } else {
+                            format!(
+                                "{} is missing Dock's entry for: {} — run `dock hooks --install`",
+                                path.display(),
+                                missing.join(", ")
+                            )
+                        },
+                    );
+                }
+                Err(error) => report(
+                    false,
+                    format!("{} is not valid JSON: {error}", path.display()),
+                ),
+            },
+            _ => {}
+        }
+    }
+    if !any_hooks {
+        report(
+            false,
+            "no hooks found at .claude/settings.json or .codex/hooks.json — run `dock hooks --install`"
+                .into(),
+        );
     }
 
     let path = std::env::var("PATH").ok();
@@ -1892,22 +1931,93 @@ fn hook_debug(reason: &str) {
 
 /// The turn boundaries Dock needs, in the vocabulary Claude Code and Codex both use.
 ///
-/// The two agents converged on the same event names and the same handler shape, so one description
-/// serves both and only the destination differs. Amp is not here: its lifecycle is a plugin system
-/// with its own names (`agent.start`, `agent.end`), so it stays on the output-and-screen tier until
-/// somebody writes that adapter. Copilot is not here because nothing of its interface has been
-/// verified, and inventing one would produce a config that silently never fires.
+/// Roster mapping is the same state machine both already share: PreToolUse and UserPromptSubmit
+/// are working, PostToolUse stays working, PermissionRequest needs you, Stop is done, SessionEnd
+/// is idle. Amp is not here: it has no published command-hook stdin schema (its Plugin API and
+/// `--stream-json` are not an interactive-pane hook). Copilot is not here because nothing of its
+/// interface has been verified, and inventing one would produce a config that silently never fires.
 fn hook_events() -> serde_json::Value {
+    claude_hook_events()
+}
+
+fn command_hook(state: &str) -> serde_json::Value {
+    serde_json::json!([{"hooks": [{"type": "command", "command": format!("dock agent-state {state}")}]}])
+}
+
+fn claude_hook_events() -> serde_json::Value {
     serde_json::json!({
         "hooks": {
-            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "dock agent-state working"}]}],
-            "PreToolUse": [{"hooks": [{"type": "command", "command": "dock agent-state working"}]}],
-            "PermissionRequest": [{"hooks": [{"type": "command", "command": "dock agent-state blocked"}]}],
-            "Notification": [{"hooks": [{"type": "command", "command": "dock agent-state blocked"}]}],
-            "Stop": [{"hooks": [{"type": "command", "command": "dock agent-state done"}]}],
-            "SessionEnd": [{"hooks": [{"type": "command", "command": "dock agent-state idle"}]}]
+            "UserPromptSubmit": command_hook("working"),
+            "PreToolUse": command_hook("working"),
+            "PostToolUse": command_hook("working"),
+            "PermissionRequest": command_hook("blocked"),
+            "Notification": command_hook("blocked"),
+            "Stop": command_hook("done"),
+            "SessionEnd": command_hook("idle")
         }
     })
+}
+
+/// Codex's published events. `Notification` is Claude-only; PostToolUse is in the Codex schema.
+fn codex_hook_events() -> serde_json::Value {
+    serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": command_hook("working"),
+            "PreToolUse": command_hook("working"),
+            "PostToolUse": command_hook("working"),
+            "PermissionRequest": command_hook("blocked"),
+            "Stop": command_hook("done"),
+            "SessionEnd": command_hook("idle")
+        }
+    })
+}
+
+fn merge_hook_events(
+    settings: &mut serde_json::Value,
+    expected: &serde_json::Value,
+) -> io::Result<()> {
+    let existing = settings
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("hook config is not an object"))?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let existing = existing
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("hook config \"hooks\" is not an object"))?;
+    for (event, entry) in expected["hooks"].as_object().expect("hook events") {
+        let slot = existing
+            .entry(event.clone())
+            .or_insert_with(|| serde_json::json!([]));
+        let Some(list) = slot.as_array_mut() else {
+            continue;
+        };
+        let ours = entry.as_array().expect("hook entries")[0].clone();
+        if !list.contains(&ours) {
+            list.push(ours);
+        }
+    }
+    Ok(())
+}
+
+fn merge_hooks_file(path: &Path, expected: &serde_json::Value) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut settings: serde_json::Value = match fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)?,
+        _ => serde_json::json!({}),
+    };
+    merge_hook_events(&mut settings, expected)?;
+    fs::write(path, serde_json::to_string_pretty(&settings)? + "\n")?;
+    Ok(())
+}
+
+fn codex_user_hooks_path() -> PathBuf {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")));
+    home.unwrap_or_else(|| PathBuf::from(".codex"))
+        .join("hooks.json")
 }
 
 /// `dock hooks` — the hook configuration that makes agent state exact rather than inferred.
@@ -1923,16 +2033,15 @@ fn hooks_command(args: &[String]) -> io::Result<()> {
     }
     if !args.iter().any(|argument| argument == "--install") {
         println!("{pretty}");
-        eprintln!("\nClaude Code: .claude/settings.json — or `dock hooks --install` to merge it.");
+        eprintln!("\nClaude Code: .claude/settings.json — `dock hooks --install` merges it.");
         eprintln!(
-            "Codex: the same events and shape, in hooks.json or an inline [hooks] table, and it \
-             needs `hooks = true` under [features]. Added by hand: Dock has not verified where \
-             your Codex build reads that file from, and a config written to the wrong path is one \
-             that silently never fires."
+            "Codex: .codex/hooks.json and $CODEX_HOME/hooks.json (default ~/.codex/hooks.json). \
+             `dock hooks --install` merges the published command-hook events without replacing \
+             anyone else's handlers."
         );
         eprintln!(
-            "Amp: not supported — its lifecycle is a plugin system with different event names, so \
-             it stays on Dock's output-and-screen detection."
+            "Amp: no published command-hook stdin schema. Plugin API / --stream-json is not an \
+             interactive-pane hook, so Amp stays on screen detection."
         );
         eprintln!(
             "GitHub Copilot CLI: not supported — no hook schema has been verified, and Dock will \
@@ -1940,37 +2049,15 @@ fn hooks_command(args: &[String]) -> io::Result<()> {
         );
         return Ok(());
     }
-    let path = PathBuf::from(".claude").join("settings.json");
-    fs::create_dir_all(".claude")?;
-    let mut settings: serde_json::Value = match fs::read_to_string(&path) {
-        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)?,
-        _ => serde_json::json!({}),
-    };
-    // Merged per event rather than wholesale: whatever else is hooked to these events is somebody
-    // else's and stays. Dock's entry is skipped where it is already present, so this is repeatable.
-    let existing = settings
-        .as_object_mut()
-        .ok_or_else(|| io::Error::other("settings.json is not an object"))?
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-    let existing = existing
-        .as_object_mut()
-        .ok_or_else(|| io::Error::other("settings.json \"hooks\" is not an object"))?;
-    for (event, entry) in hooks["hooks"].as_object().expect("hook events") {
-        let slot = existing
-            .entry(event.clone())
-            .or_insert_with(|| serde_json::json!([]));
-        let Some(list) = slot.as_array_mut() else {
-            continue;
-        };
-        let ours = entry.as_array().expect("hook entries")[0].clone();
-        if !list.contains(&ours) {
-            list.push(ours);
-        }
-    }
-    fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
-    println!("merged Dock's hooks into {}", path.display());
-    println!("Codex uses the same events — run `dock hooks` to print them for it.");
+    let claude_path = PathBuf::from(".claude").join("settings.json");
+    merge_hooks_file(&claude_path, &claude_hook_events())?;
+    println!("merged Dock's hooks into {}", claude_path.display());
+    let project_codex = PathBuf::from(".codex").join("hooks.json");
+    merge_hooks_file(&project_codex, &codex_hook_events())?;
+    println!("merged Dock's hooks into {}", project_codex.display());
+    let user_codex = codex_user_hooks_path();
+    merge_hooks_file(&user_codex, &codex_hook_events())?;
+    println!("merged Dock's hooks into {}", user_codex.display());
     Ok(())
 }
 

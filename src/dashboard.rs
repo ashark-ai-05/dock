@@ -4121,11 +4121,15 @@ impl Dashboard {
                 Span::styled(facts.branch.clone(), heading),
                 Span::styled(
                     format!(
-                        "   {} files  +{} −{}   {} uncommitted",
+                        "   {} files  +{} −{}{}",
                         facts.changed_files,
                         facts.insertions,
                         facts.deletions,
-                        facts.status_entries
+                        if facts.untracked_files == 0 {
+                            String::new()
+                        } else {
+                            format!("   {} untracked", facts.untracked_files)
+                        }
                     ),
                     muted,
                 ),
@@ -10311,6 +10315,7 @@ mod tests {
                 head_sha: "def".into(),
                 status_entries: 2,
                 changed_files: 4,
+                untracked_files: 0,
                 insertions: 12,
                 deletions: 3,
             },
@@ -13097,6 +13102,7 @@ mod tests {
             head_sha: "def".into(),
             status_entries: 2,
             changed_files: 1,
+            untracked_files: 0,
             insertions: 3,
             deletions: 1,
         }

@@ -129,6 +129,7 @@ pub struct GitFacts {
     pub head_sha: String,
     pub status_entries: usize,
     pub changed_files: usize,
+    pub untracked_files: usize,
     pub insertions: usize,
     pub deletions: usize,
 }
@@ -169,12 +170,9 @@ impl GitAdapter {
             .if_empty("DETACHED")
             .to_owned();
         let status = self.git(["status", "--porcelain=v1", "--untracked-files=normal"])?;
-        if status.lines().any(|line| line.starts_with("?? ")) {
-            return Err(
-                "handoff Git evidence does not accept untracked files; track or remove them first"
-                    .into(),
-            );
-        }
+        // Untracked files are evidence, not a reason to refuse the handoff. Porcelain lines
+        // (including `??`) are `status_entries`; `changed_files` stays the numstat against base.
+        let (status_entries, untracked_files) = parse_porcelain(&status);
         let numstat = self.git(["diff", "--numstat", &base_sha])?;
         let (changed_files, insertions, deletions) = parse_numstat(&numstat);
         Ok(GitFacts {
@@ -182,8 +180,9 @@ impl GitAdapter {
             branch,
             base_sha,
             head_sha,
-            status_entries: changed_files,
+            status_entries,
             changed_files,
+            untracked_files,
             insertions,
             deletions,
         })
@@ -263,6 +262,21 @@ impl EmptyFallback for str {
     }
 }
 
+fn parse_porcelain(status: &str) -> (usize, usize) {
+    let mut entries = 0usize;
+    let mut untracked = 0usize;
+    for line in status.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        entries += 1;
+        if line.starts_with("?? ") {
+            untracked += 1;
+        }
+    }
+    (entries, untracked)
+}
+
 fn parse_numstat(numstat: &str) -> (usize, usize, usize) {
     numstat
         .lines()
@@ -297,6 +311,12 @@ mod tests {
     #[test]
     fn empty_numstat_means_clean_comparison() {
         assert_eq!(parse_numstat(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn porcelain_counts_untracked_apart_from_the_numstat_diff() {
+        assert_eq!(parse_porcelain(" M src/git.rs\n?? scratch.txt\n"), (2, 1));
+        assert_eq!(parse_porcelain(""), (0, 0));
     }
 }
 
@@ -433,6 +453,18 @@ mod worktree_tests {
         assert_eq!(facts.head_sha, facts.base_sha, "base HEAD resolves to HEAD");
         assert_eq!(facts.head_sha.len(), 40, "{}", facts.head_sha);
         assert!(facts.head_sha.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn untracked_files_are_counted_as_evidence_rather_than_refusing_facts() {
+        let repo = Repo::new();
+        fs::write(repo.0.join("scratch.txt"), "not tracked yet").unwrap();
+        let facts = GitAdapter::new(&repo.0).facts("HEAD").expect("facts");
+        assert_eq!(facts.status_entries, 1, "the untracked file is visible");
+        assert_eq!(
+            facts.changed_files, 0,
+            "numstat against HEAD is still empty"
+        );
     }
 
     #[test]

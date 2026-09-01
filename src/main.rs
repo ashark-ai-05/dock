@@ -857,9 +857,10 @@ fn run_dashboard(
                 // one would be another protocol version for records this client can already
                 // reach: it computed this directory itself and handed it to the daemon at startup.
                 let store = LocalStore::new(state_dir);
-                match store.list_handoff_records() {
-                    Ok(records) => {
-                        let with_decisions = records
+                match store.list_handoff_inbox() {
+                    Ok(inbox) => {
+                        let with_decisions = inbox
+                            .records
                             .into_iter()
                             .map(|record| {
                                 let decision = store.load_decision(&record.packet.run_id).ok();
@@ -867,6 +868,18 @@ fn run_dashboard(
                             })
                             .collect();
                         dashboard.set_review_inbox(with_decisions);
+                        if !inbox.skipped.is_empty() {
+                            dashboard.error = Some(format!(
+                                "skipped {} poisoned handoff file(s): {}",
+                                inbox.skipped.len(),
+                                inbox
+                                    .skipped
+                                    .iter()
+                                    .map(|(id, reason)| format!("{id}: {reason}"))
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            ));
+                        }
                     }
                     Err(message) => dashboard.error = Some(message),
                 }

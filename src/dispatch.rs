@@ -3438,6 +3438,7 @@ impl RuntimeRegistry {
                 head_sha: facts.head_sha,
                 status_entries: facts.status_entries,
                 changed_files: facts.changed_files,
+                untracked_files: facts.untracked_files,
                 insertions: facts.insertions,
                 deletions: facts.deletions,
             },
@@ -9488,10 +9489,18 @@ mod tests {
             .dispatch(repo.request("dock_handoff_untracked"))
             .unwrap();
         fs::write(repo.root.join("fixture/untracked-secret.txt"), "local\n").unwrap();
-        assert!(matches!(
-            registry.submit_handoff(packet(&second)),
-            Err((ErrorCode::InvalidHandoff, message)) if message.contains("untracked files")
-        ));
+        let accepted = registry
+            .submit_handoff(packet(&second))
+            .expect("untracked files are evidence");
+        assert!(
+            accepted.evidence.untracked_files >= 1,
+            "{:?}",
+            accepted.evidence
+        );
+        assert_ne!(
+            accepted.evidence.status_entries, accepted.evidence.changed_files,
+            "porcelain and numstat must not be copied onto each other"
+        );
     }
 
     #[test]

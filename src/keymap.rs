@@ -65,6 +65,10 @@ pub enum PaneCommand {
     Detach,
     Help,
     Quit,
+    /// Show this session's prompt queues.
+    Queue,
+    /// Open LazyGit on the focused pane's worktree when it is on PATH.
+    Lazygit,
     /// Collapse the sidebar to a rail, or bring it back.
     ToggleSidebar,
 }
@@ -136,6 +140,7 @@ impl Keymap {
             // separate entry for the second one pushed the last binding out of the two-row bar.
             ("k/B", "board ▤"),
             ("g", "git"),
+            ("G", "lazygit"),
             ("[", "copy mode"),
             ("+/-", "resize"),
             ("z", "zoom"),
@@ -153,7 +158,7 @@ impl Keymap {
             ("l", "launch"),
             ("d", "leave · runs keep running"),
             ("?", "help"),
-            ("q", "quit"),
+            ("q", "queue"),
         ]
     }
 }
@@ -179,7 +184,7 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Char('l') => PaneCommand::Launch,
         KeyCode::Char('d') => PaneCommand::Detach,
         KeyCode::Char('?') => PaneCommand::Help,
-        KeyCode::Char('q') => PaneCommand::Quit,
+        KeyCode::Char('q') => PaneCommand::Queue,
         // `[` is tmux's copy-mode key and copying is the far more frequent act, so workspace
         // cycling moved to the unshifted `,`/`.` pair rather than keeping the bracket.
         KeyCode::Char('[') => PaneCommand::CopyMode,
@@ -202,6 +207,7 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         // the prefix key itself — pressing it twice already means "send a literal Ctrl+B".
         KeyCode::Char('B') => PaneCommand::SplitBoard,
         KeyCode::Char('g') => PaneCommand::Git,
+        KeyCode::Char('G') => PaneCommand::Lazygit,
         // `s` for sidebar. `b` would be the obvious letter and is unavailable: the prefix is
         // Ctrl+B, so pressing it twice already means "send a literal Ctrl+B".
         KeyCode::Char('s') => PaneCommand::ToggleSidebar,
@@ -272,7 +278,7 @@ mod tests {
         assert!(keymap.is_pending());
         assert_eq!(
             keymap.handle(plain('q'), KeyEncoding::default()),
-            KeyOutcome::Command(PaneCommand::Quit)
+            KeyOutcome::Command(PaneCommand::Queue)
         );
         assert!(!keymap.is_pending());
     }
@@ -369,6 +375,7 @@ mod tests {
             // popup over the canvas and once as a pane on it.
             "k/B",
             "g",
+            "G",
             "[",
             // The three ways to reach a workspace share one entry: the footer is two rows, and
             // listing them separately pushed the last published binding off the end of it.

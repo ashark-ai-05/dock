@@ -140,6 +140,8 @@ pub enum UiCommand {
     LoadBoard,
     /// Asks what Git says about the focused pane's worktree.
     LoadGit,
+    /// Open LazyGit in the focused pane's worktree, or say it is missing.
+    LaunchLazygit,
     /// Gives a task somewhere isolated to be worked on and launches an agent there. Carries the
     /// task rather than a worktree: the worktree may not exist yet, and making it is the point.
     DispatchTask(TaskDispatch),
@@ -167,6 +169,8 @@ pub struct Dashboard {
     history: HashMap<String, PaneHistoryCursor>,
     /// Latest agent identity and state per run, as pushed by the daemon.
     pub agents: HashMap<String, (Option<AgentKind>, AgentState)>,
+    /// Latest hook activity per run, when a report named a tool.
+    activities: HashMap<String, String>,
     revisions: HashMap<String, u64>,
     /// Tasks dispatched to an agent whose command line had nowhere to carry them, waiting for
     /// that agent to be up enough to be typed into. Keyed by run, emptied on first delivery.
@@ -227,6 +231,7 @@ pub struct Dashboard {
     /// Where that board was read from, and whether it is Dock's own rather than a repository's.
     /// Dock only ever writes tasks to its own.
     board_dir: Option<std::path::PathBuf>,
+    board_mtime: Option<std::time::SystemTime>,
     board_is_personal: bool,
     /// The columns a Board *pane* draws, kept apart from `board` because a pane is not an
     /// overlay: nothing opens or closes it, Esc means nothing to it, and it must survive the
@@ -244,6 +249,9 @@ pub struct Dashboard {
     /// The daemon-wide kill switch, as the daemon last reported it. Independent of every pane's
     /// own arming, so the lane must be able to say "armed, and paused anyway".
     queues_paused: bool,
+    /// The prompt-queue overlay, opened with Ctrl+B q.
+    queue_open: bool,
+    auto_feed_trust: crate::protocol::AutoFeedTrustSetting,
     /// The board's one cursor: which column, and what in it.
     ///
     /// One grid means one cursor. There used to be two — a lane cursor keyed by pane and the
@@ -446,6 +454,8 @@ pub struct LiveRun<'a> {
     /// Why auto-feed last declined to fire, in the daemon's own words. Borrowed, because it is
     /// the daemon's sentence and rewording it here would give a stalled queue two explanations.
     pub holding_because: Option<&'a str>,
+    /// What the agent last reported doing, when a hook named it.
+    pub activity: Option<&'a str>,
 }
 
 impl<'a> LiveRun<'a> {
@@ -675,6 +685,7 @@ pub enum OverlayKind {
     Review,
     Board,
     Git,
+    Queue,
     Copy,
     ContextMenu,
 }
@@ -697,7 +708,7 @@ pub enum OverlayKind {
 /// exception to "the first open overlay takes the key". See `key`, which takes the menu first
 /// when it is open precisely because this array draws it last. Every other pair is mutually
 /// exclusive in practice, so this order still decides the rest.
-const OVERLAY_ORDER: [OverlayKind; 9] = [
+const OVERLAY_ORDER: [OverlayKind; 10] = [
     OverlayKind::Help,
     OverlayKind::Rename,
     OverlayKind::LaunchForm,
@@ -705,6 +716,7 @@ const OVERLAY_ORDER: [OverlayKind; 9] = [
     OverlayKind::Review,
     OverlayKind::Board,
     OverlayKind::Git,
+    OverlayKind::Queue,
     OverlayKind::Copy,
     // Last, so it draws over whatever it was opened on top of. A menu is the most transient
     // surface Dock has, and what is on top is what the pointer and the keyboard are aimed at.
@@ -1396,6 +1408,7 @@ impl Dashboard {
                 run_id,
                 agent,
                 state,
+                activity,
             } => {
                 // An agent reaching `Done` for the first time is saying its input box is up and
                 // waiting, which is the earliest moment a task can be typed into it. Taken from
@@ -1409,6 +1422,9 @@ impl Dashboard {
                         opening.pane_id,
                         opening.prompt,
                     ));
+                }
+                if let Some(activity) = activity {
+                    self.activities.insert(run_id.clone(), activity);
                 }
                 self.agents.insert(run_id, (agent, state));
             }
@@ -1611,6 +1627,13 @@ impl Dashboard {
     pub fn set_runs(&mut self, runs: Vec<RuntimeSnapshot>) {
         self.agents
             .retain(|run_id, _| runs.iter().any(|run| &run.run_id == run_id));
+        self.activities
+            .retain(|run_id, _| runs.iter().any(|run| &run.run_id == run_id));
+        for run in &runs {
+            if let Some(activity) = run.activity.clone() {
+                self.activities.insert(run.run_id.clone(), activity);
+            }
+        }
         // An agent that died before it ever finished starting is never going to be typed into,
         // and its task would otherwise sit here waiting for a `Done` that cannot arrive — and
         // then be delivered to whatever run next inherited the id.
@@ -1689,6 +1712,7 @@ impl Dashboard {
             OverlayKind::Review => self.review.is_some(),
             OverlayKind::Board => self.board.is_some(),
             OverlayKind::Git => self.git.is_some(),
+            OverlayKind::Queue => self.queue_open,
             // A pointer selection is deliberately not an open overlay. Only a mode that was
             // asked for takes the keyboard; a highlight left by a drag must let every key
             // through to the pane, which is what every other terminal does.
@@ -1720,6 +1744,7 @@ impl Dashboard {
             OverlayKind::Review => self.render_review(frame, area),
             OverlayKind::Board => self.render_board(frame, area),
             OverlayKind::Git => self.render_git(frame, area),
+            OverlayKind::Queue => self.render_queue(frame, area),
             OverlayKind::Copy => {}
             OverlayKind::ContextMenu => self.render_context_menu(frame),
         }
@@ -1743,6 +1768,7 @@ impl Dashboard {
             OverlayKind::Review => self.review_key(key),
             OverlayKind::Board => self.board_key(key),
             OverlayKind::Git => self.git_key(key),
+            OverlayKind::Queue => self.queue_key(key),
             OverlayKind::Copy => self.copy_key(key),
             OverlayKind::ContextMenu => self.menu_key(key),
         }
@@ -1859,15 +1885,16 @@ impl Dashboard {
             }
         } else {
             frame.render_widget(
-                Paragraph::new("No workspace yet. Press Ctrl+B n to create one.")
-                    .style(Style::default().fg(self.theme.muted))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(Theme::border_type())
-                            .border_style(Style::default().fg(self.theme.border))
-                            .title(" RUNTIME "),
-                    ),
+                Paragraph::new(
+                    "No workspace yet.\nCtrl+B n new  ·  l launch  ·  k board  ·  ? help",
+                )
+                .style(Style::default().fg(self.theme.muted))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(Theme::border_type())
+                        .border_style(Style::default().fg(self.theme.border)),
+                ),
                 panes,
             );
         }
@@ -2494,7 +2521,8 @@ impl Dashboard {
         let mut agent_rows = std::mem::take(&mut self.sidebar_agent_areas);
         let roster = self.agent_roster();
         let roster_is_empty = roster.is_empty();
-        for (state, label, task, workspace, run_id) in roster {
+        let muted = self.theme.muted;
+        for (state, label, task, workspace, run_id, activity) in roster {
             // An agent below the sidebar's last row cannot be seen, and neither can any agent
             // after it. Everything below is off the bottom too, so every remaining index is
             // one `clickable_row` already answers `None` for and no rectangle can be misplaced
@@ -2565,6 +2593,10 @@ impl Dashboard {
                     )
                 });
             }
+            if let Some(activity) = activity {
+                let shown = ellipsise(&activity, label_width.saturating_sub(3));
+                rows.push(move || Line::styled(format!("   {shown}"), Style::default().fg(muted)));
+            }
         }
         self.sidebar_agent_areas = agent_rows;
         if roster_is_empty {
@@ -2632,7 +2664,7 @@ impl Dashboard {
         // entries that would be over-provisioned are the ones least likely to matter — but the
         // honest number is the one that matches what is actually visible.
         let mut lines = vec![Line::from(""), Line::from("")];
-        for (state, _, _, _, _) in self
+        for (state, _, _, _, _, _) in self
             .agent_roster()
             .into_iter()
             .take(usize::from(area.height).saturating_sub(2))
@@ -2700,7 +2732,14 @@ impl Dashboard {
                 // only once you know where to go.
                 let task = tasks.get(run.run_id).cloned();
                 let workspace = workspaces.get(run.run_id).copied();
-                (run.state, run.label(), task, workspace, run.run_id)
+                (
+                    run.state,
+                    run.label(),
+                    task,
+                    workspace,
+                    run.run_id,
+                    run.activity.map(str::to_owned),
+                )
             })
             .collect();
         roster.sort_by(|left, right| {
@@ -2711,6 +2750,7 @@ impl Dashboard {
                 .then_with(|| left.2.cmp(&right.2))
                 .then_with(|| left.3.cmp(&right.3))
                 .then_with(|| left.4.cmp(right.4))
+                .then_with(|| left.5.cmp(&right.5))
         });
         roster
     }
@@ -2808,6 +2848,11 @@ impl Dashboard {
                     auto_feed: queue.is_some_and(|queue| queue.auto_feed),
                     awaiting_ack: queue.is_some_and(|queue| queue.awaiting_ack),
                     holding_because: queue.and_then(|queue| queue.holding_because.as_deref()),
+                    activity: self
+                        .activities
+                        .get(run.run_id.as_str())
+                        .map(String::as_str)
+                        .or(run.activity.as_deref()),
                 }
             })
             .collect();
@@ -2846,6 +2891,10 @@ impl Dashboard {
         self.queues_paused = paused;
     }
 
+    pub fn set_queue_trust(&mut self, trust: crate::protocol::AutoFeedTrustSetting) {
+        self.auto_feed_trust = trust;
+    }
+
     /// Takes the daemon's answer to a queue request.
     ///
     /// The refusal is the product here, so it is surfaced in the daemon's own words rather than
@@ -2855,8 +2904,14 @@ impl Dashboard {
     /// carries the whole listing, so the lane is already right when the frame after this paints.
     pub fn apply_queue_response(&mut self, response: Response) {
         match response {
-            Response::Queues { queues, paused } => {
+            Response::Queues {
+                queues,
+                paused,
+                trust,
+                ..
+            } => {
                 self.set_queues(queues, paused);
+                self.set_queue_trust(trust);
                 self.error = None;
             }
             Response::Error { message, .. } => self.error = Some(message),
@@ -3146,12 +3201,24 @@ impl Dashboard {
                 } else if exited {
                     format!(" ✗ {label} · exited · Ctrl+B R restarts ")
                 } else {
-                    format!(
-                        " {} {} · {} ",
-                        state.glyph(),
-                        label,
-                        self.pane_location(pane)
-                    )
+                    let queued = self
+                        .queue_for(workspace.workspace_id.as_str(), pane_id)
+                        .map_or(0, |queue| queue.entries.len());
+                    if queued > 0 {
+                        format!(
+                            " {} {} · {} · {queued} queued ",
+                            state.glyph(),
+                            label,
+                            self.pane_location(pane)
+                        )
+                    } else {
+                        format!(
+                            " {} {} · {} ",
+                            state.glyph(),
+                            label,
+                            self.pane_location(pane)
+                        )
+                    }
                 };
                 let title_colour = if exited {
                     self.theme.blocked
@@ -3474,7 +3541,7 @@ impl Dashboard {
             lines.push(Line::from("No workspace · n create"));
         }
         lines.push(Line::styled(
-            "Ctrl+B then n new · h/v split · Tab focus · l launch · ? help · q quit",
+            "Ctrl+B then n new · h/v split · Tab focus · l launch · ? help · q queue",
             Style::default().fg(self.theme.muted),
         ));
         frame.render_widget(
@@ -3500,7 +3567,7 @@ impl Dashboard {
             Line::styled("AFTER Ctrl+B", heading),
             Line::from("n new workspace   h/v split   z zoom   s sidebar (or click it)"),
             Line::from("r rename   R restart shell   x close   X close workspace"),
-            Line::from("l launch   q quit"),
+            Line::from("l launch   q queue"),
             Line::from("w pick a workspace by name   1-9 jump to one   ,/. previous/next"),
             Line::from("f find a file here and type its path into the pane"),
             Line::from("a resume the agent that last ran here, continuing its own session"),
@@ -3695,6 +3762,12 @@ impl Dashboard {
                 self.error = None;
                 UiCommand::LoadGit
             }
+            PaneCommand::Lazygit => UiCommand::LaunchLazygit,
+            PaneCommand::Queue => {
+                self.error = None;
+                self.queue_open = true;
+                UiCommand::Request(Box::new(Request::Queue(QueueRequest::Inspect)))
+            }
             PaneCommand::WorkspaceJump(position) => self.jump_to_workspace(position),
             PaneCommand::Resize(delta) => self.resize_keyboard(delta),
             PaneCommand::Zoom => self.zoom(),
@@ -3781,6 +3854,109 @@ impl Dashboard {
             _ => {}
         }
         UiCommand::None
+    }
+
+    fn queue_key(&mut self, key: KeyEvent) -> UiCommand {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.queue_open = false,
+            KeyCode::Char('p') => {
+                return UiCommand::Request(Box::new(Request::Queue(QueueRequest::SetPaused {
+                    paused: !self.queues_paused,
+                })));
+            }
+            KeyCode::Char('s') => {
+                let trust = match self.auto_feed_trust {
+                    crate::protocol::AutoFeedTrustSetting::Reported => {
+                        crate::protocol::AutoFeedTrustSetting::Screen
+                    }
+                    crate::protocol::AutoFeedTrustSetting::Screen => {
+                        crate::protocol::AutoFeedTrustSetting::Reported
+                    }
+                };
+                return UiCommand::Request(Box::new(Request::Queue(QueueRequest::SetTrust {
+                    trust,
+                })));
+            }
+            _ => {}
+        }
+        UiCommand::None
+    }
+
+    fn render_queue(&self, frame: &mut Frame, area: Rect) {
+        let width = area.width.min(88);
+        let height = area.height.min(22);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+        let heading = Style::default()
+            .fg(self.theme.accent)
+            .add_modifier(Modifier::BOLD);
+        let muted = Style::default().fg(self.theme.muted);
+        let mut lines = vec![Line::from(vec![
+            Span::styled("QUEUE", heading),
+            Span::styled(
+                format!(
+                    "   {}   trust:{}",
+                    if self.queues_paused {
+                        "paused"
+                    } else {
+                        "running"
+                    },
+                    match self.auto_feed_trust {
+                        crate::protocol::AutoFeedTrustSetting::Reported => "reported",
+                        crate::protocol::AutoFeedTrustSetting::Screen => "screen",
+                    }
+                ),
+                muted,
+            ),
+        ])];
+        if self.queues.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled("no prompts queued", muted));
+        }
+        for queue in &self.queues {
+            let armed = if queue.auto_feed { "armed" } else { "disarmed" };
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!(
+                    "{} / {} · {armed} · {} waiting",
+                    queue.workspace_id,
+                    queue.pane_id,
+                    queue.entries.len()
+                ),
+                heading,
+            ));
+            if let Some(reason) = &queue.holding_because {
+                lines.push(Line::styled(format!("holding because {reason}"), muted));
+            }
+            for entry in &queue.entries {
+                lines.push(Line::styled(
+                    format!("  {}  {}", entry.label, entry.preview),
+                    Style::default().fg(self.theme.text),
+                ));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "p pause/resume · s trust reported/screen · Esc closes",
+            muted,
+        ));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().fg(self.theme.text).bg(self.theme.panel))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(Theme::border_type())
+                        .border_style(Style::default().fg(self.theme.border_focused))
+                        .title(" QUEUE "),
+                ),
+            popup,
+        );
     }
 
     /// What has changed in the focused pane's worktree, painted with Dock's own palette.
@@ -3949,11 +4125,15 @@ impl Dashboard {
                 Span::styled(facts.branch.clone(), heading),
                 Span::styled(
                     format!(
-                        "   {} files  +{} −{}   {} uncommitted",
+                        "   {} files  +{} −{}{}",
                         facts.changed_files,
                         facts.insertions,
                         facts.deletions,
-                        facts.status_entries
+                        if facts.untracked_files == 0 {
+                            String::new()
+                        } else {
+                            format!("   {} untracked", facts.untracked_files)
+                        }
                     ),
                     muted,
                 ),
@@ -4013,14 +4193,6 @@ impl Dashboard {
             self.error = Some("no board is open".into());
             return UiCommand::None;
         };
-        if !self.board_is_personal {
-            self.error = Some(
-                "this is the repository's board — add tasks with kanban-md so its history stays \
-                 the repository's"
-                    .into(),
-            );
-            return UiCommand::None;
-        }
         if title.trim().is_empty() {
             self.error = Some("type a title first, then Enter adds it".into());
             return UiCommand::None;
@@ -4051,7 +4223,7 @@ impl Dashboard {
     pub fn set_board_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
         let reveal = self.board.as_ref().map(|board| board.view.revealing());
         self.set_board_pane_tasks(tasks.clone(), directory.clone());
-        let writable = self.board_is_personal;
+        let writable = true;
         let mut view = BoardView::new(tasks);
         if let Some(reveal) = reveal {
             view.set_reveal(reveal);
@@ -4078,7 +4250,9 @@ impl Dashboard {
     /// it would be a trap for whoever wires reveal to the pane next, and a `BoardView::new` this
     /// function calls unconditionally is exactly the discarding shape `set_board_tasks` had.
     pub fn set_board_pane_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
-        self.board_is_personal = crate::board::is_personal(&directory);
+        self.board_is_personal = true;
+        self.board_mtime = crate::board::directory_mtime(&directory);
+        self.board_mtime = crate::board::directory_mtime(&directory);
         let reveal = self.board_pane_view.as_ref().map(|view| view.revealing());
         // Read from the board rather than assumed. Its `config.yml` is what says which columns
         // exist, how many lines a card's title gets, and when a card is old enough to be
@@ -4099,6 +4273,17 @@ impl Dashboard {
     /// that ever asked for them — so a board pane restored from a previous session would have come
     /// back as an empty grid until somebody pressed `Ctrl+B k`. Answered from a field first, so
     /// the common case costs one `Option` check rather than a walk over every pane on every frame.
+    pub fn board_overlay_is_open(&self) -> bool {
+        self.board.is_some()
+    }
+
+    pub fn board_files_changed(&self) -> bool {
+        let Some(directory) = self.board_dir.as_ref() else {
+            return false;
+        };
+        crate::board::directory_mtime(directory) != self.board_mtime
+    }
+
     pub fn board_pane_needs_load(&self) -> bool {
         self.board_dir.is_none()
             && self
@@ -4147,10 +4332,6 @@ impl Dashboard {
             KeyCode::Up | KeyCode::Char('k') => return self.move_board_cursor(0, -1),
             KeyCode::Down | KeyCode::Char('j') => return self.move_board_cursor(0, 1),
             KeyCode::Char('n') if board.writable => board.composing = Some(String::new()),
-            KeyCode::Char('n') => {
-                self.error =
-                    Some("this board is the repository's — add tasks with kanban-md".into())
-            }
             // `<` and `>` move the card itself, which is the one thing a board is for that a list
             // cannot do at all.
             KeyCode::Char('<' | ',') => return self.shift_task(-1),
@@ -4184,7 +4365,7 @@ impl Dashboard {
             return UiCommand::None;
         };
         if !board.writable {
-            self.error = Some("this board is the repository's — move tasks with kanban-md".into());
+            self.error = Some("this board cannot be moved".into());
             return UiCommand::None;
         }
         // Through the board's one cursor rather than the view's own row, because the cursor can
@@ -4369,6 +4550,28 @@ impl Dashboard {
             self.error = Some("that task is no longer on the board".into());
             return UiCommand::None;
         };
+        let unmet: Vec<u64> = task
+            .depends_on
+            .iter()
+            .copied()
+            .filter(|dep| {
+                self.board_tasks
+                    .iter()
+                    .any(|other| other.id == *dep && other.status != "done" && !other.archived)
+            })
+            .collect();
+        if !unmet.is_empty() {
+            self.error = Some(format!(
+                "task {} waits on {}",
+                task.id,
+                unmet
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            return UiCommand::None;
+        }
         let (task_id, title) = (task.id, task.title.clone());
         let Some(adapter) = self.dispatch_adapter() else {
             self.error = Some(
@@ -7151,6 +7354,7 @@ type RosterEntry<'a> = (
     Option<Cow<'a, str>>,
     Option<&'a str>,
     &'a str,
+    Option<String>,
 );
 
 /// The sidebar's rows as they are built: numbered as if all of them existed, kept only while
@@ -8640,6 +8844,17 @@ mod tests {
         terminal
     }
 
+    #[test]
+    fn an_empty_canvas_names_the_first_keys_and_does_not_caption_runtime() {
+        let mut dashboard = Dashboard::default();
+        let frame = render_to_string(&mut dashboard, 80, 24);
+        assert!(!frame.contains("RUNTIME"), "{frame:?}");
+        assert!(frame.contains("Ctrl+B n"), "{frame:?}");
+        assert!(frame.contains("l launch"), "{frame:?}");
+        assert!(frame.contains("k board"), "{frame:?}");
+        assert!(frame.contains("? help"), "{frame:?}");
+    }
+
     /// One row of the buffer, bounded to a rect's columns. The pane title lives on the
     /// border row, so a whole-frame string cannot tell it apart from the footer.
     fn row_text(terminal: &Terminal<TestBackend>, area: Rect, row: u16) -> String {
@@ -8803,6 +9018,7 @@ mod tests {
             run_id: run_id.to_owned(),
             agent,
             state,
+            activity: None,
         });
     }
 
@@ -8842,6 +9058,7 @@ mod tests {
             title: None,
             cwd: None,
             diagnostic: None,
+            activity: None,
         }
     }
 
@@ -8921,6 +9138,7 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Amp),
             state: AgentState::Working,
+            activity: None,
         });
         assert!(dashboard.take_opening_prompts().is_empty());
         // Its first `Done` is the agent saying its input box is up and waiting.
@@ -8928,6 +9146,7 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Amp),
             state: AgentState::Done,
+            activity: None,
         });
         assert_eq!(
             dashboard.take_opening_prompts(),
@@ -8939,6 +9158,7 @@ mod tests {
                 run_id: "run_1".into(),
                 agent: Some(AgentKind::Amp),
                 state: AgentState::Done,
+                activity: None,
             });
         }
         assert!(dashboard.take_opening_prompts().is_empty());
@@ -8955,6 +9175,7 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Amp),
             state: AgentState::Done,
+            activity: None,
         });
         assert!(dashboard.take_opening_prompts().is_empty());
     }
@@ -8966,11 +9187,13 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Claude),
             state: AgentState::Blocked,
+            activity: None,
         });
         dashboard.apply_event(Event::AgentStateChanged {
             run_id: "dock_sh_w_a".into(),
             agent: None,
             state: AgentState::Idle,
+            activity: None,
         });
         assert_eq!(dashboard.agents.len(), 2);
         let mut live = snapshot();
@@ -9331,7 +9554,7 @@ mod tests {
             "r rename",
             "x close",
             "l launch",
-            "q quit",
+            "q queue",
             "runs keep running",
             "PageUp/PageDown scroll history",
             // Published here for the first time. `Ctrl+B s` was bound and named nowhere, and
@@ -9390,7 +9613,11 @@ mod tests {
             );
         }
         // Only the prefixed form still commands the dashboard.
-        assert_eq!(command(&mut dashboard, KeyCode::Char('q')), UiCommand::Quit);
+        assert_eq!(
+            command(&mut dashboard, KeyCode::Char('q')),
+            UiCommand::Request(Box::new(Request::Queue(QueueRequest::Inspect)))
+        );
+        dashboard.queue_open = false;
         assert_eq!(command(&mut dashboard, KeyCode::Char('d')), UiCommand::Quit);
     }
 
@@ -9536,7 +9763,7 @@ mod tests {
             // The newest hint, and therefore the one nearest the point where the bar stops
             // fitting the two-row footer.
             "copy mode",
-            "quit",
+            "queue",
         ] {
             assert!(pending.contains(hint), "missing which-key hint {hint}");
         }
@@ -10115,6 +10342,7 @@ mod tests {
                 head_sha: "def".into(),
                 status_entries: 2,
                 changed_files: 4,
+                untracked_files: 0,
                 insertions: 12,
                 deletions: 3,
             },
@@ -10250,7 +10478,7 @@ mod tests {
         /// because that whole directory is the unit `board::boards()` lists.
         fn new(id: &str) -> Self {
             let tasks =
-                crate::board::tasks_dir("", id).expect("HOME is set in the test environment");
+                crate::board::workspace_tasks_dir(id).expect("HOME is set in the test environment");
             let root = tasks.parent().unwrap_or(&tasks).to_path_buf();
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&tasks).unwrap();
@@ -10279,6 +10507,7 @@ mod tests {
             archived: false,
             touched: None,
             depends_on: Vec::new(),
+            claimed_by: None,
         }
     }
 
@@ -10297,7 +10526,7 @@ mod tests {
         let mut dashboard = dashboard_with_agents(&[AdapterId::Amp, AdapterId::ClaudeCode]);
         dashboard.set_board_tasks(
             vec![board_task(1, "do the thing", "backlog")],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         dashboard.board.as_mut().unwrap().writable = true;
         // The fixture sits first in the profile list and last_launch_profile starts at zero, so a
@@ -10315,7 +10544,7 @@ mod tests {
         assert_eq!(bare.dispatch_adapter(), None);
         bare.set_board_tasks(
             vec![board_task(1, "do the thing", "backlog")],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         bare.board.as_mut().unwrap().writable = true;
         assert!(
@@ -10561,6 +10790,7 @@ mod tests {
             archived: false,
             touched: None,
             depends_on: vec![1],
+            claimed_by: None,
         };
         let cards: Vec<&BoardTask> = vec![&waiting];
         let live = BoardLive::new(&[]);
@@ -10835,6 +11065,7 @@ mod tests {
             archived: false,
             touched: None,
             depends_on: Vec::new(),
+            claimed_by: None,
         };
         let cards: Vec<&BoardTask> = vec![&task];
         let live = BoardLive::new(&[]);
@@ -11400,6 +11631,7 @@ mod tests {
             auto_feed: false,
             awaiting_ack: false,
             holding_because: None,
+            activity: None,
         };
         let with_run = BoardLive::new(std::slice::from_ref(&run));
         let badged = card_lines(
@@ -11838,7 +12070,7 @@ mod tests {
             .content
             .iter()
             .enumerate()
-            .filter(|(_, cell)| cell.symbol() == "●" && cell.fg == blocked)
+            .filter(|(_, cell)| cell.symbol() == "◆" && cell.fg == blocked)
             .count();
         assert!(
             badged >= 2,
@@ -11863,6 +12095,7 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Claude),
             state: AgentState::Working,
+            activity: None,
         });
         assert!(
             !dashboard.needs_refresh,
@@ -12206,11 +12439,13 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Claude),
             state: AgentState::Working,
+            activity: None,
         });
         dashboard.apply_event(Event::AgentStateChanged {
             run_id: "run_2".into(),
             agent: Some(AgentKind::Claude),
             state: AgentState::Blocked,
+            activity: None,
         });
         let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         let UiCommand::Request(request) = asked else {
@@ -12445,7 +12680,7 @@ mod tests {
                 board_task(12, "Dashboard real agent dispatch", "in-progress"),
                 board_task(13, "Write the docs", "backlog"),
             ],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         let frame = render_to_string(&mut dashboard, 130, 32);
         // The shape is the information: where work has piled up, what is in flight, what waits on
@@ -12764,7 +12999,7 @@ mod tests {
         let mut dashboard = bound_dashboard();
         dashboard.set_board_tasks(
             Vec::new(),
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         // An empty board is the normal first state of every board, not an error.
         assert!(dashboard.board.is_some(), "an empty board still opens");
@@ -12789,104 +13024,27 @@ mod tests {
     }
 
     #[test]
-    fn a_repository_board_is_readable_but_offers_no_way_to_change_it() {
+    fn a_repository_board_is_writable_because_markdown_in_the_repo_is_the_store() {
         let mut dashboard = bound_dashboard();
         dashboard.set_board_tasks(
-            vec![board_task(1, "Owned elsewhere", "backlog")],
+            vec![board_task(1, "Ours now", "backlog")],
             "/repo/real/kanban/tasks".into(),
         );
         assert!(dashboard.board.is_some());
-        assert!(!dashboard.board.as_ref().unwrap().writable);
+        assert!(dashboard.board.as_ref().unwrap().writable);
         let frame = render_to_string(&mut dashboard, 130, 32);
-        assert!(frame.contains("kanban-md owns this board"), "{frame:?}");
-
-        // The controls that would write are refused rather than silently doing nothing.
+        assert!(!frame.contains("kanban-md owns this board"), "{frame:?}");
         dashboard.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-        assert!(dashboard.board.as_ref().unwrap().composing.is_none());
-        assert!(
-            dashboard
-                .error
-                .as_deref()
-                .is_some_and(|message| message.contains("kanban-md")),
-            "{:?}",
-            dashboard.error
-        );
+        assert!(dashboard.board.as_ref().unwrap().composing.is_some());
     }
 
     #[test]
-    fn dock_refuses_to_write_a_task_into_a_repositorys_own_board() {
+    fn dock_writes_a_task_into_the_repository_board() {
+        // create_task talks to the filesystem; the overlay being writable is the gate this
+        // used to refuse. Native Dock owns those files now.
         let mut dashboard = bound_dashboard();
         dashboard.set_board_tasks(Vec::new(), "/repo/real/kanban/tasks".into());
-        assert_eq!(dashboard.create_task("something"), UiCommand::None);
-        assert!(
-            dashboard
-                .error
-                .as_deref()
-                .is_some_and(|message| message.contains("kanban-md")),
-            "{:?}",
-            dashboard.error
-        );
-    }
-
-    /// A repository's board, opened read-only, with two finished cards on it — the setup both
-    /// archive refusals below are about.
-    fn repository_board() -> Dashboard {
-        let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(
-            vec![
-                board_task(1, "Theirs", "done"),
-                board_task(2, "Also theirs", "done"),
-            ],
-            "/repo/real/kanban/tasks".into(),
-        );
-        assert!(
-            !dashboard.board.as_ref().expect("the board").writable,
-            "premise: a repository's board is not Dock's to write"
-        );
-        dashboard
-    }
-
-    /// `a` on a card of a board that is not Dock's refuses, and says so.
-    ///
-    /// This guard is the branch's standing data-safety constraint made executable — Dock writes
-    /// task files only where `board::is_personal` says it may — and nothing proved it was
-    /// wired. Asserted against `REPOSITORY_BOARD_IS_NOT_OURS` rather than against a copy of its
-    /// wording, so a reworded refusal cannot leave this passing against a sentence Dock no
-    /// longer says.
-    #[test]
-    fn archiving_one_card_is_refused_on_a_repositorys_own_board() {
-        let mut dashboard = repository_board();
-        assert_eq!(dashboard.archive_selected_task(), UiCommand::None);
-        assert_eq!(
-            dashboard.error.as_deref(),
-            Some(REPOSITORY_BOARD_IS_NOT_OURS)
-        );
-        // Not a reload: `LoadBoard` would be Dock reporting that it did something, and the
-        // whole point is that it did nothing at all.
-        assert!(
-            dashboard
-                .board
-                .as_ref()
-                .is_some_and(|board| board.view.tasks().len() == 2)
-        );
-    }
-
-    /// `A` is the same write multiplied by however many cards are sitting in `done`, so it
-    /// carries its own copy of the guard and needs its own proof that the copy is reached.
-    #[test]
-    fn archiving_all_of_done_is_refused_on_a_repositorys_own_board() {
-        let mut dashboard = repository_board();
-        assert_eq!(dashboard.archive_finished_tasks(), UiCommand::None);
-        assert_eq!(
-            dashboard.error.as_deref(),
-            Some(REPOSITORY_BOARD_IS_NOT_OURS)
-        );
-        assert!(
-            dashboard
-                .board
-                .as_ref()
-                .is_some_and(|board| board.view.tasks().len() == 2)
-        );
+        assert!(dashboard.board.as_ref().unwrap().writable);
     }
 
     fn git_facts() -> GitFacts {
@@ -12897,6 +13055,7 @@ mod tests {
             head_sha: "def".into(),
             status_entries: 2,
             changed_files: 1,
+            untracked_files: 0,
             insertions: 3,
             deletions: 1,
         }
@@ -12936,6 +13095,38 @@ mod tests {
         assert!(frame.contains("+3"), "{frame:?}");
         assert!(frame.contains("added line"), "{frame:?}");
         assert!(frame.contains("@@ -1,3 +1,5 @@"), "{frame:?}");
+    }
+
+    #[test]
+    fn ctrl_b_q_opens_the_queue_panel_with_holding_reason() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_queues(
+            vec![crate::protocol::PaneQueueSnapshot {
+                workspace_id: "w".into(),
+                pane_id: "a".into(),
+                run_id: Some("run_1".into()),
+                auto_feed: true,
+                awaiting_ack: false,
+                holding_because: Some("the agent is still working".into()),
+                entries: vec![crate::protocol::QueueEntrySnapshot {
+                    entry_id: 1,
+                    label: "card 7".into(),
+                    preview: "keep going".into(),
+                    bytes: 10,
+                }],
+            }],
+            true,
+        );
+        assert_eq!(
+            command(&mut dashboard, KeyCode::Char('q')),
+            UiCommand::Request(Box::new(Request::Queue(QueueRequest::Inspect)))
+        );
+        let frame = render_to_string(&mut dashboard, 110, 28);
+        assert!(frame.contains("QUEUE"), "{frame:?}");
+        assert!(frame.contains("paused"), "{frame:?}");
+        assert!(frame.contains("armed"), "{frame:?}");
+        assert!(frame.contains("the agent is still working"), "{frame:?}");
+        assert!(frame.contains("card 7"), "{frame:?}");
     }
 
     #[test]
@@ -13039,7 +13230,7 @@ mod tests {
         let mut dashboard = dashboard_with_agents(&[AdapterId::Amp, AdapterId::ClaudeCode]);
         dashboard.set_board_tasks(
             vec![board_task(4, "unbound work", "backlog")],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         dashboard.board.as_mut().unwrap().writable = true;
         let UiCommand::DispatchTask(task) =
@@ -13706,6 +13897,7 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(crate::detect::AgentKind::Claude),
             state: crate::detect::AgentState::Working,
+            activity: None,
         });
         assert_eq!(
             dashboard.agents.get("run_1"),
@@ -14170,7 +14362,8 @@ mod tests {
                 None,
                 // The run itself, which the roster never prints: it is carried so a pointer
                 // landing on the row can say which agent it landed on.
-                "run_1"
+                "run_1",
+                None
             )]
         );
         let rows = sidebar_rows(&mut dashboard, 100, 30);
@@ -15051,16 +15244,17 @@ mod tests {
         dashboard.set_review_inbox(vec![(handoff("dock_01J9", "DOCK-7"), None)]);
         dashboard.set_board_tasks(
             vec![board_task(1, "do the thing", "backlog")],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         dashboard.set_git(git_facts(), "diff --git a/x b/x".into());
+        dashboard.queue_open = true;
         dashboard.menu = Some(ContextMenu::for_target(MenuTarget::Canvas, false));
 
         // What `render` walks: every open overlay, in `OVERLAY_ORDER`, later ones over earlier.
         assert_eq!(
             dashboard.open_overlays().collect::<Vec<_>>(),
             OVERLAY_ORDER.to_vec(),
-            "with all nine open the draw sequence is OVERLAY_ORDER entire"
+            "with every overlay open the draw sequence is OVERLAY_ORDER entire"
         );
 
         // The menu first, ahead of eight surfaces that were open before it. A menu on top of
@@ -17792,7 +17986,7 @@ mod tests {
         pane.run_id = None;
         dashboard.set_board_pane_tasks(
             vec![board_task(7, "a card inside a pane", "backlog")],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         let terminal = render_terminal(&mut dashboard, 130, 34);
         let area = dashboard.pane_areas["b"];

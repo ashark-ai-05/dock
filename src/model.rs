@@ -30,6 +30,8 @@ pub struct HandoffEvidence {
     pub head_sha: String,
     pub status_entries: usize,
     pub changed_files: usize,
+    #[serde(default)]
+    pub untracked_files: usize,
     pub insertions: usize,
     pub deletions: usize,
 }

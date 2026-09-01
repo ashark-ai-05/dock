@@ -299,14 +299,10 @@ fn handle_connection_with_timeout(
                 )?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
             },
-            Ok(Request::ReportAgentState(request)) => {
-                match runtime.report_agent_state(&request.run_id, request.state) {
-                    Ok(()) => write_response(stream, &Response::AgentStateRecorded {})?,
-                    Err((code, message)) => {
-                        write_response(stream, &Response::Error { code, message })?
-                    }
-                }
-            }
+            Ok(Request::ReportAgentState(request)) => match runtime.report_agent_state(&request) {
+                Ok(()) => write_response(stream, &Response::AgentStateRecorded {})?,
+                Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
+            },
             Ok(Request::SubmitHandoff(request)) => match runtime.submit_handoff(request.packet) {
                 Ok(record) => write_response(stream, &Response::HandoffSubmitted { record })?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
@@ -424,6 +420,7 @@ fn handle_connection_with_timeout(
                     QueueRequest::Inspect => Response::Queues {
                         queues: runtime.queue_snapshots(),
                         paused: runtime.queue_paused(),
+                        trust: runtime.auto_feed_trust().into(),
                     },
                     QueueRequest::Add {
                         workspace_id,
@@ -437,6 +434,7 @@ fn handle_connection_with_timeout(
                         Ok(_) => Response::Queues {
                             queues: runtime.queue_snapshots(),
                             paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
                         },
                         Err((code, message)) => Response::Error { code, message },
                     },
@@ -448,6 +446,7 @@ fn handle_connection_with_timeout(
                         Ok(()) => Response::Queues {
                             queues: runtime.queue_snapshots(),
                             paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
                         },
                         Err((code, message)) => Response::Error { code, message },
                     },
@@ -458,6 +457,7 @@ fn handle_connection_with_timeout(
                         Ok(_) => Response::Queues {
                             queues: runtime.queue_snapshots(),
                             paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
                         },
                         Err((code, message)) => Response::Error { code, message },
                     },
@@ -469,6 +469,7 @@ fn handle_connection_with_timeout(
                         Ok(()) => Response::Queues {
                             queues: runtime.queue_snapshots(),
                             paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
                         },
                         Err((code, message)) => Response::Error { code, message },
                     },
@@ -476,9 +477,18 @@ fn handle_connection_with_timeout(
                         Ok(()) => Response::Queues {
                             queues: runtime.queue_snapshots(),
                             paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
                         },
                         Err((code, message)) => Response::Error { code, message },
                     },
+                    QueueRequest::SetTrust { trust } => {
+                        runtime.set_auto_feed_trust(trust.into());
+                        Response::Queues {
+                            queues: runtime.queue_snapshots(),
+                            paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
+                        }
+                    }
                 };
                 write_response(stream, &response)?;
             }
@@ -524,7 +534,8 @@ fn stream_events(
     // Kept outside `syncs` so a re-seed cannot restart the numbering: Task 11's client reads a
     // revision that moves backwards as a dropped frame and asks to re-attach, which would loop.
     let mut revisions: HashMap<String, u64> = HashMap::new();
-    let mut states: HashMap<String, (Option<AgentKind>, AgentState)> = HashMap::new();
+    let mut states: HashMap<String, (Option<AgentKind>, AgentState, Option<String>)> =
+        HashMap::new();
     // Tracked separately from `states` because a plain shell has no agent: its identity stays
     // `None` and its agent state stays `Idle` forever, so an exit would never reach a
     // subscriber through `AgentStateChanged`. Its screen stops changing at the same moment,
@@ -658,7 +669,11 @@ fn stream_events(
                 // this loop that the subscriber already knows.
                 process_states.insert(snapshot.run_id.clone(), snapshot.state.clone());
             }
-            let current = (snapshot.agent, snapshot.agent_state);
+            let current = (
+                snapshot.agent,
+                snapshot.agent_state,
+                snapshot.activity.clone(),
+            );
             if states.get(&snapshot.run_id) != Some(&current) {
                 if !push_response(
                     stream,
@@ -667,6 +682,7 @@ fn stream_events(
                             run_id: snapshot.run_id.clone(),
                             agent: current.0,
                             state: current.1,
+                            activity: current.2.clone(),
                         },
                     },
                 )? {
@@ -2756,7 +2772,7 @@ mod tests {
             ],
             &runtime,
         );
-        let Response::Queues { queues, paused } = &responses[1] else {
+        let Response::Queues { queues, paused, .. } = &responses[1] else {
             panic!("an add answers with the listing: {:?}", responses[1]);
         };
         assert_eq!(queues.len(), 1);

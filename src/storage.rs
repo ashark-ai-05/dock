@@ -27,6 +27,12 @@ pub struct PaneQueueRecord {
     pub queue: Result<DurablePaneQueue, String>,
 }
 
+/// Handoffs that parsed, plus poison files that did not — skipped so one bad JSON cannot hide the rest.
+pub struct HandoffInbox {
+    pub records: Vec<HandoffRecord>,
+    pub skipped: Vec<(String, String)>,
+}
+
 /// Where the queues live, and where a queue file that cannot be parsed goes instead.
 const QUEUES: &str = "queues";
 const QUEUE_QUARANTINE: &str = "queues-quarantine";
@@ -84,23 +90,37 @@ impl LocalStore {
     }
 
     pub fn list_handoff_records(&self) -> Result<Vec<HandoffRecord>, String> {
+        Ok(self.list_handoff_inbox()?.records)
+    }
+
+    pub fn list_handoff_inbox(&self) -> Result<HandoffInbox, String> {
         let directory = self.root.join("handoffs");
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(HandoffInbox {
+                    records: Vec::new(),
+                    skipped: Vec::new(),
+                });
+            }
             Err(error) => return Err(format!("could not read handoff inbox: {error}")),
         };
         let mut records = Vec::new();
+        let mut skipped = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error| format!("could not read handoff inbox: {error}"))?;
             let name = entry.file_name();
             let Some(run_id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
                 continue;
             };
-            records.push(self.load_handoff_record(run_id)?);
+            match self.load_handoff_record(run_id) {
+                Ok(record) => records.push(record),
+                Err(reason) => skipped.push((run_id.to_owned(), reason)),
+            }
         }
         records.sort_by(|a, b| a.packet.run_id.cmp(&b.packet.run_id));
-        Ok(records)
+        skipped.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(HandoffInbox { records, skipped })
     }
 
     pub fn save_decision(&self, decision: &ReviewDecision) -> Result<PathBuf, String> {
@@ -617,7 +637,7 @@ fn packet_filename(run_id: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Check;
+    use crate::model::{Check, HandoffEvidence};
 
     fn packet() -> HandoffPacket {
         HandoffPacket {
@@ -643,6 +663,37 @@ mod tests {
             std::env::temp_dir().join(format!("dock-storage-{test_name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         LocalStore::new(path)
+    }
+
+    #[test]
+    fn listing_handoffs_skips_an_unreadable_file_rather_than_failing_the_inbox() {
+        let store = temporary_store("handoff-skip");
+        store
+            .save_handoff_record(&HandoffRecord {
+                packet: packet(),
+                evidence: HandoffEvidence {
+                    branch: "dock/fixture-handoff".into(),
+                    base_sha: "aaa".into(),
+                    head_sha: "bbb".into(),
+                    status_entries: 1,
+                    changed_files: 0,
+                    untracked_files: 1,
+                    insertions: 0,
+                    deletions: 0,
+                },
+            })
+            .expect("save");
+        let directory = store.root.join("handoffs");
+        fs::write(directory.join("dock_bad.json"), b"not json").expect("junk");
+        let records = store
+            .list_handoff_records()
+            .expect("the inbox must still list");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].packet.run_id, "dock_01J9");
+        let inbox = store.list_handoff_inbox().expect("inbox");
+        assert_eq!(inbox.skipped.len(), 1);
+        assert_eq!(inbox.skipped[0].0, "dock_bad");
+        let _ = fs::remove_dir_all(store.root);
     }
 
     #[test]

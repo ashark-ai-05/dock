@@ -126,16 +126,38 @@ impl AgentState {
 
     pub const fn glyph(self) -> char {
         match self {
-            Self::Blocked | Self::Working => '●',
-            Self::Done => '◍',
             Self::Idle => '○',
+            Self::Working => '◐',
+            Self::Done => '◉',
+            Self::Blocked => '◆',
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{AgentKind, AgentState, classify_screen};
     use crate::terminal::VtTerminal;
+
+    #[test]
+    fn each_agent_state_has_its_own_glyph() {
+        assert_eq!(AgentState::Idle.glyph(), '○');
+        assert_eq!(AgentState::Working.glyph(), '◐');
+        assert_eq!(AgentState::Done.glyph(), '◉');
+        assert_eq!(AgentState::Blocked.glyph(), '◆');
+        let glyphs = [
+            AgentState::Idle.glyph(),
+            AgentState::Working.glyph(),
+            AgentState::Done.glyph(),
+            AgentState::Blocked.glyph(),
+        ];
+        for (index, glyph) in glyphs.iter().enumerate() {
+            assert!(
+                !glyphs[index + 1..].contains(glyph),
+                "a shared glyph cannot tell states apart"
+            );
+        }
+    }
 
     #[test]
     fn every_agent_herdr_lists_is_recognised_by_its_own_binary_name() {

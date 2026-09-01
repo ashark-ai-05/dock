@@ -33,6 +33,17 @@ pub struct BoardConfig {
     pub title_lines: usize,
     /// Age rungs, oldest last. Empty when the board declares none.
     pub age_thresholds: Vec<AgeThreshold>,
+    /// WIP caps keyed by status name. Empty when the board declares none.
+    pub wip: Vec<(String, usize)>,
+}
+
+impl BoardConfig {
+    pub fn wip_limit_for(&self, status: &str) -> Option<usize> {
+        self.wip
+            .iter()
+            .find(|(name, _)| name == status)
+            .map(|(_, limit)| *limit)
+    }
 }
 
 impl Default for BoardConfig {
@@ -54,6 +65,7 @@ impl Default for BoardConfig {
                 .map(|status| (*status).to_owned())
                 .collect(),
             title_lines: 2,
+            wip: Vec::new(),
             age_thresholds: vec![
                 AgeThreshold {
                     after: 0,
@@ -148,6 +160,8 @@ pub fn parse(text: &str) -> BoardConfig {
     let mut section: Option<&str> = None;
     let mut in_age = false;
     let mut pending_after: Option<u64> = None;
+    let mut last_status: Option<String> = None;
+    let mut wip: Vec<(String, usize)> = Vec::new();
 
     for line in text.lines() {
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
@@ -168,7 +182,15 @@ pub fn parse(text: &str) -> BoardConfig {
                     && let Some((key, value)) = rest.split_once(':')
                     && key.trim() == "name"
                 {
-                    statuses.push(unquote(value).to_owned());
+                    let name = unquote(value).to_owned();
+                    last_status = Some(name.clone());
+                    statuses.push(name);
+                } else if let Some((key, value)) = trimmed.split_once(':')
+                    && key.trim() == "wip_limit"
+                    && let Some(status) = last_status.as_ref()
+                    && let Ok(limit) = unquote(value).parse::<usize>()
+                {
+                    wip.push((status.clone(), limit));
                 }
             }
             Some("tui") => {
@@ -206,6 +228,7 @@ pub fn parse(text: &str) -> BoardConfig {
     if !rungs.is_empty() {
         config.age_thresholds = rungs;
     }
+    config.wip = wip;
     config.age_thresholds.sort_by_key(|rung| rung.after);
     config
 }
@@ -354,5 +377,13 @@ next_id: 11
         assert_eq!(duration_seconds("7d"), Some(604_800));
         assert_eq!(duration_seconds("42"), Some(42));
         assert_eq!(duration_seconds("soon"), None);
+    }
+
+    #[test]
+    fn a_column_wip_limit_is_read_from_the_status_that_declares_it() {
+        let config =
+            parse("statuses:\n    - name: backlog\n    - name: in-progress\n      wip_limit: 2\n");
+        assert_eq!(config.wip_limit_for("in-progress"), Some(2));
+        assert_eq!(config.wip_limit_for("backlog"), None);
     }
 }

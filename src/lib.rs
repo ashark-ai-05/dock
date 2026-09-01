@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod dispatch;
 pub mod files;
 pub mod git;
+pub mod hook;
 pub mod keymap;
 pub mod layout;
 pub mod model;

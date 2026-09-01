@@ -69,6 +69,7 @@ pub struct RunPulse {
     /// Filled in by the registry, which owns the process table and the classification cache.
     pub agent: Option<crate::detect::AgentKind>,
     pub agent_state: crate::detect::AgentState,
+    pub activity: Option<String>,
 }
 
 pub struct OwnedRuntime {
@@ -324,6 +325,7 @@ impl OwnedRuntime {
                 .map(|group| group.0.as_raw()),
             agent: None,
             agent_state: crate::detect::AgentState::Idle,
+            activity: None,
         }
     }
 
@@ -391,6 +393,7 @@ impl OwnedRuntime {
             title,
             cwd,
             diagnostic: self.launch_error.clone().or(runtime_diagnostic),
+            activity: None,
         }
     }
 

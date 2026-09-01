@@ -2,3 +2,4 @@
 kanban/.lock
 .dock/local/
 .superpowers/
+__pycache__/

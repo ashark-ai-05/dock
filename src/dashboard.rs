@@ -1,4 +1,9 @@
-use std::{borrow::Cow, collections::HashMap, path::Path, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    path::Path,
+    time::Instant,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -14,6 +19,7 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::{
     adapter::{AdapterId, AdapterSelection},
+    attention::{self, AttentionCandidate},
     board::{BoardTask, BoardView},
     clipboard::{self, ClipboardRoute},
     copy::{CopySession, find_matches},
@@ -267,6 +273,8 @@ pub struct Dashboard {
     /// to be: a board whose todo column is empty must still be walkable across, and refusing to
     /// enter one would make `l` skip a column silently.
     board_cursor: Option<(usize, Option<BoardTarget>)>,
+    /// Done panes already visited this turn, keyed as workspace/pane.
+    seen_done: HashSet<String>,
     #[cfg(test)]
     /// Stands in for what is installed on this machine. Tests must not ask the machine, or they
     /// assert something about the laptop they ran on rather than about Dock.
@@ -3798,7 +3806,94 @@ impl Dashboard {
                 self.sidebar_chosen = true;
                 UiCommand::None
             }
+            PaneCommand::JumpAttention => self.jump_attention(),
         }
+    }
+
+    /// Cycle to the next agent that needs you.
+    fn jump_attention(&mut self) -> UiCommand {
+        self.note_seen_done();
+        let current_workspace = self
+            .workspace()
+            .map(|workspace| workspace.workspace_id.clone())
+            .unwrap_or_default();
+        let current = self.workspace().map(|workspace| {
+            (
+                workspace.workspace_id.as_str(),
+                workspace.focused_pane_id.as_str(),
+            )
+        });
+        let include_idle = matches!(
+            std::env::var("DOCK_JUMP_IDLE").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+        let runs = self.live_runs();
+        let ranked = attention::rank_attention(
+            &current_workspace,
+            include_idle,
+            runs.iter().map(|run| AttentionCandidate {
+                workspace_id: run.workspace_id,
+                pane_id: run.pane_id,
+                state: run.state,
+                is_agent: run.is_agent(),
+                seen: self
+                    .seen_done
+                    .contains(&format!("{}/{}", run.workspace_id, run.pane_id)),
+            }),
+        );
+        let Some((workspace_id, pane_id)) = attention::next_attention(&ranked, current) else {
+            self.error = Some("nobody needs you".into());
+            return UiCommand::None;
+        };
+        self.focus_named_pane(&workspace_id, &pane_id)
+    }
+
+    fn note_seen_done(&mut self) {
+        let Some(workspace) = self.workspace() else {
+            return;
+        };
+        let key = format!("{}/{}", workspace.workspace_id, workspace.focused_pane_id);
+        let run = self.focused_run_id().and_then(|run_id| {
+            self.agents.get(run_id).copied().or_else(|| {
+                self.runs
+                    .iter()
+                    .find(|run| run.run_id == run_id)
+                    .map(|run| (run.agent, run.agent_state))
+            })
+        });
+        match run {
+            Some((_, AgentState::Done)) => {
+                self.seen_done.insert(key);
+            }
+            _ => {
+                self.seen_done.remove(&key);
+            }
+        }
+    }
+
+    fn focus_named_pane(&mut self, workspace_id: &str, pane_id: &str) -> UiCommand {
+        let Some(index) = self
+            .layout
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.workspace_id == workspace_id)
+        else {
+            self.error = Some("nobody needs you".into());
+            return UiCommand::None;
+        };
+        if !self.layout.workspaces[index].panes.contains_key(pane_id) {
+            self.error = Some("nobody needs you".into());
+            return UiCommand::None;
+        }
+        self.workspace_index = index;
+        self.layout.workspaces[index].focused_pane_id = pane_id.to_owned();
+        self.disarm_workspace_close();
+        self.error = None;
+        self.note_seen_done();
+        UiCommand::Request(Box::new(Request::Workspace(WorkspaceRequest::Focus {
+            workspace_id: workspace_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+        })))
     }
 
     /// Opens the workspace chooser. Cycling is fine for two workspaces and miserable for eight;
@@ -10781,6 +10876,67 @@ mod tests {
             Some(AgentKind::Claude),
             "the agent that needs you comes first: {runs:?}"
         );
+    }
+
+    #[test]
+    fn jump_attention_cycles_blocked_then_unseen_done_and_says_when_nobody() {
+        let mut dashboard = two_workspace_dashboard();
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("b")
+            .unwrap()
+            .run_id = Some("run_b".into());
+        let mut blocked = snapshot();
+        blocked.run_id = "run_b".into();
+        blocked.pane_id = "b".into();
+        blocked.agent = Some(AgentKind::Claude);
+        blocked.agent_state = AgentState::Blocked;
+        let mut done = snapshot();
+        done.run_id = "run_2".into();
+        done.pane_id = "c".into();
+        done.workspace_id = "w2".into();
+        done.agent = Some(AgentKind::Codex);
+        done.agent_state = AgentState::Done;
+        let mut working = snapshot();
+        working.run_id = "run_1".into();
+        working.pane_id = "a".into();
+        working.agent = Some(AgentKind::Amp);
+        working.agent_state = AgentState::Working;
+        dashboard.set_runs(vec![working, blocked, done]);
+        dashboard.agents.insert(
+            "run_b".into(),
+            (Some(AgentKind::Claude), AgentState::Blocked),
+        );
+        dashboard
+            .agents
+            .insert("run_2".into(), (Some(AgentKind::Codex), AgentState::Done));
+        dashboard
+            .agents
+            .insert("run_1".into(), (Some(AgentKind::Amp), AgentState::Working));
+        assert!(matches!(
+            dashboard.run_command(PaneCommand::JumpAttention),
+            UiCommand::Request(_)
+        ));
+        assert_eq!(dashboard.workspace_index, 0);
+        assert_eq!(dashboard.layout.workspaces[0].focused_pane_id, "b");
+        assert!(matches!(
+            dashboard.run_command(PaneCommand::JumpAttention),
+            UiCommand::Request(_)
+        ));
+        assert_eq!(dashboard.workspace_index, 1);
+        assert_eq!(dashboard.layout.workspaces[1].focused_pane_id, "c");
+        dashboard.run_command(PaneCommand::JumpAttention);
+        dashboard.run_command(PaneCommand::JumpAttention);
+        dashboard.agents.insert(
+            "run_b".into(),
+            (Some(AgentKind::Claude), AgentState::Working),
+        );
+        dashboard.agents.insert(
+            "run_2".into(),
+            (Some(AgentKind::Codex), AgentState::Working),
+        );
+        dashboard.run_command(PaneCommand::JumpAttention);
+        assert_eq!(dashboard.error.as_deref(), Some("nobody needs you"));
     }
 
     /// No column is ever wider than a card can use.

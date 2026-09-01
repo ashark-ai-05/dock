@@ -71,6 +71,8 @@ pub enum PaneCommand {
     Lazygit,
     /// Collapse the sidebar to a rail, or bring it back.
     ToggleSidebar,
+    /// Cycle agents that need you: blocked, then unseen done.
+    JumpAttention,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +161,7 @@ impl Keymap {
             ("d", "leave · runs keep running"),
             ("?", "help"),
             ("q", "queue"),
+            ("u", "needs you"),
         ]
     }
 }
@@ -211,6 +214,7 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         // `s` for sidebar. `b` would be the obvious letter and is unavailable: the prefix is
         // Ctrl+B, so pressing it twice already means "send a literal Ctrl+B".
         KeyCode::Char('s') => PaneCommand::ToggleSidebar,
+        KeyCode::Char('u') => PaneCommand::JumpAttention,
         // Cycling is fine for two workspaces and miserable for eight. A digit is the only way to
         // reach a distant workspace in constant time. `0` is deliberately unbound: the positions
         // are 1-based on screen, so binding it would place a tenth workspace under a key that
@@ -382,6 +386,7 @@ mod tests {
             ",/. w 1-9",
             // PageUp, PageDown, and End share one entry for the same reason.
             "PgUp/PgDn/End",
+            "u",
         ] {
             assert!(keys.contains(&expected), "missing hint for {expected}");
         }
@@ -466,6 +471,16 @@ mod tests {
         assert_eq!(
             keymap.handle(plain('w'), KeyEncoding::default()),
             KeyOutcome::Command(PaneCommand::WorkspacePicker)
+        );
+    }
+
+    #[test]
+    fn u_after_the_prefix_jumps_to_agents_that_need_you() {
+        let mut keymap = Keymap::new();
+        keymap.handle(prefix(), KeyEncoding::default());
+        assert_eq!(
+            keymap.handle(plain('u'), KeyEncoding::default()),
+            KeyOutcome::Command(PaneCommand::JumpAttention)
         );
     }
 }

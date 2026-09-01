@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod attention;
 pub mod board;
 pub mod board_config;
 pub mod board_watch;

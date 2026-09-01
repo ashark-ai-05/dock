@@ -930,7 +930,7 @@ fn run_dashboard(
                     })
                     .unwrap_or(false);
                 if !on_path {
-                    dashboard.error = Some("lazygit is not on PATH".into());
+                    dashboard.error = Some("lazygit is not on PATH — optional; Ctrl+B g still shows the diff".into());
                     continue;
                 }
                 let worktree = dashboard

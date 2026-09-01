@@ -67,6 +67,8 @@ pub enum PaneCommand {
     Quit,
     /// Show this session's prompt queues.
     Queue,
+    /// Open LazyGit on the focused pane's worktree when it is on PATH.
+    Lazygit,
     /// Collapse the sidebar to a rail, or bring it back.
     ToggleSidebar,
 }
@@ -138,6 +140,7 @@ impl Keymap {
             // separate entry for the second one pushed the last binding out of the two-row bar.
             ("k/B", "board ▤"),
             ("g", "git"),
+            ("G", "lazygit"),
             ("[", "copy mode"),
             ("+/-", "resize"),
             ("z", "zoom"),
@@ -204,6 +207,7 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         // the prefix key itself — pressing it twice already means "send a literal Ctrl+B".
         KeyCode::Char('B') => PaneCommand::SplitBoard,
         KeyCode::Char('g') => PaneCommand::Git,
+        KeyCode::Char('G') => PaneCommand::Lazygit,
         // `s` for sidebar. `b` would be the obvious letter and is unavailable: the prefix is
         // Ctrl+B, so pressing it twice already means "send a literal Ctrl+B".
         KeyCode::Char('s') => PaneCommand::ToggleSidebar,
@@ -371,6 +375,7 @@ mod tests {
             // popup over the canvas and once as a pane on it.
             "k/B",
             "g",
+            "G",
             "[",
             // The three ways to reach a workspace share one entry: the footer is two rows, and
             // listing them separately pushed the last published binding off the end of it.

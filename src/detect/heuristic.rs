@@ -53,10 +53,16 @@ const WORKING_PATTERNS: &[&str] = &[
     // The title spinner is deliberately *not* here; see `title_says_working`.
 ];
 
-/// Whether the agent's terminal title carries a spinner, which is the one piece of evidence here
-/// that does not depend on reading chrome off the screen at all: it survives scrolling, survives
-/// the footer being off-screen, and survives an agent whose body Dock has no patterns for — which
-/// is how Amp, which has no rules of its own, gets a working state.
+/// Whether the agent's *window title* (OSC 0/2) carries a spinner.
+///
+/// This is the one piece of evidence that does not depend on reading chrome off the screen: it
+/// survives scrolling, survives the footer being off-screen, and survives an agent whose body
+/// Dock has no patterns for — which is how Amp, which has no rules of its own, gets a working
+/// state.
+///
+/// It must not look at the first body row. Amp's idle welcome splash leads with braille art, and
+/// treating that row as a title made every idle Amp pane read as working. The spinner counts only
+/// when it is the OSC/window title (or a dedicated title field passed in beside the body).
 ///
 /// Code rather than a pattern in `WORKING_PATTERNS`, and the reason is measured. Written as a
 /// regex this is `\A[ \t]*[…]\s` — anchored, so it should cost nothing. In a `RegexSet` it costs
@@ -66,18 +72,15 @@ const WORKING_PATTERNS: &[&str] = &[
 /// screen, to run an anchored test that reads at most three characters. Here it reads those three
 /// characters and stops.
 ///
-/// The `\A` anchor was also doing a second job badly. It meant "the title" only because
-/// [`classifiable_text`](crate::terminal::VtTerminal::classifiable_text) happens to put the title
-/// first; on a pane with no title it silently anchored to the top screen row instead. This asks
-/// the question it means to ask.
-///
 /// Both glyph families are spinners and nothing else — braille for most agents, the quarter
 /// circles Claude Code moved to in 2.1.228. Claude's other title glyph, `✳`, is deliberately
 /// absent because it marks the *finished* title, and `·` is absent because it is ordinary
 /// punctuation in agent output, as the token-count rule above shows.
-fn title_says_working(tail: &str) -> bool {
-    let first = tail.lines().next().unwrap_or_default();
-    let mut glyphs = first.trim_start_matches([' ', '\t']).chars();
+fn title_says_working(title: Option<&str>) -> bool {
+    let Some(title) = title else {
+        return false;
+    };
+    let mut glyphs = title.trim_start_matches([' ', '\t']).chars();
     let Some('\u{2800}'..='\u{28FF}' | '\u{25D0}'..='\u{25D3}') = glyphs.next() else {
         return false;
     };
@@ -205,20 +208,30 @@ impl From<AgentState> for ScreenRead {
 
 /// Everything one pass over a screen can establish. See [`classify_screen`] for the ordering.
 pub fn read_screen(agent: AgentKind, tail: &str) -> ScreenRead {
+    read_screen_titled(agent, tail, None)
+}
+
+/// Like [`read_screen`], with the OSC/window title kept apart from the body.
+pub fn read_screen_titled(agent: AgentKind, tail: &str, title: Option<&str>) -> ScreenRead {
     ScreenRead {
-        state: classify_screen(agent, tail),
-        title_working: title_says_working(tail),
+        state: classify_screen_titled(agent, tail, title),
+        title_working: title_says_working(title),
     }
 }
 
 pub fn classify_screen(agent: AgentKind, tail: &str) -> AgentState {
+    classify_screen_titled(agent, tail, None)
+}
+
+/// Classifies a screen when the window title is known independently of the body.
+pub fn classify_screen_titled(agent: AgentKind, tail: &str, title: Option<&str>) -> AgentState {
     static DONE: OnceLock<RegexSet> = OnceLock::new();
     // Through the manifest, so a rule someone edited is the rule that runs.
     let rules = crate::detect::manifest::resolve(agent);
     if rules.blocked.is_match(tail) {
         return AgentState::Blocked;
     }
-    if title_says_working(tail) || rules.working.is_match(tail) {
+    if title_says_working(title) || rules.working.is_match(tail) {
         return AgentState::Working;
     }
     if rules.awaiting.is_match(tail) {
@@ -551,21 +564,37 @@ mod affordance_tests {
 
     /// The signal that needs no per-agent chrome at all. Amp has no body patterns in this file and
     /// never will have every agent's; the spinner it writes into its terminal title is enough on
-    /// its own, and `classifiable_text` already puts that title on the first line.
+    /// its own. The title is a dedicated field, not the first body row.
     #[test]
     fn a_spinner_in_the_title_is_work_for_an_agent_with_no_rules_of_its_own() {
         // Amp's real working title, and the body Dock cannot read anything from.
-        let working = "⠹ amp\n╰  gpt-5 thinking ─\n";
+        let body = "╰  gpt-5 thinking ─\n";
         assert_eq!(
-            classify_screen(AgentKind::Amp, working),
+            classify_screen_titled(AgentKind::Amp, body, Some("⠹ amp")),
             AgentState::Working,
             "the title answers when the body cannot"
         );
 
         // Claude Code's 2.1.228 spinner is a quarter circle rather than braille.
         assert_eq!(
-            classify_screen(AgentKind::Claude, "◐ dock\nsome output\n"),
+            classify_screen_titled(AgentKind::Claude, "some output\n", Some("◐ dock")),
             AgentState::Working
+        );
+    }
+
+    /// Amp's idle welcome splash leads with braille art on the first body row. That is not a
+    /// window title, and classifying it as one made every idle Amp pane read as working.
+    #[test]
+    fn a_splash_row_of_braille_art_is_idle_not_a_working_title() {
+        let splash = "⣿⣿⣿  amp\n\n> \n";
+        assert_eq!(
+            classify_screen(AgentKind::Amp, splash),
+            AgentState::Idle,
+            "braille on the first body row is splash chrome, not OSC"
+        );
+        assert_eq!(
+            classify_screen_titled(AgentKind::Amp, splash, None),
+            AgentState::Idle
         );
     }
 
@@ -581,16 +610,21 @@ mod affordance_tests {
         );
         // Claude's idle title glyph must not read as work.
         assert_eq!(
-            classify_screen(AgentKind::Amp, "✳ amp\nidle\n"),
+            classify_screen_titled(AgentKind::Amp, "idle\n", Some("✳ amp")),
             AgentState::Idle,
             "`✳` marks the finished title, not a spinner"
         );
         // A spinner leads the title; it does not open a word in it.
         assert_eq!(
-            classify_screen(AgentKind::Amp, "⠹amp\nidle\n"),
+            classify_screen_titled(AgentKind::Amp, "idle\n", Some("⠹amp")),
             AgentState::Idle
         );
         // A title that is nothing but the spinner is still the spinner.
-        assert_eq!(classify_screen(AgentKind::Amp, "⠹"), AgentState::Working);
+        assert_eq!(
+            classify_screen_titled(AgentKind::Amp, "", Some("⠹")),
+            AgentState::Working
+        );
+        // The same glyph as the first *body* line, with no title field, is not work.
+        assert_eq!(classify_screen(AgentKind::Amp, "⠹"), AgentState::Idle);
     }
 }

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     adapter::AdapterSelection,
-    detect::{AgentKind, AgentState, ScreenRead, process::ProcessTree, read_screen},
+    detect::{AgentKind, AgentState, ScreenRead, process::ProcessTree, read_screen_titled},
     git::GitAdapter,
     layout::{LayoutRegistry, LayoutSnapshot, PaneKind, PaneRuntime, WorkspaceLayout},
     model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
@@ -2321,9 +2321,11 @@ impl RuntimeRegistry {
             // cannot contain the very chrome that says the agent is waiting — every pattern
             // matched against one was unreachable.
             _ => match agent {
-                Some(kind) => {
-                    runtime.with_screen(|screen| read_screen(kind, &screen.classifiable_text()))
-                }
+                Some(kind) => runtime.with_screen(|screen| {
+                    // Body and OSC title are separate questions. Folding the title onto the
+                    // first line of `classifiable_text` made splash art look like a spinner.
+                    read_screen_titled(kind, &screen.visible_text(), screen.title().as_deref())
+                }),
                 None => AgentState::Idle.into(),
             },
         };

@@ -63,11 +63,39 @@ const STATUS_ORDER: [&str; 5] = ["in-progress", "needs-input", "review", "backlo
 /// Returns `None` when Dock is not sitting in a repository: there is no default under
 /// `~/.dock/boards`. The board is markdown in the repo, or it is not a board Dock will open.
 pub fn tasks_dir(repository_root: &str, _workspace_id: &str) -> Option<PathBuf> {
-    let repository = repository_root.trim();
-    if repository.is_empty() {
-        return None;
+    resolve_tasks_dir(&[repository_root])
+}
+
+/// Where a dashboard should look for `kanban/tasks`.
+///
+/// `tasks_dir` used to answer from `repository_root` alone. That field is filled by the launch
+/// catalog, which only ran when the launch form opened, so a `@board` pane in a repo that *has*
+/// the directory sat on "reading the board…" forever. Walk every candidate — declared repo,
+/// client cwd, pane cwd — and prefer a directory that actually exists. If none exists, keep the
+/// historical contract: a non-empty declared root still points at `kanban/tasks` so a missing
+/// board is an empty view rather than a silent refusal to look.
+pub fn resolve_tasks_dir(candidates: &[&str]) -> Option<PathBuf> {
+    let mut declared = None;
+    let mut git_fallback = None;
+    for candidate in candidates {
+        let start = candidate.trim();
+        if start.is_empty() {
+            continue;
+        }
+        for ancestor in Path::new(start).ancestors() {
+            let tasks = ancestor.join("kanban").join("tasks");
+            if tasks.is_dir() {
+                return Some(tasks);
+            }
+            if declared.is_none() {
+                declared = Some(Path::new(start).join("kanban").join("tasks"));
+            }
+            if git_fallback.is_none() && ancestor.join(".git").exists() {
+                git_fallback = Some(tasks);
+            }
+        }
     }
-    Some(Path::new(repository).join("kanban").join("tasks"))
+    git_fallback.or(declared)
 }
 
 /// A workspace's own board, under `~/.dock/boards/<workspace>/tasks`.
@@ -946,6 +974,26 @@ mod tests {
         let repository = tasks_dir("/repo/real", "workspace_1").expect("a repository board");
         assert_eq!(repository, Path::new("/repo/real/kanban/tasks"));
         assert!(!is_personal(&repository));
+    }
+
+    #[test]
+    fn an_existing_kanban_on_cwd_is_found_when_the_declared_root_is_empty() {
+        let root = std::env::temp_dir().join(format!(
+            "dock-resolve-board-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("src");
+        let tasks = root.join("kanban").join("tasks");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&tasks).unwrap();
+        let found = resolve_tasks_dir(&["", nested.to_str().unwrap()]).expect("walk cwd");
+        assert_eq!(found, tasks);
+        assert!(resolve_tasks_dir(&["", "", "   "]).is_none());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

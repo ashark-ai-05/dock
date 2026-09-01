@@ -4296,6 +4296,57 @@ impl Dashboard {
                 .any(|workspace| workspace.panes.values().any(|pane| pane.is_board()))
     }
 
+    /// Directories that may hold `kanban/tasks`: the catalog repo, the client cwd, then each
+    /// pane's reported cwd / worktree / repository. Order is preference; [`crate::board::resolve_tasks_dir`]
+    /// still prefers a directory that actually exists.
+    pub fn board_search_roots(&self) -> Vec<String> {
+        let mut roots = Vec::new();
+        let push = |roots: &mut Vec<String>, value: &str| {
+            let value = value.trim();
+            if !value.is_empty() {
+                roots.push(value.to_owned());
+            }
+        };
+        push(&mut roots, &self.repository_root);
+        push(&mut roots, &self.runtime_directory);
+        for run in &self.runs {
+            if let Some(cwd) = &run.cwd {
+                push(&mut roots, cwd);
+            }
+            push(&mut roots, &run.worktree);
+            push(&mut roots, &run.repository_root);
+        }
+        roots
+    }
+
+    /// A board pane that has already looked and found nothing. Never leave `board_pane_view`
+    /// as `None` after the first attempt — that is the "reading the board…" hang.
+    pub fn set_board_pane_empty(&mut self) {
+        if self.board_pane_view.is_none() {
+            self.board_pane_view = Some(crate::board::BoardView::new(Vec::new()));
+        }
+    }
+
+    /// Load (or re-load) the board for a pane or overlay from disk.
+    ///
+    /// Independent of Ctrl+B k: a `@board` pane must populate without the overlay. If every
+    /// candidate fails, the pane still gets an empty view so it never stays on the loading copy.
+    pub fn reload_board_from_disk(&mut self) {
+        let roots = self.board_search_roots();
+        let borrowed: Vec<&str> = roots.iter().map(String::as_str).collect();
+        match crate::board::resolve_tasks_dir(&borrowed) {
+            Some(directory) => {
+                let tasks = crate::board::load(&directory);
+                if self.board_overlay_is_open() {
+                    self.set_board_tasks(tasks, directory);
+                } else {
+                    self.set_board_pane_tasks(tasks, directory);
+                }
+            }
+            None => self.set_board_pane_empty(),
+        }
+    }
+
     fn board_key(&mut self, key: KeyEvent) -> UiCommand {
         let Some(board) = self.board.as_mut() else {
             return UiCommand::None;
@@ -12604,6 +12655,69 @@ mod tests {
 
         // A canvas with no board on it never reads the board at all.
         assert!(!bound_dashboard().board_pane_needs_load());
+    }
+
+    #[test]
+    fn a_board_pane_never_stays_on_the_loading_placeholder() {
+        // The hang: `board_pane_view` stayed None whenever `tasks_dir(repository_root)` was
+        // None, and the catalog that fills `repository_root` never ran unless the launch form
+        // opened. A pane in a repo that has `kanban/tasks` must still find it via cwd, and a
+        // pane with nowhere to look must show an empty board rather than "reading the board…".
+        let root = std::env::temp_dir().join(format!(
+            "dock-board-pane-load-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let tasks = root.join("kanban").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join("009-docs.md"),
+            "---\nid: 9\ntitle: write the docs\nstatus: backlog\npriority: medium\n---\n",
+        )
+        .unwrap();
+
+        let mut fresh = Dashboard {
+            layout: {
+                let dashboard = dashboard_with_a_board_pane();
+                dashboard.layout
+            },
+            ..Dashboard::default()
+        };
+        fresh.board_pane_view = None;
+        fresh.board_dir = None;
+        fresh.repository_root.clear();
+        fresh.runtime_directory = root.to_string_lossy().into_owned();
+        assert!(fresh.board_pane_needs_load());
+        assert!(render_to_string(&mut fresh, 160, 40).contains("reading the board…"));
+
+        fresh.reload_board_from_disk();
+        let painted = render_to_string(&mut fresh, 160, 40);
+        assert!(
+            !painted.contains("reading the board…"),
+            "load must retire the placeholder: {painted}"
+        );
+        assert!(painted.contains("#9"), "{painted}");
+        assert!(!fresh.board_pane_needs_load());
+
+        let mut nowhere = Dashboard {
+            layout: fresh.layout.clone(),
+            ..Dashboard::default()
+        };
+        nowhere.board_pane_view = None;
+        nowhere.board_dir = None;
+        nowhere.reload_board_from_disk();
+        let empty = render_to_string(&mut nowhere, 160, 40);
+        assert!(
+            !empty.contains("reading the board…"),
+            "a missing board is an empty grid, not a hang: {empty}"
+        );
+        assert!(nowhere.board_pane_view.is_some());
+        // Overlay is not required for the pane to fill.
+        assert!(!nowhere.board_overlay_is_open());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

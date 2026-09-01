@@ -660,7 +660,17 @@ fn run_dashboard(
     dashboard.apply_sidebar_env();
     dashboard.apply_theme_env();
     let (catalog_tx, catalog_rx) = mpsc::channel();
-    let mut catalog_loading = false;
+    // Fill `repository_root` on start, not only when the launch form opens. The board pane
+    // used to wait on that field and hang on "reading the board…" until someone pressed a
+    // key that had nothing to do with the board.
+    let mut catalog_loading = true;
+    {
+        let directory = PathBuf::from(runtime_directory.clone());
+        let sender = catalog_tx.clone();
+        thread::spawn(move || {
+            let _ = sender.send(repository_catalog(&directory));
+        });
+    }
     let mut test_events = test_events()?;
     // Events drained from the terminal in one burst and not yet handled. Handled one per
     // iteration like any other, so each still gets its own paint; the burst is only *read* in
@@ -713,20 +723,9 @@ fn run_dashboard(
             board_watch.ensure(directory);
         }
         let board_fs_changed = board_watch.take_changed();
-        if (dashboard.board_pane_needs_load()
-            || dashboard.board_files_changed()
-            || board_fs_changed)
-            && let Some(directory) = dock::board::tasks_dir(
-                &dashboard.repository_root,
-                dashboard.workspace_id().unwrap_or_default(),
-            )
+        if dashboard.board_pane_needs_load() || dashboard.board_files_changed() || board_fs_changed
         {
-            let tasks = dock::board::load(&directory);
-            if dashboard.board_overlay_is_open() {
-                dashboard.set_board_tasks(tasks, directory);
-            } else {
-                dashboard.set_board_pane_tasks(tasks, directory);
-            }
+            dashboard.reload_board_from_disk();
         }
         terminal
             .draw(|frame| dashboard.render(frame))
@@ -994,19 +993,21 @@ fn run_dashboard(
                     Err(message) => dashboard.error = Some(message),
                 }
             }
-            UiCommand::LoadBoard => match dock::board::tasks_dir(
-                &dashboard.repository_root,
-                dashboard.workspace_id().unwrap_or_default(),
-            ) {
-                Some(directory) => {
-                    let tasks = dock::board::load(&directory);
-                    dashboard.set_board_tasks(tasks, directory);
+            UiCommand::LoadBoard => {
+                let roots = dashboard.board_search_roots();
+                let borrowed: Vec<&str> = roots.iter().map(String::as_str).collect();
+                match dock::board::resolve_tasks_dir(&borrowed) {
+                    Some(directory) => {
+                        let tasks = dock::board::load(&directory);
+                        dashboard.set_board_tasks(tasks, directory);
+                    }
+                    None => {
+                        dashboard.set_board_pane_empty();
+                        dashboard.error =
+                            Some("no board: open a repository that has kanban/tasks".into())
+                    }
                 }
-                None => {
-                    dashboard.error =
-                        Some("no board: open a repository that has kanban/tasks".into())
-                }
-            },
+            }
             UiCommand::DispatchTask(task) => {
                 terminal
                     .draw(|frame| dashboard.render(frame))

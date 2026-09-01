@@ -1,7 +1,9 @@
 pub(crate) mod heuristic;
 pub mod process;
 
-pub use heuristic::{ScreenRead, classify_screen, read_screen};
+pub use heuristic::{
+    ScreenRead, classify_screen, classify_screen_titled, read_screen, read_screen_titled,
+};
 pub mod manifest;
 pub use process::agent_in_process_table;
 
@@ -136,7 +138,7 @@ impl AgentState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentKind, AgentState, classify_screen};
+    use super::{AgentKind, AgentState, classify_screen, classify_screen_titled};
     use crate::terminal::VtTerminal;
 
     #[test]
@@ -188,29 +190,75 @@ mod tests {
         assert_eq!(AgentKind::from_executable("bash"), None);
     }
 
-    /// End to end, through the escape sequence an agent actually emits: OSC 2 sets the title, the
-    /// title leads `classifiable_text`, and the spinner in it is read as work.
-    ///
-    /// This is the path that fixes Amp, which has no body patterns of its own. Before it, an Amp
-    /// pane mid-turn classified as `Idle` — the roster showed nothing happening while it worked.
+    /// End to end through OSC 2: the window title is a dedicated field, and a spinner in it is
+    /// work even when the body has no patterns of its own. Concatenating that title onto the body
+    /// is not how classification is asked — splash art on the first body row must not count.
     #[test]
     fn an_agent_that_only_says_it_is_working_in_its_title_is_read_as_working() {
         let mut screen = VtTerminal::new(24, 100, 100);
         screen.feed("\x1b]2;\u{2839} amp\x07".as_bytes());
         screen.feed("╰  gpt-5 thinking ─\r\n".as_bytes());
         assert_eq!(
-            classify_screen(AgentKind::Amp, &screen.classifiable_text()),
+            classify_screen_titled(
+                AgentKind::Amp,
+                &screen.visible_text(),
+                screen.title().as_deref(),
+            ),
             AgentState::Working,
-            "the title is the only evidence there is, and it is enough"
+            "the OSC title is the only evidence there is, and it is enough"
         );
 
         // When the turn ends the agent rewrites the title without the spinner, and the same screen
         // stops reading as work.
         screen.feed(b"\x1b]2;amp\x07");
         assert_ne!(
-            classify_screen(AgentKind::Amp, &screen.classifiable_text()),
+            classify_screen_titled(
+                AgentKind::Amp,
+                &screen.visible_text(),
+                screen.title().as_deref(),
+            ),
             AgentState::Working,
             "the spinner going away is what says the turn ended"
+        );
+    }
+
+    /// The title spinner is a property of the window title, never of the first body row, for
+    /// every agent Dock will launch. A welcome splash that happens to start with braille or a
+    /// quarter-circle is idle chrome, not work.
+    #[test]
+    fn splash_art_on_the_first_body_row_is_never_a_working_title() {
+        let splash = "\u{28ff}\u{28ff}\u{28ff}  welcome\n> \n";
+        for agent in [
+            AgentKind::Amp,
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Copilot,
+        ] {
+            assert_ne!(
+                classify_screen(agent, splash),
+                AgentState::Working,
+                "{agent:?} must not treat body art as a spinner title"
+            );
+            let mut screen = VtTerminal::new(24, 80, 50);
+            screen.feed(splash.replace('\n', "\r\n").as_bytes());
+            assert!(screen.title().is_none() || screen.title().as_deref() == Some(""));
+            assert_ne!(
+                classify_screen_titled(agent, &screen.visible_text(), screen.title().as_deref()),
+                AgentState::Working,
+                "{agent:?} through a real PTY screen with no OSC title"
+            );
+        }
+        let mut working = VtTerminal::new(24, 80, 50);
+        working.feed("\x1b]2;\u{2839} amp\x07".as_bytes());
+        working.feed(splash.replace('\n', "\r\n").as_bytes());
+        assert_eq!(
+            classify_screen_titled(
+                AgentKind::Amp,
+                &working.visible_text(),
+                working.title().as_deref(),
+            ),
+            AgentState::Working,
+            "the same splash with a real spinner title is still work"
         );
     }
 

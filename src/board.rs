@@ -861,11 +861,17 @@ mod tests {
 
         assert_eq!(
             view.statuses(),
+            ["backlog", "in-progress", "needs-input", "review"],
+            "the board's own columns, in its own order, without done until revealed"
+        );
+        let mut revealed = view.clone();
+        revealed.set_reveal(true);
+        assert_eq!(
+            revealed.statuses(),
             ["backlog", "in-progress", "needs-input", "review", "done"],
-            "the board's own columns, in its own order"
         );
         assert!(
-            !view.statuses().iter().any(|status| status == "todo"),
+            !view.statuses().contains(&"todo"),
             "the column that existed only in Dock is gone: {:?}",
             view.statuses()
         );
@@ -1529,8 +1535,8 @@ pub struct BoardView {
     statuses: Vec<String>,
     column: usize,
     row: usize,
-    /// Whether archived cards are shown. Off by default, so a board that has been archiving
-    /// finished work looks like what is left to do rather than everything that was ever on it.
+    /// Whether archived cards *and* the `done` column are shown. Off by default, so a board
+    /// that has been finishing work looks like what is left to do rather than an archive.
     reveal: bool,
 }
 
@@ -1579,6 +1585,13 @@ impl BoardView {
         }
     }
 
+    fn visible_statuses(&self) -> impl Iterator<Item = &str> {
+        self.statuses
+            .iter()
+            .map(String::as_str)
+            .filter(|status| self.reveal || *status != "done")
+    }
+
     /// How many lines a card's title may take on this board.
     pub fn title_lines(&self) -> usize {
         self.title_lines
@@ -1594,13 +1607,26 @@ impl BoardView {
     }
 
     /// The columns to draw, which is what to iterate instead of [`STATUSES`].
-    pub fn statuses(&self) -> &[String] {
+    ///
+    /// `done` is omitted unless revealed (`A`), so the default view is work.
+    pub fn statuses(&self) -> Vec<&str> {
+        self.visible_statuses().collect()
+    }
+
+    /// Every column the workflow can move a card through, including hidden `done`.
+    pub fn workflow_statuses(&self) -> &[String] {
         &self.statuses
     }
 
     /// The status the cursor is in, or `None` for a board with no columns at all.
     pub fn status(&self) -> Option<&str> {
-        self.statuses.get(self.column).map(String::as_str)
+        self.visible_statuses().nth(self.column)
+    }
+
+    /// Whether any card is actually on screen in the default (or revealed) view.
+    pub fn has_visible_cards(&self) -> bool {
+        self.visible_statuses()
+            .any(|status| !self.cards(status).is_empty())
     }
 
     pub fn column(&self) -> usize {
@@ -1636,6 +1662,9 @@ impl BoardView {
     /// board — the count in the footer, the muted card style — so a caller flips one bit.
     pub fn set_reveal(&mut self, reveal: bool) {
         self.reveal = reveal;
+        let last = self.statuses().len().saturating_sub(1);
+        self.column = self.column.min(last);
+        self.clamp_row();
     }
 
     pub fn revealing(&self) -> bool {
@@ -1652,7 +1681,7 @@ impl BoardView {
         self.column = self
             .column
             .saturating_add_signed(delta)
-            .min(self.statuses.len().saturating_sub(1));
+            .min(self.statuses().len().saturating_sub(1));
         self.clamp_row();
     }
 
@@ -1673,19 +1702,19 @@ impl BoardView {
     /// Follows a task to wherever it has just been moved, so the card the user was holding stays
     /// under the cursor instead of the cursor staying over a column position.
     pub fn follow(&mut self, id: u64) {
-        if let Some(task) = self.tasks.iter().find(|task| task.id == id)
-            && let Some(column) = self
-                .statuses
-                .iter()
-                .position(|status| *status == task.status)
-        {
-            self.column = column;
-            self.row = self
-                .cards(&self.statuses[column])
-                .iter()
-                .position(|card| card.id == id)
-                .unwrap_or(0);
-        }
+        let Some(task) = self.tasks.iter().find(|task| task.id == id) else {
+            return;
+        };
+        let status = task.status.clone();
+        let Some(column) = self.visible_statuses().position(|shown| shown == status) else {
+            return;
+        };
+        self.column = column;
+        self.row = self
+            .cards(&status)
+            .iter()
+            .position(|card| card.id == id)
+            .unwrap_or(0);
     }
 }
 
@@ -1737,6 +1766,16 @@ mod view_tests {
     /// A revealed board shows archived cards; a normal one does not, and says how many it is
     /// holding back.
     #[test]
+    fn done_is_hidden_until_revealed() {
+        let mut view = BoardView::new(vec![task(1, "backlog"), task(2, "done")]);
+        assert!(!view.statuses().contains(&"done"));
+        assert!(view.has_visible_cards());
+        view.set_reveal(true);
+        assert!(view.statuses().contains(&"done"));
+        assert_eq!(view.cards("done").len(), 1);
+    }
+
+    #[test]
     fn archived_cards_are_hidden_until_revealed_and_counted_while_they_are() {
         let mut view = BoardView::new(vec![
             task_with(1, "done", false),
@@ -1770,7 +1809,10 @@ mod view_tests {
         assert_eq!(view.selected().map(|task| task.id), Some(4));
         // And the ends hold rather than wrapping round.
         view.move_column(9);
-        assert_eq!(STATUSES[view.column()], "done");
+        assert_eq!(view.status(), Some("review"));
+        view.set_reveal(true);
+        view.move_column(9);
+        assert_eq!(view.status(), Some("done"));
         view.move_column(-9);
         assert_eq!(STATUSES[view.column()], "backlog");
     }
@@ -1817,7 +1859,7 @@ mod view_tests {
         // work moves through them, and whatever else the board uses lands after them, in the
         // order `status_rank` already sorts cards by.
         let view = BoardView::new(vec![task(1, "todo"), task(2, "blocked")]);
-        let columns: Vec<&str> = view.statuses().iter().map(String::as_str).collect();
+        let columns: Vec<&str> = view.statuses();
         assert_eq!(
             columns,
             [
@@ -1825,7 +1867,6 @@ mod view_tests {
                 "in-progress",
                 "needs-input",
                 "review",
-                "done",
                 "blocked",
                 "todo",
             ]

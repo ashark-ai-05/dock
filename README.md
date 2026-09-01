@@ -32,7 +32,7 @@ Prefix is `Ctrl+B`. Unprefixed keys go to the pane. `Esc` is never intercepted. 
 | `d` | detach (daemon keeps running) | `q` | prompt queue |
 | `g` / `G` | git review overlay / lazygit if on PATH | `u` | cycle agents that need you |
 
-Mouse: tabs, sidebar agent rows (focus that pane), split/close on the pane border, drag dividers, drag to select. A blocked pane paints a blocked border; the sidebar quotes the last hook reason next to ◆ when it has one.
+Mouse: tabs, sidebar agent rows (focus that pane), split/close on the pane border, drag dividers, drag to select. A blocked pane marks the left edge (and the sidebar ◆); not a full-perimeter red frame. The sidebar quotes the last hook reason next to ◆ when it has one.
 
 ## Roster
 
@@ -56,7 +56,7 @@ dock hooks --install    # Claude Code + Codex: merge, keep existing handlers
 
 ## Board
 
-`Ctrl+B k` is markdown tasks in the repo (`kanban/tasks/`). Same drive keys on the overlay and a `@board` pane: hjkl move, H/L set status (WIP), c claim, a archive, A show archived, n new, Enter dispatch (body, not title-only). `o` focuses the card's live pane, or resumes/launches in its worktree. Dock never closes a card from a screen heuristic.
+`Ctrl+B k` is markdown tasks in the repo (`kanban/tasks/`). Same drive keys on the overlay and a `@board` pane: hjkl move, H/L set status (WIP), c claim, a archive, A show archived and done, n new, Enter dispatch (body, not title-only). `o` focuses the card's live pane, or resumes/launches in its worktree. Dock never closes a card from a screen heuristic. The board shows markdown cards only (no agent/mux rows); `done` is hidden until A.
 
 ```bash
 dock task list

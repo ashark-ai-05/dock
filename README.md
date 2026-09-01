@@ -32,7 +32,7 @@ Prefix is `Ctrl+B`. Unprefixed keys go to the pane. `Esc` is never intercepted. 
 | `d` | detach (daemon keeps running) | `q` | prompt queue |
 | `g` / `G` | git review overlay / lazygit if on PATH | `u` | cycle agents that need you |
 
-Mouse: tabs, split/close on the pane border, drag dividers, drag to select.
+Mouse: tabs, sidebar agent rows (focus that pane), split/close on the pane border, drag dividers, drag to select. A blocked pane paints a blocked border; the sidebar quotes the last hook reason next to ◆ when it has one.
 
 ## Roster
 

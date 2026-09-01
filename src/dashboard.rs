@@ -2255,11 +2255,25 @@ impl Dashboard {
             }
             let workspace = &self.layout.workspaces[index];
             let tab = Rect::new(x, area.y, label_width, 1);
+            let worst = crate::attention::worst_state(
+                self.live_runs()
+                    .iter()
+                    .filter(|run| run.workspace_id == workspace.workspace_id && run.is_agent())
+                    .map(|run| run.state),
+            );
             let style = if active {
                 Style::default()
-                    .bg(self.theme.accent)
+                    .bg(if worst == Some(AgentState::Blocked) {
+                        self.theme.blocked
+                    } else {
+                        self.theme.accent
+                    })
                     .fg(self.theme.surface)
                     .add_modifier(Modifier::BOLD)
+            } else if worst == Some(AgentState::Blocked) {
+                // Same chip as every other inactive tab, but in the blocked token so a
+                // workspace that needs you is visible on the strip without opening it.
+                Style::default().fg(self.theme.blocked).bg(self.theme.panel)
             } else {
                 // A chip rather than bare text: the `panel` surface gives an inactive tab an
                 // edge of its own, so the strip reads as several things rather than one line
@@ -2568,18 +2582,24 @@ impl Dashboard {
                 None => label.to_owned(),
             };
             let name_width = label_width.saturating_sub(state_text.chars().count() + 2);
-            // The workspace goes inline when it fits and on its own line when it does not. The
-            // sidebar is narrow enough that appending it unconditionally ellipsised it away,
-            // which reads as a roster answering "which workspace" and in fact never saying. A
-            // second line costs a row and always says it.
-            let inline = workspace
-                .map(|workspace| format!("{named} · {workspace}"))
-                .filter(|inline| inline.chars().count() <= name_width);
-            let overflow = match (&inline, workspace) {
-                (None, Some(workspace)) => Some(workspace),
-                _ => None,
+            // Blocked (and done) get the last hook sentence on this same row, next to ◆,
+            // rather than a second line that reads as a chat excerpt. Working keeps the
+            // existing activity line below. No hook means no invented question. The
+            // workspace yields the identity line when a reason is present so the reason
+            // is what gets truncated, not buried after a workspace name.
+            let why = roster_why(state, activity.as_deref());
+            let (named, overflow) = if let Some(reason) = why {
+                (format!("{named} · {reason}"), workspace)
+            } else {
+                let inline = workspace
+                    .map(|workspace| format!("{named} · {workspace}"))
+                    .filter(|inline| inline.chars().count() <= name_width);
+                let overflow = match (&inline, workspace) {
+                    (None, Some(workspace)) => Some(workspace),
+                    _ => None,
+                };
+                (inline.unwrap_or(named), overflow)
             };
-            let named = inline.unwrap_or(named);
             let name = ellipsise(&named, name_width);
             let gap = label_width.saturating_sub(name.chars().count() + state_text.chars().count());
             rows.push(|| {
@@ -2619,7 +2639,9 @@ impl Dashboard {
                     )
                 });
             }
-            if let Some(activity) = activity {
+            if why.is_none()
+                && let Some(activity) = activity
+            {
                 let shown = ellipsise(&activity, label_width.saturating_sub(3));
                 rows.push(move || Line::styled(format!("   {shown}"), Style::default().fg(muted)));
             }
@@ -3323,11 +3345,11 @@ impl Dashboard {
                     .border_type(Theme::border_type())
                     .title(title)
                     .title_style(Style::default().fg(title_colour))
-                    .border_style(Style::default().fg(if focused {
-                        self.theme.border_focused
-                    } else {
-                        self.theme.border
-                    }));
+                    .border_style(Style::default().fg(pane_border_colour(
+                        &self.theme,
+                        focused,
+                        state,
+                    )));
                 let block = if show_controls {
                     block.title_bottom(
                         Line::from(
@@ -6820,10 +6842,28 @@ impl Dashboard {
         {
             return Some(MenuTarget::SidebarWorkspace(workspace_id.clone()));
         }
+        self.sidebar_agent_at(column, row)
+            .map(MenuTarget::SidebarAgent)
+    }
+
+    /// The run whose sidebar AGENTS row is under the pointer, if any.
+    fn sidebar_agent_at(&self, column: u16, row: u16) -> Option<String> {
         self.sidebar_agent_areas
             .iter()
             .find(|(_, area)| contains(*area, column, row))
-            .map(|(run_id, _)| MenuTarget::SidebarAgent(run_id.clone()))
+            .map(|(run_id, _)| run_id.clone())
+    }
+
+    /// The pane that row focuses, looked up from the layout rather than guessed from the
+    /// row index. The hit target is a run id; the pane is what a left click has to name.
+    #[cfg(test)]
+    fn sidebar_pane_id_at(&self, column: u16, row: u16) -> Option<String> {
+        let run_id = self.sidebar_agent_at(column, row)?;
+        self.layout.workspaces.iter().find_map(|workspace| {
+            workspace.panes.values().find_map(|pane| {
+                (pane.run_id.as_deref() == Some(run_id.as_str())).then(|| pane.pane_id.clone())
+            })
+        })
     }
 
     /// The pane under the pointer, if any. Shared with the left button's focus arm and with the
@@ -7364,6 +7404,11 @@ impl Dashboard {
                     .is_some_and(|area| contains(area, event.column, event.row))
                 {
                     return self.run_command(PaneCommand::ToggleSidebar);
+                }
+                // A left click on a roster row is the pointer equivalent of jumping to that
+                // pane: focus it, and switch workspace if the row is not on the canvas.
+                if let Some(run_id) = self.sidebar_agent_at(event.column, event.row) {
+                    return self.focus_run(&run_id);
                 }
                 if let Some(command) = self
                     .quick_action_areas
@@ -8916,6 +8961,29 @@ fn target_gone(target: &MenuTarget) -> String {
 fn clickable_row(area: Rect, index: usize) -> Option<Rect> {
     let row = area.y.checked_add(u16::try_from(index).ok()?)?;
     (row < area.bottom()).then(|| Rect::new(area.x, row, area.width, 1))
+}
+
+/// The last hook sentence a blocked (or done) roster row may print. Working agents keep
+/// their activity on a line of their own; heuristic panes with nothing to quote omit this
+/// rather than inventing a question.
+fn roster_why(state: AgentState, activity: Option<&str>) -> Option<&str> {
+    if !matches!(state, AgentState::Blocked | AgentState::Done) {
+        return None;
+    }
+    activity.map(str::trim).filter(|text| !text.is_empty())
+}
+
+/// Blocked chrome uses the blocked token whether or not the pane is focused, so a pane
+/// that needs you is visible even when the keyboard is elsewhere. Working and idle keep
+/// the ordinary focus/idle border pair.
+fn pane_border_colour(theme: &Theme, focused: bool, state: AgentState) -> ratatui::style::Color {
+    if state == AgentState::Blocked {
+        theme.blocked
+    } else if focused {
+        theme.border_focused
+    } else {
+        theme.border
+    }
 }
 
 /// The cell of a pane's grid under the pointer, or `None` if the pointer is on the border
@@ -19003,5 +19071,153 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_sidebar_agent_row_hit_target_maps_to_that_pane_id() {
+        let mut dashboard = two_workspace_dashboard();
+        let mut run = snapshot();
+        run.run_id = "run_2".into();
+        run.workspace_id = "w2".into();
+        run.pane_id = "c".into();
+        run.agent = Some(AgentKind::Claude);
+        run.external_task_ref = String::new();
+        dashboard.runs.push(run);
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_2".into(),
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Blocked,
+            activity: Some("PermissionRequest".into()),
+        });
+        render_terminal(&mut dashboard, 120, 34);
+        let (run_id, row) = dashboard
+            .sidebar_agent_areas
+            .iter()
+            .find(|(id, _)| id == "run_2")
+            .cloned()
+            .expect("the roster lists the agent on the other workspace");
+        assert_eq!(run_id, "run_2");
+        assert_eq!(
+            dashboard.sidebar_pane_id_at(row.x + 2, row.y).as_deref(),
+            Some("c"),
+            "the clickable row names the pane that holds the run"
+        );
+        assert_eq!(dashboard.workspace_index, 0, "focus has not moved yet");
+        assert_eq!(
+            dashboard.layout.workspaces[0].focused_pane_id, "a",
+            "the visible workspace still has its original pane"
+        );
+        let command = dashboard.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: row.x + 2,
+            row: row.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(dashboard.workspace_index, 1, "the click switched workspace");
+        assert_eq!(
+            dashboard.layout.workspaces[1].focused_pane_id, "c",
+            "and focused the pane that holds the run"
+        );
+        assert!(
+            matches!(
+                command,
+                UiCommand::Request(ref request)
+                    if matches!(
+                        request.as_ref(),
+                        Request::Workspace(WorkspaceRequest::Focus {
+                            workspace_id,
+                            pane_id,
+                        }) if workspace_id == "w2" && pane_id == "c"
+                    )
+            ),
+            "and told the daemon, got {command:?}"
+        );
+    }
+
+    #[test]
+    fn a_blocked_pane_paints_blocked_border_chrome() {
+        let mut dashboard = bound_dashboard();
+        observe_agent(
+            &mut dashboard,
+            "run_1",
+            Some(AgentKind::Claude),
+            AgentState::Blocked,
+        );
+        let theme = Theme::default();
+        assert_eq!(
+            pane_border_colour(&theme, true, AgentState::Blocked),
+            theme.blocked
+        );
+        assert_eq!(
+            pane_border_colour(&theme, false, AgentState::Blocked),
+            theme.blocked
+        );
+        assert_eq!(
+            pane_border_colour(&theme, true, AgentState::Working),
+            theme.border_focused
+        );
+        assert_eq!(
+            pane_border_colour(&theme, false, AgentState::Idle),
+            theme.border
+        );
+        let terminal = render_terminal(&mut dashboard, 90, 24);
+        let focused = dashboard.pane_areas["a"];
+        let unfocused = dashboard.pane_areas["b"];
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(focused.x, focused.y + 1)].fg, theme.blocked);
+        assert_eq!(buffer[(unfocused.x, unfocused.y + 1)].fg, theme.border);
+    }
+
+    #[test]
+    fn roster_why_quotes_the_hook_and_invents_nothing() {
+        assert_eq!(
+            roster_why(AgentState::Blocked, Some("PermissionRequest")),
+            Some("PermissionRequest")
+        );
+        assert_eq!(
+            roster_why(AgentState::Blocked, Some("Bash ls")),
+            Some("Bash ls")
+        );
+        assert_eq!(roster_why(AgentState::Blocked, Some("Stop")), Some("Stop"));
+        assert_eq!(roster_why(AgentState::Blocked, Some("  ")), None);
+        assert_eq!(roster_why(AgentState::Blocked, None), None);
+        assert_eq!(roster_why(AgentState::Done, Some("Stop")), Some("Stop"));
+        assert_eq!(
+            roster_why(AgentState::Working, Some("Read src/lib.rs")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_blocked_sidebar_row_prints_the_hook_reason_on_the_same_line() {
+        let mut dashboard = bound_dashboard();
+        let mut run = snapshot();
+        run.run_id = "run_1".into();
+        run.agent = Some(AgentKind::Claude);
+        run.external_task_ref = String::new();
+        dashboard.runs.push(run);
+        dashboard.apply_event(Event::AgentStateChanged {
+            run_id: "run_1".into(),
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Blocked,
+            activity: Some("PermissionRequest".into()),
+        });
+        let frame = render_to_string(&mut dashboard, 120, 34);
+        assert!(
+            frame.contains("claude · Per"),
+            "blocked roster quotes the hook on the identity line (truncated to width): {frame:?}"
+        );
+        let mut heuristic = bound_dashboard();
+        observe_agent(
+            &mut heuristic,
+            "run_1",
+            Some(AgentKind::Amp),
+            AgentState::Blocked,
+        );
+        let quiet = render_to_string(&mut heuristic, 120, 34);
+        assert!(
+            !quiet.contains("PermissionRequest"),
+            "a heuristic pane has no hook sentence to quote"
+        );
     }
 }

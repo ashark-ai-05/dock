@@ -420,6 +420,7 @@ fn handle_connection_with_timeout(
                     QueueRequest::Inspect => Response::Queues {
                         queues: runtime.queue_snapshots(),
                         paused: runtime.queue_paused(),
+                        trust: runtime.auto_feed_trust().into(),
                     },
                     QueueRequest::Add {
                         workspace_id,
@@ -433,6 +434,7 @@ fn handle_connection_with_timeout(
                         Ok(_) => Response::Queues {
                             queues: runtime.queue_snapshots(),
                             paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
                         },
                         Err((code, message)) => Response::Error { code, message },
                     },
@@ -444,6 +446,7 @@ fn handle_connection_with_timeout(
                         Ok(()) => Response::Queues {
                             queues: runtime.queue_snapshots(),
                             paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
                         },
                         Err((code, message)) => Response::Error { code, message },
                     },
@@ -454,6 +457,7 @@ fn handle_connection_with_timeout(
                         Ok(_) => Response::Queues {
                             queues: runtime.queue_snapshots(),
                             paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
                         },
                         Err((code, message)) => Response::Error { code, message },
                     },
@@ -465,6 +469,7 @@ fn handle_connection_with_timeout(
                         Ok(()) => Response::Queues {
                             queues: runtime.queue_snapshots(),
                             paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
                         },
                         Err((code, message)) => Response::Error { code, message },
                     },
@@ -472,9 +477,18 @@ fn handle_connection_with_timeout(
                         Ok(()) => Response::Queues {
                             queues: runtime.queue_snapshots(),
                             paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
                         },
                         Err((code, message)) => Response::Error { code, message },
                     },
+                    QueueRequest::SetTrust { trust } => {
+                        runtime.set_auto_feed_trust(trust.into());
+                        Response::Queues {
+                            queues: runtime.queue_snapshots(),
+                            paused: runtime.queue_paused(),
+                            trust: runtime.auto_feed_trust().into(),
+                        }
+                    }
                 };
                 write_response(stream, &response)?;
             }
@@ -2758,7 +2772,7 @@ mod tests {
             ],
             &runtime,
         );
-        let Response::Queues { queues, paused } = &responses[1] else {
+        let Response::Queues { queues, paused, .. } = &responses[1] else {
             panic!("an add answers with the listing: {:?}", responses[1]);
         };
         assert_eq!(queues.len(), 1);

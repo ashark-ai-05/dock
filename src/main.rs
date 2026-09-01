@@ -2434,7 +2434,7 @@ fn queue_command(args: &[String]) -> io::Result<()> {
         }
     };
     match client.request(&request).map_err(io::Error::other)? {
-        Response::Queues { queues, paused } => {
+        Response::Queues { queues, paused, .. } => {
             render_queues(&queues, paused, None, None);
             Ok(())
         }
@@ -2515,7 +2515,7 @@ fn print_queues(
         .request(&Request::Queue(QueueRequest::Inspect))
         .map_err(io::Error::other)?
     {
-        Response::Queues { queues, paused } => {
+        Response::Queues { queues, paused, .. } => {
             render_queues(&queues, paused, pane, workspace);
             Ok(())
         }
@@ -3071,7 +3071,15 @@ fn refresh(client: &mut Client, dashboard: &mut Dashboard) -> Result<(), String>
     // the client dirty — so a `dock queue add` from another terminal lands in the open board pane
     // through exactly the path an agent state change does, with no keypress and no second poll.
     match client.request(&Request::Queue(QueueRequest::Inspect))? {
-        Response::Queues { queues, paused } => dashboard.set_queues(queues, paused),
+        Response::Queues {
+            queues,
+            paused,
+            trust,
+            ..
+        } => {
+            dashboard.set_queues(queues, paused);
+            dashboard.set_queue_trust(trust);
+        }
         Response::Error { message, .. } => return Err(message),
         response => return Err(format!("unexpected queue response: {response:?}")),
     }

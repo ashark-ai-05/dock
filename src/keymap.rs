@@ -65,6 +65,8 @@ pub enum PaneCommand {
     Detach,
     Help,
     Quit,
+    /// Show this session's prompt queues.
+    Queue,
     /// Collapse the sidebar to a rail, or bring it back.
     ToggleSidebar,
 }
@@ -153,7 +155,7 @@ impl Keymap {
             ("l", "launch"),
             ("d", "leave · runs keep running"),
             ("?", "help"),
-            ("q", "quit"),
+            ("q", "queue"),
         ]
     }
 }
@@ -179,7 +181,7 @@ fn command_for(key: KeyEvent) -> Option<PaneCommand> {
         KeyCode::Char('l') => PaneCommand::Launch,
         KeyCode::Char('d') => PaneCommand::Detach,
         KeyCode::Char('?') => PaneCommand::Help,
-        KeyCode::Char('q') => PaneCommand::Quit,
+        KeyCode::Char('q') => PaneCommand::Queue,
         // `[` is tmux's copy-mode key and copying is the far more frequent act, so workspace
         // cycling moved to the unshifted `,`/`.` pair rather than keeping the bracket.
         KeyCode::Char('[') => PaneCommand::CopyMode,
@@ -272,7 +274,7 @@ mod tests {
         assert!(keymap.is_pending());
         assert_eq!(
             keymap.handle(plain('q'), KeyEncoding::default()),
-            KeyOutcome::Command(PaneCommand::Quit)
+            KeyOutcome::Command(PaneCommand::Queue)
         );
         assert!(!keymap.is_pending());
     }

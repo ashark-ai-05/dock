@@ -246,6 +246,9 @@ pub struct Dashboard {
     /// The daemon-wide kill switch, as the daemon last reported it. Independent of every pane's
     /// own arming, so the lane must be able to say "armed, and paused anyway".
     queues_paused: bool,
+    /// The prompt-queue overlay, opened with Ctrl+B q.
+    queue_open: bool,
+    auto_feed_trust: crate::protocol::AutoFeedTrustSetting,
     /// The board's one cursor: which column, and what in it.
     ///
     /// One grid means one cursor. There used to be two — a lane cursor keyed by pane and the
@@ -679,6 +682,7 @@ pub enum OverlayKind {
     Review,
     Board,
     Git,
+    Queue,
     Copy,
     ContextMenu,
 }
@@ -701,7 +705,7 @@ pub enum OverlayKind {
 /// exception to "the first open overlay takes the key". See `key`, which takes the menu first
 /// when it is open precisely because this array draws it last. Every other pair is mutually
 /// exclusive in practice, so this order still decides the rest.
-const OVERLAY_ORDER: [OverlayKind; 9] = [
+const OVERLAY_ORDER: [OverlayKind; 10] = [
     OverlayKind::Help,
     OverlayKind::Rename,
     OverlayKind::LaunchForm,
@@ -709,6 +713,7 @@ const OVERLAY_ORDER: [OverlayKind; 9] = [
     OverlayKind::Review,
     OverlayKind::Board,
     OverlayKind::Git,
+    OverlayKind::Queue,
     OverlayKind::Copy,
     // Last, so it draws over whatever it was opened on top of. A menu is the most transient
     // surface Dock has, and what is on top is what the pointer and the keyboard are aimed at.
@@ -1704,6 +1709,7 @@ impl Dashboard {
             OverlayKind::Review => self.review.is_some(),
             OverlayKind::Board => self.board.is_some(),
             OverlayKind::Git => self.git.is_some(),
+            OverlayKind::Queue => self.queue_open,
             // A pointer selection is deliberately not an open overlay. Only a mode that was
             // asked for takes the keyboard; a highlight left by a drag must let every key
             // through to the pane, which is what every other terminal does.
@@ -1735,6 +1741,7 @@ impl Dashboard {
             OverlayKind::Review => self.render_review(frame, area),
             OverlayKind::Board => self.render_board(frame, area),
             OverlayKind::Git => self.render_git(frame, area),
+            OverlayKind::Queue => self.render_queue(frame, area),
             OverlayKind::Copy => {}
             OverlayKind::ContextMenu => self.render_context_menu(frame),
         }
@@ -1758,6 +1765,7 @@ impl Dashboard {
             OverlayKind::Review => self.review_key(key),
             OverlayKind::Board => self.board_key(key),
             OverlayKind::Git => self.git_key(key),
+            OverlayKind::Queue => self.queue_key(key),
             OverlayKind::Copy => self.copy_key(key),
             OverlayKind::ContextMenu => self.menu_key(key),
         }
@@ -2879,6 +2887,10 @@ impl Dashboard {
         self.queues_paused = paused;
     }
 
+    pub fn set_queue_trust(&mut self, trust: crate::protocol::AutoFeedTrustSetting) {
+        self.auto_feed_trust = trust;
+    }
+
     /// Takes the daemon's answer to a queue request.
     ///
     /// The refusal is the product here, so it is surfaced in the daemon's own words rather than
@@ -2888,8 +2900,14 @@ impl Dashboard {
     /// carries the whole listing, so the lane is already right when the frame after this paints.
     pub fn apply_queue_response(&mut self, response: Response) {
         match response {
-            Response::Queues { queues, paused } => {
+            Response::Queues {
+                queues,
+                paused,
+                trust,
+                ..
+            } => {
                 self.set_queues(queues, paused);
+                self.set_queue_trust(trust);
                 self.error = None;
             }
             Response::Error { message, .. } => self.error = Some(message),
@@ -3179,12 +3197,24 @@ impl Dashboard {
                 } else if exited {
                     format!(" ✗ {label} · exited · Ctrl+B R restarts ")
                 } else {
-                    format!(
-                        " {} {} · {} ",
-                        state.glyph(),
-                        label,
-                        self.pane_location(pane)
-                    )
+                    let queued = self
+                        .queue_for(workspace.workspace_id.as_str(), pane_id)
+                        .map_or(0, |queue| queue.entries.len());
+                    if queued > 0 {
+                        format!(
+                            " {} {} · {} · {queued} queued ",
+                            state.glyph(),
+                            label,
+                            self.pane_location(pane)
+                        )
+                    } else {
+                        format!(
+                            " {} {} · {} ",
+                            state.glyph(),
+                            label,
+                            self.pane_location(pane)
+                        )
+                    }
                 };
                 let title_colour = if exited {
                     self.theme.blocked
@@ -3507,7 +3537,7 @@ impl Dashboard {
             lines.push(Line::from("No workspace · n create"));
         }
         lines.push(Line::styled(
-            "Ctrl+B then n new · h/v split · Tab focus · l launch · ? help · q quit",
+            "Ctrl+B then n new · h/v split · Tab focus · l launch · ? help · q queue",
             Style::default().fg(self.theme.muted),
         ));
         frame.render_widget(
@@ -3533,7 +3563,7 @@ impl Dashboard {
             Line::styled("AFTER Ctrl+B", heading),
             Line::from("n new workspace   h/v split   z zoom   s sidebar (or click it)"),
             Line::from("r rename   R restart shell   x close   X close workspace"),
-            Line::from("l launch   q quit"),
+            Line::from("l launch   q queue"),
             Line::from("w pick a workspace by name   1-9 jump to one   ,/. previous/next"),
             Line::from("f find a file here and type its path into the pane"),
             Line::from("a resume the agent that last ran here, continuing its own session"),
@@ -3728,6 +3758,11 @@ impl Dashboard {
                 self.error = None;
                 UiCommand::LoadGit
             }
+            PaneCommand::Queue => {
+                self.error = None;
+                self.queue_open = true;
+                UiCommand::Request(Box::new(Request::Queue(QueueRequest::Inspect)))
+            }
             PaneCommand::WorkspaceJump(position) => self.jump_to_workspace(position),
             PaneCommand::Resize(delta) => self.resize_keyboard(delta),
             PaneCommand::Zoom => self.zoom(),
@@ -3814,6 +3849,109 @@ impl Dashboard {
             _ => {}
         }
         UiCommand::None
+    }
+
+    fn queue_key(&mut self, key: KeyEvent) -> UiCommand {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.queue_open = false,
+            KeyCode::Char('p') => {
+                return UiCommand::Request(Box::new(Request::Queue(QueueRequest::SetPaused {
+                    paused: !self.queues_paused,
+                })));
+            }
+            KeyCode::Char('s') => {
+                let trust = match self.auto_feed_trust {
+                    crate::protocol::AutoFeedTrustSetting::Reported => {
+                        crate::protocol::AutoFeedTrustSetting::Screen
+                    }
+                    crate::protocol::AutoFeedTrustSetting::Screen => {
+                        crate::protocol::AutoFeedTrustSetting::Reported
+                    }
+                };
+                return UiCommand::Request(Box::new(Request::Queue(QueueRequest::SetTrust {
+                    trust,
+                })));
+            }
+            _ => {}
+        }
+        UiCommand::None
+    }
+
+    fn render_queue(&self, frame: &mut Frame, area: Rect) {
+        let width = area.width.min(88);
+        let height = area.height.min(22);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+        let heading = Style::default()
+            .fg(self.theme.accent)
+            .add_modifier(Modifier::BOLD);
+        let muted = Style::default().fg(self.theme.muted);
+        let mut lines = vec![Line::from(vec![
+            Span::styled("QUEUE", heading),
+            Span::styled(
+                format!(
+                    "   {}   trust:{}",
+                    if self.queues_paused {
+                        "paused"
+                    } else {
+                        "running"
+                    },
+                    match self.auto_feed_trust {
+                        crate::protocol::AutoFeedTrustSetting::Reported => "reported",
+                        crate::protocol::AutoFeedTrustSetting::Screen => "screen",
+                    }
+                ),
+                muted,
+            ),
+        ])];
+        if self.queues.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled("no prompts queued", muted));
+        }
+        for queue in &self.queues {
+            let armed = if queue.auto_feed { "armed" } else { "disarmed" };
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!(
+                    "{} / {} · {armed} · {} waiting",
+                    queue.workspace_id,
+                    queue.pane_id,
+                    queue.entries.len()
+                ),
+                heading,
+            ));
+            if let Some(reason) = &queue.holding_because {
+                lines.push(Line::styled(format!("holding because {reason}"), muted));
+            }
+            for entry in &queue.entries {
+                lines.push(Line::styled(
+                    format!("  {}  {}", entry.label, entry.preview),
+                    Style::default().fg(self.theme.text),
+                ));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "p pause/resume · s trust reported/screen · Esc closes",
+            muted,
+        ));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().fg(self.theme.text).bg(self.theme.panel))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(Theme::border_type())
+                        .border_style(Style::default().fg(self.theme.border_focused))
+                        .title(" QUEUE "),
+                ),
+            popup,
+        );
     }
 
     /// What has changed in the focused pane's worktree, painted with Dock's own palette.
@@ -9373,7 +9511,7 @@ mod tests {
             "r rename",
             "x close",
             "l launch",
-            "q quit",
+            "q queue",
             "runs keep running",
             "PageUp/PageDown scroll history",
             // Published here for the first time. `Ctrl+B s` was bound and named nowhere, and
@@ -9432,7 +9570,11 @@ mod tests {
             );
         }
         // Only the prefixed form still commands the dashboard.
-        assert_eq!(command(&mut dashboard, KeyCode::Char('q')), UiCommand::Quit);
+        assert_eq!(
+            command(&mut dashboard, KeyCode::Char('q')),
+            UiCommand::Request(Box::new(Request::Queue(QueueRequest::Inspect)))
+        );
+        dashboard.queue_open = false;
         assert_eq!(command(&mut dashboard, KeyCode::Char('d')), UiCommand::Quit);
     }
 
@@ -9578,7 +9720,7 @@ mod tests {
             // The newest hint, and therefore the one nearest the point where the bar stops
             // fitting the two-row footer.
             "copy mode",
-            "quit",
+            "queue",
         ] {
             assert!(pending.contains(hint), "missing which-key hint {hint}");
         }
@@ -12985,6 +13127,38 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_b_q_opens_the_queue_panel_with_holding_reason() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_queues(
+            vec![crate::protocol::PaneQueueSnapshot {
+                workspace_id: "w".into(),
+                pane_id: "a".into(),
+                run_id: Some("run_1".into()),
+                auto_feed: true,
+                awaiting_ack: false,
+                holding_because: Some("the agent is still working".into()),
+                entries: vec![crate::protocol::QueueEntrySnapshot {
+                    entry_id: 1,
+                    label: "card 7".into(),
+                    preview: "keep going".into(),
+                    bytes: 10,
+                }],
+            }],
+            true,
+        );
+        assert_eq!(
+            command(&mut dashboard, KeyCode::Char('q')),
+            UiCommand::Request(Box::new(Request::Queue(QueueRequest::Inspect)))
+        );
+        let frame = render_to_string(&mut dashboard, 110, 28);
+        assert!(frame.contains("QUEUE"), "{frame:?}");
+        assert!(frame.contains("paused"), "{frame:?}");
+        assert!(frame.contains("armed"), "{frame:?}");
+        assert!(frame.contains("the agent is still working"), "{frame:?}");
+        assert!(frame.contains("card 7"), "{frame:?}");
+    }
+
+    #[test]
     fn added_and_removed_lines_are_coloured_by_dock_rather_than_by_an_external_renderer() {
         let mut dashboard = bound_dashboard();
         dashboard.set_git(git_facts(), SAMPLE_DIFF.into());
@@ -15102,13 +15276,14 @@ mod tests {
             crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
         );
         dashboard.set_git(git_facts(), "diff --git a/x b/x".into());
+        dashboard.queue_open = true;
         dashboard.menu = Some(ContextMenu::for_target(MenuTarget::Canvas, false));
 
         // What `render` walks: every open overlay, in `OVERLAY_ORDER`, later ones over earlier.
         assert_eq!(
             dashboard.open_overlays().collect::<Vec<_>>(),
             OVERLAY_ORDER.to_vec(),
-            "with all nine open the draw sequence is OVERLAY_ORDER entire"
+            "with every overlay open the draw sequence is OVERLAY_ORDER entire"
         );
 
         // The menu first, ahead of eight surfaces that were open before it. A menu on top of

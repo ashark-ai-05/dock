@@ -59,7 +59,7 @@ pane**, `Esc` is never intercepted, and `Ctrl+B` twice sends a literal `Ctrl+B`.
 | arrows, `Tab`/`S-Tab` | focus | `x` | close pane |
 | `+` `-` | resize split | `l` | launch an agent |
 | `[` | copy mode | `d` | leave — runs keep running |
-| `?` | help | `q` | quit |
+| `?` | help | `q` | queue |
 
 With more than one workspace open, a tab strip names them all and numbers them
 by the digit that jumps there. Most of Dock is reachable with the mouse: click
@@ -152,6 +152,13 @@ A dispatched agent is also told how to close the loop: its prompt ends with
 `dock task move <id> review`, so the board follows the work. Dock never moves a
 task because an agent *looks* finished — "looks finished" is a regex over a
 screen, and the board is the durable record of what happened.
+
+`Ctrl+B q` is the prompt queue: what is waiting to be typed into a pane, whether
+auto-feed is armed or paused, and *why* it is holding if it is. Depth also
+appears in a pane's title when it is greater than zero. `dock queue` is the same
+surface from a shell. Auto-feed never acts on a *screen-inferred* done unless
+you opt in (`dock queue` trust, or `dockd --auto-feed-trust=screen`); the
+default is a state the agent reported through a hook.
 
 ### Exact state, from the agent itself
 

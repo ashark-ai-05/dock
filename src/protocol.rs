@@ -8,7 +8,7 @@ use crate::{
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +223,36 @@ pub enum QueueRequest {
     },
     /// The kill switch. Daemon-wide, persisted, and independent of every pane's own arming.
     SetPaused { paused: bool },
+    /// Which "the agent finished" signal auto-feed will act on. Does not arm anything.
+    SetTrust { trust: AutoFeedTrustSetting },
+}
+
+/// Wire form of [`crate::queue::AutoFeedTrust`]. Named here so a client can change it without
+/// restarting dockd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoFeedTrustSetting {
+    #[default]
+    Reported,
+    Screen,
+}
+
+impl From<crate::queue::AutoFeedTrust> for AutoFeedTrustSetting {
+    fn from(trust: crate::queue::AutoFeedTrust) -> Self {
+        match trust {
+            crate::queue::AutoFeedTrust::Reported => Self::Reported,
+            crate::queue::AutoFeedTrust::Screen => Self::Screen,
+        }
+    }
+}
+
+impl From<AutoFeedTrustSetting> for crate::queue::AutoFeedTrust {
+    fn from(trust: AutoFeedTrustSetting) -> Self {
+        match trust {
+            AutoFeedTrustSetting::Reported => Self::Reported,
+            AutoFeedTrustSetting::Screen => Self::Screen,
+        }
+    }
 }
 
 /// One pane's queue as a listing sees it.
@@ -557,6 +587,8 @@ pub enum Response {
     Queues {
         queues: Vec<PaneQueueSnapshot>,
         paused: bool,
+        #[serde(default)]
+        trust: AutoFeedTrustSetting,
     },
     /// Output older than the caller's cursor. `complete` says the answer reaches the oldest
     /// byte still retained, so there is nothing further back to ask for.
@@ -820,7 +852,7 @@ mod tests {
 
     #[test]
     fn the_protocol_version_records_the_pane_history_request() {
-        assert_eq!(PROTOCOL_VERSION, 14);
+        assert_eq!(PROTOCOL_VERSION, 15);
     }
 
     #[test]

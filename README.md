@@ -56,7 +56,7 @@ dock hooks --install    # Claude Code + Codex: merge, keep existing handlers
 
 ## Board
 
-`Ctrl+B k` is markdown tasks in the repo (`kanban/tasks/`). Unbound panes get the same `DOCK_BOARD` path. Watch updates the TUI when files change. `Enter` dispatches (claims `in-progress`, `git worktree add` on `dock/task-<id>` in a repo). Dock never closes a card from a screen heuristic.
+`Ctrl+B k` is markdown tasks in the repo (`kanban/tasks/`). Same drive keys on the overlay and a `@board` pane: hjkl move, H/L set status (WIP), c claim, a archive, A show archived, n new, Enter dispatch (body, not title-only). Dock never closes a card from a screen heuristic.
 
 ```bash
 dock task list

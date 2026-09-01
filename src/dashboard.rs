@@ -273,6 +273,8 @@ pub struct Dashboard {
     /// to be: a board whose todo column is empty must still be walkable across, and refusing to
     /// enter one would make `l` skip a column silently.
     board_cursor: Option<(usize, Option<BoardTarget>)>,
+    /// Title being typed for a new card when the overlay is not holding one.
+    board_composing: Option<String>,
     /// Done panes already visited this turn, keyed as workspace/pane.
     seen_done: HashSet<String>,
     #[cfg(test)]
@@ -3038,7 +3040,7 @@ impl Dashboard {
         let live = BoardLive::new(&runs);
         let (column, index) = self.board_cursor_at(view, &live);
         if view.statuses().get(column).map(String::as_str) != Some(ACTIVE_STATUS) {
-            return Err("a arms an agent: move the cursor into ACTIVE first".into());
+            return Err("e arms an agent: move the cursor into ACTIVE first".into());
         }
         let entries = active_entries(view, &live);
         let Some(entry) = entries.get(index).copied() else {
@@ -3092,14 +3094,7 @@ impl Dashboard {
     /// `PaneInput` however the key is encoded. Anything unrecognised is ignored rather than
     /// guessed at — a board is not a keyboard surface, it has a cursor and a switch.
     fn board_pane_key(&mut self, key: KeyEvent) -> UiCommand {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.move_board_cursor(0, 1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_board_cursor(0, -1),
-            KeyCode::Char('h') | KeyCode::Left => self.move_board_cursor(-1, 0),
-            KeyCode::Char('l') | KeyCode::Right => self.move_board_cursor(1, 0),
-            KeyCode::Char('a') => self.toggle_auto_feed(),
-            _ => UiCommand::None,
-        }
+        self.drive_board_key(key, false)
     }
 
     /// A Board pane: one grid, and the live agents drawn in the column they belong in.
@@ -4161,7 +4156,7 @@ impl Dashboard {
             // this board ended up in-progress with a test stub behind it.
             None if board.writable => Line::from(vec![
                 Span::styled(
-                    "←/→ column · ↑/↓ card · </> move it · n new · Esc close · Enter → ",
+                    "hjkl · H/L status · c claim · a archive · A archived · n new · Enter → ",
                     Style::default().fg(self.theme.muted),
                 ),
                 match self.dispatch_adapter() {
@@ -4443,77 +4438,115 @@ impl Dashboard {
     }
 
     fn board_key(&mut self, key: KeyEvent) -> UiCommand {
-        let Some(board) = self.board.as_mut() else {
-            return UiCommand::None;
-        };
-        // A title being typed owns every printable key, so the single-letter controls below are
-        // live only when one is not. Esc unwinds a level at a time, as copy mode does: abandoning
-        // a half-typed title should not also close the board behind it.
-        if let Some(title) = board.composing.as_mut() {
-            match key.code {
-                KeyCode::Esc => board.composing = None,
-                KeyCode::Backspace => {
-                    title.pop();
-                }
-                KeyCode::Enter => {
-                    let title = title.clone();
-                    board.composing = None;
-                    return self.create_task(&title);
-                }
-                KeyCode::Char(character)
-                    if !key.modifiers.intersects(
-                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                    ) =>
-                {
-                    title.push(character)
-                }
-                _ => {}
-            }
+        self.drive_board_key(key, true)
+    }
+
+    /// Keys shared by the overlay and a `@board` pane.
+    fn drive_board_key(&mut self, key: KeyEvent, overlay: bool) -> UiCommand {
+        if self.compose_board_title(key) {
             return UiCommand::None;
         }
+        if let Some(title) = self.take_composed_title(key) {
+            return self.create_task(&title);
+        }
+        let writable = self.board.as_ref().is_none_or(|board| board.writable);
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.board = None,
-            // Through the board's own cursor rather than through the view's, because `ACTIVE`
-            // holds entries no view can name: the cursor walks what the grid draws, in the order
-            // the grid draws it, or `j` would jump about wherever that column has re-sorted.
+            KeyCode::Esc | KeyCode::Char('q') if overlay => self.board = None,
             KeyCode::Left | KeyCode::Char('h') => return self.move_board_cursor(-1, 0),
             KeyCode::Right | KeyCode::Char('l') => return self.move_board_cursor(1, 0),
             KeyCode::Up | KeyCode::Char('k') => return self.move_board_cursor(0, -1),
             KeyCode::Down | KeyCode::Char('j') => return self.move_board_cursor(0, 1),
-            KeyCode::Char('n') if board.writable => board.composing = Some(String::new()),
-            // `<` and `>` move the card itself, which is the one thing a board is for that a list
-            // cannot do at all.
-            KeyCode::Char('<' | ',') => return self.shift_task(-1),
-            KeyCode::Char('>' | '.') => return self.shift_task(1),
-            // `h`, `j`, `k`, `l` are already cursor motion, so the obvious `h` for "hide" is
-            // unavailable — `v` reveals or hides archived cards instead, `a` retires or restores
-            // the one under the cursor, and `A` clears out the whole of `done` at once.
-            KeyCode::Char('v') => {
-                let revealing = board.view.revealing();
-                board.view.set_reveal(!revealing);
-                // One board, one reveal: a Board pane can be showing the same board underneath
-                // this overlay, and if `v` moved only the overlay's own copy the two surfaces
-                // would disagree about whether this board is revealing its archived pile — the
-                // exact drift `set_board_cursor`'s "one cursor over two surfaces" comment exists
-                // to prevent, just for `reveal` instead of the cursor.
-                if let Some(pane) = self.board_pane_view.as_mut() {
-                    pane.set_reveal(!revealing);
-                }
-            }
+            KeyCode::Char('n') if writable => self.begin_compose(),
+            KeyCode::Char('<' | ',' | 'H') => return self.shift_task(-1),
+            KeyCode::Char('>' | '.' | 'L') => return self.shift_task(1),
+            KeyCode::Char('v' | 'A') => self.toggle_archived_reveal(),
             KeyCode::Char('a') => return self.archive_selected_task(),
-            KeyCode::Char('A') => return self.archive_finished_tasks(),
+            KeyCode::Char('c') => return self.claim_selected_task(),
+            KeyCode::Char('e') => return self.toggle_auto_feed(),
             KeyCode::Enter => return self.dispatch_selected_task(),
             _ => {}
         }
         UiCommand::None
     }
 
+    fn composing_mut(&mut self) -> Option<&mut String> {
+        if let Some(board) = self.board.as_mut() {
+            return board.composing.as_mut();
+        }
+        self.board_composing.as_mut()
+    }
+
+    fn compose_board_title(&mut self, key: KeyEvent) -> bool {
+        if self.composing_mut().is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(board) = self.board.as_mut() {
+                    board.composing = None;
+                }
+                self.board_composing = None;
+            }
+            KeyCode::Backspace => {
+                if let Some(title) = self.composing_mut() {
+                    title.pop();
+                }
+            }
+            KeyCode::Enter => return false,
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                if let Some(title) = self.composing_mut() {
+                    title.push(character);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn take_composed_title(&mut self, key: KeyEvent) -> Option<String> {
+        if key.code != KeyCode::Enter {
+            return None;
+        }
+        if self
+            .board
+            .as_ref()
+            .is_some_and(|board| board.composing.is_some())
+        {
+            return self.board.as_mut().and_then(|board| board.composing.take());
+        }
+        self.board_composing.take()
+    }
+
+    fn begin_compose(&mut self) {
+        if let Some(board) = self.board.as_mut() {
+            board.composing = Some(String::new());
+        } else {
+            self.board_composing = Some(String::new());
+        }
+    }
+
+    fn toggle_archived_reveal(&mut self) {
+        let revealing = self
+            .board
+            .as_ref()
+            .map(|board| board.view.revealing())
+            .or_else(|| self.board_pane_view.as_ref().map(|view| view.revealing()))
+            .unwrap_or(false);
+        if let Some(board) = self.board.as_mut() {
+            board.view.set_reveal(!revealing);
+        }
+        if let Some(pane) = self.board_pane_view.as_mut() {
+            pane.set_reveal(!revealing);
+        }
+    }
+
     /// Moves the selected card one column, and follows it there.
     fn shift_task(&mut self, delta: isize) -> UiCommand {
-        let Some(board) = self.board.as_mut() else {
-            return UiCommand::None;
-        };
-        if !board.writable {
+        if self.board.as_ref().is_some_and(|board| !board.writable) {
             self.error = Some("this board cannot be moved".into());
             return UiCommand::None;
         }
@@ -4524,11 +4557,10 @@ impl Dashboard {
             self.error = Some("that is a running agent, not a card".into());
             return UiCommand::None;
         };
-        let Some(board) = self.board.as_ref() else {
+        let Some(view) = self.cursor_view() else {
             return UiCommand::None;
         };
-        let Some(status) = board
-            .view
+        let Some(status) = view
             .tasks()
             .iter()
             .find(|task| task.id == id)
@@ -4536,10 +4568,7 @@ impl Dashboard {
         else {
             return UiCommand::None;
         };
-        // The board's own columns, not the constant's. A card sitting in a status Dock has never
-        // heard of is exactly the card a person most wants to move, and resolving its position
-        // through `STATUSES` made that the one card `<` and `>` refused to touch.
-        let columns: Vec<String> = board.view.statuses().to_vec();
+        let columns: Vec<String> = view.statuses().to_vec();
         let Some(current) = columns.iter().position(|known| *known == status) else {
             self.error = Some(format!("task {id} is in an unknown column: {status}"));
             return UiCommand::None;
@@ -4550,7 +4579,14 @@ impl Dashboard {
         if next == current {
             return UiCommand::None;
         }
-        let directory = board.directory.clone();
+        let Some(directory) = self
+            .board
+            .as_ref()
+            .map(|board| board.directory.clone())
+            .or_else(|| self.board_dir.clone())
+        else {
+            return UiCommand::None;
+        };
         match crate::board::set_status(&directory, id, &columns[next]) {
             Ok(_) => {
                 // Re-read rather than editing the copy in hand: the board is files on disk and
@@ -4586,28 +4622,29 @@ impl Dashboard {
     /// directions, because `v` already answers "what am I looking at" — a normal board's cards,
     /// or its held-back ones — and `a` acts on whichever of those is on screen under the cursor.
     fn archive_selected_task(&mut self) -> UiCommand {
-        let Some(board) = self.board.as_ref() else {
-            return UiCommand::None;
-        };
-        if !board.writable {
+        if self.board.as_ref().is_some_and(|board| !board.writable) {
             self.error = Some(REPOSITORY_BOARD_IS_NOT_OURS.into());
             return UiCommand::None;
         }
         let (Some(directory), Some(task)) = (self.board_dir.clone(), self.cursor_card()) else {
             return UiCommand::None;
         };
-        let archived = !board.view.revealing();
+        let revealing = self
+            .board
+            .as_ref()
+            .map(|board| board.view.revealing())
+            .or_else(|| self.board_pane_view.as_ref().map(|view| view.revealing()))
+            .unwrap_or(false);
+        let archived = !revealing;
         // Pressing `a` on a card that is already on the side of `archived` that `v` currently
         // means is a no-op — most reachable by pressing `a` on a revealed, still-unarchived
         // card. Writing anyway would still rewrite the file: inserting an `archived:` line (or
         // rewriting an identical one) and touching its mtime for a change that never happened,
         // in a file that belongs to the user's repository. `set_archived` is only reached when
         // it would actually change something.
-        let already = board
-            .view
-            .tasks()
-            .iter()
-            .find(|candidate| candidate.id == task)
+        let already = self
+            .cursor_view()
+            .and_then(|view| view.tasks().iter().find(|candidate| candidate.id == task))
             .is_some_and(|candidate| candidate.archived == archived);
         if already {
             return UiCommand::None;
@@ -4621,48 +4658,8 @@ impl Dashboard {
         }
     }
 
-    /// Archives every card in `done` at once, which is the answer to a column that has been
-    /// accumulating since the board was made.
-    fn archive_finished_tasks(&mut self) -> UiCommand {
-        let Some(board) = self.board.as_ref() else {
-            return UiCommand::None;
-        };
-        if !board.writable {
-            self.error = Some(REPOSITORY_BOARD_IS_NOT_OURS.into());
-            return UiCommand::None;
-        }
-        let Some(directory) = self.board_dir.clone() else {
-            return UiCommand::None;
-        };
-        let finished: Vec<u64> = board
-            .view
-            .cards("done")
-            .iter()
-            .filter(|task| !task.archived)
-            .map(|task| task.id)
-            .collect();
-        if finished.is_empty() {
-            self.error = Some("nothing in done to archive".into());
-            return UiCommand::None;
-        }
-        let count = finished.len();
-        for id in finished {
-            if let Err(message) = crate::board::set_archived(&directory, id, true) {
-                self.error = Some(message);
-                return UiCommand::LoadBoard;
-            }
-        }
-        self.error = Some(format!("archived {count} finished tasks"));
-        UiCommand::LoadBoard
-    }
-
     /// Puts an agent on the selected card.
     fn dispatch_selected_task(&mut self) -> UiCommand {
-        if self.board.is_none() {
-            return UiCommand::None;
-        }
-        // The cursor, not the view's row: `ACTIVE` holds live agents that were never dispatched
-        // from a card, and there is nothing to put an agent on there because one is already on it.
         let Some(id) = self.cursor_card() else {
             self.error = Some("that is a running agent, not a card".into());
             return UiCommand::None;
@@ -4670,6 +4667,36 @@ impl Dashboard {
         let key = id.to_string();
         self.board = None;
         self.task_dispatch_for(&key)
+    }
+
+    fn claim_selected_task(&mut self) -> UiCommand {
+        let Some(id) = self.cursor_card() else {
+            self.error = Some("that is a running agent, not a card".into());
+            return UiCommand::None;
+        };
+        let Some(directory) = self.board_dir.clone() else {
+            self.error = Some("no board is open".into());
+            return UiCommand::None;
+        };
+        if let Err(message) = crate::board::set_claimed_by(&directory, id, "dock") {
+            self.error = Some(message);
+            return UiCommand::None;
+        }
+        match crate::board::set_status(&directory, id, "in-progress") {
+            Ok(_) => {
+                self.set_board_tasks(crate::board::load(&directory), directory.clone());
+                if let Some(column) = self.cursor_view().and_then(|view| {
+                    view.statuses()
+                        .iter()
+                        .position(|status| status == "in-progress")
+                }) {
+                    self.set_board_cursor(column, Some(BoardTarget::Card(id)));
+                }
+                self.error = Some(format!("claimed task {id}"));
+            }
+            Err(message) => self.error = Some(message),
+        }
+        UiCommand::None
     }
 
     /// Assembles the dispatch for one card: the workspace and pane it lands in, the task it
@@ -8094,9 +8121,9 @@ fn render_board_columns(
         );
         if show_footer {
             let note = if view.revealing() {
-                format!("{hidden} archived · v hides")
+                format!("{hidden} archived · A hides")
             } else {
-                format!("{hidden} archived · v reveals")
+                format!("{hidden} archived · A reveals")
             };
             frame.render_widget(
                 Paragraph::new(Line::styled(
@@ -8296,7 +8323,7 @@ fn card_lines<'a>(
         // Archived cards only ever appear here while revealed, and a revealed archived card
         // must never read as an ordinary one — muted regardless of the cursor, so `v` alone
         // tells the difference rather than a colour that also depends on where the cursor is.
-        let style = if task.archived {
+        let style = if task.archived || (!here && shape.blocked.contains(&task.id)) {
             Style::default().fg(theme.muted)
         } else {
             card_style(theme, here, true)
@@ -8552,6 +8579,32 @@ fn write_liveness(buffer: &mut String, run: &LiveRun<'_>) {
     }
 }
 
+fn card_detail(task: &BoardTask) -> String {
+    let deps = if task.depends_on.is_empty() {
+        "none".to_owned()
+    } else {
+        task.depends_on
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let claimed = task.claimed_by.as_deref().unwrap_or("unclaimed");
+    let preview = task
+        .body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or("")
+        .chars()
+        .take(48)
+        .collect::<String>();
+    format!(
+        "{} · {} · depends {deps} · {claimed} · {preview}",
+        task.title, task.status
+    )
+}
+
 /// What the board pane's footer says.
 ///
 /// Three things, in the order they matter. The daemon-wide pause first, because an *armed* pane
@@ -8610,11 +8663,13 @@ fn board_pane_footer(
         // floor under that: the card the cursor is on can always be read in full somewhere,
         // without opening it and without widening the pane.
         separate(&mut footer);
-        let _ = write!(footer, "#{} {}", task.id, task.title);
+        footer.push_str(&card_detail(task));
     }
     if focused {
         separate(&mut footer);
-        footer.push_str("h/l column · j/k card · a arms auto-feed");
+        footer.push_str(
+            "hjkl · H/L · c claim · a archive · A archived · n new · Enter dispatch · e feed",
+        );
     }
     footer
 }
@@ -12574,9 +12629,9 @@ mod tests {
         render_to_string(&mut dashboard, 400, 40);
         cursor_into_active(&mut dashboard);
 
-        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         let UiCommand::Request(request) = asked else {
-            panic!("`a` on an ACTIVE entry must ask the daemon to arm, got {asked:?}");
+            panic!("`e` on an ACTIVE entry must ask the daemon to arm, got {asked:?}");
         };
         assert_eq!(
             *request,
@@ -12603,7 +12658,7 @@ mod tests {
         render_to_string(&mut dashboard, 400, 40);
 
         assert_eq!(
-            dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            dashboard.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
             UiCommand::None,
             "nothing is asked of the daemon"
         );
@@ -12637,7 +12692,7 @@ mod tests {
             UiCommand::None,
             "moving the cursor costs the daemon nothing"
         );
-        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         let UiCommand::Request(request) = asked else {
             panic!("expected an arming request, got {asked:?}");
         };
@@ -12664,7 +12719,7 @@ mod tests {
             state: AgentState::Blocked,
             activity: None,
         });
-        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         let UiCommand::Request(request) = asked else {
             panic!("expected an arming request, got {asked:?}");
         };
@@ -12688,7 +12743,7 @@ mod tests {
         render_to_string(&mut dashboard, 400, 40);
         cursor_into_active(&mut dashboard);
 
-        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         let UiCommand::Request(request) = asked else {
             panic!("expected a disarming request, got {asked:?}");
         };
@@ -12714,7 +12769,7 @@ mod tests {
         render_to_string(&mut dashboard, 400, 40);
         cursor_into_active(&mut dashboard);
         assert!(matches!(
-            dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            dashboard.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
             UiCommand::Request(_)
         ));
 
@@ -12948,6 +13003,31 @@ mod tests {
             Some("in-progress"),
             "the cursor follows the card it just moved"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn overlay_and_pane_drive_keys_move_claim_and_toggle_archived() {
+        let root = std::env::temp_dir().join(format!("dock-drive-keys-{}", std::process::id()));
+        let dir = root.join("tasks");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("001-ready.md"),
+            "---\nid: 1\ntitle: 'ready card'\nstatus: backlog\npriority: high\n---\n\n# Outcome\n\ndo the thing\n",
+        )
+        .unwrap();
+        let mut dashboard = bound_dashboard();
+        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.board.as_mut().unwrap().writable = true;
+        dashboard.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        let claimed = crate::board::load(&dir);
+        assert_eq!(claimed[0].claimed_by.as_deref(), Some("dock"));
+        assert_eq!(claimed[0].status, "in-progress");
+        dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(crate::board::load(&dir)[0].archived);
+        dashboard.key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        assert!(dashboard.board.as_ref().unwrap().view.revealing());
         let _ = std::fs::remove_dir_all(&root);
     }
 

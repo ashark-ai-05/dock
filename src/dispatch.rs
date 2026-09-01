@@ -803,7 +803,7 @@ impl RuntimeRegistry {
     /// Called once at daemon start-up rather than from the constructor, because constructing a
     /// registry is not by itself a statement that panes should start running.
     pub fn revive_restored_panes(&self) {
-        let targets: Vec<(String, String)> = self
+        let targets: Vec<(String, String, Option<crate::adapter::AdapterId>)> = self
             .layout
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -816,12 +816,104 @@ impl RuntimeRegistry {
                     .panes
                     .into_values()
                     .filter(|pane| pane.run_id.is_none())
-                    .map(move |pane| (workspace_id.clone(), pane.pane_id))
+                    .map(move |pane| (workspace_id.clone(), pane.pane_id, pane.adapter))
             })
             .collect();
-        for (workspace_id, pane_id) in targets {
-            self.launch_pane_shell(&workspace_id, &pane_id);
+        for (workspace_id, pane_id, adapter) in targets {
+            self.restore_pane(&workspace_id, &pane_id, adapter);
         }
+    }
+
+    /// Restores a pane that existed before this daemon process. Agents Dock launched itself
+    /// come back on their documented resume argv; a plain shell stays a shell. Copilot has no
+    /// verified resume flags, so it is launched again with none rather than invented ones.
+    fn restore_pane(
+        &self,
+        workspace_id: &str,
+        pane_id: &str,
+        adapter: Option<crate::adapter::AdapterId>,
+    ) {
+        let Some(id) = adapter else {
+            self.launch_pane_shell(workspace_id, pane_id);
+            return;
+        };
+        match id {
+            crate::adapter::AdapterId::ClaudeCode
+            | crate::adapter::AdapterId::CodexCli
+            | crate::adapter::AdapterId::Amp
+            | crate::adapter::AdapterId::GithubCopilotCli => {
+                let arguments = id
+                    .resume_arguments()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect();
+                self.launch_restored_agent(workspace_id, pane_id, id, arguments);
+            }
+            _ => self.launch_pane_shell(workspace_id, pane_id),
+        }
+    }
+
+    fn launch_restored_agent(
+        &self,
+        workspace_id: &str,
+        pane_id: &str,
+        adapter_id: crate::adapter::AdapterId,
+        arguments: Vec<String>,
+    ) {
+        let kind = self
+            .layout
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pane_kind(workspace_id, pane_id);
+        if kind == Some(crate::layout::PaneKind::Board) {
+            return;
+        }
+        #[cfg(test)]
+        if *self
+            .suppress_pane_shells
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+        {
+            return;
+        }
+        let Some(directory) = std::env::current_dir()
+            .ok()
+            .and_then(|directory| canonical_terminal_directory(&directory).ok())
+        else {
+            return;
+        };
+        self.reclaim_pane_shell_identity(workspace_id, pane_id);
+        let run_id = format!("dock_rv_{workspace_id}_{pane_id}");
+        let request = crate::protocol::DispatchRequest {
+            repository_root: directory.display().to_string(),
+            external_task_ref: String::new(),
+            run_id: run_id.clone(),
+            worktree: directory.display().to_string(),
+            adapter: crate::adapter::AdapterSelection {
+                id: adapter_id,
+                executable: None,
+                arguments,
+            },
+        };
+        let binding = RunBinding {
+            binding_kind: BindingKind::Terminal,
+            repository_root: directory.clone(),
+            external_task_ref: String::new(),
+            run_id,
+            worktree: directory,
+            branch: String::new(),
+            base_sha: String::new(),
+            workspace_id: workspace_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+        };
+        let _ = self.dispatch_with_binding(
+            request,
+            false,
+            Some((workspace_id.to_owned(), pane_id.to_owned())),
+            Some(binding),
+            false,
+        );
     }
 
     /// Retires the placeholder shell a committed dispatch has just displaced from a pane. Called
@@ -1600,11 +1692,24 @@ impl RuntimeRegistry {
                 transition: Arc::clone(&transition),
                 state: RuntimeSlotState::Active(RuntimeEntry {
                     runtime,
-                    selection: request.adapter,
+                    selection: request.adapter.clone(),
                 }),
                 pane_shell,
             },
         );
+        if !pane_shell {
+            let identity = match request.adapter.id {
+                crate::adapter::AdapterId::Shell
+                | crate::adapter::AdapterId::Fixture
+                | crate::adapter::AdapterId::Generic => None,
+                id => Some(id),
+            };
+            let _ = self
+                .layout
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set_pane_adapter(&bound_pane.0, &bound_pane.1, identity);
+        }
         if gate_release_authorized {
             let mut programme = self.programme.lock().unwrap_or_else(|p| p.into_inner());
             self.authorize_programme_dispatch(&programme, &run_id, true)?;
@@ -4628,6 +4733,112 @@ mod tests {
             "the shell identity belongs to the pane, not to one launch"
         );
         assert!(restored.pane_input("w1", "p1", b"echo revived\n").is_ok());
+    }
+
+    #[test]
+    fn launched_agents_restore_with_documented_resume_argv_and_copilot_gets_none() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "dock-restore-agents-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["claude", "codex", "amp", "copilot"] {
+            let path = bin.join(name);
+            fs::write(&path, "#!/bin/sh\nexec sleep 30\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let previous_path = std::env::var("PATH").unwrap();
+        unsafe { std::env::set_var("PATH", format!("{}:{previous_path}", bin.display())) };
+        struct RestorePath(String);
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                unsafe { std::env::set_var("PATH", &self.0) };
+            }
+        }
+        let _path = RestorePath(previous_path);
+
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        {
+            let mut layout = crate::layout::LayoutRegistry::load(&state).unwrap();
+            layout
+                .create_workspace("w1".into(), "Daily".into(), "shell".into())
+                .unwrap();
+            for (from, new, adapter) in [
+                ("shell", "claude", crate::adapter::AdapterId::ClaudeCode),
+                ("claude", "codex", crate::adapter::AdapterId::CodexCli),
+                ("codex", "amp", crate::adapter::AdapterId::Amp),
+                (
+                    "amp",
+                    "copilot",
+                    crate::adapter::AdapterId::GithubCopilotCli,
+                ),
+            ] {
+                layout
+                    .split(
+                        "w1",
+                        from,
+                        new.into(),
+                        crate::layout::SplitAxis::Vertical,
+                        PaneKind::Terminal,
+                    )
+                    .unwrap();
+                layout.set_pane_adapter("w1", new, Some(adapter)).unwrap();
+            }
+        }
+
+        let restored = TestRegistry {
+            registry: RuntimeRegistry::new(&state, 2000).unwrap(),
+            state: state.clone(),
+        };
+        restored.revive_restored_panes();
+        let runs = restored.inspect(None).expect("inspect restored runs");
+        let command_for = |pane: &str| {
+            runs.iter()
+                .find(|run| run.pane_id == pane)
+                .unwrap_or_else(|| panic!("missing restored run for {pane}"))
+                .command
+                .clone()
+        };
+        let claude = command_for("claude");
+        assert!(
+            claude.iter().any(|part| part == "--continue"),
+            "claude resume: {claude:?}"
+        );
+        let codex = command_for("codex");
+        assert!(
+            codex.windows(2).any(|pair| pair == ["resume", "--last"]),
+            "codex resume: {codex:?}"
+        );
+        let amp = command_for("amp");
+        assert!(
+            amp.windows(3)
+                .any(|triple| triple == ["threads", "continue", "--last"]),
+            "amp resume: {amp:?}"
+        );
+        let copilot = command_for("copilot");
+        assert!(
+            !copilot.iter().any(|part| part.contains("resume")
+                || part.contains("continue")
+                || part == "--last"),
+            "copilot must not invent resume flags: {copilot:?}"
+        );
+        let shell = command_for("shell");
+        assert!(
+            !shell.iter().any(|part| part.contains("claude")
+                || part.contains("codex")
+                || part.contains("amp")
+                || part.contains("copilot")),
+            "plain shell stays a shell: {shell:?}"
+        );
     }
 
     /// The one property that makes a Board pane a board rather than a terminal with a picture in

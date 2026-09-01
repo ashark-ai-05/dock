@@ -6222,6 +6222,7 @@ impl Dashboard {
                 run_id: None,
                 runtime: PaneRuntime::Empty,
                 kind,
+                adapter: None,
             },
         );
         workspace.focused_pane_id = new_pane_id.clone();
@@ -8817,6 +8818,7 @@ mod tests {
                     run_id: None,
                     runtime: PaneRuntime::Running,
                     kind: PaneKind::Terminal,
+                    adapter: None,
                 },
             ),
             (
@@ -8827,6 +8829,7 @@ mod tests {
                     run_id: None,
                     runtime: PaneRuntime::Restored,
                     kind: PaneKind::Terminal,
+                    adapter: None,
                 },
             ),
         ]);
@@ -9006,6 +9009,7 @@ mod tests {
                     run_id: Some("run_2".into()),
                     runtime: PaneRuntime::Running,
                     kind: PaneKind::Terminal,
+                    adapter: None,
                 },
             )]),
             root: LayoutNode::Pane {
@@ -9037,6 +9041,7 @@ mod tests {
                         run_id: None,
                         runtime: PaneRuntime::Empty,
                         kind: PaneKind::Terminal,
+                        adapter: None,
                     },
                 )]),
                 root: LayoutNode::Pane { pane_id },
@@ -9426,6 +9431,7 @@ mod tests {
                 run_id: None,
                 runtime: PaneRuntime::Restored,
                 kind: PaneKind::Terminal,
+                adapter: None,
             },
         );
         dashboard.layout.workspaces[0].panes.insert(
@@ -9436,6 +9442,7 @@ mod tests {
                 run_id: None,
                 runtime: PaneRuntime::Restored,
                 kind: PaneKind::Terminal,
+                adapter: None,
             },
         );
         let create = command(&mut dashboard, KeyCode::Char('n'));
@@ -16907,6 +16914,7 @@ mod tests {
                         run_id: Some(run_id.clone()),
                         runtime: PaneRuntime::Running,
                         kind: PaneKind::Terminal,
+                        adapter: None,
                     },
                 );
                 let mut screen = PaneScreen::new(100, 220, 2000);

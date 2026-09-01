@@ -11,7 +11,7 @@ dock
 
 Same thing: `./scripts/install.sh`. Run from any directory. Dock starts a per-directory daemon or attaches to one. Each new pane is `$SHELL`. Type `claude`, `codex`, or `amp` as usual.
 
-Protocol is v15 — kill an older `dockd` before connecting.
+Protocol is v16 — kill an older `dockd` before connecting.
 
 ## Keys
 
@@ -45,11 +45,11 @@ Dock only tracks PTYs it launched.
 | `◉` | done (your turn) |
 | `○` | idle |
 
-Screen scrape is the fallback. Hooks exist only for Claude Code (`dock hooks --install` merges into `.claude/settings.json`). Amp and GitHub Copilot CLI have no hook install; their state stays on the screen (and OSC title). Codex can use the same printed events by hand — `dock hooks` does not write Codex or Amp/Copilot configs.
+Screen scrape is the fallback. `dock hooks --install` merges Claude Code into `.claude/settings.json` and Codex command hooks into `.codex/hooks.json` (and `$CODEX_HOME/hooks.json`). Amp has no published command-hook stdin schema (Plugin API / `--stream-json` is not an interactive-pane hook). GitHub Copilot CLI has no verified hook schema.
 
 ```bash
 dock hooks              # print config
-dock hooks --install    # Claude Code: merge into .claude/settings.json
+dock hooks --install    # Claude Code + Codex: merge, keep existing handlers
 ```
 
 `Ctrl+B a` resumes only when Dock has read that CLI's flags: `claude --continue`, `codex resume --last`, `amp threads continue --last`. GitHub Copilot CLI is refused — those flags were never read, so Dock does not guess them.
@@ -108,6 +108,6 @@ dock --socket=/tmp/dock.sock inspect
 - Only PTYs Dock created.
 - Only git write: `git worktree add` on dispatch. No stage, commit, rebase, merge, push, or worktree remove.
 - Review does not merge or complete a task. `dock task` rewrites `status:` (and claim) only.
-- Layout is in `.dock/local`. A daemon restart restores layout with fresh shells, not old processes.
+- Layout is in `.dock/local`. A daemon restart restores layout: agent panes Dock launched resume with that CLI's documented flags (`claude --continue`, `codex resume --last`, `amp threads continue --last`). Plain shells stay shells. Copilot has no resume flags, so it is launched again without invented ones. PTY contents are not saved.
 
 MIT

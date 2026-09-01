@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+
+use crate::adapter::AdapterId;
 use std::{
     collections::BTreeMap,
     ffi::CString,
@@ -24,16 +26,18 @@ pub const MAX_PANES_PER_WORKSPACE: usize = 64;
 
 /// The `layout.json` schema this build writes, and the newest it can read.
 ///
-/// Version 2 added [`PaneKind`]. Reading version 1 costs nothing — `deny_unknown_fields` rejects
-/// *extra* fields, not missing ones, so a v1 file simply has no `kind` and every pane defaults
-/// back to the terminal it already was. The first persist after any change writes 2.
+/// Version 2 added [`PaneKind`]. Version 3 added optional [`AdapterId`] identity so a pane Dock
+/// launched as an agent can resume after a daemon restart. Reading older files costs nothing —
+/// `deny_unknown_fields` rejects *extra* fields, not missing ones, so a v1 file has no `kind`
+/// (every pane is a terminal) and a v2 file has no `adapter` (every pane is a plain shell).
+/// The first persist after any change writes 3.
 ///
 /// The reverse does not work and deliberately is not made to: an older binary sees `kind` as an
 /// unknown field and refuses the whole file. Loosening `deny_unknown_fields` to buy that back was
 /// rejected — this file names the panes a daemon will spawn shells into, and the hardening on it
 /// is worth more than a downgrade convenience. What a downgrade loses is one split arrangement,
 /// which `layout.json` already half-discards on every load.
-const LAYOUT_SCHEMA_VERSION: u16 = 2;
+const LAYOUT_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +87,10 @@ pub struct PaneLayout {
     /// `runtime` it survives a restart: a board that came back as a terminal would come back with
     /// a shell in it.
     pub kind: PaneKind,
+    /// Which agent Dock last launched into this pane, if any. Identity only — not argv, not a
+    /// transcript, not a PTY. A restart uses this to pick that agent's documented resume flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<AdapterId>,
 }
 
 impl PaneLayout {
@@ -150,6 +158,10 @@ struct DurablePane {
     /// `Terminal` — exactly what each of them was.
     #[serde(default)]
     kind: PaneKind,
+    /// Defaulted the same way as `kind`: a layout written before adapters were persisted loads
+    /// with `None`, which is a shell — the only thing those panes ever were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adapter: Option<AdapterId>,
 }
 
 pub struct LayoutRegistry {
@@ -300,6 +312,35 @@ impl LayoutRegistry {
     pub fn pane_kind(&self, workspace_id: &str, pane_id: &str) -> Option<PaneKind> {
         Some(self.workspaces.get(workspace_id)?.panes.get(pane_id)?.kind)
     }
+    /// Which agent Dock launched into this pane, if the pane was not a plain shell.
+    pub fn pane_adapter(&self, workspace_id: &str, pane_id: &str) -> Option<AdapterId> {
+        self.workspaces
+            .get(workspace_id)?
+            .panes
+            .get(pane_id)?
+            .adapter
+            .clone()
+    }
+    /// Records (or clears) the launched-agent identity that a restart will resume.
+    pub fn set_pane_adapter(
+        &mut self,
+        workspace_id: &str,
+        pane_id: &str,
+        adapter: Option<AdapterId>,
+    ) -> Result<(), String> {
+        let mut candidate = self.workspaces.clone();
+        let pane = candidate
+            .get_mut(workspace_id)
+            .ok_or("workspace not found")?
+            .panes
+            .get_mut(pane_id)
+            .ok_or("pane not found")?;
+        if pane.is_board() {
+            return Err("that pane is a board; it cannot be bound to an agent".into());
+        }
+        pane.adapter = adapter;
+        self.commit(candidate)
+    }
     pub fn set_runtime(&mut self, run_id: &str, runtime: PaneRuntime) {
         for workspace in self.workspaces.values_mut() {
             for pane in workspace.panes.values_mut() {
@@ -341,6 +382,7 @@ impl LayoutRegistry {
             run_id: None,
             runtime: PaneRuntime::Empty,
             kind: PaneKind::Terminal,
+            adapter: None,
         };
         let workspace = WorkspaceLayout {
             workspace_id: id.clone(),
@@ -393,6 +435,7 @@ impl LayoutRegistry {
                 run_id: None,
                 runtime: PaneRuntime::Empty,
                 kind,
+                adapter: None,
             },
         );
         workspace.focused_pane_id = new_id;
@@ -524,6 +567,7 @@ impl LayoutRegistry {
                 run_id: None,
                 runtime: PaneRuntime::Empty,
                 kind: PaneKind::Terminal,
+                adapter: None,
             };
             candidate.insert(
                 workspace_id.clone(),
@@ -553,6 +597,7 @@ impl LayoutRegistry {
                     run_id: None,
                     runtime: PaneRuntime::Empty,
                     kind: PaneKind::Terminal,
+                    adapter: None,
                 },
             );
             workspace.focused_pane_id = pane_id.clone();
@@ -984,6 +1029,7 @@ impl DurableWorkspace {
                             // is topology, and a board restored as a terminal would be handed a
                             // shell by `revive_restored_panes` the moment it came back.
                             kind: pane.kind,
+                            adapter: pane.adapter,
                         },
                     )
                 })
@@ -1009,6 +1055,7 @@ impl From<&WorkspaceLayout> for DurableWorkspace {
                             pane_id: pane.pane_id.clone(),
                             name: pane.name.clone(),
                             kind: pane.kind,
+                            adapter: pane.adapter.clone(),
                         },
                     )
                 })
@@ -1496,7 +1543,7 @@ mod tests {
         layout.rename("w", Some("p"), "renamed".into()).unwrap();
         let written = fs::read_to_string(dir.join("layout.json")).unwrap();
         assert!(
-            written.contains(r#""schema_version": 2"#),
+            written.contains(r#""schema_version": 3"#),
             "the first persist upgrades the file: {written}"
         );
         assert!(written.contains(r#""kind": "terminal""#), "{written}");
@@ -1624,14 +1671,14 @@ mod tests {
         let dir = directory("from-the-future");
         fs::write(
             dir.join("layout.json"),
-            br#"{"schema_version":3,"workspaces":[]}"#,
+            br#"{"schema_version":4,"workspaces":[]}"#,
         )
         .unwrap();
         let Err(refusal) = LayoutRegistry::load(&dir) else {
             panic!("a newer schema must be refused rather than loaded");
         };
         assert!(
-            refusal.contains("newer Dock") && refusal.contains('3'),
+            refusal.contains("newer Dock") && refusal.contains('4'),
             "the refusal must name the version that wrote it: {refusal}"
         );
         assert!(
@@ -1909,5 +1956,44 @@ mod tests {
         );
         assert_eq!(layout.snapshot(), baseline);
         assert_eq!(fs::read(dir.join("layout.json")).unwrap(), durable);
+    }
+    #[test]
+    fn a_launched_agent_identity_survives_a_restart_without_storing_argv_or_transcripts() {
+        let dir = directory("agent-identity");
+        {
+            let mut layout = LayoutRegistry::load(&dir).unwrap();
+            layout
+                .create_workspace("w".into(), "daily".into(), "p".into())
+                .unwrap();
+            layout
+                .set_pane_adapter("w", "p", Some(AdapterId::ClaudeCode))
+                .unwrap();
+            layout
+                .split(
+                    "w",
+                    "p",
+                    "q".into(),
+                    SplitAxis::Vertical,
+                    PaneKind::Terminal,
+                )
+                .unwrap();
+            layout
+                .set_pane_adapter("w", "q", Some(AdapterId::GithubCopilotCli))
+                .unwrap();
+        }
+        let bytes = fs::read(dir.join("layout.json")).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains("claude-code"), "{text}");
+        assert!(text.contains("github-copilot-cli"), "{text}");
+        assert!(!text.contains("continue"), "{text}");
+        assert!(!text.contains("resume"), "{text}");
+        assert!(!text.contains("transcript"), "{text}");
+        let layout = LayoutRegistry::load(&dir).unwrap();
+        assert_eq!(layout.pane_adapter("w", "p"), Some(AdapterId::ClaudeCode));
+        assert_eq!(
+            layout.pane_adapter("w", "q"),
+            Some(AdapterId::GithubCopilotCli)
+        );
+        assert_eq!(layout.snapshot().workspaces[0].panes["p"].run_id, None);
     }
 }

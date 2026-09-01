@@ -8,7 +8,7 @@ use crate::{
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn the_protocol_version_records_the_pane_history_request() {
-        assert_eq!(PROTOCOL_VERSION, 15);
+        assert_eq!(PROTOCOL_VERSION, 16);
     }
 
     #[test]

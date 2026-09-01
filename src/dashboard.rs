@@ -1882,15 +1882,16 @@ impl Dashboard {
             }
         } else {
             frame.render_widget(
-                Paragraph::new("No workspace yet. Press Ctrl+B n to create one.")
-                    .style(Style::default().fg(self.theme.muted))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(Theme::border_type())
-                            .border_style(Style::default().fg(self.theme.border))
-                            .title(" RUNTIME "),
-                    ),
+                Paragraph::new(
+                    "No workspace yet.\nCtrl+B n new  ·  l launch  ·  k board  ·  ? help",
+                )
+                .style(Style::default().fg(self.theme.muted))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(Theme::border_type())
+                        .border_style(Style::default().fg(self.theme.border)),
+                ),
                 panes,
             );
         }
@@ -8812,6 +8813,17 @@ mod tests {
         terminal
     }
 
+    #[test]
+    fn an_empty_canvas_names_the_first_keys_and_does_not_caption_runtime() {
+        let mut dashboard = Dashboard::default();
+        let frame = render_to_string(&mut dashboard, 80, 24);
+        assert!(!frame.contains("RUNTIME"), "{frame:?}");
+        assert!(frame.contains("Ctrl+B n"), "{frame:?}");
+        assert!(frame.contains("l launch"), "{frame:?}");
+        assert!(frame.contains("k board"), "{frame:?}");
+        assert!(frame.contains("? help"), "{frame:?}");
+    }
+
     /// One row of the buffer, bounded to a rect's columns. The pane title lives on the
     /// border row, so a whole-frame string cannot tell it apart from the footer.
     fn row_text(terminal: &Terminal<TestBackend>, area: Rect, row: u16) -> String {
@@ -12023,7 +12035,7 @@ mod tests {
             .content
             .iter()
             .enumerate()
-            .filter(|(_, cell)| cell.symbol() == "●" && cell.fg == blocked)
+            .filter(|(_, cell)| cell.symbol() == "◆" && cell.fg == blocked)
             .count();
         assert!(
             badged >= 2,

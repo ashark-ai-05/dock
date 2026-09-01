@@ -42,7 +42,7 @@ impl Theme {
             surface: Color::Rgb(18, 18, 20),
             panel: Color::Rgb(26, 26, 29),
             muted: Color::Rgb(122, 118, 112),
-            border: Color::Rgb(58, 56, 54),
+            border: Color::Rgb(80, 78, 74),
             border_focused: Color::Rgb(232, 168, 88),
             text: Color::Rgb(226, 222, 214),
             selection: Color::Rgb(70, 100, 124),
@@ -68,7 +68,7 @@ impl Theme {
             surface: Color::Rgb(18, 22, 26),
             panel: Color::Rgb(27, 32, 38),
             muted: Color::Rgb(124, 138, 145),
-            border: Color::Rgb(38, 46, 51),
+            border: Color::Rgb(70, 82, 90),
             border_focused: Color::Rgb(79, 209, 197),
             text: Color::Rgb(221, 228, 232),
             selection: Color::Rgb(58, 107, 120),
@@ -167,6 +167,19 @@ mod tests {
         let theme = Theme::warm();
         assert_ne!(theme.border, theme.border_focused);
         assert_eq!(Theme::border_type(), BorderType::Rounded);
+    }
+
+    /// Unfocused pane chrome has to be a line you can see, not a 1.2:1 ghost.
+    /// 3:1 is the text floor; structural borders sit at 2:1 so they stay quieter than
+    /// `border_focused` while remaining visible on both surfaces.
+    #[test]
+    fn unfocused_borders_clear_two_to_one_on_both_surfaces() {
+        for theme in [Theme::warm(), Theme::cool()] {
+            for (ground, surface) in [("surface", theme.surface), ("panel", theme.panel)] {
+                let ratio = contrast(theme.border, surface);
+                assert!(ratio >= 2.0, "border on {ground} is only {ratio:.2}:1");
+            }
+        }
     }
 
     /// Relative luminance, as WCAG defines it.

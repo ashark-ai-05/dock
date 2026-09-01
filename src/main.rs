@@ -939,11 +939,13 @@ fn run_dashboard(
                     continue;
                 }
                 let adapter = GitAdapter::new(&worktree);
-                match adapter
-                    .facts("HEAD")
-                    .and_then(|facts| adapter.diff("HEAD").map(|diff| (facts, diff)))
-                {
-                    Ok((facts, diff)) => dashboard.set_git(facts, diff),
+                match adapter.review("HEAD") {
+                    Ok(review) => dashboard.set_git_review(
+                        review.facts,
+                        review.files,
+                        review.worktrees,
+                        String::new(),
+                    ),
                     Err(message) => dashboard.error = Some(message),
                 }
             }
@@ -955,7 +957,8 @@ fn run_dashboard(
                     .unwrap_or(false);
                 if !on_path {
                     dashboard.error = Some(
-                        "lazygit is not on PATH — optional; Ctrl+B g still shows the diff".into(),
+                        "lazygit is not on PATH — optional; Ctrl+B g still shows the overlay"
+                            .into(),
                     );
                     continue;
                 }

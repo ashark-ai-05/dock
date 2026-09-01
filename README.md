@@ -30,7 +30,7 @@ Prefix is `Ctrl+B`. Unprefixed keys go to the pane. `Esc` is never intercepted. 
 | arrows, Tab | focus | `x` | close pane |
 | `+` `-` | resize | `[` | copy mode |
 | `d` | detach (daemon keeps running) | `q` | prompt queue |
-| `g` / `G` | git overlay / lazygit if on PATH | `u` | cycle agents that need you |
+| `g` / `G` | git review overlay / lazygit if on PATH | `u` | cycle agents that need you |
 
 Mouse: tabs, split/close on the pane border, drag dividers, drag to select.
 

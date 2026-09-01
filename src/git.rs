@@ -134,6 +134,75 @@ pub struct GitFacts {
     pub deletions: usize,
 }
 
+/// One path in the review overlay: porcelain evidence plus the diff to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitFile {
+    pub path: String,
+    pub untracked: bool,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitReview {
+    pub facts: GitFacts,
+    pub files: Vec<GitFile>,
+    pub worktrees: Vec<(PathBuf, String)>,
+}
+
+/// Split a unified diff into per-path hunks. Untracked files are not in a diff.
+pub fn split_diff_files(diff: &str) -> Vec<GitFile> {
+    let mut files = Vec::new();
+    let mut current_path = String::new();
+    let mut current = String::new();
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if !current_path.is_empty() {
+                files.push(GitFile {
+                    path: std::mem::take(&mut current_path),
+                    untracked: false,
+                    insertions: current
+                        .lines()
+                        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+                        .count(),
+                    deletions: current
+                        .lines()
+                        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+                        .count(),
+                    diff: std::mem::take(&mut current),
+                });
+            }
+            current_path = rest
+                .split_once(" b/")
+                .map(|(_, path)| path.to_owned())
+                .or_else(|| rest.strip_prefix("a/").map(str::to_owned))
+                .unwrap_or_else(|| rest.to_owned());
+            current.push_str(line);
+            current.push('\n');
+        } else if !current_path.is_empty() {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    if !current_path.is_empty() {
+        files.push(GitFile {
+            path: current_path,
+            untracked: false,
+            insertions: current
+                .lines()
+                .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+                .count(),
+            deletions: current
+                .lines()
+                .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+                .count(),
+            diff: current,
+        });
+    }
+    files
+}
+
 #[derive(Debug, Clone)]
 pub struct GitAdapter {
     worktree: PathBuf,
@@ -196,6 +265,54 @@ impl GitAdapter {
     pub fn diff(&self, base: &str) -> Result<String, String> {
         let base_sha = self.git(["rev-parse", base])?;
         self.git(["diff", "--no-ext-diff", &base_sha])
+    }
+
+    /// Porcelain + numstat + per-file diffs + worktrees. Review only: no stage/commit/push.
+    pub fn review(&self, base: &str) -> Result<GitReview, String> {
+        let facts = self.facts(base)?;
+        let porcelain = self.git(["status", "--porcelain=v1", "--untracked-files=normal"])?;
+        let numstat = self.git(["diff", "--numstat", &facts.base_sha])?;
+        let mut stats: std::collections::HashMap<String, (usize, usize)> =
+            std::collections::HashMap::new();
+        for line in numstat.lines() {
+            let mut fields = line.splitn(3, '\t');
+            let additions = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let deletions = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            if let Some(path) = fields.next() {
+                stats.insert(path.to_owned(), (additions, deletions));
+            }
+        }
+        let mut files = Vec::new();
+        for line in porcelain.lines().filter(|line| !line.is_empty()) {
+            let untracked = line.starts_with("?? ");
+            let path = if untracked {
+                line[3..].to_owned()
+            } else if line.len() >= 3 {
+                line[3..].trim().to_owned()
+            } else {
+                continue;
+            };
+            let (insertions, deletions) = stats.get(&path).copied().unwrap_or((0, 0));
+            let diff = if untracked {
+                format!("untracked: {path}\n")
+            } else {
+                self.git(["diff", "--no-ext-diff", &facts.base_sha, "--", &path])
+                    .unwrap_or_default()
+            };
+            files.push(GitFile {
+                path,
+                untracked,
+                insertions,
+                deletions,
+                diff,
+            });
+        }
+        let trees = worktrees(&self.worktree).unwrap_or_default();
+        Ok(GitReview {
+            facts,
+            files,
+            worktrees: trees,
+        })
     }
 
     pub fn render_diff(&self, base: &str) -> Result<(String, bool), String> {
@@ -311,6 +428,20 @@ mod tests {
     #[test]
     fn empty_numstat_means_clean_comparison() {
         assert_eq!(parse_numstat(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn split_diff_files_keeps_each_path() {
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "+one\n",
+            "diff --git a/src/b.rs b/src/b.rs\n",
+            "+two\n",
+        );
+        let files = split_diff_files(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/a.rs");
+        assert_eq!(files[1].path, "src/b.rs");
     }
 
     #[test]

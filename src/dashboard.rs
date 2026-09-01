@@ -25,7 +25,7 @@ use crate::{
     copy::{CopySession, find_matches},
     detect::{AgentKind, AgentState},
     files,
-    git::GitFacts,
+    git::{GitFacts, GitFile, split_diff_files},
     keymap::{FocusDirection, KeyOutcome, Keymap, PaneCommand},
     layout::{
         LayoutNode, LayoutSnapshot, PaneKind, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout,
@@ -637,6 +637,10 @@ pub struct BoardOverlay {
 #[derive(Debug, Clone)]
 pub struct GitOverlay {
     pub facts: GitFacts,
+    pub files: Vec<GitFile>,
+    pub selected: usize,
+    pub worktrees: Vec<(std::path::PathBuf, String)>,
+    pub showing_worktrees: bool,
     pub diff: Vec<String>,
     pub scroll: usize,
 }
@@ -3916,30 +3920,60 @@ impl Dashboard {
 
     /// Receives what Git says about the focused pane's worktree and opens the overlay over it.
     pub fn set_git(&mut self, facts: GitFacts, diff: String) {
+        self.set_git_review(facts, split_diff_files(&diff), Vec::new(), diff);
+    }
+
+    pub fn set_git_review(
+        &mut self,
+        facts: GitFacts,
+        files: Vec<GitFile>,
+        worktrees: Vec<(std::path::PathBuf, String)>,
+        fallback_diff: String,
+    ) {
+        let diff = files
+            .first()
+            .map(|file| file.diff.clone())
+            .filter(|diff| !diff.is_empty())
+            .unwrap_or(fallback_diff);
         self.git = Some(GitOverlay {
             facts,
+            files,
+            selected: 0,
+            worktrees,
+            showing_worktrees: false,
             diff: diff.lines().map(str::to_owned).collect(),
             scroll: 0,
         });
         self.error = None;
     }
 
+    fn select_git_file(git: &mut GitOverlay, selected: usize) {
+        git.selected = selected;
+        git.scroll = 0;
+        git.diff = git
+            .files
+            .get(selected)
+            .map(|file| file.diff.lines().map(str::to_owned).collect())
+            .unwrap_or_default();
+    }
+
     fn git_key(&mut self, key: KeyEvent) -> UiCommand {
         let Some(git) = self.git.as_mut() else {
             return UiCommand::None;
         };
-        // Paging is bounded by the diff itself rather than by the visible height, which the key
-        // handler does not know: scrolling past the end would show a blank overlay and read as a
-        // broken render rather than as the end of the diff.
+        let last_file = git.files.len().saturating_sub(1);
         let last = git.diff.len().saturating_sub(1);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.git = None,
-            KeyCode::Char('j') | KeyCode::Down => git.scroll = (git.scroll + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => git.scroll = git.scroll.saturating_sub(1),
+            KeyCode::Char('j') | KeyCode::Down if !git.showing_worktrees => {
+                Self::select_git_file(git, (git.selected + 1).min(last_file));
+            }
+            KeyCode::Char('k') | KeyCode::Up if !git.showing_worktrees => {
+                Self::select_git_file(git, git.selected.saturating_sub(1));
+            }
+            KeyCode::Char('w') => git.showing_worktrees = !git.showing_worktrees,
             KeyCode::PageDown => git.scroll = (git.scroll + 10).min(last),
             KeyCode::PageUp => git.scroll = git.scroll.saturating_sub(10),
-            KeyCode::Char('g') => git.scroll = 0,
-            KeyCode::Char('G') => git.scroll = last,
             _ => {}
         }
         UiCommand::None
@@ -4229,7 +4263,43 @@ impl Dashboard {
             ]),
             Line::from(""),
         ];
-        if git.diff.is_empty() {
+        lines.push(Line::styled(
+            format!(
+                "base {}",
+                &facts.base_sha.chars().take(8).collect::<String>()
+            ),
+            muted,
+        ));
+        if git.showing_worktrees {
+            lines.push(Line::styled("worktrees", heading));
+            for (path, branch) in &git.worktrees {
+                lines.push(Line::styled(
+                    format!("{}  {}", branch, path.display()),
+                    Style::default().fg(self.theme.text),
+                ));
+            }
+            if git.worktrees.is_empty() {
+                lines.push(Line::styled("no worktrees listed", muted));
+            }
+        } else if !git.files.is_empty() {
+            for (index, file) in git.files.iter().enumerate() {
+                let mark = if index == git.selected { "›" } else { " " };
+                let extra = if file.untracked { "  ??" } else { "" };
+                lines.push(Line::styled(
+                    format!(
+                        "{mark} {}  +{} −{}{extra}",
+                        file.path, file.insertions, file.deletions
+                    ),
+                    if index == git.selected {
+                        heading
+                    } else {
+                        Style::default().fg(self.theme.text)
+                    },
+                ));
+            }
+            lines.push(Line::from(""));
+        }
+        if git.diff.is_empty() && !git.showing_worktrees {
             lines.push(Line::styled("nothing changed here", muted));
         }
         // Two rows of chrome above and two below, so the diff never paints over its own border.
@@ -4256,9 +4326,9 @@ impl Dashboard {
         lines.push(Line::from(""));
         lines.push(Line::styled(
             if more > 0 {
-                format!("j/k scroll · g/G ends · {more} more lines · Esc closes")
+                format!("j/k files · w worktrees · PgUp/Dn diff · {more} more · Esc")
             } else {
-                "j/k scroll · g/G ends · Esc closes".to_owned()
+                "j/k files · w worktrees · PgUp/Dn diff · Esc".to_owned()
             },
             muted,
         ));
@@ -13455,6 +13525,43 @@ mod tests {
         assert!(frame.contains("+3"), "{frame:?}");
         assert!(frame.contains("added line"), "{frame:?}");
         assert!(frame.contains("@@ -1,3 +1,5 @@"), "{frame:?}");
+        assert!(frame.contains("src/lib.rs"), "{frame:?}");
+        assert!(frame.contains("base abc"), "{frame:?}");
+    }
+
+    #[test]
+    fn git_j_k_walks_files_and_w_lists_worktrees() {
+        let mut dashboard = bound_dashboard();
+        let facts = git_facts();
+        dashboard.set_git_review(
+            facts,
+            vec![
+                crate::git::GitFile {
+                    path: "one.rs".into(),
+                    untracked: false,
+                    insertions: 1,
+                    deletions: 0,
+                    diff: "+one\n".into(),
+                },
+                crate::git::GitFile {
+                    path: "two.rs".into(),
+                    untracked: true,
+                    insertions: 0,
+                    deletions: 0,
+                    diff: "untracked: two.rs\n".into(),
+                },
+            ],
+            vec![(std::path::PathBuf::from("/repo/wt"), "dock/task-1".into())],
+            String::new(),
+        );
+        dashboard.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(dashboard.git.as_ref().unwrap().selected, 1);
+        let frame = render_to_string(&mut dashboard, 110, 34);
+        assert!(frame.contains("two.rs"), "{frame:?}");
+        assert!(frame.contains("untracked"), "{frame:?}");
+        dashboard.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        let trees = render_to_string(&mut dashboard, 110, 34);
+        assert!(trees.contains("dock/task-1"), "{trees:?}");
     }
 
     #[test]
@@ -13529,19 +13636,19 @@ mod tests {
         let long: String = (0..50).map(|n| format!("+line {n}\n")).collect();
         dashboard.set_git(git_facts(), long);
         render_to_string(&mut dashboard, 110, 34);
-        dashboard.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        dashboard.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(
             dashboard.git.as_ref().unwrap().scroll,
             0,
             "already at the top"
         );
-        dashboard.key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
-        assert_eq!(dashboard.git.as_ref().unwrap().scroll, 49);
+        dashboard.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(dashboard.git.as_ref().unwrap().scroll, 10);
         dashboard.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(
-            dashboard.git.as_ref().unwrap().scroll,
-            49,
-            "scrolling past the end would paint a blank overlay"
+            dashboard.git.as_ref().unwrap().selected,
+            0,
+            "one file: j stays on it"
         );
         dashboard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(dashboard.git.is_none());

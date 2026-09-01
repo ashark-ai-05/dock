@@ -176,9 +176,19 @@ const VERBS: &[Verb] = &[
         run: dock::cli::programme::run,
     },
     Verb {
+        name: "prompt",
+        summary: "send text into a pane (uses DOCK_WORKSPACE / DOCK_PANE)",
+        run: dock::cli::prompt::run,
+    },
+    Verb {
         name: "queue",
         summary: "list, add to, or arm and disarm a pane's prompt queue",
         run: run_queue,
+    },
+    Verb {
+        name: "read",
+        summary: "print a bounded snapshot of a pane's output",
+        run: dock::cli::read::run,
     },
     Verb {
         name: "review",
@@ -192,7 +202,7 @@ const VERBS: &[Verb] = &[
     },
     Verb {
         name: "task",
-        summary: "list, add, move or show tasks on the board",
+        summary: "list, add, claim, move or show tasks on the board",
         run: run_task,
     },
     Verb {
@@ -2148,7 +2158,13 @@ fn task_command(args: &[String]) -> io::Result<()> {
                 println!("no tasks in {}", board.display());
             }
             for task in tasks {
-                println!("{}\t{}\t{}", task.id, task.status, task.title);
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    task.id,
+                    task.status,
+                    task.claimed_by.as_deref().unwrap_or("unclaimed"),
+                    task.title
+                );
             }
         }
         "add" => {
@@ -2170,6 +2186,21 @@ fn task_command(args: &[String]) -> io::Result<()> {
             let task = dock::board::set_status(&board, id, status).map_err(io::Error::other)?;
             println!("{}\t{}\t{}", task.id, task.status, task.title);
         }
+        "claim" => {
+            let id: u64 = positional
+                .get(1)
+                .ok_or_else(|| io::Error::other("dock task claim <id> [who]"))?
+                .parse()
+                .map_err(|_| io::Error::other("the task id must be a number"))?;
+            let who = positional
+                .get(2)
+                .map(|name| (*name).clone())
+                .or_else(|| std::env::var("DOCK_RUN").ok().filter(|id| !id.is_empty()))
+                .unwrap_or_else(|| "dock".into());
+            dock::board::set_status(&board, id, "in-progress").map_err(io::Error::other)?;
+            let task = dock::board::set_claimed_by(&board, id, &who).map_err(io::Error::other)?;
+            println!("{}\t{}\t{}\t{}", task.id, task.status, who, task.title);
+        }
         "show" => {
             let id: u64 = positional
                 .get(1)
@@ -2184,7 +2215,7 @@ fn task_command(args: &[String]) -> io::Result<()> {
         }
         other => {
             return Err(io::Error::other(format!(
-                "unknown task command {other:?}; expected list, add, move or show"
+                "unknown task command {other:?}; expected list, add, claim, move or show"
             )));
         }
     }
@@ -3381,11 +3412,11 @@ mod terminal_tests {
             VERBS.windows(2).all(|pair| pair[0].name < pair[1].name),
             "VERBS is listed in the order --help prints, so it is kept sorted"
         );
-        // Fourteen: every non-interactive verb lives in this table, so a command dispatched
+        // Sixteen: every non-interactive verb lives in this table, so a command dispatched
         // outside it would move this count.
         assert_eq!(
             VERBS.len(),
-            14,
+            16,
             "a verb was added to or removed from dispatch without this count following"
         );
         assert!(
@@ -3395,6 +3426,14 @@ mod terminal_tests {
         assert!(
             VERBS.iter().any(|verb| verb.name == "inspect"),
             "inspect is dispatched outside the table"
+        );
+        assert!(
+            VERBS.iter().any(|verb| verb.name == "prompt"),
+            "prompt is dispatched outside the table"
+        );
+        assert!(
+            VERBS.iter().any(|verb| verb.name == "read"),
+            "read is dispatched outside the table"
         );
     }
 }

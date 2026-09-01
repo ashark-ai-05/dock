@@ -55,7 +55,7 @@ pane**, `Esc` is never intercepted, and `Ctrl+B` twice sends a literal `Ctrl+B`.
 | `,` `.` | previous / next workspace | `r` | rename |
 | `w` | pick a workspace by name | `f` | find a file, type its path |
 | `a` | resume the agent here | `i` | review agent handoffs |
-| `k` | task board — dispatch one | `g` | what changed here |
+| `k` | task board — dispatch one | `g` / `G` | git / lazygit (if on PATH) |
 | `1`–`9` | jump to a workspace | | |
 | `h` `v` | split ⇋ / ⇵ | `R` | restart a pane whose shell exited |
 | arrows, `Tab`/`S-Tab` | focus | `x` | close pane |
@@ -120,7 +120,8 @@ checkout with `cargo run`. An agent needs no arguments:
 
 ```bash
 dock task list                       # what is on this board
-dock task add "fix the retry path"   # write one down
+dock task add "fix the retry path"   # write a markdown card
+dock task claim 3                    # in-progress + claimed_by (you or DOCK_RUN)
 dock task move 3 in-progress         # backlog · todo · in-progress · review · done
 dock task show 3
 
@@ -341,17 +342,28 @@ Agents already running in a pane can drive Dock over the same Unix socket
 
 ```bash
 dock split vertical              # new terminal pane beside this one
-dock queue add "$DOCK_PANE" "continue"   # prompt that pane
+dock prompt "continue"           # type into this pane now (DOCK_PANE)
+dock read                        # bounded output snapshot (DOCK_RUN)
+dock queue add "$DOCK_PANE" "continue"   # enqueue, do not type yet
 dock wait --until=blocked        # until the run needs you
 dock workspace inspect           # layout JSON
 ```
 
 `dock workspace` is the full pane API (create, split, focus, resize, close).
+`dock prompt` writes bytes into a pane immediately; `dock read` prints up to
+8 KiB of that pane's log (cap `--max-bytes=`, hard max 32 KiB).
 `dock programme` inspects multi-repository capacity and dependency gates.
 
-SSH attach is deferred: the daemon is a local Unix socket, and a fake
-`dock --remote` flag is not shipped. Attach from another machine when that
-socket is reachable (ssh+unix-forward), not through a stub client.
+SSH attach is not a Dock flag. The daemon is a local Unix socket. Forward it
+and run the same `dock` client against the forwarded path:
+
+```bash
+ssh -L /tmp/dock.sock:$DOCK_SOCKET user@host
+dock --socket=/tmp/dock.sock inspect
+```
+
+There is no `dock --remote`. If the socket is not forwarded, the client cannot
+reach the daemon.
 
 ## Safety
 

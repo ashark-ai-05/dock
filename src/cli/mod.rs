@@ -8,6 +8,8 @@ pub mod agent;
 pub mod dispatch;
 pub mod inspect;
 pub mod programme;
+pub mod prompt;
+pub mod read;
 pub mod review;
 pub mod split;
 pub mod wait;

@@ -1510,9 +1510,39 @@ fn agent_state_command(args: &[String]) -> io::Result<()> {
         serde_json::to_string(&Request::Hello(dock::protocol::HelloRequest {
             version: dock::protocol::PROTOCOL_VERSION,
         }))?,
-        serde_json::to_string(&Request::ReportAgentState(
-            dock::protocol::ReportAgentStateRequest { run_id, state },
-        ))?,
+        serde_json::to_string(&Request::ReportAgentState({
+            let hook = if io::stdin().is_terminal() {
+                None
+            } else {
+                let mut buf = String::new();
+                let _ = io::stdin().read_to_string(&mut buf);
+                dock::hook::parse_stdin(&buf)
+            };
+            dock::protocol::ReportAgentStateRequest {
+                run_id,
+                state,
+                session_id: hook.as_ref().and_then(|h| h.session_id.clone()),
+                transcript_path: hook.as_ref().and_then(|h| h.transcript_path.clone()),
+                cwd: hook.as_ref().and_then(|h| h.cwd.clone()),
+                hook_event_name: hook.as_ref().and_then(|h| h.hook_event_name.clone()),
+                tool_name: hook.as_ref().and_then(|h| h.tool_name.clone()),
+                tool_input: hook.as_ref().and_then(|h| {
+                    h.tool_input.as_ref().map(|value| {
+                        let rendered = value.to_string();
+                        if rendered.chars().count() > 240 {
+                            rendered
+                                .chars()
+                                .take(239)
+                                .chain(std::iter::once('…'))
+                                .collect()
+                        } else {
+                            rendered
+                        }
+                    })
+                }),
+                activity: hook.as_ref().and_then(dock::hook::activity_summary),
+            }
+        }))?,
     ] {
         if stream.write_all(request.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
             hook_debug("the daemon closed the connection mid-report");

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::CString,
     fs::{self, File, OpenOptions},
     io::Write,
@@ -298,6 +298,8 @@ pub struct RuntimeRegistry {
     /// anything read from the screen: an agent firing its own turn-start and turn-end events knows
     /// what a pattern can only infer.
     reported_states: Mutex<HashMap<String, AgentState>>,
+    /// Bounded per-run notes from hook reports: what the agent last said it was doing.
+    activity_rings: Mutex<HashMap<String, VecDeque<String>>>,
     /// When each run's output last grew. Not memoisable the way classification is: the answer it
     /// feeds changes with the passage of time rather than with new bytes, so it is read afresh.
     output_marks: Mutex<HashMap<String, StateTracker>>,
@@ -597,6 +599,7 @@ impl RuntimeRegistry {
             agent_states: Mutex::new(HashMap::new()),
             output_marks: Mutex::new(HashMap::new()),
             reported_states: Mutex::new(HashMap::new()),
+            activity_rings: Mutex::new(HashMap::new()),
             queues: Mutex::new(queues),
             queue_paused: AtomicBool::new(paused),
             auto_feed_trust: Mutex::new(AutoFeedTrust::default()),
@@ -2379,9 +2382,9 @@ impl RuntimeRegistry {
     /// nobody observed — which is the whole failing of guessing from a screen.
     pub fn report_agent_state(
         &self,
-        run_id: &str,
-        state: AgentState,
+        request: &crate::protocol::ReportAgentStateRequest,
     ) -> Result<(), (ErrorCode, String)> {
+        let run_id = request.run_id.as_str();
         if !self
             .runs
             .lock()
@@ -2396,8 +2399,41 @@ impl RuntimeRegistry {
         self.reported_states
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(run_id.to_owned(), state);
+            .insert(run_id.to_owned(), request.state);
+        if let Some(summary) = request
+            .activity
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                request
+                    .tool_name
+                    .as_ref()
+                    .map(|tool| match &request.tool_input {
+                        Some(input) if !input.is_empty() => format!("{tool} {input}"),
+                        _ => tool.clone(),
+                    })
+            })
+        {
+            const MAX_ACTIVITY_RING: usize = 32;
+            let mut rings = self
+                .activity_rings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let ring = rings.entry(run_id.to_owned()).or_default();
+            ring.push_back(summary);
+            while ring.len() > MAX_ACTIVITY_RING {
+                ring.pop_front();
+            }
+        }
         Ok(())
+    }
+
+    fn latest_activity(&self, run_id: &str) -> Option<String> {
+        self.activity_rings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(run_id)
+            .and_then(|ring| ring.back().cloned())
     }
 
     /// Forgets everything remembered about runs that have ended.
@@ -2452,6 +2488,10 @@ impl RuntimeRegistry {
             .unwrap_or_else(|p| p.into_inner())
             .retain(|run_id, _| live.contains(run_id));
         self.reported_states
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|run_id, _| live.contains(run_id));
+        self.activity_rings
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|run_id, _| live.contains(run_id));
@@ -2592,6 +2632,7 @@ impl RuntimeRegistry {
                 );
                 pulse.agent = agent;
                 pulse.agent_state = state;
+                pulse.activity = self.latest_activity(&pulse.run_id);
                 pulse
             })
             .collect()
@@ -2676,6 +2717,7 @@ impl RuntimeRegistry {
                 );
                 snapshot.agent = agent;
                 snapshot.agent_state = state;
+                snapshot.activity = self.latest_activity(&snapshot.run_id);
                 snapshot
             })
             .collect())
@@ -4395,6 +4437,23 @@ mod tests {
     };
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
+    fn state_report(
+        run_id: impl Into<String>,
+        state: AgentState,
+    ) -> crate::protocol::ReportAgentStateRequest {
+        crate::protocol::ReportAgentStateRequest {
+            run_id: run_id.into(),
+            state,
+            session_id: None,
+            transcript_path: None,
+            cwd: None,
+            hook_event_name: None,
+            tool_name: None,
+            tool_input: None,
+            activity: None,
+        }
+    }
+
     /// A registry over a throwaway state directory. Panes auto-launch real shells, so the guard
     /// retires every run it still owns rather than leaking process groups into the test run.
     struct TestRegistry {
@@ -4872,7 +4931,7 @@ mod tests {
         // A hook fires on the agent's own turn boundaries, so it knows what a pattern can only
         // infer — and a freshly launched shell writing its prompt would otherwise read as working.
         registry
-            .report_agent_state(&run_id, AgentState::Done)
+            .report_agent_state(&state_report(&run_id, AgentState::Done))
             .expect("report");
         let reported = registry
             .inspect(Some(&run_id))
@@ -4893,7 +4952,7 @@ mod tests {
             AgentState::Done
         );
         registry
-            .report_agent_state(&run_id, AgentState::Working)
+            .report_agent_state(&state_report(&run_id, AgentState::Working))
             .expect("report again");
         assert_eq!(
             registry
@@ -5445,7 +5504,7 @@ mod tests {
         // to be refused rather than recorded against nothing.
         assert!(
             registry
-                .report_agent_state("dock_not_mine", AgentState::Working)
+                .report_agent_state(&state_report("dock_not_mine", AgentState::Working))
                 .is_err()
         );
     }
@@ -5879,7 +5938,7 @@ mod tests {
             let first = RuntimeRegistry::new(&state, 2000).unwrap();
             let run_id = queue_pane(&first);
             first
-                .report_agent_state(&run_id, AgentState::Done)
+                .report_agent_state(&state_report(&run_id, AgentState::Done))
                 .expect("a hooked agent reports its state");
             first
                 .queue_add("w1", "p1", "card 7".into(), "keep going".into())
@@ -5938,7 +5997,7 @@ mod tests {
         );
         let run_id = queue_pane(&restored);
         restored
-            .report_agent_state(&run_id, AgentState::Done)
+            .report_agent_state(&state_report(&run_id, AgentState::Done))
             .expect("report a state");
         restored
             .queue_add("w1", "p1", "card 7".into(), "keep going".into())
@@ -6055,7 +6114,7 @@ mod tests {
         let registry = registry();
         let run_id = queue_pane(&registry);
         registry
-            .report_agent_state(&run_id, AgentState::Done)
+            .report_agent_state(&state_report(&run_id, AgentState::Done))
             .expect("report a state");
         registry
             .queue_add("w1", "p1", "card 7".into(), "keep going".into())
@@ -6114,7 +6173,7 @@ mod tests {
         };
         let run_id = queue_pane(&registry);
         registry
-            .report_agent_state(&run_id, AgentState::Done)
+            .report_agent_state(&state_report(&run_id, AgentState::Done))
             .expect("report a state");
         registry
             .queue_add("w1", "p1", "card 7".into(), "keep going".into())
@@ -6208,7 +6267,7 @@ mod tests {
         let registry = registry();
         let run_id = queue_pane(&registry);
         registry
-            .report_agent_state(&run_id, AgentState::Done)
+            .report_agent_state(&state_report(&run_id, AgentState::Done))
             .expect("report a state");
         registry
             .queue_add("w1", "p1", "card 7".into(), "keep going".into())
@@ -6372,7 +6431,7 @@ mod tests {
         let registry = registry();
         let run_id = queue_pane(&registry);
         registry
-            .report_agent_state(&run_id, AgentState::Done)
+            .report_agent_state(&state_report(&run_id, AgentState::Done))
             .expect("report a state");
         registry
             .queue_add("w1", "p1", "card 7".into(), "keep going".into())

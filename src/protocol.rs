@@ -8,7 +8,7 @@ use crate::{
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
 
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,6 +322,9 @@ pub enum Event {
         run_id: String,
         agent: Option<AgentKind>,
         state: AgentState,
+        /// What the agent last said it was doing, when a hook named a tool.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<String>,
     },
     LayoutChanged,
     /// One pane's queue changed — an entry added, removed, or fed to its agent.
@@ -392,6 +395,20 @@ pub struct SubmitHandoffRequest {
 pub struct ReportAgentStateRequest {
     pub run_id: String,
     pub state: AgentState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_event_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_input: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -661,6 +678,9 @@ pub struct RuntimeSnapshot {
     pub title: Option<String>,
     pub cwd: Option<String>,
     pub diagnostic: Option<String>,
+    /// Latest hook activity for this run, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -717,6 +737,7 @@ mod tests {
             title: Some("dock".into()),
             cwd: Some("/repo/real".into()),
             diagnostic: None,
+            activity: None,
         }
     }
 
@@ -799,7 +820,25 @@ mod tests {
 
     #[test]
     fn the_protocol_version_records_the_pane_history_request() {
-        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(PROTOCOL_VERSION, 14);
+    }
+
+    #[test]
+    fn a_state_report_may_carry_hook_fields_and_still_accepts_argv_only_json() {
+        let minimal: crate::protocol::ReportAgentStateRequest =
+            serde_json::from_str(r#"{"run_id":"dock_1","state":"working"}"#)
+                .expect("argv-only report");
+        assert_eq!(minimal.run_id, "dock_1");
+        assert_eq!(minimal.activity, None);
+        let rich = serde_json::from_str::<crate::protocol::Request>(
+            r#"{"type":"report_agent_state","run_id":"dock_1","state":"working","session_id":"s","tool_name":"Read","activity":"Read src/lib.rs"}"#,
+        )
+        .expect("hook-rich report");
+        let crate::protocol::Request::ReportAgentState(request) = rich else {
+            panic!("expected a report");
+        };
+        assert_eq!(request.session_id.as_deref(), Some("s"));
+        assert_eq!(request.activity.as_deref(), Some("Read src/lib.rs"));
     }
 
     #[test]

@@ -167,6 +167,8 @@ pub struct Dashboard {
     history: HashMap<String, PaneHistoryCursor>,
     /// Latest agent identity and state per run, as pushed by the daemon.
     pub agents: HashMap<String, (Option<AgentKind>, AgentState)>,
+    /// Latest hook activity per run, when a report named a tool.
+    activities: HashMap<String, String>,
     revisions: HashMap<String, u64>,
     /// Tasks dispatched to an agent whose command line had nowhere to carry them, waiting for
     /// that agent to be up enough to be typed into. Keyed by run, emptied on first delivery.
@@ -446,6 +448,8 @@ pub struct LiveRun<'a> {
     /// Why auto-feed last declined to fire, in the daemon's own words. Borrowed, because it is
     /// the daemon's sentence and rewording it here would give a stalled queue two explanations.
     pub holding_because: Option<&'a str>,
+    /// What the agent last reported doing, when a hook named it.
+    pub activity: Option<&'a str>,
 }
 
 impl<'a> LiveRun<'a> {
@@ -1396,6 +1400,7 @@ impl Dashboard {
                 run_id,
                 agent,
                 state,
+                activity,
             } => {
                 // An agent reaching `Done` for the first time is saying its input box is up and
                 // waiting, which is the earliest moment a task can be typed into it. Taken from
@@ -1409,6 +1414,9 @@ impl Dashboard {
                         opening.pane_id,
                         opening.prompt,
                     ));
+                }
+                if let Some(activity) = activity {
+                    self.activities.insert(run_id.clone(), activity);
                 }
                 self.agents.insert(run_id, (agent, state));
             }
@@ -1611,6 +1619,13 @@ impl Dashboard {
     pub fn set_runs(&mut self, runs: Vec<RuntimeSnapshot>) {
         self.agents
             .retain(|run_id, _| runs.iter().any(|run| &run.run_id == run_id));
+        self.activities
+            .retain(|run_id, _| runs.iter().any(|run| &run.run_id == run_id));
+        for run in &runs {
+            if let Some(activity) = run.activity.clone() {
+                self.activities.insert(run.run_id.clone(), activity);
+            }
+        }
         // An agent that died before it ever finished starting is never going to be typed into,
         // and its task would otherwise sit here waiting for a `Done` that cannot arrive — and
         // then be delivered to whatever run next inherited the id.
@@ -2494,7 +2509,8 @@ impl Dashboard {
         let mut agent_rows = std::mem::take(&mut self.sidebar_agent_areas);
         let roster = self.agent_roster();
         let roster_is_empty = roster.is_empty();
-        for (state, label, task, workspace, run_id) in roster {
+        let muted = self.theme.muted;
+        for (state, label, task, workspace, run_id, activity) in roster {
             // An agent below the sidebar's last row cannot be seen, and neither can any agent
             // after it. Everything below is off the bottom too, so every remaining index is
             // one `clickable_row` already answers `None` for and no rectangle can be misplaced
@@ -2565,6 +2581,10 @@ impl Dashboard {
                     )
                 });
             }
+            if let Some(activity) = activity {
+                let shown = ellipsise(&activity, label_width.saturating_sub(3));
+                rows.push(move || Line::styled(format!("   {shown}"), Style::default().fg(muted)));
+            }
         }
         self.sidebar_agent_areas = agent_rows;
         if roster_is_empty {
@@ -2632,7 +2652,7 @@ impl Dashboard {
         // entries that would be over-provisioned are the ones least likely to matter — but the
         // honest number is the one that matches what is actually visible.
         let mut lines = vec![Line::from(""), Line::from("")];
-        for (state, _, _, _, _) in self
+        for (state, _, _, _, _, _) in self
             .agent_roster()
             .into_iter()
             .take(usize::from(area.height).saturating_sub(2))
@@ -2700,7 +2720,14 @@ impl Dashboard {
                 // only once you know where to go.
                 let task = tasks.get(run.run_id).cloned();
                 let workspace = workspaces.get(run.run_id).copied();
-                (run.state, run.label(), task, workspace, run.run_id)
+                (
+                    run.state,
+                    run.label(),
+                    task,
+                    workspace,
+                    run.run_id,
+                    run.activity.map(str::to_owned),
+                )
             })
             .collect();
         roster.sort_by(|left, right| {
@@ -2711,6 +2738,7 @@ impl Dashboard {
                 .then_with(|| left.2.cmp(&right.2))
                 .then_with(|| left.3.cmp(&right.3))
                 .then_with(|| left.4.cmp(right.4))
+                .then_with(|| left.5.cmp(&right.5))
         });
         roster
     }
@@ -2808,6 +2836,11 @@ impl Dashboard {
                     auto_feed: queue.is_some_and(|queue| queue.auto_feed),
                     awaiting_ack: queue.is_some_and(|queue| queue.awaiting_ack),
                     holding_because: queue.and_then(|queue| queue.holding_because.as_deref()),
+                    activity: self
+                        .activities
+                        .get(run.run_id.as_str())
+                        .map(String::as_str)
+                        .or(run.activity.as_deref()),
                 }
             })
             .collect();
@@ -7151,6 +7184,7 @@ type RosterEntry<'a> = (
     Option<Cow<'a, str>>,
     Option<&'a str>,
     &'a str,
+    Option<String>,
 );
 
 /// The sidebar's rows as they are built: numbered as if all of them existed, kept only while
@@ -8803,6 +8837,7 @@ mod tests {
             run_id: run_id.to_owned(),
             agent,
             state,
+            activity: None,
         });
     }
 
@@ -8842,6 +8877,7 @@ mod tests {
             title: None,
             cwd: None,
             diagnostic: None,
+            activity: None,
         }
     }
 
@@ -8921,6 +8957,7 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Amp),
             state: AgentState::Working,
+            activity: None,
         });
         assert!(dashboard.take_opening_prompts().is_empty());
         // Its first `Done` is the agent saying its input box is up and waiting.
@@ -8928,6 +8965,7 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Amp),
             state: AgentState::Done,
+            activity: None,
         });
         assert_eq!(
             dashboard.take_opening_prompts(),
@@ -8939,6 +8977,7 @@ mod tests {
                 run_id: "run_1".into(),
                 agent: Some(AgentKind::Amp),
                 state: AgentState::Done,
+                activity: None,
             });
         }
         assert!(dashboard.take_opening_prompts().is_empty());
@@ -8955,6 +8994,7 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Amp),
             state: AgentState::Done,
+            activity: None,
         });
         assert!(dashboard.take_opening_prompts().is_empty());
     }
@@ -8966,11 +9006,13 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Claude),
             state: AgentState::Blocked,
+            activity: None,
         });
         dashboard.apply_event(Event::AgentStateChanged {
             run_id: "dock_sh_w_a".into(),
             agent: None,
             state: AgentState::Idle,
+            activity: None,
         });
         assert_eq!(dashboard.agents.len(), 2);
         let mut live = snapshot();
@@ -11400,6 +11442,7 @@ mod tests {
             auto_feed: false,
             awaiting_ack: false,
             holding_because: None,
+            activity: None,
         };
         let with_run = BoardLive::new(std::slice::from_ref(&run));
         let badged = card_lines(
@@ -11863,6 +11906,7 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Claude),
             state: AgentState::Working,
+            activity: None,
         });
         assert!(
             !dashboard.needs_refresh,
@@ -12206,11 +12250,13 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(AgentKind::Claude),
             state: AgentState::Working,
+            activity: None,
         });
         dashboard.apply_event(Event::AgentStateChanged {
             run_id: "run_2".into(),
             agent: Some(AgentKind::Claude),
             state: AgentState::Blocked,
+            activity: None,
         });
         let asked = dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         let UiCommand::Request(request) = asked else {
@@ -13706,6 +13752,7 @@ mod tests {
             run_id: "run_1".into(),
             agent: Some(crate::detect::AgentKind::Claude),
             state: crate::detect::AgentState::Working,
+            activity: None,
         });
         assert_eq!(
             dashboard.agents.get("run_1"),
@@ -14170,7 +14217,8 @@ mod tests {
                 None,
                 // The run itself, which the roster never prints: it is carried so a pointer
                 // landing on the row can say which agent it landed on.
-                "run_1"
+                "run_1",
+                None
             )]
         );
         let rows = sidebar_rows(&mut dashboard, 100, 30);

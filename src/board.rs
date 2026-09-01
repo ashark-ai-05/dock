@@ -32,6 +32,8 @@ pub struct BoardTask {
     /// other card it looks exactly as ready as one that is — which is the mistake a board is
     /// supposed to prevent.
     pub depends_on: Vec<u64>,
+    /// Who claimed the card, from `claimed_by`. Absent means unclaimed.
+    pub claimed_by: Option<String>,
     /// When the card was last touched, as seconds since the Unix epoch.
     ///
     /// From `updated` where the file has one and `created` otherwise, which is what kanban-md
@@ -61,14 +63,14 @@ const STATUS_ORDER: [&str; 5] = ["in-progress", "needs-input", "review", "backlo
 /// nothing to show at all. So it falls back to a personal board under the home directory, which
 /// survives moving between projects and belongs to no project in particular.
 ///
-/// Returns `None` only when neither a repository nor a home directory can be determined, which
-/// leaves nowhere a board could sensibly live.
-pub fn tasks_dir(repository_root: &str, workspace_id: &str) -> Option<PathBuf> {
+/// Returns `None` when Dock is not sitting in a repository: there is no default under
+/// `~/.dock/boards`. The board is markdown in the repo, or it is not a board Dock will open.
+pub fn tasks_dir(repository_root: &str, _workspace_id: &str) -> Option<PathBuf> {
     let repository = repository_root.trim();
-    if !repository.is_empty() {
-        return Some(Path::new(repository).join("kanban").join("tasks"));
+    if repository.is_empty() {
+        return None;
     }
-    workspace_tasks_dir(workspace_id)
+    Some(Path::new(repository).join("kanban").join("tasks"))
 }
 
 /// A workspace's own board, under `~/.dock/boards/<workspace>/tasks`.
@@ -197,6 +199,7 @@ pub fn create(directory: &Path, title: &str) -> Result<BoardTask, String> {
         archived: false,
         touched: stamp.map(|(seconds, _)| seconds),
         depends_on: Vec::new(),
+        claimed_by: None,
     })
 }
 
@@ -265,6 +268,30 @@ pub fn set_status(directory: &Path, id: u64, status: &str) -> Result<BoardTask, 
             "unknown status {status:?}; expected one of {}",
             columns.join(", ")
         ));
+    }
+    if let Some(limit) = crate::board_config::load(directory).wip_limit_for(status) {
+        let occupied = tasks
+            .iter()
+            .filter(|task| task.status == status && !task.archived && task.id != id)
+            .count();
+        if occupied >= limit {
+            return Err(format!("WIP limit {limit} already filled in {status}"));
+        }
+    }
+    if status == "in-progress"
+        && let Some(task) = tasks.iter().find(|task| task.id == id)
+    {
+        for dep in &task.depends_on {
+            if let Some(other) = tasks.iter().find(|other| other.id == *dep)
+                && other.status != "done"
+                && !other.archived
+            {
+                return Err(format!(
+                    "task {id} depends on {dep} still in {}",
+                    other.status
+                ));
+            }
+        }
     }
     let task = tasks
         .into_iter()
@@ -346,6 +373,64 @@ pub fn set_archived(directory: &Path, id: u64, archived: bool) -> Result<BoardTa
     Ok(BoardTask { archived, ..task })
 }
 
+/// Records who claimed the card, rewriting only `claimed_by`.
+pub fn set_claimed_by(directory: &Path, id: u64, claim: &str) -> Result<BoardTask, String> {
+    let claim = claim.trim();
+    if claim.is_empty() {
+        return Err("a claim needs a name".into());
+    }
+    let task = load(directory)
+        .into_iter()
+        .find(|task| task.id == id)
+        .ok_or_else(|| format!("no task {id} on this board"))?;
+    let text = fs::read_to_string(&task.file)
+        .map_err(|error| format!("could not read the task: {error}"))?;
+    let mut rewritten = String::with_capacity(text.len() + 24);
+    let mut in_front_matter = false;
+    let mut replaced = false;
+    for (index, line) in text.lines().enumerate() {
+        let fence = line.trim() == "---";
+        if fence && in_front_matter && !replaced {
+            rewritten.push_str(&format!("claimed_by: {claim}\n"));
+            replaced = true;
+        }
+        if fence {
+            in_front_matter = index == 0 || !in_front_matter;
+        }
+        if in_front_matter && !replaced && line.starts_with("claimed_by:") {
+            rewritten.push_str(&format!("claimed_by: {claim}"));
+            replaced = true;
+        } else {
+            rewritten.push_str(line);
+        }
+        rewritten.push('\n');
+    }
+    if !replaced {
+        return Err(format!("task {id} has no front matter to claim"));
+    }
+    fs::write(&task.file, rewritten)
+        .map_err(|error| format!("could not write the task: {error}"))?;
+    let mut claimed = task;
+    claimed.claimed_by = Some(claim.to_owned());
+    Ok(claimed)
+}
+
+/// Latest mtime of the tasks directory or a file in it, so the TUI can reload without a key.
+pub fn directory_mtime(directory: &Path) -> Option<std::time::SystemTime> {
+    let mut latest = directory
+        .metadata()
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    if let Ok(entries) = fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                latest = Some(latest.map_or(modified, |current| current.max(modified)));
+            }
+        }
+    }
+    latest
+}
+
 /// Every task in `directory`, ordered by status then id.
 ///
 /// Best-effort by design: a file that cannot be read or has no `id` is skipped rather than failing
@@ -400,6 +485,7 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
     }
     let (mut id, mut title, mut status, mut priority, mut archived) =
         (None, None, None, None, false);
+    let mut claimed_by = None;
     let (mut created, mut updated) = (None, None);
     let mut depends_on: Vec<u64> = Vec::new();
     // Which list, if any, the indented lines below currently belong to. The front matter also
@@ -435,6 +521,7 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
             "status" => status = Some(value.to_owned()),
             "priority" => priority = Some(value.to_owned()),
             "archived" => archived = value.eq_ignore_ascii_case("true"),
+            "claimed_by" if !value.is_empty() => claimed_by = Some(value.to_owned()),
             "created" => created = rfc3339_seconds(value),
             "updated" => updated = rfc3339_seconds(value),
             _ => {}
@@ -450,6 +537,7 @@ fn parse(text: &str, path: &Path) -> Option<BoardTask> {
         archived,
         touched: updated.or(created),
         depends_on,
+        claimed_by,
     })
 }
 
@@ -853,32 +941,57 @@ mod tests {
     }
 
     #[test]
-    fn each_workspace_gets_its_own_board_outside_a_repository() {
-        // A workspace is already the unit a person keeps one piece of work in, so its list is
-        // kept there too rather than pooled with every other workspace's.
-        let one = tasks_dir("", "workspace_1").expect("HOME is set in the test environment");
-        let two = tasks_dir("", "workspace_2").expect("a second board");
-        assert_ne!(one, two);
-        assert!(one.ends_with("workspace_1/tasks"), "{one:?}");
-        assert!(is_personal(&one) && is_personal(&two));
-
-        // A repository's board is its own, shared by every workspace open on it, and is never
-        // treated as Dock's to write to.
+    fn a_board_lives_in_the_repository_or_nowhere() {
+        assert!(
+            tasks_dir("", "workspace_1").is_none(),
+            "no ~/.dock/boards default"
+        );
         let repository = tasks_dir("/repo/real", "workspace_1").expect("a repository board");
         assert_eq!(repository, Path::new("/repo/real/kanban/tasks"));
         assert!(!is_personal(&repository));
     }
 
     #[test]
-    fn a_workspace_id_that_is_not_a_filename_still_gets_a_board() {
-        let awkward = tasks_dir("", "../../etc/passwd").expect("a board");
-        // Nothing in the id may escape the boards directory: the id reaches this from the daemon,
-        // and a board is a directory Dock creates.
+    fn a_workspace_id_that_is_not_a_filename_still_gets_a_personal_path_if_asked() {
+        let awkward = workspace_tasks_dir("../../etc/passwd").expect("a board");
         assert!(
             awkward.starts_with(dock_boards_dir().unwrap()),
             "{awkward:?}"
         );
         assert!(!awkward.to_string_lossy().contains(".."), "{awkward:?}");
+    }
+
+    #[test]
+    fn a_wip_limit_refuses_a_move_into_a_full_column() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        fs::write(
+            dir.parent().unwrap().join("config.yml"),
+            "statuses:\n    - name: backlog\n    - name: in-progress\n      wip_limit: 1\n    - name: done\n",
+        )
+        .unwrap();
+        board.task("001-a.md", &task_file(1, "One", "in-progress"));
+        board.task("002-b.md", &task_file(2, "Two", "backlog"));
+        let refused = set_status(&dir, 2, "in-progress").expect_err("wip");
+        assert!(refused.contains("WIP"), "{refused}");
+        assert_eq!(
+            load(&dir).iter().find(|t| t.id == 2).unwrap().status,
+            "backlog"
+        );
+    }
+
+    #[test]
+    fn unfinished_depends_on_block_a_claim() {
+        let board = Board::new();
+        let dir = board.0.join("kanban/tasks");
+        board.task("001-a.md", "---\nid: 1\ntitle: 'A'\nstatus: backlog\n---\n");
+        board.task(
+            "002-b.md",
+            "---\nid: 2\ntitle: 'B'\nstatus: backlog\ndepends_on:\n  - 1\n---\n",
+        );
+        let refused = set_status(&dir, 2, "in-progress").expect_err("depends");
+        assert!(refused.contains("depends"), "{refused}");
     }
 
     #[test]
@@ -1394,6 +1507,7 @@ mod view_tests {
             archived,
             touched: None,
             depends_on: Vec::new(),
+            claimed_by: None,
         }
     }
 

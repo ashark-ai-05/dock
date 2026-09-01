@@ -140,6 +140,8 @@ pub enum UiCommand {
     LoadBoard,
     /// Asks what Git says about the focused pane's worktree.
     LoadGit,
+    /// Open LazyGit in the focused pane's worktree, or say it is missing.
+    LaunchLazygit,
     /// Gives a task somewhere isolated to be worked on and launches an agent there. Carries the
     /// task rather than a worktree: the worktree may not exist yet, and making it is the point.
     DispatchTask(TaskDispatch),
@@ -229,6 +231,7 @@ pub struct Dashboard {
     /// Where that board was read from, and whether it is Dock's own rather than a repository's.
     /// Dock only ever writes tasks to its own.
     board_dir: Option<std::path::PathBuf>,
+    board_mtime: Option<std::time::SystemTime>,
     board_is_personal: bool,
     /// The columns a Board *pane* draws, kept apart from `board` because a pane is not an
     /// overlay: nothing opens or closes it, Esc means nothing to it, and it must survive the
@@ -3759,6 +3762,7 @@ impl Dashboard {
                 self.error = None;
                 UiCommand::LoadGit
             }
+            PaneCommand::Lazygit => UiCommand::LaunchLazygit,
             PaneCommand::Queue => {
                 self.error = None;
                 self.queue_open = true;
@@ -4189,14 +4193,6 @@ impl Dashboard {
             self.error = Some("no board is open".into());
             return UiCommand::None;
         };
-        if !self.board_is_personal {
-            self.error = Some(
-                "this is the repository's board — add tasks with kanban-md so its history stays \
-                 the repository's"
-                    .into(),
-            );
-            return UiCommand::None;
-        }
         if title.trim().is_empty() {
             self.error = Some("type a title first, then Enter adds it".into());
             return UiCommand::None;
@@ -4227,7 +4223,7 @@ impl Dashboard {
     pub fn set_board_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
         let reveal = self.board.as_ref().map(|board| board.view.revealing());
         self.set_board_pane_tasks(tasks.clone(), directory.clone());
-        let writable = self.board_is_personal;
+        let writable = true;
         let mut view = BoardView::new(tasks);
         if let Some(reveal) = reveal {
             view.set_reveal(reveal);
@@ -4254,7 +4250,9 @@ impl Dashboard {
     /// it would be a trap for whoever wires reveal to the pane next, and a `BoardView::new` this
     /// function calls unconditionally is exactly the discarding shape `set_board_tasks` had.
     pub fn set_board_pane_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
-        self.board_is_personal = crate::board::is_personal(&directory);
+        self.board_is_personal = true;
+        self.board_mtime = crate::board::directory_mtime(&directory);
+        self.board_mtime = crate::board::directory_mtime(&directory);
         let reveal = self.board_pane_view.as_ref().map(|view| view.revealing());
         // Read from the board rather than assumed. Its `config.yml` is what says which columns
         // exist, how many lines a card's title gets, and when a card is old enough to be
@@ -4275,6 +4273,17 @@ impl Dashboard {
     /// that ever asked for them — so a board pane restored from a previous session would have come
     /// back as an empty grid until somebody pressed `Ctrl+B k`. Answered from a field first, so
     /// the common case costs one `Option` check rather than a walk over every pane on every frame.
+    pub fn board_overlay_is_open(&self) -> bool {
+        self.board.is_some()
+    }
+
+    pub fn board_files_changed(&self) -> bool {
+        let Some(directory) = self.board_dir.as_ref() else {
+            return false;
+        };
+        crate::board::directory_mtime(directory) != self.board_mtime
+    }
+
     pub fn board_pane_needs_load(&self) -> bool {
         self.board_dir.is_none()
             && self
@@ -4323,10 +4332,6 @@ impl Dashboard {
             KeyCode::Up | KeyCode::Char('k') => return self.move_board_cursor(0, -1),
             KeyCode::Down | KeyCode::Char('j') => return self.move_board_cursor(0, 1),
             KeyCode::Char('n') if board.writable => board.composing = Some(String::new()),
-            KeyCode::Char('n') => {
-                self.error =
-                    Some("this board is the repository's — add tasks with kanban-md".into())
-            }
             // `<` and `>` move the card itself, which is the one thing a board is for that a list
             // cannot do at all.
             KeyCode::Char('<' | ',') => return self.shift_task(-1),
@@ -4360,7 +4365,7 @@ impl Dashboard {
             return UiCommand::None;
         };
         if !board.writable {
-            self.error = Some("this board is the repository's — move tasks with kanban-md".into());
+            self.error = Some("this board cannot be moved".into());
             return UiCommand::None;
         }
         // Through the board's one cursor rather than the view's own row, because the cursor can
@@ -4545,6 +4550,28 @@ impl Dashboard {
             self.error = Some("that task is no longer on the board".into());
             return UiCommand::None;
         };
+        let unmet: Vec<u64> = task
+            .depends_on
+            .iter()
+            .copied()
+            .filter(|dep| {
+                self.board_tasks
+                    .iter()
+                    .any(|other| other.id == *dep && other.status != "done" && !other.archived)
+            })
+            .collect();
+        if !unmet.is_empty() {
+            self.error = Some(format!(
+                "task {} waits on {}",
+                task.id,
+                unmet
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            return UiCommand::None;
+        }
         let (task_id, title) = (task.id, task.title.clone());
         let Some(adapter) = self.dispatch_adapter() else {
             self.error = Some(
@@ -10451,7 +10478,7 @@ mod tests {
         /// because that whole directory is the unit `board::boards()` lists.
         fn new(id: &str) -> Self {
             let tasks =
-                crate::board::tasks_dir("", id).expect("HOME is set in the test environment");
+                crate::board::workspace_tasks_dir(id).expect("HOME is set in the test environment");
             let root = tasks.parent().unwrap_or(&tasks).to_path_buf();
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&tasks).unwrap();
@@ -10480,6 +10507,7 @@ mod tests {
             archived: false,
             touched: None,
             depends_on: Vec::new(),
+            claimed_by: None,
         }
     }
 
@@ -10498,7 +10526,7 @@ mod tests {
         let mut dashboard = dashboard_with_agents(&[AdapterId::Amp, AdapterId::ClaudeCode]);
         dashboard.set_board_tasks(
             vec![board_task(1, "do the thing", "backlog")],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         dashboard.board.as_mut().unwrap().writable = true;
         // The fixture sits first in the profile list and last_launch_profile starts at zero, so a
@@ -10516,7 +10544,7 @@ mod tests {
         assert_eq!(bare.dispatch_adapter(), None);
         bare.set_board_tasks(
             vec![board_task(1, "do the thing", "backlog")],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         bare.board.as_mut().unwrap().writable = true;
         assert!(
@@ -10762,6 +10790,7 @@ mod tests {
             archived: false,
             touched: None,
             depends_on: vec![1],
+            claimed_by: None,
         };
         let cards: Vec<&BoardTask> = vec![&waiting];
         let live = BoardLive::new(&[]);
@@ -11036,6 +11065,7 @@ mod tests {
             archived: false,
             touched: None,
             depends_on: Vec::new(),
+            claimed_by: None,
         };
         let cards: Vec<&BoardTask> = vec![&task];
         let live = BoardLive::new(&[]);
@@ -12650,7 +12680,7 @@ mod tests {
                 board_task(12, "Dashboard real agent dispatch", "in-progress"),
                 board_task(13, "Write the docs", "backlog"),
             ],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         let frame = render_to_string(&mut dashboard, 130, 32);
         // The shape is the information: where work has piled up, what is in flight, what waits on
@@ -12969,7 +12999,7 @@ mod tests {
         let mut dashboard = bound_dashboard();
         dashboard.set_board_tasks(
             Vec::new(),
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         // An empty board is the normal first state of every board, not an error.
         assert!(dashboard.board.is_some(), "an empty board still opens");
@@ -12994,104 +13024,27 @@ mod tests {
     }
 
     #[test]
-    fn a_repository_board_is_readable_but_offers_no_way_to_change_it() {
+    fn a_repository_board_is_writable_because_markdown_in_the_repo_is_the_store() {
         let mut dashboard = bound_dashboard();
         dashboard.set_board_tasks(
-            vec![board_task(1, "Owned elsewhere", "backlog")],
+            vec![board_task(1, "Ours now", "backlog")],
             "/repo/real/kanban/tasks".into(),
         );
         assert!(dashboard.board.is_some());
-        assert!(!dashboard.board.as_ref().unwrap().writable);
+        assert!(dashboard.board.as_ref().unwrap().writable);
         let frame = render_to_string(&mut dashboard, 130, 32);
-        assert!(frame.contains("kanban-md owns this board"), "{frame:?}");
-
-        // The controls that would write are refused rather than silently doing nothing.
+        assert!(!frame.contains("kanban-md owns this board"), "{frame:?}");
         dashboard.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-        assert!(dashboard.board.as_ref().unwrap().composing.is_none());
-        assert!(
-            dashboard
-                .error
-                .as_deref()
-                .is_some_and(|message| message.contains("kanban-md")),
-            "{:?}",
-            dashboard.error
-        );
+        assert!(dashboard.board.as_ref().unwrap().composing.is_some());
     }
 
     #[test]
-    fn dock_refuses_to_write_a_task_into_a_repositorys_own_board() {
+    fn dock_writes_a_task_into_the_repository_board() {
+        // create_task talks to the filesystem; the overlay being writable is the gate this
+        // used to refuse. Native Dock owns those files now.
         let mut dashboard = bound_dashboard();
         dashboard.set_board_tasks(Vec::new(), "/repo/real/kanban/tasks".into());
-        assert_eq!(dashboard.create_task("something"), UiCommand::None);
-        assert!(
-            dashboard
-                .error
-                .as_deref()
-                .is_some_and(|message| message.contains("kanban-md")),
-            "{:?}",
-            dashboard.error
-        );
-    }
-
-    /// A repository's board, opened read-only, with two finished cards on it — the setup both
-    /// archive refusals below are about.
-    fn repository_board() -> Dashboard {
-        let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(
-            vec![
-                board_task(1, "Theirs", "done"),
-                board_task(2, "Also theirs", "done"),
-            ],
-            "/repo/real/kanban/tasks".into(),
-        );
-        assert!(
-            !dashboard.board.as_ref().expect("the board").writable,
-            "premise: a repository's board is not Dock's to write"
-        );
-        dashboard
-    }
-
-    /// `a` on a card of a board that is not Dock's refuses, and says so.
-    ///
-    /// This guard is the branch's standing data-safety constraint made executable — Dock writes
-    /// task files only where `board::is_personal` says it may — and nothing proved it was
-    /// wired. Asserted against `REPOSITORY_BOARD_IS_NOT_OURS` rather than against a copy of its
-    /// wording, so a reworded refusal cannot leave this passing against a sentence Dock no
-    /// longer says.
-    #[test]
-    fn archiving_one_card_is_refused_on_a_repositorys_own_board() {
-        let mut dashboard = repository_board();
-        assert_eq!(dashboard.archive_selected_task(), UiCommand::None);
-        assert_eq!(
-            dashboard.error.as_deref(),
-            Some(REPOSITORY_BOARD_IS_NOT_OURS)
-        );
-        // Not a reload: `LoadBoard` would be Dock reporting that it did something, and the
-        // whole point is that it did nothing at all.
-        assert!(
-            dashboard
-                .board
-                .as_ref()
-                .is_some_and(|board| board.view.tasks().len() == 2)
-        );
-    }
-
-    /// `A` is the same write multiplied by however many cards are sitting in `done`, so it
-    /// carries its own copy of the guard and needs its own proof that the copy is reached.
-    #[test]
-    fn archiving_all_of_done_is_refused_on_a_repositorys_own_board() {
-        let mut dashboard = repository_board();
-        assert_eq!(dashboard.archive_finished_tasks(), UiCommand::None);
-        assert_eq!(
-            dashboard.error.as_deref(),
-            Some(REPOSITORY_BOARD_IS_NOT_OURS)
-        );
-        assert!(
-            dashboard
-                .board
-                .as_ref()
-                .is_some_and(|board| board.view.tasks().len() == 2)
-        );
+        assert!(dashboard.board.as_ref().unwrap().writable);
     }
 
     fn git_facts() -> GitFacts {
@@ -13277,7 +13230,7 @@ mod tests {
         let mut dashboard = dashboard_with_agents(&[AdapterId::Amp, AdapterId::ClaudeCode]);
         dashboard.set_board_tasks(
             vec![board_task(4, "unbound work", "backlog")],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         dashboard.board.as_mut().unwrap().writable = true;
         let UiCommand::DispatchTask(task) =
@@ -15291,7 +15244,7 @@ mod tests {
         dashboard.set_review_inbox(vec![(handoff("dock_01J9", "DOCK-7"), None)]);
         dashboard.set_board_tasks(
             vec![board_task(1, "do the thing", "backlog")],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         dashboard.set_git(git_facts(), "diff --git a/x b/x".into());
         dashboard.queue_open = true;
@@ -18033,7 +17986,7 @@ mod tests {
         pane.run_id = None;
         dashboard.set_board_pane_tasks(
             vec![board_task(7, "a card inside a pane", "backlog")],
-            crate::board::tasks_dir("", "workspace_1").expect("a workspace board"),
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         let terminal = render_terminal(&mut dashboard, 130, 34);
         let area = dashboard.pane_areas["b"];

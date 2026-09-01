@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod kanban;
 
 use std::{
@@ -26,7 +27,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use dock::{
-    adapter::AdapterSelection,
+    adapter::{AdapterId, AdapterSelection},
     client::Client,
     client::{EventStream, StreamPoll},
     dashboard::{Dashboard, TaskDispatch, UiCommand},
@@ -269,15 +270,27 @@ fn run_noninteractive_legacy(args: &[String]) -> Result<bool, Box<dyn Error>> {
         );
         return Ok(true);
     }
-    if let Some(board_dir) = args.iter().find_map(|a| a.strip_prefix("--kanban-dir=")) {
-        let adapter = kanban::KanbanMdAdapter::new(board_dir);
+    if let Some(board_dir) = args.iter().find_map(|a| {
+        a.strip_prefix("--kanban-dir=")
+            .or_else(|| a.strip_prefix("--board-dir="))
+    }) {
+        let directory = PathBuf::from(board_dir);
         if let Some(claim) = args.iter().find_map(|a| a.strip_prefix("--claim=")) {
-            let task = adapter
-                .pick(claim, "backlog", "in-progress")
-                .map_err(io::Error::other)?;
+            let id: u64 = claim.parse().map_err(io::Error::other)?;
+            dock::board::set_status(&directory, id, "in-progress").map_err(io::Error::other)?;
+            let task =
+                dock::board::set_claimed_by(&directory, id, "dock").map_err(io::Error::other)?;
             println!("claimed {}\t{}\t{}", task.id, task.status, task.title);
+        } else if let Some(id) = args.iter().find_map(|a| a.strip_prefix("--move=")) {
+            let id: u64 = id.parse().map_err(io::Error::other)?;
+            let status = args
+                .iter()
+                .find_map(|a| a.strip_prefix("--status="))
+                .ok_or_else(|| io::Error::other("--move= needs --status="))?;
+            let task = dock::board::set_status(&directory, id, status).map_err(io::Error::other)?;
+            println!("moved {}\t{}\t{}", task.id, task.status, task.title);
         } else {
-            for task in adapter.list().map_err(io::Error::other)? {
+            for task in dock::board::load(&directory) {
                 println!(
                     "{}\t{}\t{}\t{}",
                     task.id,
@@ -677,14 +690,18 @@ fn run_dashboard(
         // session would therefore have come back as an empty grid until somebody pressed
         // `Ctrl+B k`. Read once, when a board pane first exists and nothing has been read yet;
         // the check short-circuits on a field the moment it has.
-        if dashboard.board_pane_needs_load()
+        if (dashboard.board_pane_needs_load() || dashboard.board_files_changed())
             && let Some(directory) = dock::board::tasks_dir(
                 &dashboard.repository_root,
                 dashboard.workspace_id().unwrap_or_default(),
             )
         {
             let tasks = dock::board::load(&directory);
-            dashboard.set_board_pane_tasks(tasks, directory);
+            if dashboard.board_overlay_is_open() {
+                dashboard.set_board_tasks(tasks, directory);
+            } else {
+                dashboard.set_board_pane_tasks(tasks, directory);
+            }
         }
         terminal
             .draw(|frame| dashboard.render(frame))
@@ -906,6 +923,50 @@ fn run_dashboard(
                     Err(message) => dashboard.error = Some(message),
                 }
             }
+            UiCommand::LaunchLazygit => {
+                let on_path = std::env::var_os("PATH")
+                    .map(|path| {
+                        std::env::split_paths(&path).any(|dir| dir.join("lazygit").is_file())
+                    })
+                    .unwrap_or(false);
+                if !on_path {
+                    dashboard.error = Some("lazygit is not on PATH".into());
+                    continue;
+                }
+                let worktree = dashboard
+                    .focused_run()
+                    .map(|run| run.worktree.clone())
+                    .filter(|worktree| !worktree.is_empty())
+                    .unwrap_or_else(|| dashboard.repository_root.clone());
+                if worktree.is_empty() {
+                    dashboard.error = Some("no worktree here for lazygit".into());
+                    continue;
+                }
+                let Some(workspace) = dashboard.workspace() else {
+                    dashboard.error = Some("lazygit unavailable: create a workspace first".into());
+                    continue;
+                };
+                let request = Request::LaunchIntoPane(LaunchIntoPaneRequest {
+                    workspace_id: workspace.workspace_id.clone(),
+                    pane_id: workspace.focused_pane_id.clone(),
+                    dispatch: DispatchRequest {
+                        repository_root: dashboard.repository_root.clone(),
+                        external_task_ref: "lazygit".into(),
+                        run_id: format!("dock_lazygit_{}", workspace.focused_pane_id),
+                        worktree,
+                        adapter: AdapterSelection {
+                            id: AdapterId::Generic,
+                            executable: Some("lazygit".into()),
+                            arguments: Vec::new(),
+                        },
+                    },
+                });
+                match client.request(&request) {
+                    Ok(Response::Error { message, .. }) => dashboard.error = Some(message),
+                    Ok(_) => dashboard.error = None,
+                    Err(message) => dashboard.error = Some(message),
+                }
+            }
             UiCommand::LoadBoard => match dock::board::tasks_dir(
                 &dashboard.repository_root,
                 dashboard.workspace_id().unwrap_or_default(),
@@ -915,7 +976,8 @@ fn run_dashboard(
                     dashboard.set_board_tasks(tasks, directory);
                 }
                 None => {
-                    dashboard.error = Some("no board: not in a repository and HOME is unset".into())
+                    dashboard.error =
+                        Some("no board: open a repository that has kanban/tasks".into())
                 }
             },
             UiCommand::DispatchTask(task) => {
@@ -1208,7 +1270,7 @@ mod claim_tests {
     use std::fs;
 
     #[test]
-    fn a_claim_is_never_written_to_a_board_that_is_not_docks_own() {
+    fn a_claim_is_written_onto_the_markdown_board_in_the_repo() {
         // The claim moved to after the daemon accepts, and the rule it has to keep on the way is
         // this one: a repository's board belongs to kanban-md and to whoever commits to it, and
         // Dock moving a card there is that tool's business rather than this one's.
@@ -1222,7 +1284,7 @@ mod claim_tests {
 
         claim_task(Some(&directory), 1);
 
-        assert_eq!(dock::board::load(&directory)[0].status, "backlog");
+        assert_eq!(dock::board::load(&directory)[0].status, "in-progress");
         let _ = fs::remove_dir_all(&directory);
     }
 }
@@ -1367,10 +1429,9 @@ fn dispatch_task(
 /// Only on Dock's own board: a repository's belongs to `kanban-md` and to whoever commits to it,
 /// and moving a task there is that tool's business, not this one's.
 fn claim_task(board: Option<&Path>, task_id: u64) {
-    if let Some(directory) = board
-        && dock::board::is_personal(directory)
-    {
+    if let Some(directory) = board {
         let _ = dock::board::set_status(directory, task_id, "in-progress");
+        let _ = dock::board::set_claimed_by(directory, task_id, "dock");
     }
 }
 

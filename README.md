@@ -56,7 +56,7 @@ dock hooks --install    # Claude Code + Codex: merge, keep existing handlers
 
 ## Board
 
-`Ctrl+B k` is markdown tasks in the repo (`kanban/tasks/`). Same drive keys on the overlay and a `@board` pane: hjkl move, H/L set status (WIP), c claim, a archive, A show archived, n new, Enter dispatch (body, not title-only). Dock never closes a card from a screen heuristic.
+`Ctrl+B k` is markdown tasks in the repo (`kanban/tasks/`). Same drive keys on the overlay and a `@board` pane: hjkl move, H/L set status (WIP), c claim, a archive, A show archived, n new, Enter dispatch (body, not title-only). `o` focuses the card's live pane, or resumes/launches in its worktree. Dock never closes a card from a screen heuristic.
 
 ```bash
 dock task list
@@ -64,6 +64,7 @@ dock task add "fix the retry path"
 dock task claim 3
 dock task move 3 review
 dock task show 3
+dock task next
 ```
 
 Panes get `DOCK_BOARD`, `DOCK_WORKSPACE`, `DOCK_PANE`, `DOCK_RUN`, and `DOCK_TASK` when dispatched. `PATH` includes Dock, so `dock` works inside a pane.

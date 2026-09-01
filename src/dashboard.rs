@@ -3591,7 +3591,9 @@ impl Dashboard {
             Line::from("f find a file here and type its path into the pane"),
             Line::from("a resume the agent that last ran here, continuing its own session"),
             Line::from("i review handoffs agents are waiting on: a accept · c request changes"),
-            Line::from("k board: ←/→ column · ↑/↓ card · </> move · n new · Enter dispatch"),
+            Line::from(
+                "k board: ←/→ column · ↑/↓ card · </> move · n new · o pane · Enter dispatch",
+            ),
             Line::from("  a archive or restore · A archive all of done · v show the archived"),
             Line::from("B splits the same board into the canvas as a pane, with its runs lane"),
             Line::from("g what changed in this pane's worktree · j/k scroll · g/G ends"),
@@ -4411,6 +4413,7 @@ impl Dashboard {
     /// card back" re-hide everything else in the same pile on the very next frame. The reveal a
     /// caller had is carried forward into the freshly loaded view instead.
     pub fn set_board_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
+        let opening = self.board.is_none();
         let reveal = self.board.as_ref().map(|board| board.view.revealing());
         self.set_board_pane_tasks(tasks.clone(), directory.clone());
         let writable = true;
@@ -4425,6 +4428,9 @@ impl Dashboard {
             composing: None,
         });
         self.error = None;
+        if opening {
+            self.select_focused_task_card();
+        }
     }
 
     /// Receives the board without opening anything over the canvas.
@@ -4564,7 +4570,8 @@ impl Dashboard {
             KeyCode::Char('a') => return self.archive_selected_task(),
             KeyCode::Char('c') => return self.claim_selected_task(),
             KeyCode::Char('e') => return self.toggle_auto_feed(),
-            KeyCode::Enter => return self.dispatch_selected_task(),
+            KeyCode::Char('o') => return self.open_selected_task_pane(),
+            KeyCode::Enter => return self.dispatch_enter(),
             _ => {}
         }
         UiCommand::None
@@ -4757,6 +4764,82 @@ impl Dashboard {
                 UiCommand::None
             }
         }
+    }
+
+    /// Enter on a specific card dispatches that card. Enter with no card under the cursor
+    /// (and not on a live agent row) dispatches the next ready backlog card.
+    fn dispatch_enter(&mut self) -> UiCommand {
+        if self.cursor_card().is_some() {
+            return self.dispatch_selected_task();
+        }
+        if self.cursor_is_agent_pane() {
+            self.error = Some("that is a running agent, not a card".into());
+            return UiCommand::None;
+        }
+        self.dispatch_next_ready()
+    }
+
+    fn cursor_is_agent_pane(&self) -> bool {
+        let Some(view) = self.cursor_view() else {
+            return false;
+        };
+        let runs = self.live_runs();
+        let live = BoardLive::new(&runs);
+        let (column, index) = self.board_cursor_at(view, &live);
+        matches!(
+            column_targets(view, &live, column).into_iter().nth(index),
+            Some(BoardTarget::Pane(..))
+        )
+    }
+
+    fn dispatch_next_ready(&mut self) -> UiCommand {
+        let Some(directory) = self.board_dir.clone() else {
+            self.error = Some("no board is open".into());
+            return UiCommand::None;
+        };
+        let Some(task) = crate::board::next_ready(&directory) else {
+            self.error = Some("no ready task".into());
+            return UiCommand::None;
+        };
+        if !self.aim_at_card(task.id) {
+            self.error = Some(format!("ready task {} is not on this board", task.id));
+            return UiCommand::None;
+        }
+        self.dispatch_selected_task()
+    }
+
+    /// From a selected card: focus its live pane, or resume/launch in that task's worktree
+    /// using the adapter's documented resume flags — never invented ones.
+    fn open_selected_task_pane(&mut self) -> UiCommand {
+        let Some(id) = self.cursor_card() else {
+            self.error = Some("that is a running agent, not a card".into());
+            return UiCommand::None;
+        };
+        let bound = self
+            .runs
+            .iter()
+            .find(|run| bound_task(run).and_then(|task| task.parse().ok()) == Some(id))
+            .cloned();
+        if let Some(run) = bound {
+            if run.state == ProcessState::Running {
+                self.board = None;
+                return self.focus_run(&run.run_id);
+            }
+            self.board = None;
+            return self.resume_run(run);
+        }
+        self.board = None;
+        self.task_dispatch_for(&id.to_string())
+    }
+
+    fn select_focused_task_card(&mut self) {
+        let Some(run) = self.focused_run() else {
+            return;
+        };
+        let Some(id) = bound_task(run).and_then(|task| task.parse().ok()) else {
+            return;
+        };
+        let _ = self.aim_at_card(id);
     }
 
     /// Puts an agent on the selected card.
@@ -5113,18 +5196,16 @@ impl Dashboard {
     /// pane's process dying, the daemon restarting, and the machine rebooting, none of which
     /// adopting a live process could have survived.
     fn resume_agent(&mut self) -> UiCommand {
-        let Some(workspace) = self.workspace() else {
-            self.error = Some("resume unavailable: create a workspace first".into());
-            return UiCommand::None;
-        };
-        let workspace_id = workspace.workspace_id.clone();
-        let pane_id = workspace.focused_pane_id.clone();
-        // The pane keeps its run binding after the run exits, which is exactly the case this
-        // command exists for: the agent is gone and its conversation is what remains.
         let Some(run) = self.focused_run().cloned() else {
             self.error = Some("resume unavailable: no agent has run in this pane".into());
             return UiCommand::None;
         };
+        self.resume_run(run)
+    }
+
+    fn resume_run(&mut self, run: RuntimeSnapshot) -> UiCommand {
+        let workspace_id = run.workspace_id.clone();
+        let pane_id = run.pane_id.clone();
         let Some(arguments) = run.adapter.resume_arguments() else {
             self.error = Some(format!("{} cannot be resumed", run.adapter.label()));
             return UiCommand::None;
@@ -13743,6 +13824,177 @@ mod tests {
             rows.find("#7").unwrap() < rows.find("#12").unwrap(),
             "blocked first"
         );
+    }
+
+    #[test]
+    fn opening_the_board_from_a_dispatched_pane_selects_that_card() {
+        let mut dashboard = bound_dashboard();
+        let mut run = snapshot();
+        run.run_id = "run_1".into();
+        run.external_task_ref = "7".into();
+        dashboard.runs = vec![run];
+        dashboard.set_board_tasks(
+            vec![
+                board_task(9, "later", "backlog"),
+                board_task(7, "this pane", "in-progress"),
+            ],
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+        );
+        assert_eq!(dashboard.cursor_card(), Some(7));
+    }
+
+    #[test]
+    fn o_on_a_card_focuses_its_live_pane() {
+        let mut dashboard = dashboard_with_agents(&[AdapterId::ClaudeCode]);
+        let mut run = snapshot();
+        run.run_id = "run_1".into();
+        run.pane_id = "a".into();
+        run.external_task_ref = "7".into();
+        run.state = ProcessState::Running;
+        dashboard.runs = vec![run];
+        dashboard.set_board_tasks(
+            vec![board_task(7, "this pane", "in-progress")],
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+        );
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let UiCommand::Request(request) = asked else {
+            panic!("o on a live card focuses the pane, got {asked:?}");
+        };
+        assert!(
+            matches!(
+                request.as_ref(),
+                Request::Workspace(WorkspaceRequest::Focus {
+                    workspace_id,
+                    pane_id,
+                }) if workspace_id == "w" && pane_id == "a"
+            ),
+            "{request:?}"
+        );
+        assert!(dashboard.board.is_none(), "the overlay yields to the pane");
+    }
+
+    #[test]
+    fn o_on_a_card_resumes_an_exited_run_with_that_adapters_flags() {
+        let mut dashboard = dashboard_with_agents(&[AdapterId::ClaudeCode]);
+        let mut run = snapshot();
+        run.run_id = "run_2".into();
+        run.pane_id = "b".into();
+        run.external_task_ref = "7".into();
+        run.adapter = AdapterId::ClaudeCode;
+        run.state = ProcessState::Exited { code: Some(0) };
+        run.worktree = "/repo/real-task-7".into();
+        dashboard.runs = vec![run];
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("b")
+            .unwrap()
+            .run_id = Some("run_2".into());
+        dashboard.set_board_tasks(
+            vec![board_task(7, "this pane", "in-progress")],
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+        );
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let UiCommand::Request(request) = asked else {
+            panic!("o on an exited card resumes, got {asked:?}");
+        };
+        match request.as_ref() {
+            Request::LaunchIntoPane(launch) => {
+                assert_eq!(launch.pane_id, "b");
+                assert_eq!(launch.dispatch.adapter.arguments, vec!["--continue"]);
+                assert_eq!(launch.dispatch.external_task_ref, "7");
+                assert_eq!(launch.dispatch.worktree, "/repo/real-task-7");
+            }
+            other => panic!("expected a resume launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn o_does_not_invent_resume_flags() {
+        let mut dashboard = dashboard_with_agents(&[AdapterId::GithubCopilotCli]);
+        let mut run = snapshot();
+        run.run_id = "run_1".into();
+        run.external_task_ref = "7".into();
+        run.adapter = AdapterId::GithubCopilotCli;
+        run.state = ProcessState::Exited { code: Some(0) };
+        dashboard.runs = vec![run];
+        dashboard.set_board_tasks(
+            vec![board_task(7, "this pane", "in-progress")],
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+        );
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(matches!(asked, UiCommand::None), "{asked:?}");
+        assert!(
+            dashboard
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("cannot be resumed")),
+            "{:?}",
+            dashboard.error
+        );
+    }
+
+    #[test]
+    fn o_on_a_card_without_a_pane_launches_with_existing_dispatch_rules() {
+        let mut dashboard = dashboard_with_agents(&[AdapterId::ClaudeCode]);
+        dashboard.set_board_tasks(
+            vec![board_task(7, "fresh", "backlog")],
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+        );
+        dashboard.board.as_mut().unwrap().writable = true;
+        let asked = dashboard.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let UiCommand::DispatchTask(task) = asked else {
+            panic!("o without a pane launches, got {asked:?}");
+        };
+        assert_eq!(task.task_id, 7);
+        assert_eq!(task.adapter, AdapterId::ClaudeCode);
+    }
+
+    #[test]
+    fn enter_on_a_specific_card_still_dispatches_that_card() {
+        let mut dashboard = dashboard_with_agents(&[AdapterId::ClaudeCode]);
+        dashboard.set_board_tasks(
+            vec![
+                board_task(1, "first", "backlog"),
+                board_task(2, "second", "backlog"),
+            ],
+            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+        );
+        dashboard.board.as_mut().unwrap().writable = true;
+        assert!(dashboard.aim_at_card(2));
+        let UiCommand::DispatchTask(task) =
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter on a card dispatches that card");
+        };
+        assert_eq!(task.task_id, 2);
+    }
+
+    #[test]
+    fn enter_with_no_card_selected_dispatches_the_next_ready() {
+        let personal = PersonalBoard::new(&format!("next-ready-{}", std::process::id()));
+        let dir = personal.tasks_dir();
+        crate::board::create(&dir, "first").expect("seed");
+        crate::board::create(&dir, "second").expect("seed");
+        let mut dashboard = dashboard_with_agents(&[AdapterId::ClaudeCode]);
+        dashboard.set_board_tasks(crate::board::load(&dir), dir);
+        dashboard.board.as_mut().unwrap().writable = true;
+        let done = dashboard
+            .board
+            .as_ref()
+            .unwrap()
+            .view
+            .statuses()
+            .iter()
+            .position(|status| status == "done")
+            .expect("done");
+        dashboard.set_board_cursor(done, None);
+        assert!(dashboard.cursor_card().is_none());
+        let UiCommand::DispatchTask(task) =
+            dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter with no card dispatches the next ready");
+        };
+        assert_eq!(task.task_id, 1);
     }
 
     #[test]

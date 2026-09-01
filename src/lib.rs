@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod board;
 pub mod board_config;
+pub mod board_watch;
 pub mod cli;
 pub mod client;
 pub mod clipboard;

@@ -9,5 +9,7 @@ pub mod dispatch;
 pub mod inspect;
 pub mod programme;
 pub mod review;
+pub mod split;
+pub mod wait;
 pub mod wire;
 pub mod workspace;

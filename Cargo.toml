@@ -25,6 +25,7 @@ path = "src/bin/dockd.rs"
 [dependencies]
 base64 = "0.23"
 crossterm = "0.29"
+notify = "6.1"
 nix = { version = "=0.29.0", features = ["process", "signal", "term"] }
 ratatui = "0.30"
 regex = "1"

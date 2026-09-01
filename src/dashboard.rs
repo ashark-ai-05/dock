@@ -760,8 +760,7 @@ const QUICK_ACTIONS: [(&str, &str, PaneCommand); 4] = [
 /// that can drift. The guards themselves are the branch's standing data-safety constraint made
 /// executable: Dock writes task files only on its own board (`board::is_personal`), and a
 /// repository's kanban directory belongs to the repository's history.
-const REPOSITORY_BOARD_IS_NOT_OURS: &str = "this is the repository's board — retire tasks with kanban-md so its history stays the \
-     repository's";
+const REPOSITORY_BOARD_IS_NOT_OURS: &str = "this board is read-only in this view";
 
 /// The glyph the full sidebar collapses by, drawn at the right edge of its heading row.
 ///
@@ -4084,7 +4083,7 @@ impl Dashboard {
                 },
             ]),
             None => Line::styled(
-                "←/→ column · ↑/↓ card · Enter put an agent on it · Esc close · kanban-md owns this board",
+                "←/→ column · ↑/↓ card · Enter put an agent on it · Esc close",
                 Style::default().fg(self.theme.muted),
             ),
         };
@@ -4275,6 +4274,10 @@ impl Dashboard {
     /// the common case costs one `Option` check rather than a walk over every pane on every frame.
     pub fn board_overlay_is_open(&self) -> bool {
         self.board.is_some()
+    }
+
+    pub fn board_directory(&self) -> Option<&std::path::Path> {
+        self.board_dir.as_deref()
     }
 
     pub fn board_files_changed(&self) -> bool {

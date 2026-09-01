@@ -30,13 +30,15 @@ did not launch.
 ## Quick start
 
 ```bash
-cargo run --bin dock
+# crate dock-tui, binary dock — rustc/cargo only
+cargo install --path . --locked
+dock
 ```
 
-That's it. Run it from any directory, Git or not. Dock connects to that
-directory's private daemon, or starts one for you.
-
-> Once the first release is cut, this becomes `brew install dock` or `cargo install dock-tui` — the crate is `dock-tui`, the binary is `dock`.
+Or from this checkout: `./scripts/install.sh` (same command). Run it from any
+directory, Git or not. Dock connects to that directory's private daemon, or
+starts one for you. There is no companion brew formula and no other binaries to
+install.
 
 Every pane launches `$SHELL` the moment it exists, so you can type immediately.
 Start an agent the way you always do — `claude`, `codex`, `amp` — and Dock picks
@@ -107,8 +109,8 @@ columns, `n` starts a new task, and `Enter` puts an agent on the selected one.
 The footer names the agent `Enter` will use — the last one you launched from
 `Ctrl+B l`, or otherwise the first installed agent that can be handed the task.
 The board names its own directory along the bottom, so a workspace board and a
-repository board are never confused — and a repository's board is shown but
-never altered, since `kanban-md` owns it.
+repository board are never confused. The TUI reloads when those files change
+(a directory watch, not only an mtime check on the next key).
 
 Agents track their own work with `dock task`. Every pane Dock launches gets
 `DOCK_BOARD` (its board), `DOCK_WORKSPACE`, `DOCK_PANE`, `DOCK_RUN`, and
@@ -134,7 +136,7 @@ The same commands work from any shell with `--board=<dir>`, so a board with no
 agent on it is entirely yours to run by hand. Tasks are Markdown with YAML
 front matter and `move` rewrites only the `status:` line, leaving everything
 else byte for byte — so `kanban-md`, your editor, and Dock all read and write
-the same files without fighting.
+the same files.
 
 Choosing a task puts an agent on it, and claims it: the task moves to
 `in-progress` on Dock's own boards before the agent starts. The task is handed
@@ -334,8 +336,22 @@ Swap `fixture` for `amp`, `claude-code`, `codex-cli`, or `github-copilot-cli`.
 Dock checks the binary exists before creating a run; agent authentication stays
 with that agent's own setup.
 
-`dock workspace` manages panes non-interactively, and `dock programme` inspects
-multi-repository capacity and dependency gates.
+Agents already running in a pane can drive Dock over the same Unix socket
+(`DOCK_SOCKET`, `DOCK_WORKSPACE`, `DOCK_PANE`, `DOCK_RUN`):
+
+```bash
+dock split vertical              # new terminal pane beside this one
+dock queue add "$DOCK_PANE" "continue"   # prompt that pane
+dock wait --until=blocked        # until the run needs you
+dock workspace inspect           # layout JSON
+```
+
+`dock workspace` is the full pane API (create, split, focus, resize, close).
+`dock programme` inspects multi-repository capacity and dependency gates.
+
+SSH attach is deferred: the daemon is a local Unix socket, and a fake
+`dock --remote` flag is not shipped. Attach from another machine when that
+socket is reachable (ssh+unix-forward), not through a stub client.
 
 ## Safety
 
@@ -352,16 +368,12 @@ multi-repository capacity and dependency gates.
   wanted.
 - It never completes or closes a task. A review decision is recorded and
   carries `external_task_completed: false` and `git_mutated: false`; accepting
-  scope is a note, not a merge. Claiming a task through `kanban-md` moves it to
-  in-progress and is the only status Dock will ever set.
-- The dashboard writes task files **only under `~/.dock/boards/`**, its own
-  boards: it adds a task there, and claims one to `in-progress` when it puts an
-  agent on it. A repository's board belongs to `kanban-md` and to whoever
-  commits to it, so the dashboard never writes there. The `dock task` command
-  writes wherever it is explicitly pointed — that is how an agent records its
-  own progress — and rewrites only the `status:` line, never reformatting the
-  rest of a file it shares with other tools. Reading any board is always safe
-  and never runs `kanban-md`. Dock never deletes a board or a task.
+  scope is a note, not a merge. Dock moves a claimed task to `in-progress` by
+  rewriting the `status:` line in its Markdown file.
+- The `dock task` command writes wherever it is pointed (`--board=` or
+  `DOCK_BOARD`) and rewrites only the `status:` line, never reformatting the
+  rest of the file. Humans and agents use the same CLI. Dock never deletes a
+  board or a task.
 - Durable state lives in `.dock/local` at `0700`/`0600`. Layout records hold
   topology and labels only — never terminal output, commands, credentials, PIDs,
   or process-group IDs. Use `--state-dir=` to relocate it.
@@ -375,8 +387,9 @@ state detection, zoom, bracketed paste, `Ctrl+C` signal delivery, wheel
 scrollback, and copy mode (keyboard and mouse-drag selection, search, OSC 52
 clipboard).
 
-Deferred: pane swap, alternative theme palettes, notifications, and durable
-transcript replay. Scrollback is bounded per pane (default 2000 rows,
+Deferred: pane swap, alternative theme palettes, notifications, durable
+transcript replay, and SSH attach (the daemon is a Unix socket; forward it if
+you need a remote dashboard). Scrollback is bounded per pane (default 2000 rows,
 `dockd --scrollback-rows`) and is not restored across a daemon restart.
 
 The [parity matrix](docs/terminal-runtime-parity.md) states the exact status of
@@ -395,7 +408,7 @@ scripts/smoke-slice61-macos.sh
 scripts/smoke-slice62-nongit-macos.sh
 ```
 
-Dock speaks protocol v13 — stop any older daemon before connecting.
+Dock speaks protocol v15 — stop any older daemon before connecting.
 
 CI runs the same three gates plus a build on Linux and macOS. Many tests drive
 real PTYs, subprocesses, and signals, so they wait on a wall clock; those

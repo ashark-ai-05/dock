@@ -1,10 +1,7 @@
-//! Reading the kanban board straight from its task files.
+//! Reading the markdown board straight from its task files.
 //!
-//! `kanban-md` owns the board and is what moves a task between statuses, but reading does not need
-//! it: the tasks are Markdown files with YAML front matter, and they are in the repository the user
-//! already has open. Parsing them directly means the board renders on a machine where the binary is
-//! not installed, which is most machines — and a board you can read but not yet claim from is worth
-//! considerably more than an error message.
+//! Tasks are Markdown with YAML front matter. Dock reads and writes them itself; there is no
+//! companion binary for the board.
 
 use std::{
     fs,

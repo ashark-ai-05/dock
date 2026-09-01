@@ -1,6 +1,3 @@
-#[allow(dead_code)]
-mod kanban;
-
 use std::{
     collections::VecDeque,
     error::Error,
@@ -28,6 +25,7 @@ use crossterm::{
 };
 use dock::{
     adapter::{AdapterId, AdapterSelection},
+    board_watch::BoardWatcher,
     client::Client,
     client::{EventStream, StreamPoll},
     dashboard::{Dashboard, TaskDispatch, UiCommand},
@@ -188,9 +186,19 @@ const VERBS: &[Verb] = &[
         run: dock::cli::review::run,
     },
     Verb {
+        name: "split",
+        summary: "split the current pane (uses DOCK_WORKSPACE / DOCK_PANE)",
+        run: dock::cli::split::run,
+    },
+    Verb {
         name: "task",
         summary: "list, add, move or show tasks on the board",
         run: run_task,
+    },
+    Verb {
+        name: "wait",
+        summary: "block until a run is blocked, done or idle",
+        run: dock::cli::wait::run,
     },
     Verb {
         name: "workspace",
@@ -653,6 +661,7 @@ fn run_dashboard(
     // now arrives on it, which is what lets the timed Inspect poll below go away entirely: an
     // idle dashboard sends nothing and the daemon sends nothing back.
     let mut events = EventStream::subscribe(socket)?;
+    let mut board_watch = BoardWatcher::new();
     refresh(client, &mut dashboard)?;
     loop {
         if let Ok((root, launches)) = catalog_rx.try_recv() {
@@ -690,7 +699,13 @@ fn run_dashboard(
         // session would therefore have come back as an empty grid until somebody pressed
         // `Ctrl+B k`. Read once, when a board pane first exists and nothing has been read yet;
         // the check short-circuits on a field the moment it has.
-        if (dashboard.board_pane_needs_load() || dashboard.board_files_changed())
+        if let Some(directory) = dashboard.board_directory() {
+            board_watch.ensure(directory);
+        }
+        let board_fs_changed = board_watch.take_changed();
+        if (dashboard.board_pane_needs_load()
+            || dashboard.board_files_changed()
+            || board_fs_changed)
             && let Some(directory) = dock::board::tasks_dir(
                 &dashboard.repository_root,
                 dashboard.workspace_id().unwrap_or_default(),
@@ -930,7 +945,9 @@ fn run_dashboard(
                     })
                     .unwrap_or(false);
                 if !on_path {
-                    dashboard.error = Some("lazygit is not on PATH — optional; Ctrl+B g still shows the diff".into());
+                    dashboard.error = Some(
+                        "lazygit is not on PATH — optional; Ctrl+B g still shows the diff".into(),
+                    );
                     continue;
                 }
                 let worktree = dashboard
@@ -3364,11 +3381,11 @@ mod terminal_tests {
             VERBS.windows(2).all(|pair| pair[0].name < pair[1].name),
             "VERBS is listed in the order --help prints, so it is kept sorted"
         );
-        // Twelve, not six: the folded scripting verbs and the six commands a person actually
-        // types are one table now, so a command dispatched outside it would move this count.
+        // Fourteen: every non-interactive verb lives in this table, so a command dispatched
+        // outside it would move this count.
         assert_eq!(
             VERBS.len(),
-            12,
+            14,
             "a verb was added to or removed from dispatch without this count following"
         );
         assert!(

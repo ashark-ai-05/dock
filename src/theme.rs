@@ -47,7 +47,13 @@ impl Theme {
             text: Color::Rgb(226, 222, 214),
             selection: Color::Rgb(70, 100, 124),
             blocked: Color::Rgb(226, 106, 94),
-            working: Color::Rgb(226, 184, 96),
+            // Separated from the accent by value within the same amber hue, which is how
+            // `cool` solves the identical problem (its `working` sits 70.8 from its accent).
+            // The previous Rgb(226,184,96) was 18.9 from this palette's accent — an agent
+            // that was working looked exactly like ordinary chrome.
+            //
+            // accent 86.2 · blocked 70.7 · done 129.6 · idle 74.6 · 4.47:1 on both grounds.
+            working: Color::Rgb(168, 120, 56),
             done: Color::Rgb(122, 176, 214),
             idle: Color::Rgb(108, 122, 114),
         }
@@ -265,33 +271,35 @@ mod tests {
         assert_eq!(names, vec!["warm", "cool"]);
     }
 
-    /// The four agent states must stay far enough apart to be told apart at a glance.
+    /// The four agent states must stay far enough apart to be told apart at a glance, in
+    /// every palette.
     ///
-    /// Not theoretical: `working` and `idle` collided twice while this palette was being chosen,
-    /// because both mean "nothing is being asked of you" and both drift toward the same quiet
-    /// slate. This is what keeps them apart.
+    /// Not theoretical: `working` and `idle` collided twice while `cool` was being chosen,
+    /// and `warm` shipped with `working` 18.9 from its accent because this test named one
+    /// palette by hand.
     #[test]
     fn the_agent_states_stay_far_apart() {
-        let theme = Theme::cool();
-        let states = [
-            ("blocked", theme.blocked),
-            ("working", theme.working),
-            ("done", theme.done),
-            ("idle", theme.idle),
-        ];
-        for (index, (name, colour)) in states.iter().enumerate() {
-            for (other, second) in &states[index + 1..] {
-                let apart = distance(*colour, *second);
+        for (theme_name, theme) in Theme::all() {
+            let states = [
+                ("blocked", theme.blocked),
+                ("working", theme.working),
+                ("done", theme.done),
+                ("idle", theme.idle),
+            ];
+            for (index, (name, colour)) in states.iter().enumerate() {
+                for (other, second) in &states[index + 1..] {
+                    let apart = distance(*colour, *second);
+                    assert!(
+                        apart >= 60.0,
+                        "{theme_name}: {name} and {other} are only {apart:.1} apart"
+                    );
+                }
+                let from_accent = distance(*colour, theme.accent);
                 assert!(
-                    apart >= 60.0,
-                    "{name} and {other} are only {apart:.1} apart"
+                    from_accent >= 60.0,
+                    "{theme_name}: {name} is only {from_accent:.1} from the accent"
                 );
             }
-            let from_accent = distance(*colour, theme.accent);
-            assert!(
-                from_accent >= 60.0,
-                "{name} is only {from_accent:.1} from the accent"
-            );
         }
     }
 }

@@ -75,9 +75,14 @@ fn check_failed(receipt: &Receipt, findings: &mut Vec<Finding>) {
 
 /// A check that ran, but not at the commit the receipt is reporting on — the green tick it
 /// earned belongs to an earlier state of the tree.
+///
+/// A check with no after-pin at all is skipped rather than flagged. An empty pin is the absence
+/// of an answer, not the answer "somewhere else", and it would otherwise fire on every check that
+/// never reached a spawn. The test is the pin rather than the outcome on purpose: a check that
+/// timed out is `Unwitnessed` *and* carries a real pin, and its tree may genuinely have moved.
 fn check_stale(receipt: &Receipt, findings: &mut Vec<Finding>) {
     for check in &receipt.witnessed.checks {
-        if check.sha_after != receipt.observed.head_sha {
+        if !check.sha_after.is_empty() && check.sha_after != receipt.observed.head_sha {
             findings.push(Finding {
                 rule: Rule::CheckStale,
                 fact: format!(
@@ -105,8 +110,15 @@ fn check_unwitnessed(receipt: &Receipt, findings: &mut Vec<Finding>) {
 
 /// A check that left the worktree in a different state than it found it — dirty when it wasn't,
 /// or on a different commit. A check is supposed to observe, not mutate.
+///
+/// Skipped for a check with no after-pin, for the same reason [`check_stale`] skips one: without
+/// a pin on the far side there is nothing to compare, and reading the absence as a difference
+/// would accuse a check that never ran of having moved the tree.
 fn check_mutated_worktree(receipt: &Receipt, findings: &mut Vec<Finding>) {
     for check in &receipt.witnessed.checks {
+        if check.sha_after.is_empty() {
+            continue;
+        }
         if check.dirty_before != check.dirty_after || check.sha_before != check.sha_after {
             let mut changes = Vec::new();
             if check.dirty_before != check.dirty_after {
@@ -330,6 +342,27 @@ mod tests {
         receipt
     }
 
+    /// What a check Dock declined to run leaves behind: no command, no pins, and a sentence
+    /// saying why. `sha_after` empty is the shape both `check_stale` and `check_mutated_worktree`
+    /// have to skip.
+    fn receipt_with_a_check_that_never_pinned_a_sha() -> Receipt {
+        let mut receipt = base_receipt();
+        receipt.witnessed.checks[0] = CheckRun {
+            name: "lint".into(),
+            command: vec![],
+            outcome: CheckOutcome::Unwitnessed,
+            exit_code: None,
+            duration_ms: 0,
+            sha_before: String::new(),
+            sha_after: String::new(),
+            dirty_before: false,
+            dirty_after: false,
+            tail: String::new(),
+            reason: Some("no check named `lint` in .dock/checks.toml".into()),
+        };
+        receipt
+    }
+
     fn receipt_with_a_check_that_dirtied_the_tree() -> Receipt {
         let mut receipt = base_receipt();
         receipt.witnessed.checks[0].dirty_before = false;
@@ -540,6 +573,54 @@ mod tests {
             .unwrap();
         assert!(failed.fact.contains("test"), "{:?}", failed.fact);
         assert!(failed.fact.contains("exit 1"), "{:?}", failed.fact);
+    }
+
+    /// A check that never reached a spawn has no after-pin, and an absent pin is the absence of
+    /// an answer. `check_stale` asks whether a check ran at the head the receipt reports; a check
+    /// that ran nowhere did not run somewhere else, and saying so would print a sentence — "ran
+    /// at ``" — that no reader could check against the receipt.
+    #[test]
+    fn a_check_with_no_after_pin_is_never_called_stale() {
+        let receipt = receipt_with_a_check_that_never_pinned_a_sha();
+        let (_, findings) = evaluate(&receipt);
+        let fired: Vec<Rule> = findings.iter().map(|finding| finding.rule).collect();
+        assert_eq!(fired, vec![Rule::CheckUnwitnessed], "{findings:?}");
+    }
+
+    /// The same absent pin, and the same reason: with nothing on the far side to compare against,
+    /// reading the gap as a difference would accuse a check that never ran of moving the tree.
+    #[test]
+    fn a_check_with_no_after_pin_is_never_called_a_mutation() {
+        // A before-pin and no after-pin is exactly what a spawn failure leaves behind: the
+        // worktree was read, and then nothing happened.
+        let mut receipt = receipt_with_a_check_that_never_pinned_a_sha();
+        receipt.witnessed.checks[0].sha_before = "bbbb222".into();
+        receipt.witnessed.checks[0].dirty_before = true;
+        let (_, findings) = evaluate(&receipt);
+        let fired: Vec<Rule> = findings.iter().map(|finding| finding.rule).collect();
+        assert_eq!(fired, vec![Rule::CheckUnwitnessed], "{findings:?}");
+    }
+
+    /// A timed-out check is `Unwitnessed` and *does* carry a real after-pin, so neither rule may
+    /// key on the outcome: one that really did move the tree still has to be caught.
+    #[test]
+    fn a_timed_out_check_that_moved_the_tree_is_still_caught() {
+        let mut receipt = receipt_with_a_check_that_never_pinned_a_sha();
+        receipt.witnessed.checks[0].sha_before = "bbbb222".into();
+        receipt.witnessed.checks[0].sha_after = "cccc333".into();
+        receipt.witnessed.checks[0].reason = Some("timed out after 600s".into());
+        let (verdict, findings) = evaluate(&receipt);
+        let fired: Vec<Rule> = findings.iter().map(|finding| finding.rule).collect();
+        assert_eq!(
+            fired,
+            vec![
+                Rule::CheckStale,
+                Rule::CheckUnwitnessed,
+                Rule::CheckMutatedWorktree
+            ],
+            "{findings:?}"
+        );
+        assert_eq!(verdict, Verdict::Look);
     }
 
     /// A rule with no data source yet says so, rather than silently never firing.

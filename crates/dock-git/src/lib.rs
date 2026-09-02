@@ -277,6 +277,21 @@ impl GitAdapter {
         self.git(["diff", "--no-ext-diff", &base_sha])
     }
 
+    /// Just the untracked paths, as `git status` reports them.
+    ///
+    /// Split out from [`Self::review`] rather than taken from it, because a caller that wants to
+    /// know which files are new wants only that: `review` runs one `git diff` per changed file to
+    /// build the review overlay's per-file hunks, and every one of those diffs would be read from
+    /// a pipe and thrown away. A receipt asks this question on every handoff.
+    pub fn untracked_paths(&self) -> Result<Vec<String>, String> {
+        let porcelain = self.git(["status", "--porcelain=v1", "--untracked-files=normal"])?;
+        Ok(porcelain
+            .lines()
+            .filter_map(|line| line.strip_prefix("?? "))
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// Porcelain + numstat + per-file diffs + worktrees. Review only: no stage/commit/push.
     pub fn review(&self, base: &str) -> Result<GitReview, String> {
         let facts = self.facts(base)?;
@@ -594,6 +609,29 @@ mod worktree_tests {
         assert_eq!(facts.head_sha, facts.base_sha, "base HEAD resolves to HEAD");
         assert_eq!(facts.head_sha.len(), 40, "{}", facts.head_sha);
         assert!(facts.head_sha.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// `untracked_paths` answers the same question `review` answers as a side effect, and must
+    /// answer it identically — a modified tracked file is not new, and an untracked one is.
+    #[test]
+    fn untracked_paths_lists_new_files_and_nothing_that_was_merely_edited() {
+        let repo = Repo::new();
+        fs::write(repo.0.join("tracked"), "fixture\nedited\n").unwrap();
+        fs::write(repo.0.join("scratch.txt"), "not tracked yet").unwrap();
+        let adapter = GitAdapter::new(&repo.0);
+        assert_eq!(
+            adapter.untracked_paths().expect("untracked paths"),
+            vec!["scratch.txt".to_owned()]
+        );
+        let from_review: Vec<String> = adapter
+            .review("HEAD")
+            .expect("review")
+            .files
+            .into_iter()
+            .filter(|file| file.untracked)
+            .map(|file| file.path)
+            .collect();
+        assert_eq!(adapter.untracked_paths().unwrap(), from_review);
     }
 
     #[test]

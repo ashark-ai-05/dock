@@ -3622,7 +3622,8 @@ impl RuntimeRegistry {
                 "handoff binding does not exactly match the active bound run".into(),
             ));
         }
-        let facts = GitAdapter::new(&snapshot.worktree)
+        let adapter = GitAdapter::new(&snapshot.worktree);
+        let facts = adapter
             .facts(&snapshot.base_sha)
             .map_err(|message| (ErrorCode::InvalidHandoff, message))?;
         let live_worktree = facts.worktree.display().to_string();
@@ -3644,7 +3645,6 @@ impl RuntimeRegistry {
             &packet.checks,
             Path::new(&snapshot.repository_root),
             bound_worktree(&snapshot),
-            &facts,
             &packet.run_id,
         );
         // Every field here is Dock's own: `claimed` is the only column the packet reaches, and it
@@ -3662,15 +3662,13 @@ impl RuntimeRegistry {
                 question: packet.question.clone(),
                 checks: packet.checks.clone(),
             },
-            observed: Observed {
-                base_sha: facts.base_sha.clone(),
-                head_sha: facts.head_sha.clone(),
-                changed_files: facts.changed_files,
-                insertions: facts.insertions,
-                deletions: facts.deletions,
-                untracked: untracked_files(Path::new(&snapshot.worktree), &facts.base_sha),
-                tool_calls: self.tool_calls(&packet.run_id),
-            },
+            observed: observe(
+                &adapter,
+                Path::new(&snapshot.worktree),
+                &snapshot.base_sha,
+                &facts,
+                self.tool_calls(&packet.run_id),
+            ),
             witnessed: Witnessed { checks: witnessed },
             // Dock never writes this column. A person's decision arrives through `decide`, which
             // is a different call with a different author, and a receipt Dock wrote must show
@@ -3799,19 +3797,21 @@ fn bound_worktree(snapshot: &RuntimeSnapshot) -> Result<&Path, String> {
 ///
 /// The declaration is read from `repository_root`, never from the run's own worktree. An agent
 /// may write any file in the worktree it was given, `.dock/checks.toml` included, so a
-/// declaration read from there would let the agent author the command Dock spawns on its behalf.
-/// The repository root is the checkout the person reviewing the work is sitting in, and no Dock
-/// run is ever bound to it.
+/// declaration read from there would be one the agent could author. The exact claim this makes is
+/// narrow: **Dock never reads a declaration from the path it handed the agent.** It is not that
+/// an agent cannot reach the declaration at all — Dock does not confine the agent's process to
+/// its worktree, so one that walks out of it could still write the repository root's copy. What
+/// this closes is the path that needed no walking out.
 fn witness_checks(
     names: &[String],
     repository_root: &Path,
     worktree: Result<&Path, String>,
-    facts: &dock_git::GitFacts,
     run_id: &str,
 ) -> Vec<CheckRun> {
-    // A check Dock declined to run, pinned at the commit and dirtiness it declined at. The pins
-    // are the tree the receipt reports rather than blank, so `check_stale` — which asks only
-    // whether a check's after-pin is the head — cannot read "never ran" as "ran somewhere else".
+    // A check Dock declined to run. Every field that would describe a run is left empty, the SHA
+    // pins included: Dock pinned no tree because it looked at none, and `check_stale` and
+    // `check_mutated_worktree` both skip a check with no after-pin rather than reading the
+    // absence of an answer as one.
     let declined = |name: &str, reason: String| CheckRun {
         name: name.to_owned(),
         // Empty, and load-bearing: a command is copied here only by the runner, from the
@@ -3820,13 +3820,24 @@ fn witness_checks(
         outcome: CheckOutcome::Unwitnessed,
         exit_code: None,
         duration_ms: 0,
-        sha_before: facts.head_sha.clone(),
-        sha_after: facts.head_sha.clone(),
-        dirty_before: facts.status_entries > 0,
-        dirty_after: facts.status_entries > 0,
+        sha_before: String::new(),
+        sha_after: String::new(),
+        dirty_before: false,
+        dirty_after: false,
         tail: String::new(),
         reason: Some(reason),
     };
+    // Deduped, first-seen order kept. Containment holds without this — the argv is still the
+    // repository's, whatever the agent asks for — but the *number* of executions would not be:
+    // one legitimately declared check named sixty-four times is sixty-four spawns, which at the
+    // ten-minute default timeout is hours of a synchronous handoff call. Running a declared check
+    // twice witnesses nothing the first run did not, and the receipt reads better for it.
+    let mut seen = HashSet::new();
+    let names: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| seen.insert(*name))
+        .collect();
     let checks = match Checks::load(repository_root) {
         Ok(checks) => checks,
         // A declaration Dock cannot read is not a refused handoff. One entry carrying the parse
@@ -3883,28 +3894,54 @@ fn witness_checks(
     witnessed
 }
 
+/// The observed column, read *after* the checks have run.
+///
+/// After, and that is the whole point of the function existing. The head a receipt reports has to
+/// be the commit a reader will actually find when they go and look, and `check_stale` asks
+/// exactly one question of every check — is your after-pin that head? A head read before the
+/// checks answers it against a tree that Dock's own checks may since have moved, and words the
+/// finding backwards when one of them did: it would name the check that moved the tree instead of
+/// the green that no longer describes it.
+///
+/// `before_checks` stands in if the re-read fails. Its numbers are older, but a receipt with the
+/// numbers Dock measured a moment earlier is worth a great deal more than one with none.
+fn observe(
+    adapter: &GitAdapter,
+    worktree: &Path,
+    base_sha: &str,
+    before_checks: &dock_git::GitFacts,
+    tool_calls: Vec<ToolCall>,
+) -> Observed {
+    let facts = adapter
+        .facts(base_sha)
+        .unwrap_or_else(|_| before_checks.clone());
+    Observed {
+        base_sha: facts.base_sha,
+        head_sha: facts.head_sha,
+        changed_files: facts.changed_files,
+        insertions: facts.insertions,
+        deletions: facts.deletions,
+        untracked: untracked_files(adapter, worktree),
+        tool_calls,
+    }
+}
+
 /// The untracked paths in a run's worktree, each with the size Dock could read for it.
 ///
 /// `bytes` is `None` rather than `0` wherever the size could not be read — a race with an agent
 /// still writing the file, a permissions error, a symlink to nowhere. Zero reads as "small", and
 /// would silently exempt from `sensitive_new_file`'s size clause exactly the file whose size Dock
 /// could not determine.
-fn untracked_files(worktree: &Path, base_sha: &str) -> Vec<UntrackedFile> {
-    let Ok(review) = GitAdapter::new(worktree).review(base_sha) else {
-        // The same adapter answered `facts` a moment ago, so this is close to unreachable; an
-        // empty list is still the honest answer to "which untracked files did Dock see", because
-        // it saw none.
-        return Vec::new();
-    };
-    review
-        .files
+fn untracked_files(adapter: &GitAdapter, worktree: &Path) -> Vec<UntrackedFile> {
+    adapter
+        .untracked_paths()
+        .unwrap_or_default()
         .into_iter()
-        .filter(|file| file.untracked)
-        .map(|file| UntrackedFile {
-            bytes: fs::metadata(worktree.join(&file.path))
+        .map(|path| UntrackedFile {
+            bytes: fs::metadata(worktree.join(&path))
                 .ok()
                 .map(|metadata| metadata.len()),
-            path: file.path,
+            path,
         })
         .collect()
 }
@@ -10184,15 +10221,68 @@ mod tests {
             .collect();
         assert_eq!(names, ["test", "edit"]);
         assert_eq!(receipt.witnessed.checks[0].outcome, CheckOutcome::Passed);
+
+        // Which check is stale, and in which direction. `any(CheckStale)` would pass just as
+        // happily on a head read *before* the checks, where the finding lands on `edit` and reads
+        // "ran at `B`, but head is now `A`" — a sentence naming as head a commit that is not one.
+        // Naming the check and both SHAs is what makes this test able to tell the two apart.
+        let head_before = snapshot.base_sha.clone();
+        assert_ne!(
+            receipt.observed.head_sha, head_before,
+            "the observed column is read after the checks, so it sees the commit `edit` made"
+        );
+        let stale: Vec<&str> = receipt
+            .findings
+            .iter()
+            .filter(|finding| finding.rule == dock_model::receipt::Rule::CheckStale)
+            .map(|finding| finding.fact.as_str())
+            .collect();
+        assert_eq!(
+            stale,
+            [format!(
+                "check `test` ran at `{head_before}`, but head is now `{}`",
+                receipt.observed.head_sha
+            )]
+        );
+        // And `edit`, which did move the tree, is named by the rule about moving the tree.
+        let mutated: Vec<&str> = receipt
+            .findings
+            .iter()
+            .filter(|finding| finding.rule == dock_model::receipt::Rule::CheckMutatedWorktree)
+            .map(|finding| finding.fact.as_str())
+            .collect();
+        assert_eq!(mutated.len(), 1, "{mutated:?}");
         assert!(
-            receipt
-                .findings
-                .iter()
-                .any(|finding| finding.rule == dock_model::receipt::Rule::CheckStale),
-            "{:?}",
-            receipt.findings
+            mutated[0].starts_with("check `edit` mutated the worktree"),
+            "{mutated:?}"
         );
         assert_eq!(receipt.verdict, Verdict::Look);
+    }
+
+    /// An agent chooses the names, so without this it would choose the number of executions too:
+    /// `validate_concise_safe_packet` caps the list at 64, and 64 copies of one declared check is
+    /// 64 spawns of it. Containment is not the property at risk — the argv is the repository's
+    /// either way — the cost of the handoff is.
+    #[test]
+    fn a_check_named_twice_is_run_once() {
+        let repo = Repo::new("handoff-receipt-repeated");
+        declare_checks(&repo, "[check.test]\nrun = [\"true\"]\n");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let snapshot = registry.dispatch(repo.request("dock_receipt_8")).unwrap();
+        touch_worktree_file(&repo, "note.txt", "work happened here\n");
+        let mut packet = packet(&snapshot);
+        packet.checks = vec!["test".into(), "test".into(), "test".into()];
+
+        registry.submit_handoff(packet).expect("submit handoff");
+
+        let receipt = LocalStore::new(&repo.state)
+            .load_receipt("dock_receipt_8")
+            .expect("a handoff leaves a receipt");
+        // What the agent asked for is kept verbatim in its own column; what Dock ran is not.
+        assert_eq!(receipt.claimed.checks, ["test", "test", "test"]);
+        assert_eq!(receipt.witnessed.checks.len(), 1);
+        assert_eq!(receipt.witnessed.checks[0].outcome, CheckOutcome::Passed);
+        assert_eq!(receipt.verdict, Verdict::Clear, "{:?}", receipt.findings);
     }
 
     /// The containment claim, asserted rather than described: a name nobody declared is recorded

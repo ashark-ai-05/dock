@@ -8,12 +8,9 @@
 #![deny(clippy::disallowed_methods)]
 pub mod cli;
 
-pub use dock_daemon::{client, discovery, dispatch, hook, server};
+pub use dock_daemon::{client, dispatch, hook, server};
 pub use dock_detect as detect;
 pub use dock_git as git;
-pub use dock_git::files;
-pub use dock_model::{
-    adapter, board, board_config, board_watch, layout, model, paths, protocol, queue, storage,
-};
-pub use dock_pty::{clipboard, runtime, terminal};
-pub use dock_ui::{attention, copy, dashboard, keymap, picker, theme, verdict};
+pub use dock_model::{adapter, board, board_watch, layout, model, paths, protocol, queue, storage};
+pub use dock_pty::terminal;
+pub use dock_ui::dashboard;

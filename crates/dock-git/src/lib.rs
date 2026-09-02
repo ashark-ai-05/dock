@@ -1,3 +1,8 @@
+//! Git, read-mostly: SHA, diffstat, dirty state and worktrees, plus `files`, which lists a
+//! directory for the file picker by asking `git` rather than by walking the tree.
+//!
+//! One function mutates. `ensure_worktree` runs `git worktree add`, which is the only
+//! repository mutation Dock performs anywhere. Everything else here reads.
 // Spawns `git` and `delta`, both with argv fixed at compile time. Dock wrote every argument.
 #![allow(clippy::disallowed_methods)]
 

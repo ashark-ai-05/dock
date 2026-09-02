@@ -1,3 +1,8 @@
+//! Which coding agent is in a pane, and whether it is working, blocked, done or idle.
+//!
+//! Detection is data: per-agent rules ship as manifests and are overridable per agent, so a
+//! wrong answer is a file a user can edit rather than a rebuild.
+
 pub(crate) mod heuristic;
 pub mod process;
 

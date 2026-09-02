@@ -3,9 +3,9 @@ name = "dock-git"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Read-only Git facts: SHA, diffstat, dirty state, worktrees. Never a mutation."
+description = "Git facts — SHA, diffstat, dirty state, worktrees — plus the file listing behind the picker, and `git worktree add`, which is the one repository mutation Dock is permitted."
 
 [dependencies]
 
 [dev-dependencies]
-dock-testing = { path = "../dock-testing" }
+dock-testing = { path = "../dock-testing", version = "0.1.0" }

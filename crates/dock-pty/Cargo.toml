@@ -10,8 +10,8 @@ base64 = "0.23"          # OSC 52 clipboard payloads
 crossterm = "0.29"
 nix = { version = "=0.29.0", features = ["process", "signal", "term"] }
 vt100 = "0.16"
-dock-detect = { path = "../dock-detect" }
-dock-model = { path = "../dock-model" }
+dock-detect = { path = "../dock-detect", version = "0.1.0" }
+dock-model = { path = "../dock-model", version = "0.1.0" }
 
 [dev-dependencies]
-dock-testing = { path = "../dock-testing" }
+dock-testing = { path = "../dock-testing", version = "0.1.0" }

@@ -1,0 +1,11 @@
+[package]
+name = "dock-git"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Read-only Git facts: SHA, diffstat, dirty state, worktrees. Never a mutation."
+
+[dependencies]
+
+[dev-dependencies]
+dock-testing = { path = "../dock-testing" }

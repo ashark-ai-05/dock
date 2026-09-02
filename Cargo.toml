@@ -37,6 +37,7 @@ serde_json = "1"
 tui-term = "0.3"
 vt100 = "0.16"
 dock-detect = { path = "crates/dock-detect" }
+dock-git = { path = "crates/dock-git" }
 dock-pty = { path = "crates/dock-pty" }
 
 [dev-dependencies]

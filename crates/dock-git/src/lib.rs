@@ -3,6 +3,8 @@ use std::{
     process::{Command, Stdio},
 };
 
+pub mod files;
+
 /// Where a task's worktree lives and which branch it is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {

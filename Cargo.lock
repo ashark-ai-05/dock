@@ -336,6 +336,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dock-git"
+version = "0.1.0"
+dependencies = [
+ "dock-testing",
+]
+
+[[package]]
 name = "dock-pty"
 version = "0.1.0"
 dependencies = [
@@ -358,6 +365,7 @@ dependencies = [
  "base64 0.23.1",
  "crossterm",
  "dock-detect",
+ "dock-git",
  "dock-pty",
  "dock-testing",
  "nix",

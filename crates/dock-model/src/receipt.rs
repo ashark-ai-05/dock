@@ -35,10 +35,22 @@ pub struct Observed {
     pub changed_files: usize,
     pub insertions: usize,
     pub deletions: usize,
-    /// Paths, not contents. `sensitive_new_file` reads these names and nothing else.
-    pub untracked: Vec<String>,
+    /// Paths and sizes, not contents. `sensitive_new_file` reads these and nothing else.
+    pub untracked: Vec<UntrackedFile>,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+}
+
+/// One untracked path, with the size Dock could read for it at record time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UntrackedFile {
+    pub path: String,
+    /// `None` when the size could not be read — a race with the agent, a permissions error, a
+    /// symlink to nowhere. Never `0`: zero reads as "small" and would silently exempt the file
+    /// from `sensitive_new_file`'s size clause for exactly the file whose size Dock could not
+    /// determine.
+    pub bytes: Option<u64>,
 }
 
 /// One tool call a hook reported, with the time it happened.
@@ -241,7 +253,10 @@ pub(crate) fn fixture() -> Receipt {
             changed_files: 2,
             insertions: 40,
             deletions: 3,
-            untracked: vec![".env.local".into()],
+            untracked: vec![UntrackedFile {
+                path: ".env.local".into(),
+                bytes: Some(42),
+            }],
             tool_calls: vec![ToolCall {
                 at_unix_ms: 1_764_000_000_000,
                 tool: "Bash".into(),

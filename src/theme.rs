@@ -129,6 +129,27 @@ impl Default for Theme {
     }
 }
 
+/// Dock's typographic vocabulary.
+///
+/// The palette rule at the top of this file — no colour outside this module — exists so a
+/// reader can learn one visual language. Marks are the same kind of claim: one glyph per
+/// meaning, declared once, so a render function reaches for a constant rather than typing
+/// whichever close-box character came to mind.
+pub mod glyph {
+    /// Close or dismiss. Not `✘`, not `✗`: both read as "failed", and Dock now spends `✗`
+    /// on a verdict where failure is exactly what it means.
+    pub const CLOSE: &str = "×";
+    /// The selected row, in every list Dock draws.
+    pub const CURSOR: &str = "›";
+    /// One character, not three dots.
+    pub const ELLIPSIS: &str = "…";
+    /// U+2212 MINUS SIGN. Same advance width as `+` in a monospace face, so a diff stat
+    /// column stays a column.
+    pub const MINUS: &str = "\u{2212}";
+    /// The mark in `d·ock`, and the separator between every pair of facts in a title.
+    pub const SEPARATOR: &str = " · ";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +342,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The typographic vocabulary, asserted the way the palette is.
+    ///
+    /// Not decoration: `×`, `✘` and `✗` all currently mean "close" in different render
+    /// functions, and the same three diff numbers are set with U+2212 in one overlay and an
+    /// ASCII hyphen in another. A reader cannot learn a mark that is spelled three ways.
+    #[test]
+    fn the_glyph_vocabulary_has_one_spelling_per_mark() {
+        use super::glyph;
+        assert_eq!(glyph::CLOSE, "×");
+        assert_eq!(glyph::CURSOR, "›");
+        assert_eq!(glyph::ELLIPSIS, "…");
+        assert_eq!(glyph::SEPARATOR, " · ");
+        // U+2212 MINUS SIGN, not U+002D HYPHEN-MINUS: it is the same width as `+` in every
+        // monospace face worth using, so `+120 −33` lines up in a column and `+120 -33`
+        // does not.
+        assert_eq!(glyph::MINUS, "\u{2212}");
     }
 }

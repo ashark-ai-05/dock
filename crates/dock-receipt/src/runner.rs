@@ -79,6 +79,13 @@ pub fn run(check: &Check, worktree: &Path, permitted_env: &[String], run_id: &st
         return unwitnessed(format!("check `{}` declares no command", check.name), None);
     }
 
+    // Before the pin, not after it. A lane can park for as long as four other checks take, and
+    // a pin taken on the far side of that wait describes a worktree the check never ran against
+    // — `check_stale` and `check_mutated_worktree` are decided from these two SHAs, so a queued
+    // check would report a mutation that happened minutes before it was spawned. Holding a lane
+    // across one `git rev-parse` costs about 13ms against a ten-minute default timeout.
+    let _lane = Lane::acquire();
+
     // A worktree whose facts cannot be read is unwitnessed with that error as the reason: a
     // check with no SHA witnesses nothing, however cleanly it exits.
     let adapter = dock_git::GitAdapter::new(worktree);
@@ -86,11 +93,6 @@ pub fn run(check: &Check, worktree: &Path, permitted_env: &[String], run_id: &st
         Ok(facts) => facts,
         Err(error) => return unwitnessed(error, None),
     };
-
-    // Held across spawn and wait so that eight simultaneous handoffs cannot fork-bomb the
-    // machine. One check at a time *per run* falls out of the caller running a run's checks in
-    // sequence; this bounds the checks of unrelated runs against each other.
-    let _lane = Lane::acquire();
 
     let started = Instant::now();
     let Watched {
@@ -318,7 +320,7 @@ fn drain(mut stream: impl Read, tail: &Mutex<Tail>) {
         for &byte in &buffer[..count] {
             if byte == b'\n' {
                 push(tail, std::mem::take(&mut line));
-            } else if line.len() < TAIL_BYTES {
+            } else if line.len() + 1 < TAIL_BYTES {
                 line.push(byte);
             }
         }
@@ -346,7 +348,19 @@ struct Tail {
 }
 
 impl Tail {
-    fn push(&mut self, line: String) {
+    fn push(&mut self, mut line: String) {
+        // `drain` caps what it accumulates, but the lossy conversion between there and here can
+        // still expand a line — every invalid byte becomes a three-byte U+FFFD — so the cap is
+        // re-applied to the string that is actually stored. Without it the arithmetic below is
+        // asked to free more than the whole deque holds, and a single enormous line erases every
+        // line before it: an empty tail on exactly the noisy failure a reader needs to see.
+        let mut limit = TAIL_BYTES - 1;
+        if line.len() > limit {
+            while !line.is_char_boundary(limit) {
+                limit -= 1;
+            }
+            line.truncate(limit);
+        }
         // The newline this line will be rendered with is counted here, so the byte budget is
         // never an underestimate of what `render` produces.
         self.bytes += line.len() + 1;
@@ -525,13 +539,20 @@ mod tests {
 
     /// A check that outlives its timeout is unwitnessed, and its whole process group is gone —
     /// not just the process Dock spawned.
+    ///
+    /// The descendant proves its own death, because the outcome alone cannot. A runner that
+    /// signalled the process instead of the group would still record `Unwitnessed` promptly:
+    /// `sh` dies, `wait()` returns, and the backgrounded child is merely orphaned and runs on.
+    /// So the orphan is given a job — sleep, then touch a file in the worktree — and the test
+    /// waits well past the moment it would have finished to assert the file never appeared.
     #[test]
     fn a_check_that_overruns_is_killed_by_the_group_and_recorded_unwitnessed() {
         let repo = fixture_repo("runner-timeout");
+        let survivor = repo.join("survivor");
         let outcome = run(
             &check(
                 "slow",
-                &["sh", "-c", "sleep 30 & sleep 30"],
+                &["sh", "-c", r#"sh -c "sleep 3; touch survivor" & sleep 30"#],
                 Duration::from_millis(300),
             ),
             &repo,
@@ -549,26 +570,45 @@ mod tests {
             outcome.duration_ms < 10_000,
             "the kill did not happen promptly"
         );
+        // Comfortably past the orphan's three seconds, so a machine under load cannot make this
+        // pass by being slow. The wait is only ever spent on the passing path.
+        let deadline = Instant::now() + dock_testing::budget(9);
+        while Instant::now() < deadline {
+            assert!(
+                !survivor.exists(),
+                "a descendant outlived the timeout and kept working: the group was not retired"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// A check may not see a credential-shaped variable it was not permitted. This extends the
     /// allowlist test that moved to `dock-model` in step 1 to the process that actually runs.
+    ///
+    /// The unpermitted variable is one cargo already put in this process rather than one the
+    /// test sets, because `set_var` here would be a live data race: the other tests in this
+    /// binary walk `environ` inside `apply_check_environment` on parallel harness threads, which
+    /// is exactly the pattern Rust 2024 made `unsafe` for. The filter is by name and does not
+    /// care that this particular value is not literally a token, so the property under test is
+    /// identical — a variable outside the allowlist does not reach the child.
     #[test]
     fn a_check_cannot_see_a_credential_the_user_did_not_permit() {
         let repo = fixture_repo("runner-env");
-        unsafe { std::env::set_var("NPM_TOKEN", "super-secret") };
+        // Without this the assertion below could pass by the variable simply being absent,
+        // which would prove nothing about the filter.
+        let unpermitted = std::env::var("CARGO_PKG_NAME").expect("cargo sets this for its tests");
+        assert!(!unpermitted.is_empty());
         let outcome = run(
             &check(
                 "env",
-                &["sh", "-c", "echo [$NPM_TOKEN][$PATH]"],
+                &["sh", "-c", "echo [$CARGO_PKG_NAME][$PATH]"],
                 Duration::from_secs(5),
             ),
             &repo,
             &[],
             "run_1",
         );
-        unsafe { std::env::remove_var("NPM_TOKEN") };
-        assert!(!outcome.tail.contains("super-secret"), "{:?}", outcome.tail);
+        assert!(!outcome.tail.contains(&unpermitted), "{:?}", outcome.tail);
         assert!(
             outcome.tail.contains("[]["),
             "PATH must survive: {:?}",

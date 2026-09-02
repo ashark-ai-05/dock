@@ -318,9 +318,37 @@ additions:
 
 | Token | Rationale |
 |---|---|
-| `border_pane` | Structure, not a hint. `border` is right for a tab separator and wrong for the only line telling a person where one terminal ends and the next begins. Floor: ≥ 2:1 against `surface`, enforced by test. |
 | `age: [Color; 5]` | The board's staleness ramp, descending toward `muted`. A stale card is not urgent, it is forgotten. Today it goes red and collides with `blocked` on the one surface a stranger screenshots. |
 | `passed` | The verdict's green. `look` reuses `working` and `failed` reuses `blocked`; only "witnessed green" is a meaning the palette lacks. |
+
+**No `border_pane` token.** An earlier draft of this spec proposed one, on the strength of
+the 2026-08-30 review measuring `cool.border` at 1.32:1 against `surface` — "not dim, gone".
+Commit `a99d44a` already fixed it: `cool.border` is now `Rgb(70,82,90)`, measuring **2.26:1**
+on `surface` and 2.04:1 on `panel`, and `warm.border` measures 2.25:1. Both clear the 2:1
+floor a structural line needs. Splitting the token would add a concept to buy a property the
+palette already has. What is missing is only a **test**, so it cannot silently regress again.
+
+### A shipped palette is currently broken
+
+`the_agent_states_stay_far_apart` requires every state colour to sit ≥ 60 RGB units from
+every other and from the accent — and it runs against `Theme::cool()` only. Measured against
+`Theme::warm()`:
+
+    warm.working (226,184,96)  vs  warm.accent (232,168,88)  =  18.9      FAILS
+
+This is not hypothetical drift. `theme.rs`'s own doc comment names it — *"in `warm` the
+accent and `working` are nearly the same colour"* — as the reason `cool` was written. `warm`
+was never fixed, and no test covers it, so Dock ships a theme in which "an agent is working"
+is indistinguishable from ordinary chrome.
+
+The fix separates by **value within the amber hue**, which is how `cool` solves the identical
+problem (its `working` sits 70.8 from its accent at the same hue):
+
+    warm.working := Rgb(168, 120, 56)
+      accent 86.2 · blocked 70.7 · done 129.6 · idle 74.6 · contrast 4.47:1 on both grounds
+
+Row 0 parameterises every palette test over every shipped theme, so the third and fourth
+palettes cannot ship broken the way the second did.
 
 ### Vocabulary
 
@@ -366,21 +394,24 @@ harness is `#[ignore]`d tests run deliberately, not `benches/` — there is no c
 dependency and none is wanted, because an ignored test can reach private render internals
 that an external bench target cannot.
 
-Two survive: `render_measurement` (`dashboard.rs:17581`) and `measure_board_load`
-(`board.rs:1288`). **The daemon-idle harness the audit also left is gone** — the tree now
-holds exactly two `#[ignore]`d tests and neither measures the daemon. That loss is why the
-2026-08-23 finding (a daemon spending a tenth of a core with nothing watching it) is not
-currently detectable, and restoring it is part of row 0.
+Fourteen exist and they are in good health, covering render (whole frame and a breakdown by
+the work it does), the daemon hot path, a subscriber whose client has gone, the queue tick
+over every run, classification of one pane screen, board load, copy-mode freeze, pane byte
+log, history seeding and paging, and press-and-drag. Run them with:
 
-Row 0 therefore extends the existing harness rather than replacing it:
+    cargo test --release --lib -- --ignored --nocapture measure_
+    cargo test --release --lib -- --ignored --nocapture render_measurement
 
-- `render_measurement` gains the Split Spine and receipt rail, and parameterises over 1, 4,
-  and 12 panes at 400×100.
-- `measure_board_load` stays as is.
-- A daemon measurement is restored: idle CPU over a fixed window, and streaming p99 with
-  one busy pane.
-- A new `measure_check_runner`: spawn-to-result overhead for a trivial check, so the cost
-  Dock adds is separable from the cost of the check itself.
+Row 0 therefore adds nothing to the harness. It only extends it where this work creates new
+cost:
+
+- `render_measurement_of_a_busy_dashboard_at_three_terminal_sizes` gains the Split Spine and
+  receipt rail once row 3 lands, so the spine's cost is separable from the canvas's.
+- A new `measure_what_running_a_declared_check_costs` lands with row 2: spawn-to-result
+  overhead for a trivial check, so the cost Dock adds is separable from the cost of the
+  check itself.
+
+Both are written in the row that creates the surface they measure, not ahead of it.
 
 Measurements are reported as the **fastest of several rounds, never the mean** — this
 machine's mean swings around 40% between identical runs under load, which has already
@@ -449,7 +480,7 @@ Each row ships and is usable before the next starts.
 
 | | Ships | Why here |
 |---|---|---|
-| 0 | Measurement harness extended and daemon measurement restored; contrast test parameterised over all palettes | Nothing can be honestly called fast or legible until these exist |
+| 0 | Palette tests parameterised over every shipped theme; `warm.working` fixed; `border` floor enforced; vocabulary consts | A shipped palette is currently broken and no test catches it |
 | 1 | Workspace split; `dashboard.rs` dissolved into `dock-ui` | Prerequisite for 2–5. No user-visible change; all 843 tests stay green |
 | 2 | `dock-receipt`: `checks.toml`, runner, receipt store, nine rules, verdict | The product |
 | 3 | Split Spine and receipt rail; overlay tiers; scrim; `border_pane`; `age` ramp | The product becomes visible |

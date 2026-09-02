@@ -236,7 +236,13 @@ Note that `border_focused` has been removed from the legibility list. It is a st
 Run: `cargo test --lib theme::tests::every_token_is_legible_on_both_surfaces theme::tests::the_selection_band_clears_both_of_its_floors`
 Expected: PASS immediately. `warm` clears every floor: lowest is `idle` on `panel` at 3.86:1, and its selection band measures 3.01:1 / 4.64:1.
 
-This is a guard, not a fix, so a green run is the correct outcome. To prove the guard actually bites, temporarily change `warm`'s `muted` to `Color::Rgb(60, 58, 56)`, re-run, and confirm it reports `warm: muted on panel is only 1.55:1`. Revert that edit before continuing.
+This is a guard, not a fix, so a green run is the correct outcome. To prove the guard actually bites, temporarily change `warm`'s `muted` to `Color::Rgb(60, 58, 56)`, re-run, and confirm it reports:
+
+```
+warm: muted on surface is only 1.65:1
+```
+
+Note which ground is named. The inner loop asserts against `surface` before `panel`, and `assert!` stops at the first failure, so `surface` (1.65:1) fires even though `panel` is the worse of the two at 1.53:1. Revert that edit before continuing.
 
 - [ ] **Step 3: Write minimal implementation**
 

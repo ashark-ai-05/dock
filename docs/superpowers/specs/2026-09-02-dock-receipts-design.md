@@ -325,8 +325,8 @@ additions:
 the 2026-08-30 review measuring `cool.border` at 1.32:1 against `surface` — "not dim, gone".
 Commit `a99d44a` already fixed it, and shipped a guard with it: `cool.border` is now
 `Rgb(70,82,90)`, measuring **2.26:1** on `surface` and 2.04:1 on `panel`; `warm.border`
-measures 2.25:1 and 2.09:1. Both clear the 2:1 floor a structural line needs, and
-`unfocused_borders_clear_two_to_one_on_both_surfaces` already holds them there.
+measures 2.25:1 and 2.09:1. Both clear the 2:1 floor a structural line needs, and a guard
+shipped in that commit already held them there.
 
 So a new token would buy a property the palette has, and a new test would restate a
 guarantee that exists. What is actually missing is narrower: the existing guard covers
@@ -353,8 +353,13 @@ problem (its `working` sits 70.8 from its accent at the same hue):
     warm.working := Rgb(168, 120, 56)
       accent 86.2 · blocked 70.7 · done 173.8 · idle 83.5 · 4.82:1 on surface, 4.47:1 on panel
 
-Row 0 parameterises every palette test over every shipped theme, so the third and fourth
-palettes cannot ship broken the way the second did.
+Row 0 parameterises every palette test over every shipped theme via a single `Theme::all()`
+enumerator, so the third and fourth palettes cannot ship broken the way the second did. That
+means *every* palette test, not the four that stated the contrast and separation floors: a
+first pass converted those four and left three others — distinctness of state colours, of the
+selection background, and of the focused against the unfocused border — still naming their
+palettes by hand, one of them checking `warm` alone. An enumerator that three tests bypass is
+not a seam, it is a convention. All seven loop it.
 
 ### Vocabulary
 

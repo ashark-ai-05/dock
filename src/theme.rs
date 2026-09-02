@@ -79,6 +79,16 @@ impl Theme {
         }
     }
 
+    /// Every palette Dock ships, paired with its name.
+    ///
+    /// The palette assertions below loop over this rather than naming a theme, because the
+    /// alternative already failed once: `the_agent_states_stay_far_apart` was written
+    /// against `cool` alone, and `warm` shipped for weeks with `working` 18.9 units from
+    /// `accent` against a floor of 60.
+    pub const fn all() -> [(&'static str, Self); 2] {
+        [("warm", Self::warm()), ("cool", Self::cool())]
+    }
+
     /// `DOCK_THEME=warm` keeps the old palette. Not read through `Default`, for the reason
     /// `DOCK_SIDEBAR` is not read through it either: `Default for Theme` backs
     /// `Dashboard::default()`, which every test in this file builds a dashboard from, and a
@@ -244,6 +254,15 @@ mod tests {
         let theme = Theme::cool();
         assert!(contrast(theme.selection, theme.surface) >= 3.0);
         assert!(contrast(theme.text, theme.selection) >= 4.5);
+    }
+
+    /// Every palette Dock ships has to be reachable from one place, or a test that means
+    /// "this rule holds" quietly degrades into "this rule holds for the palette somebody
+    /// remembered to name".
+    #[test]
+    fn every_shipped_palette_is_enumerated() {
+        let names: Vec<&str> = Theme::all().iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, vec!["warm", "cool"]);
     }
 
     /// The four agent states must stay far enough apart to be told apart at a glance.

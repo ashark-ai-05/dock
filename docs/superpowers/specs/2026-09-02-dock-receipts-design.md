@@ -360,13 +360,31 @@ palettes before adding a third**, or the third ships broken.
 
 ### Speed, measured
 
-There is no `benches/`, no `[[bench]]`, and no criterion dependency; the 1.438 ms figure in
-the existing design docs was measured by hand. The standing rule is to measure before and
-after every feature against a 60 fps budget, and that rule currently has no instrument.
+The standing rule is to measure before and after every feature against a 16.7 ms budget,
+using the harness the 2026-08-23 audit left rather than writing a new one each time. That
+harness is `#[ignore]`d tests run deliberately, not `benches/` — there is no criterion
+dependency and none is wanted, because an ignored test can reach private render internals
+that an external bench target cannot.
 
-The first commit of this work is therefore `benches/`: full frame at 400×100 with 1, 4, and
-12 panes; spine build; receipt rail; board; `vt` parse throughput. Plus scripted startup
-time and daemon idle CPU.
+Two survive: `render_measurement` (`dashboard.rs:17581`) and `measure_board_load`
+(`board.rs:1288`). **The daemon-idle harness the audit also left is gone** — the tree now
+holds exactly two `#[ignore]`d tests and neither measures the daemon. That loss is why the
+2026-08-23 finding (a daemon spending a tenth of a core with nothing watching it) is not
+currently detectable, and restoring it is part of row 0.
+
+Row 0 therefore extends the existing harness rather than replacing it:
+
+- `render_measurement` gains the Split Spine and receipt rail, and parameterises over 1, 4,
+  and 12 panes at 400×100.
+- `measure_board_load` stays as is.
+- A daemon measurement is restored: idle CPU over a fixed window, and streaming p99 with
+  one busy pane.
+- A new `measure_check_runner`: spawn-to-result overhead for a trivial check, so the cost
+  Dock adds is separable from the cost of the check itself.
+
+Measurements are reported as the **fastest of several rounds, never the mean** — this
+machine's mean swings around 40% between identical runs under load, which has already
+hidden a real 25% change once.
 
 **One question is reopened once that harness exists, and not before.** The event loop
 repaints unconditionally every 16 ms whether or not anything changed — roughly 8.6% of a
@@ -431,7 +449,7 @@ Each row ships and is usable before the next starts.
 
 | | Ships | Why here |
 |---|---|---|
-| 0 | `benches/`; contrast test parameterised over all palettes | Nothing can be honestly called fast or legible until these exist |
+| 0 | Measurement harness extended and daemon measurement restored; contrast test parameterised over all palettes | Nothing can be honestly called fast or legible until these exist |
 | 1 | Workspace split; `dashboard.rs` dissolved into `dock-ui` | Prerequisite for 2–5. No user-visible change; all 843 tests stay green |
 | 2 | `dock-receipt`: `checks.toml`, runner, receipt store, nine rules, verdict | The product |
 | 3 | Split Spine and receipt rail; overlay tiers; scrim; `border_pane`; `age` ramp | The product becomes visible |

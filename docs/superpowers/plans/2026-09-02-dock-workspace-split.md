@@ -20,6 +20,25 @@
 - **Use `git mv`, never copy-and-delete.** History has to follow these files; a copy makes `git log --follow` useless on a 19,000-line file.
 - **No behaviour changes.** No renamed public items, no changed signatures, no "while I'm here" fixes. If you find a bug, report it; do not fix it.
 - **`pub(crate)` becoming `pub` is expected, and is not a behaviour change.** An item marked `pub(crate)` is private to its crate, so the moment its callers are in a different crate it must widen to `pub` or the workspace does not compile. This is an inherent cost of splitting and it will recur in Tasks 4, 5 and 6. Widen it, and add a one-line comment at each site saying it is public because of the crate boundary rather than because the API grew on purpose. Do **not** work around it by moving the caller, duplicating the helper, or re-exporting through a shim — those are worse than an honest `pub`. Do report every widening in your task report so the reviewer can confirm each one was forced rather than convenient.
+- **A `sed` cannot rewrite a braced import, and the biggest files use them.** `use crate::{ adapter::{…}, board::{…}, detect::{…} }` does not contain the string `crate::adapter::`, so every `sed 's/crate::X::/dock_x::X::/'` in this plan silently skips it. These blocks must be split by hand, one `use` per destination crate. Task 4 did this correctly in `protocol.rs` — follow that shape:
+
+  ```rust
+  // before
+  use crate::{
+      adapter::{AdapterCapabilities, AdapterId},
+      detect::{AgentKind, AgentState},
+      layout::{LayoutSnapshot, PaneKind},
+  };
+
+  // after: siblings stay in crate::{}, everything else is lifted out by crate
+  use crate::{
+      adapter::{AdapterCapabilities, AdapterId},
+      layout::{LayoutSnapshot, PaneKind},
+  };
+  use dock_detect::{AgentKind, AgentState};
+  ```
+
+  Before running any `sed`, list the braced blocks you must split: `grep -n "use crate::{" <files>`. `dashboard.rs` has one spanning five destination crates; `dispatch.rs` and `server.rs` have their own. After the `sed`, `cargo build` is what proves you caught them all — a missed one is a compile error, not a silent bug, so build early.
 - **Doc-link counts in this plan are estimates.** Where a task says "five broken doc links", treat the number as a hint, not a specification: verify against the pre-task commit and fix what is actually broken. Reporting "the plan said five, I found two, here is the evidence" is the correct outcome; inventing three more edits to match a number is not.
 - Every crate is `edition = "2024"`, `version = "0.1.0"`, `license = "MIT"`, and inherits nothing it does not use.
 
@@ -565,7 +584,7 @@ dock-testing = { path = "../dock-testing" }
 cd crates/dock-ui/src
 sed -i '' -e 's/crate::detect::/dock_detect::/g' \
           -e 's/crate::git::/dock_git::/g' \
-          -e 's/crate::\(board\|board_config\|board_watch\|model\|paths\|protocol\|queue\|storage\)::/dock_model::\1::/g' \
+          -e 's/crate::\(adapter\|board\|board_config\|board_watch\|layout\|model\|paths\|protocol\|queue\|storage\)::/dock_model::\1::/g' \
           -e 's/crate::\(terminal\|clipboard\)::/dock_pty::\1::/g' \
           -e 's/crate::files::/dock_git::files::/g' \
           *.rs

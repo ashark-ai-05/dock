@@ -153,7 +153,10 @@ git mv src/detect/mod.rs crates/dock-detect/src/lib.rs
 git mv src/detect/heuristic.rs src/detect/manifest.rs src/detect/process.rs crates/dock-detect/src/
 rmdir src/detect
 git mv src/terminal crates/dock-pty/src/terminal
+git mv src/clipboard.rs crates/dock-pty/src/clipboard.rs
 ```
+
+`clipboard.rs` comes here, not to `dock-ui`. It writes OSC 52 escape sequences to the terminal's file descriptor and spawns `pbcopy` / `wl-copy` / `xclip` — terminal and OS integration, not drawing. Putting it in `dock-ui` would make that crate a process-spawner and break Task 7's lint.
 
 Create `crates/dock-pty/src/lib.rs`:
 
@@ -161,6 +164,7 @@ Create `crates/dock-pty/src/lib.rs`:
 //! Real PTYs: the terminal emulator, key encoding, and the process groups Dock owns.
 //!
 //! `runtime` joins this crate in Task 4, once `dock-model` exists for its one board call.
+pub mod clipboard;
 pub mod terminal;
 ```
 
@@ -200,6 +204,7 @@ license = "MIT"
 description = "Dock's PTYs: vt100 emulation, key encoding, and owned process groups."
 
 [dependencies]
+base64 = "0.23"          # OSC 52 clipboard payloads
 crossterm = "0.29"
 nix = { version = "=0.29.0", features = ["process", "signal", "term"] }
 vt100 = "0.16"
@@ -226,7 +231,7 @@ In `src/lib.rs`, replace `pub mod detect;` and `pub mod terminal;` with:
 // The extracted crates keep their old paths so every `crate::detect::…` and
 // `crate::terminal::…` call site in this crate resolves unchanged.
 pub use dock_detect as detect;
-pub use dock_pty::terminal;
+pub use dock_pty::{clipboard, terminal};
 ```
 
 - [ ] **Step 4: Fix paths inside the moved code**
@@ -297,7 +302,12 @@ The smallest and most isolated extraction: `git.rs` imports nothing from the cra
 ```bash
 mkdir -p crates/dock-git/src
 git mv src/git.rs crates/dock-git/src/lib.rs
+git mv src/files.rs crates/dock-git/src/files.rs
 ```
+
+Add `pub mod files;` to the top of `crates/dock-git/src/lib.rs`.
+
+`files.rs` comes here, not to `dock-ui`. Its own doc comment says it lists "the files under a directory, for the file picker" — and it does that by running `git -C <root> ls-files`. It is a Git query wearing a picker's name. In `dock-ui` it would make that crate a process-spawner and break Task 7's lint.
 
 - [ ] **Step 2: Manifest**
 
@@ -315,12 +325,17 @@ description = "Read-only Git facts: SHA, diffstat, dirty state, worktrees. Never
 dock-testing = { path = "../dock-testing" }
 ```
 
-Note the empty `[dependencies]`: this crate is std-only. It spawns `git` and `delta`, both with argv fixed at compile time.
+Note the empty `[dependencies]`: this crate is std-only, `files.rs` included. It spawns `git` and `delta`, both with argv fixed at compile time.
 
 - [ ] **Step 3: Shim**
 
 Root `Cargo.toml`: `dock-git = { path = "crates/dock-git" }`.
-`src/lib.rs`: replace `pub mod git;` with `pub use dock_git as git;`.
+`src/lib.rs`: replace `pub mod git;` and `pub mod files;` with:
+
+```rust
+pub use dock_git as git;
+pub use dock_git::files;
+```
 
 - [ ] **Step 4: Verify**
 
@@ -483,7 +498,9 @@ Everything that draws. `dashboard.rs` moves **whole and untouched** — see Glob
 
 **Files:**
 - Create: `crates/dock-ui/Cargo.toml`, `crates/dock-ui/src/lib.rs`
-- Move into `crates/dock-ui/src/`: `theme.rs`, `verdict.rs`, `dashboard.rs`, `copy.rs`, `picker.rs`, `keymap.rs`, `clipboard.rs`, `attention.rs`, `files.rs`
+- Move into `crates/dock-ui/src/`: `theme.rs`, `verdict.rs`, `dashboard.rs`, `copy.rs`, `picker.rs`, `keymap.rs`, `attention.rs`
+
+`clipboard.rs` and `files.rs` are NOT here — they moved to `dock-pty` (Task 2) and `dock-git` (Task 3) respectively, because both spawn processes and `dock-ui` must not.
 - Modify: `src/lib.rs`, root `Cargo.toml`
 
 **Interfaces:**
@@ -495,7 +512,7 @@ Everything that draws. `dashboard.rs` moves **whole and untouched** — see Glob
 ```bash
 mkdir -p crates/dock-ui/src
 git mv src/theme.rs src/verdict.rs src/dashboard.rs src/copy.rs src/picker.rs \
-       src/keymap.rs src/clipboard.rs src/attention.rs src/files.rs \
+       src/keymap.rs src/attention.rs \
        crates/dock-ui/src/
 ```
 
@@ -503,11 +520,10 @@ Create `crates/dock-ui/src/lib.rs`:
 
 ```rust
 //! Everything Dock draws: the palette, the widgets, and the dashboard.
+//! Nothing here spawns a process; Task 7 makes that a build failure rather than a promise.
 pub mod attention;
-pub mod clipboard;
 pub mod copy;
 pub mod dashboard;
-pub mod files;
 pub mod keymap;
 pub mod picker;
 pub mod theme;
@@ -532,12 +548,13 @@ tui-term = "0.3"
 dock-detect = { path = "../dock-detect" }
 dock-git = { path = "../dock-git" }
 dock-model = { path = "../dock-model" }
+dock-pty = { path = "../dock-pty" }
 
 [dev-dependencies]
 dock-testing = { path = "../dock-testing" }
 ```
 
-`dock-ui` deliberately does not depend on `dock-pty`: it renders a terminal's contents from data, and `dashboard.rs`'s `tui_term` usage takes a screen, not a PTY. If the build proves otherwise, add it and say so in your report rather than working around it.
+`dock-ui` depends on `dock-pty` for exactly two reasons, both in `dashboard.rs`: it renders a pane's screen, and it yanks to the clipboard. It does not spawn anything itself, which is what Task 7 enforces.
 
 - [ ] **Step 3: Fix outward paths**
 
@@ -546,12 +563,11 @@ cd crates/dock-ui/src
 sed -i '' -e 's/crate::detect::/dock_detect::/g' \
           -e 's/crate::git::/dock_git::/g' \
           -e 's/crate::\(board\|board_config\|board_watch\|model\|paths\|protocol\|queue\|storage\)::/dock_model::\1::/g' \
-          -e 's/crate::terminal::/dock_pty::terminal::/g' \
+          -e 's/crate::\(terminal\|clipboard\)::/dock_pty::\1::/g' \
+          -e 's/crate::files::/dock_git::files::/g' \
           *.rs
 cd -
 ```
-
-If that last substitution fires, `dock-ui` does need `dock-pty` after all — add it to the manifest and note it in your report.
 
 - [ ] **Step 4: Shim**
 
@@ -559,7 +575,7 @@ Root `Cargo.toml`: `dock-ui = { path = "crates/dock-ui" }`.
 `src/lib.rs`: replace the nine `pub mod` lines with:
 
 ```rust
-pub use dock_ui::{attention, clipboard, copy, dashboard, files, keymap, picker, theme, verdict};
+pub use dock_ui::{attention, copy, dashboard, keymap, picker, theme, verdict};
 ```
 
 - [ ] **Step 5: Verify**
@@ -678,8 +694,9 @@ pub use dock_daemon::{adapter, client, discovery, dispatch, hook, layout, server
 pub use dock_detect as detect;
 pub use dock_git as git;
 pub use dock_model::{board, board_config, board_watch, model, paths, protocol, queue, storage};
-pub use dock_pty::{runtime, terminal};
-pub use dock_ui::{attention, clipboard, copy, dashboard, files, keymap, picker, theme, verdict};
+pub use dock_git::files;
+pub use dock_pty::{clipboard, runtime, terminal};
+pub use dock_ui::{attention, copy, dashboard, keymap, picker, theme, verdict};
 ```
 
 - [ ] **Step 5: Verify, including the install story**

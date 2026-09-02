@@ -442,11 +442,13 @@ how the new safety claim becomes checkable.
 ```
 dock-testing   budget/deadline helpers. dev-dependency only, depended on by nothing at runtime
 dock-detect    manifests, heuristics, state classification, AgentKind, AgentState
-dock-git       read-only git facts: SHA, diffstat, dirty, worktrees
+dock-git       read-only git facts: SHA, diffstat, dirty, worktrees, and the file listing
+               behind the picker, which is a `git ls-files` query wearing a picker's name
 dock-model     protocol, queue, storage, model, board, board_config, Receipt, Finding, Verdict
-dock-pty       terminal, vt, keys, runtime: PTY spawn and process groups
+dock-pty       terminal, vt, keys, runtime: PTY spawn and process groups; clipboard, whose
+               OSC 52 writes and pbcopy/wl-copy/xclip helpers are terminal integration
 dock-receipt   checks: the only crate that runs argv it did not author
-dock-ui        theme, verdict glyphs, widgets, dashboard, the Split Spine
+dock-ui        theme, verdict glyphs, widgets, dashboard, the Split Spine. Spawns nothing
 dock-daemon    dispatch, server, client, layout, adapter — the daemon and its protocol handling
 dock / dockd   binaries
 ```
@@ -460,7 +462,7 @@ dock-git       depends on nothing
 dock-model  →  dock-detect
 dock-pty    →  dock-detect, dock-model
 dock-receipt →  dock-model, dock-git
-dock-ui     →  dock-model, dock-detect, dock-git
+dock-ui     →  dock-model, dock-detect, dock-git, dock-pty
 dock-daemon →  all of the above
 ```
 
@@ -512,7 +514,14 @@ it exactly rather than as "only one crate spawns anything", which is false:
 | `dock-receipt` | declared checks | **the repository or the user**, read from `checks.toml` |
 
 So the enforceable rule is: **`dock-receipt` is the only crate that executes argv Dock did
-not write**, and `dock-model`, `dock-ui` and `dock-testing` may not spawn at all. Both halves are lints —
+not write**, and `dock-model`, `dock-ui` and `dock-testing` may not spawn at all.
+
+That second half is not free. `dock-ui` as first scoped would have held `clipboard.rs`,
+which spawns `pbcopy`, and `files.rs`, which runs `git ls-files` — so the lint would have
+failed on the crate it exists to protect. Both belong elsewhere on their own merits:
+clipboard is terminal integration and goes to `dock-pty`, and a file listing produced by
+`git` is a Git query and goes to `dock-git`. A rule that forces a better decomposition is
+doing its job; one that has to be weakened to fit the code was the wrong rule. Both halves are lints —
 a `disallowed-methods` entry on `std::process::Command::new` in `dock-model` and `dock-ui`,
 and a review-gated allowlist comment required at each construction site in the other four.
 The safety claim then fails the build rather than a code review, which is what makes it

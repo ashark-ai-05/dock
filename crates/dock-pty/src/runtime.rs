@@ -20,10 +20,10 @@ use nix::{
 
 #[cfg(test)]
 use crate::terminal::PANE_HISTORY_BYTES;
-use crate::{
+use crate::terminal::{PaneOutput, PaneScreen};
+use dock_model::{
     adapter::{AdapterCapabilities, AdapterId, ProcessCapabilities, ResolvedAdapter},
     protocol::{BindingKind, ProcessState, ProviderState, RuntimeSnapshot},
-    terminal::{PaneOutput, PaneScreen},
 };
 
 #[derive(Debug, Clone)]
@@ -67,15 +67,17 @@ pub struct RunPulse {
     pub state: ProcessState,
     pub process_group_id: Option<i32>,
     /// Filled in by the registry, which owns the process table and the classification cache.
-    pub agent: Option<crate::detect::AgentKind>,
-    pub agent_state: crate::detect::AgentState,
+    pub agent: Option<dock_detect::AgentKind>,
+    pub agent_state: dock_detect::AgentState,
     pub activity: Option<String>,
 }
 
 pub struct OwnedRuntime {
-    #[cfg(test)]
     /// Lengthened by tests that need a reap to stay parked while they check something else.
-    pub(crate) stop_escalation: Mutex<Option<Duration>>,
+    // No longer `#[cfg(test)]`: public because of the crate boundary. src/dispatch.rs's tests
+    // (root crate) reach into this field directly, and `cfg(test)` does not propagate across a
+    // crate dependency edge the way it did when dispatch.rs and this type were one crate.
+    pub stop_escalation: Mutex<Option<Duration>>,
     binding: RunBinding,
     command: Vec<String>,
     adapter: AdapterId,
@@ -194,7 +196,6 @@ impl OwnedRuntime {
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
                     }) {
                     Ok(reaper) => Self {
-                        #[cfg(test)]
                         stop_escalation: Mutex::new(None),
                         binding,
                         command,
@@ -216,7 +217,6 @@ impl OwnedRuntime {
                         launch_error: None,
                     },
                     Err(error) => Self {
-                        #[cfg(test)]
                         stop_escalation: Mutex::new(None),
                         binding,
                         command,
@@ -242,7 +242,6 @@ impl OwnedRuntime {
                 }
             }
             Err(error) => Self {
-                #[cfg(test)]
                 stop_escalation: Mutex::new(None),
                 binding,
                 command,
@@ -324,7 +323,7 @@ impl OwnedRuntime {
                 .as_ref()
                 .map(|group| group.0.as_raw()),
             agent: None,
-            agent_state: crate::detect::AgentState::Idle,
+            agent_state: dock_detect::AgentState::Idle,
             activity: None,
         }
     }
@@ -389,7 +388,7 @@ impl OwnedRuntime {
             // Agent identity needs the process table, which only the registry reads; it fills
             // these in over this snapshot.
             agent: None,
-            agent_state: crate::detect::AgentState::Idle,
+            agent_state: dock_detect::AgentState::Idle,
             title,
             cwd,
             diagnostic: self.launch_error.clone().or(runtime_diagnostic),
@@ -725,7 +724,7 @@ fn dock_environment(binding: &RunBinding) -> Vec<(String, String)> {
         binding.repository_root.to_str().unwrap_or(""),
         binding.worktree.to_str().unwrap_or(""),
     ];
-    let board = crate::board::resolve_tasks_dir(&candidates);
+    let board = dock_model::board::resolve_tasks_dir(&candidates);
     if let Some(board) = board {
         variables.push(("DOCK_BOARD".to_owned(), board.display().to_string()));
     }

@@ -167,7 +167,10 @@ struct DurablePane {
 pub struct LayoutRegistry {
     path: PathBuf,
     workspaces: BTreeMap<String, WorkspaceLayout>,
-    #[cfg(test)]
+    // No longer `#[cfg(test)]`: public because of the crate boundary. src/dispatch.rs's tests
+    // (root crate) inject a persistence failure through `inject_persistence_failure`, and
+    // `cfg(test)` does not propagate across a crate dependency edge the way it did when
+    // dispatch.rs and this type were modules of the same crate.
     fail_persistence: bool,
 }
 
@@ -255,7 +258,6 @@ impl LayoutRegistry {
                 return Ok(Self {
                     path,
                     workspaces: BTreeMap::new(),
-                    #[cfg(test)]
                     fail_persistence: false,
                 });
             }
@@ -270,7 +272,6 @@ impl LayoutRegistry {
                     (id, w.into_runtime())
                 })
                 .collect(),
-            #[cfg(test)]
             fail_persistence: false,
         })
     }
@@ -278,13 +279,14 @@ impl LayoutRegistry {
         Self {
             path,
             workspaces: BTreeMap::new(),
-            #[cfg(test)]
             fail_persistence: false,
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn inject_persistence_failure(&mut self, fail: bool) {
+    /// Public because of the crate boundary: src/dispatch.rs's tests (root crate) use this to
+    /// simulate a persistence failure. Was `#[cfg(test)] pub(crate)` before the split; `cfg(test)`
+    /// does not cross a crate dependency edge, so the gate had to go along with the visibility.
+    pub fn inject_persistence_failure(&mut self, fail: bool) {
         self.fail_persistence = fail;
     }
     pub fn snapshot(&self) -> LayoutSnapshot {
@@ -729,7 +731,6 @@ impl LayoutRegistry {
         Ok(())
     }
     fn persist(&self, workspaces: &BTreeMap<String, WorkspaceLayout>) -> Result<(), String> {
-        #[cfg(test)]
         if self.fail_persistence {
             return Err("injected layout persistence failure".into());
         }

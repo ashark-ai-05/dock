@@ -1508,7 +1508,16 @@ mod tests {
     #[test]
     fn this_repositorys_own_board_parses() {
         // The format is not hypothetical: Dock's own tasks are the fixture.
-        let tasks = load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("kanban/tasks"));
+        //
+        // `CARGO_MANIFEST_DIR` is this crate's own manifest directory
+        // (`crates/dock-model`), not the workspace root, now that `board` lives in a
+        // workspace crate rather than the root crate — hence the `../..`.
+        let tasks = load(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../kanban/tasks")
+                .canonicalize()
+                .expect("workspace root's kanban/tasks must exist"),
+        );
         assert!(!tasks.is_empty(), "Dock's own kanban/tasks must parse");
         assert!(tasks.iter().all(|task| task.id > 0));
         assert!(tasks.iter().all(|task| !task.title.is_empty()));

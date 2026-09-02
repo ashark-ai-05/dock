@@ -1,0 +1,17 @@
+[package]
+name = "dock-model"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Dock's durable shapes: wire protocol, board, prompt queue, and on-disk state."
+
+[dependencies]
+base64 = "0.23"
+nix = { version = "=0.29.0" }
+notify = "6.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dock-detect = { path = "../dock-detect" }
+
+[dev-dependencies]
+dock-testing = { path = "../dock-testing" }

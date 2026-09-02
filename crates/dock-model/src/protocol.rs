@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     adapter::{AdapterCapabilities, AdapterId, AdapterSelection, ProcessCapabilities},
-    detect::{AgentKind, AgentState},
     layout::{LayoutSnapshot, PaneKind, SplitAxis, WorkspaceLayout},
     model::{HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
 };
+use dock_detect::{AgentKind, AgentState};
 
 pub const PROTOCOL_VERSION: u16 = 17;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;

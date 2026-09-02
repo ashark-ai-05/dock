@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::detect::{AgentKind, AgentState};
+use dock_detect::{AgentKind, AgentState};
 
 /// How long a pane must sit continuously non-`Working` before a queued prompt is fed.
 ///

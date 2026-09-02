@@ -440,14 +440,65 @@ A Cargo workspace, split along seams the code already has. The split is not tidi
 how the new safety claim becomes checkable.
 
 ```
-dock-model     protocol, board, storage, Receipt, Finding, Verdict, checks.toml
+dock-testing   budget/deadline helpers. dev-dependency only, depended on by nothing at runtime
+dock-detect    manifests, heuristics, state classification, AgentKind, AgentState
 dock-git       read-only git facts: SHA, diffstat, dirty, worktrees
-dock-pty       terminal, vt, keys, PTY spawn and process groups
-dock-detect    manifests, heuristics, state classification
+dock-model     protocol, queue, storage, model, board, board_config, Receipt, Finding, Verdict
+dock-pty       terminal, vt, keys, runtime: PTY spawn and process groups
 dock-receipt   checks: the only crate that runs argv it did not author
-dock-ui        theme, widgets, the Split Spine
+dock-ui        theme, verdict glyphs, widgets, dashboard, the Split Spine
+dock-daemon    dispatch, server, client, layout, adapter — the daemon and its protocol handling
 dock / dockd   binaries
 ```
+
+Dependency order, every edge verified against the real imports rather than assumed:
+
+```
+dock-testing   (dev-dependency of everything; depends on nothing)
+dock-detect    depends on nothing at runtime
+dock-git       depends on nothing
+dock-model  →  dock-detect
+dock-pty    →  dock-detect, dock-model
+dock-receipt →  dock-model, dock-git
+dock-ui     →  dock-model, dock-detect, dock-git
+dock-daemon →  all of the above
+```
+
+### Three facts about the existing module graph that constrain the split
+
+Rust *modules* may reference each other in cycles; Rust *crates* may not. The current
+single crate contains two real cycles and one that only looks like one, and each dictates
+where a boundary can fall.
+
+- **`board` ↔ `board_config` is a genuine mutual dependency.** `board::STATUSES` is defined
+  as `board_config::KANBAN_MD_STATUSES`, and `board_config`'s default reads back through
+  `board::STATUSES`. Legal inside one crate, fatal across two, so both live in `dock-model`.
+- **`protocol` → `queue` is real** — the `From` impls converting `queue::AutoFeedTrust` to
+  its wire form. Also `dock-model`, so also fine.
+- **`detect` → `dispatch` is not a dependency at all.** It is a single rustdoc link in a
+  comment. There are five such `[crate::…]` links in the tree; each becomes a broken
+  intra-doc link the moment the modules are in different crates, and each must be repointed
+  or unlinked.
+- **`detect` → `terminal` appears only inside `#[cfg(test)]`.** Cargo forbids cycles between
+  normal dependencies but permits them through `[dev-dependencies]`, so this edge is legal
+  as a dev-dependency and does not force `detect` and `terminal` into one crate.
+
+### The prerequisite that must land before any module moves
+
+`src/testing.rs` exports three functions — `budget`, `budget_millis`, `deadline` — used in
+**42 places** across `runtime`, `dispatch`, `client` and `server`, which become four
+different crates. It is declared `#[cfg(test)] pub mod testing`, which makes it invisible
+outside its own crate. The first move that crosses a boundary breaks all 42 call sites at
+once.
+
+It therefore becomes `dock-testing`, a normal (not `cfg(test)`-gated) crate that every other
+crate takes as a `[dev-dependencies]` entry. This is the first task of the split and nothing
+else can start before it.
+
+One wart worth recording rather than fixing here: `runtime` calls `board::resolve_tasks_dir`,
+which is the only reason `dock-pty` depends on `dock-model` at all. Spawning a PTY should not
+require the task board. The edge is legal and the graph stays acyclic, so it is not a
+blocker — but if that one call moves to a lower crate later, `dock-pty` loses a dependency.
 
 Four crates spawn processes and the distinction between them is the safety claim, so state
 it exactly rather than as "only one crate spawns anything", which is false:
@@ -457,10 +508,11 @@ it exactly rather than as "only one crate spawns anything", which is false:
 | `dock-git` | `git`, `delta` | Dock, fixed at compile time |
 | `dock-detect` | `ps` | Dock, fixed at compile time |
 | `dock-pty` | `$SHELL`, agent executables | Dock, from a manifest field, into a PTY it owns |
+| `dock-daemon` | `git`, `ps` | Dock, fixed at compile time |
 | `dock-receipt` | declared checks | **the repository or the user**, read from `checks.toml` |
 
 So the enforceable rule is: **`dock-receipt` is the only crate that executes argv Dock did
-not write**, and `dock-model` and `dock-ui` may not spawn at all. Both halves are lints —
+not write**, and `dock-model`, `dock-ui` and `dock-testing` may not spawn at all. Both halves are lints —
 a `disallowed-methods` entry on `std::process::Command::new` in `dock-model` and `dock-ui`,
 and a review-gated allowlist comment required at each construction site in the other four.
 The safety claim then fails the build rather than a code review, which is what makes it

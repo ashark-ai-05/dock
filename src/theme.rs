@@ -227,39 +227,42 @@ mod tests {
         (square(ar, br) + square(ag, bg) + square(ab, bb)).sqrt()
     }
 
-    /// Every token has to clear 3:1 against both surfaces it can be painted on. `panel` sits
-    /// above `surface`, so a colour chosen only against the ground can go marginal on chrome.
+    /// Every token has to clear 3:1 against both surfaces it can be painted on, in every
+    /// palette. `panel` sits above `surface`, so a colour chosen only against the ground
+    /// can go marginal on chrome.
     #[test]
     fn every_token_is_legible_on_both_surfaces() {
-        let theme = Theme::cool();
-        for (name, colour) in [
-            ("text", theme.text),
-            ("muted", theme.muted),
-            ("accent", theme.accent),
-            ("blocked", theme.blocked),
-            ("working", theme.working),
-            ("done", theme.done),
-            ("idle", theme.idle),
-            // `border_focused`, named for what it is. Plain `border` is deliberately absent:
-            // it is a structural line rather than text and cannot clear 3:1 by design, so a
-            // label saying "border" over a value that is the focused one was the one entry
-            // here that could be read as covering a token nothing covers.
-            ("border_focused", theme.border_focused),
-        ] {
-            for (ground, surface) in [("surface", theme.surface), ("panel", theme.panel)] {
-                let ratio = contrast(colour, surface);
-                assert!(ratio >= 3.0, "{name} on {ground} is only {ratio:.2}:1");
+        for (theme_name, theme) in Theme::all() {
+            for (name, colour) in [
+                ("text", theme.text),
+                ("muted", theme.muted),
+                ("accent", theme.accent),
+                ("blocked", theme.blocked),
+                ("working", theme.working),
+                ("done", theme.done),
+                ("idle", theme.idle),
+            ] {
+                for (ground, surface) in [("surface", theme.surface), ("panel", theme.panel)] {
+                    let ratio = contrast(colour, surface);
+                    assert!(
+                        ratio >= 3.0,
+                        "{theme_name}: {name} on {ground} is only {ratio:.2}:1"
+                    );
+                }
             }
         }
     }
 
-    /// The selection band's two floors, which pull in opposite directions: brighter makes the
-    /// band visible as a band and dimmer keeps the text on it readable.
+    /// The selection band's two floors, which pull in opposite directions: brighter makes
+    /// the band visible as a band and dimmer keeps the text on it readable.
     #[test]
     fn the_selection_band_clears_both_of_its_floors() {
-        let theme = Theme::cool();
-        assert!(contrast(theme.selection, theme.surface) >= 3.0);
-        assert!(contrast(theme.text, theme.selection) >= 4.5);
+        for (theme_name, theme) in Theme::all() {
+            let band = contrast(theme.selection, theme.surface);
+            assert!(band >= 3.0, "{theme_name}: band on surface is {band:.2}:1");
+            let on_band = contrast(theme.text, theme.selection);
+            assert!(on_band >= 4.5, "{theme_name}: text on band is {on_band:.2}:1");
+        }
     }
 
     /// Every palette Dock ships has to be reachable from one place, or a test that means

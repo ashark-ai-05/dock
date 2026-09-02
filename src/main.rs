@@ -1,4 +1,5 @@
-// The binaries: spawn `dockd`, and `cargo` when rebuilding a sibling daemon in a dev tree.
+// The binaries: spawn `dockd`; `cargo` when rebuilding a sibling daemon in a dev tree; and
+// `git` to resolve a repository root and list its worktrees. Dock wrote every argument.
 #![allow(clippy::disallowed_methods)]
 
 use std::{

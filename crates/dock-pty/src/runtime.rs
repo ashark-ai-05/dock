@@ -23,6 +23,7 @@ use crate::terminal::PANE_HISTORY_BYTES;
 use crate::terminal::{PaneOutput, PaneScreen};
 use dock_model::{
     adapter::{AdapterCapabilities, AdapterId, ProcessCapabilities, ResolvedAdapter},
+    env::environment_is_allowed,
     protocol::{BindingKind, ProcessState, ProviderState, RuntimeSnapshot},
 };
 
@@ -942,18 +943,6 @@ fn apply_child_environment(
     process.env("TERM", PANE_TERM);
 }
 
-fn environment_is_allowed(key: &std::ffi::OsStr) -> bool {
-    let key = key.to_string_lossy();
-    matches!(
-        key.as_ref(),
-        // `TERM` is deliberately absent: `apply_child_environment` sets it to `PANE_TERM`,
-        // because it describes the emulator the child is connected to rather than the terminal
-        // Dock happens to be running inside. `COLORTERM` stays, because whether the *outer*
-        // terminal can display 24-bit colour is a fact about the host that only the host knows.
-        "COLORTERM" | "HOME" | "LANG" | "LOGNAME" | "PATH" | "SHELL" | "TMPDIR" | "USER"
-    ) || key.starts_with("LC_")
-}
-
 fn read_pty(mut master: File, output: Arc<Mutex<PaneOutput>>) {
     let mut buffer = [0_u8; 4096];
     while let Ok(count) = master.read(&mut buffer) {
@@ -1717,21 +1706,11 @@ mod tests {
         drop(runtime);
     }
 
+    /// The allowlist itself is tested where it now lives, in `dock_model::env`. What belongs
+    /// here is that a pane's child is actually launched under it: a policy nobody applies keeps
+    /// no secret out of anything.
     #[test]
     fn child_environment_allowlist_excludes_credential_shaped_ambient_values() {
-        for poisoned in [
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "AWS_SECRET_ACCESS_KEY",
-            "GITHUB_TOKEN",
-            "SSH_AUTH_SOCK",
-            "CODEX_API_KEY",
-        ] {
-            assert!(!environment_is_allowed(std::ffi::OsStr::new(poisoned)));
-        }
-        for safe in ["HOME", "LANG", "LC_ALL", "PATH", "TMPDIR"] {
-            assert!(environment_is_allowed(std::ffi::OsStr::new(safe)));
-        }
         let mut child = Command::new("env");
         apply_child_environment(
             &mut child,

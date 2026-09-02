@@ -19,6 +19,7 @@ pub mod adapter;
 pub mod board;
 pub mod board_config;
 pub mod board_watch;
+pub mod env;
 pub mod layout;
 pub mod model;
 pub mod paths;

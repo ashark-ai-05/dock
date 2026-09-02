@@ -42,7 +42,7 @@ impl Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detect::AgentState;
+    use dock_detect::AgentState;
     use std::collections::HashSet;
 
     /// Three verdicts, three shapes. Colour is not enough: roughly 8% of men have a

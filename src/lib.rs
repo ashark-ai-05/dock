@@ -1,8 +1,5 @@
-pub mod attention;
 pub mod cli;
 pub mod client;
-pub mod copy;
-pub mod dashboard;
 // The extracted crates keep their old paths so every `crate::detect::…` and
 // `crate::terminal::…` call site in this crate resolves unchanged.
 pub use dock_detect as detect;
@@ -12,7 +9,6 @@ pub mod dispatch;
 pub use dock_git as git;
 pub use dock_git::files;
 pub mod hook;
-pub mod keymap;
 // Re-exported individually rather than as one `dock_model` module, so that every existing
 // `crate::protocol::…` and `crate::board::…` path in this crate resolves unchanged.
 //
@@ -23,7 +19,5 @@ pub mod keymap;
 pub use dock_model::{
     adapter, board, board_config, board_watch, layout, model, paths, protocol, queue, storage,
 };
-pub mod picker;
+pub use dock_ui::{attention, copy, dashboard, keymap, picker, theme, verdict};
 pub mod server;
-pub mod theme;
-pub mod verdict;

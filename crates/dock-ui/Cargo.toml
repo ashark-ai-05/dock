@@ -1,0 +1,21 @@
+[package]
+name = "dock-ui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Dock's rendering: palette, widgets, dashboard. Draws; never spawns."
+
+[dependencies]
+base64 = "0.23"
+crossterm = "0.29"
+ratatui = "0.30"
+tui-term = "0.3"
+vt100 = "0.16"
+dock-detect = { path = "../dock-detect" }
+dock-git = { path = "../dock-git" }
+dock-model = { path = "../dock-model" }
+dock-pty = { path = "../dock-pty" }
+
+[dev-dependencies]
+serde_json = "1"
+dock-testing = { path = "../dock-testing" }

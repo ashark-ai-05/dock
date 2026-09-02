@@ -383,12 +383,30 @@ dependencies = [
  "dock-model",
  "dock-pty",
  "dock-testing",
+ "dock-ui",
  "nix",
  "notify",
  "pretty_assertions",
  "ratatui",
  "regex",
  "serde",
+ "serde_json",
+ "tui-term",
+ "vt100",
+]
+
+[[package]]
+name = "dock-ui"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "crossterm",
+ "dock-detect",
+ "dock-git",
+ "dock-model",
+ "dock-pty",
+ "dock-testing",
+ "ratatui",
  "serde_json",
  "tui-term",
  "vt100",

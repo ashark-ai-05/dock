@@ -1,6 +1,6 @@
 //! Ranked jump between agents that need a person.
 
-use crate::detect::AgentState;
+use dock_detect::AgentState;
 
 /// One live pane considered for [`rank_attention`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -18,31 +18,34 @@ use ratatui::{
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::{
-    adapter::{AdapterId, AdapterSelection},
     attention::{self, AttentionCandidate},
-    board::{BoardTask, BoardView},
-    clipboard::{self, ClipboardRoute},
     copy::{CopySession, find_matches},
-    detect::{AgentKind, AgentState},
-    files,
-    git::{GitFacts, GitFile, split_diff_files},
     keymap::{FocusDirection, KeyOutcome, Keymap, PaneCommand},
+    picker::{Picker, PickerItem},
+    theme::Theme,
+};
+use dock_detect::{AgentKind, AgentState};
+use dock_git::{GitFacts, GitFile, files, split_diff_files};
+use dock_model::{
+    adapter::{AdapterId, AdapterSelection},
+    board::{BoardTask, BoardView},
     layout::{
         LayoutNode, LayoutSnapshot, PaneKind, PaneLayout, PaneRuntime, SplitAxis, WorkspaceLayout,
     },
     model::{HandoffRecord, ReviewDecision, ReviewRoute},
-    picker::{Picker, PickerItem},
     protocol::{
         BindingKind, DashboardProfile, DecideRequest, DispatchRequest, Event,
         LaunchIntoPaneRequest, PROTOCOL_VERSION, PaneHistoryRequest, PaneQueueSnapshot,
         ProcessState, QueueRequest, Request, Response, RuntimeSnapshot, TerminalLaunchRequest,
         WorkspaceRequest,
     },
+};
+use dock_pty::{
+    clipboard::{self, ClipboardRoute},
     terminal::{
         KeyEncoding, MouseEncoding, PANE_HISTORY_BYTES, PaneScreen, PaneSnapshot, encode_mouse,
         encode_paste, row_text, text_between,
     },
-    theme::Theme,
 };
 
 /// How much older output one page-back asks for.
@@ -257,7 +260,7 @@ pub struct Dashboard {
     queues_paused: bool,
     /// The prompt-queue overlay, opened with Ctrl+B q.
     queue_open: bool,
-    auto_feed_trust: crate::protocol::AutoFeedTrustSetting,
+    auto_feed_trust: dock_model::protocol::AutoFeedTrustSetting,
     /// The board's one cursor: which column, and what in it.
     ///
     /// One grid means one cursor. There used to be two — a lane cursor keyed by pane and the
@@ -2944,7 +2947,7 @@ impl Dashboard {
         self.queues_paused = paused;
     }
 
-    pub fn set_queue_trust(&mut self, trust: crate::protocol::AutoFeedTrustSetting) {
+    pub fn set_queue_trust(&mut self, trust: dock_model::protocol::AutoFeedTrustSetting) {
         self.auto_feed_trust = trust;
     }
 
@@ -4035,11 +4038,11 @@ impl Dashboard {
             }
             KeyCode::Char('s') => {
                 let trust = match self.auto_feed_trust {
-                    crate::protocol::AutoFeedTrustSetting::Reported => {
-                        crate::protocol::AutoFeedTrustSetting::Screen
+                    dock_model::protocol::AutoFeedTrustSetting::Reported => {
+                        dock_model::protocol::AutoFeedTrustSetting::Screen
                     }
-                    crate::protocol::AutoFeedTrustSetting::Screen => {
-                        crate::protocol::AutoFeedTrustSetting::Reported
+                    dock_model::protocol::AutoFeedTrustSetting::Screen => {
+                        dock_model::protocol::AutoFeedTrustSetting::Reported
                     }
                 };
                 return UiCommand::Request(Box::new(Request::Queue(QueueRequest::SetTrust {
@@ -4076,8 +4079,8 @@ impl Dashboard {
                         "running"
                     },
                     match self.auto_feed_trust {
-                        crate::protocol::AutoFeedTrustSetting::Reported => "reported",
-                        crate::protocol::AutoFeedTrustSetting::Screen => "screen",
+                        dock_model::protocol::AutoFeedTrustSetting::Reported => "reported",
+                        dock_model::protocol::AutoFeedTrustSetting::Screen => "screen",
                     }
                 ),
                 muted,
@@ -4402,7 +4405,7 @@ impl Dashboard {
             self.error = Some("type a title first, then Enter adds it".into());
             return UiCommand::None;
         }
-        match crate::board::create(&directory, title) {
+        match dock_model::board::create(&directory, title) {
             Ok(task) => {
                 self.error = Some(format!("added task {}: {}", task.id, task.title));
                 // Re-read rather than pushing the new task onto the open list: the board is files
@@ -4460,13 +4463,13 @@ impl Dashboard {
     /// function calls unconditionally is exactly the discarding shape `set_board_tasks` had.
     pub fn set_board_pane_tasks(&mut self, tasks: Vec<BoardTask>, directory: std::path::PathBuf) {
         self.board_is_personal = true;
-        self.board_mtime = crate::board::directory_mtime(&directory);
-        self.board_mtime = crate::board::directory_mtime(&directory);
+        self.board_mtime = dock_model::board::directory_mtime(&directory);
+        self.board_mtime = dock_model::board::directory_mtime(&directory);
         let reveal = self.board_pane_view.as_ref().map(|view| view.revealing());
         // Read from the board rather than assumed. Its `config.yml` is what says which columns
         // exist, how many lines a card's title gets, and when a card is old enough to be
         // coloured for it — all of which Dock used to answer for itself, and answer differently.
-        let config = crate::board_config::load(&directory);
+        let config = dock_model::board_config::load(&directory);
         let mut view = BoardView::with_config(tasks.clone(), &config);
         if let Some(reveal) = reveal {
             view.set_reveal(reveal);
@@ -4494,7 +4497,7 @@ impl Dashboard {
         let Some(directory) = self.board_dir.as_ref() else {
             return false;
         };
-        crate::board::directory_mtime(directory) != self.board_mtime
+        dock_model::board::directory_mtime(directory) != self.board_mtime
     }
 
     pub fn board_pane_needs_load(&self) -> bool {
@@ -4507,7 +4510,7 @@ impl Dashboard {
     }
 
     /// Directories that may hold `kanban/tasks`: the catalog repo, the client cwd, then each
-    /// pane's reported cwd / worktree / repository. Order is preference; [`crate::board::resolve_tasks_dir`]
+    /// pane's reported cwd / worktree / repository. Order is preference; [`dock_model::board::resolve_tasks_dir`]
     /// still prefers a directory that actually exists.
     pub fn board_search_roots(&self) -> Vec<String> {
         let mut roots = Vec::new();
@@ -4533,7 +4536,7 @@ impl Dashboard {
     /// as `None` after the first attempt — that is the "reading the board…" hang.
     pub fn set_board_pane_empty(&mut self) {
         if self.board_pane_view.is_none() {
-            self.board_pane_view = Some(crate::board::BoardView::new(Vec::new()));
+            self.board_pane_view = Some(dock_model::board::BoardView::new(Vec::new()));
         }
     }
 
@@ -4544,9 +4547,9 @@ impl Dashboard {
     pub fn reload_board_from_disk(&mut self) {
         let roots = self.board_search_roots();
         let borrowed: Vec<&str> = roots.iter().map(String::as_str).collect();
-        match crate::board::resolve_tasks_dir(&borrowed) {
+        match dock_model::board::resolve_tasks_dir(&borrowed) {
             Some(directory) => {
-                let tasks = crate::board::load(&directory);
+                let tasks = dock_model::board::load(&directory);
                 if self.board_overlay_is_open() {
                     self.set_board_tasks(tasks, directory);
                 } else {
@@ -4708,7 +4711,7 @@ impl Dashboard {
         else {
             return UiCommand::None;
         };
-        match crate::board::set_status(&directory, id, &columns[next]) {
+        match dock_model::board::set_status(&directory, id, &columns[next]) {
             Ok(_) => {
                 // Re-read rather than editing the copy in hand: the board is files on disk and
                 // anything else may have written to it since it was opened. Routed through
@@ -4718,7 +4721,7 @@ impl Dashboard {
                 // pane (already going through `set_board_pane_tasks`) kept it, so the two
                 // surfaces disagreed about what `v` had done. One rebuild path both surfaces
                 // share cannot drift apart like that.
-                self.set_board_tasks(crate::board::load(&directory), directory);
+                self.set_board_tasks(dock_model::board::load(&directory), directory);
                 // Both views, because a Board pane may be on the canvas underneath this overlay
                 // and a card that moved in one and not the other is two answers to one question.
                 if let Some(view) = self.board_pane_view.as_mut() {
@@ -4770,7 +4773,7 @@ impl Dashboard {
         if already {
             return UiCommand::None;
         }
-        match crate::board::set_archived(&directory, task, archived) {
+        match dock_model::board::set_archived(&directory, task, archived) {
             Ok(_) => UiCommand::LoadBoard,
             Err(message) => {
                 self.error = Some(message);
@@ -4810,7 +4813,7 @@ impl Dashboard {
             self.error = Some("no board is open".into());
             return UiCommand::None;
         };
-        let Some(task) = crate::board::next_ready(&directory) else {
+        let Some(task) = dock_model::board::next_ready(&directory) else {
             self.error = Some("no ready task".into());
             return UiCommand::None;
         };
@@ -4875,13 +4878,13 @@ impl Dashboard {
             self.error = Some("no board is open".into());
             return UiCommand::None;
         };
-        if let Err(message) = crate::board::set_claimed_by(&directory, id, "dock") {
+        if let Err(message) = dock_model::board::set_claimed_by(&directory, id, "dock") {
             self.error = Some(message);
             return UiCommand::None;
         }
-        match crate::board::set_status(&directory, id, "in-progress") {
+        match dock_model::board::set_status(&directory, id, "in-progress") {
             Ok(_) => {
-                self.set_board_tasks(crate::board::load(&directory), directory.clone());
+                self.set_board_tasks(dock_model::board::load(&directory), directory.clone());
                 if let Some(column) = self.cursor_view().and_then(|view| {
                     view.statuses()
                         .iter()
@@ -4996,11 +4999,11 @@ impl Dashboard {
         let Some(directory) = self.board_dir.clone() else {
             return;
         };
-        let _ = crate::board::set_status(&directory, id, "done");
+        let _ = dock_model::board::set_status(&directory, id, "done");
         if self.board.is_some() {
-            self.set_board_tasks(crate::board::load(&directory), directory);
+            self.set_board_tasks(dock_model::board::load(&directory), directory);
         } else {
-            self.set_board_pane_tasks(crate::board::load(&directory), directory);
+            self.set_board_pane_tasks(dock_model::board::load(&directory), directory);
         }
     }
 
@@ -6175,14 +6178,14 @@ impl Dashboard {
             .get(self.last_launch_profile)
             .map(|(profile, _)| AdapterId::from(*profile))
             .filter(|adapter| *adapter != AdapterId::Fixture)
-            .filter(crate::adapter::builtin_available);
+            .filter(dock_model::adapter::builtin_available);
         chosen.or_else(|| {
             let installed = || {
                 PROFILES
                     .iter()
                     .map(|(profile, _)| AdapterId::from(*profile))
                     .filter(|adapter| *adapter != AdapterId::Fixture)
-                    .filter(crate::adapter::builtin_available)
+                    .filter(dock_model::adapter::builtin_available)
             };
             // An agent that can be handed the task beats one that cannot. Dispatch exists to put
             // an agent on a specific piece of work, and an agent with no prompt positional — amp
@@ -6353,7 +6356,7 @@ impl Dashboard {
         let run_id = self.next_unique_id("dock_ui");
         let profile = PROFILES[form.index].0;
         let id = AdapterId::from(profile);
-        if !crate::adapter::builtin_available(&id) {
+        if !dock_model::adapter::builtin_available(&id) {
             self.error = Some(format!(
                 "{} is unavailable: fixed executable not found",
                 PROFILES[form.index].1
@@ -6443,7 +6446,7 @@ impl Dashboard {
             })
             .collect();
         for (index, (profile, label)) in PROFILES.iter().enumerate() {
-            let available = crate::adapter::builtin_available(&AdapterId::from(*profile));
+            let available = dock_model::adapter::builtin_available(&AdapterId::from(*profile));
             let matches = profile_matches(index, &form.query);
             lines.push(Line::styled(
                 format!(
@@ -8402,7 +8405,10 @@ fn column_targets(view: &BoardView, live: &BoardLive<'_>, column: usize) -> Vec<
 ///
 /// `None` for a board that declares no rungs, or a card with no readable date — an undated card
 /// keeps the ordinary card colour rather than being coloured as though it were fresh.
-fn age_colour(rungs: &[crate::board_config::AgeThreshold], touched: Option<i64>) -> Option<Color> {
+fn age_colour(
+    rungs: &[dock_model::board_config::AgeThreshold],
+    touched: Option<i64>,
+) -> Option<Color> {
     let touched = touched?;
     if rungs.is_empty() {
         return None;
@@ -8489,7 +8495,7 @@ struct CardShape<'a> {
     /// How many rows a title may take, from `tui.title_lines`.
     title_lines: usize,
     /// The age rungs the board declares, oldest last.
-    rungs: &'a [crate::board_config::AgeThreshold],
+    rungs: &'a [dock_model::board_config::AgeThreshold],
     /// Cards waiting on something that has not finished, by id.
     ///
     /// Computed once per frame rather than per card: answering "is this one blocked" means
@@ -9187,12 +9193,12 @@ fn pane_count(panes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::PaneLayout;
-    use crate::{
+    use crossterm::event::KeyEventKind;
+    use dock_model::{
         adapter::{AdapterCapabilities, ProcessCapabilities},
+        layout::PaneLayout,
         protocol::{ProcessState, ProviderState},
     };
-    use crossterm::event::KeyEventKind;
     use ratatui::{Terminal, backend::TestBackend};
     use std::collections::BTreeMap;
 
@@ -9336,7 +9342,7 @@ mod tests {
     /// An attach frame with a chosen paging cursor and epoch, for the tests that care where a
     /// replica's own history starts and which byte stream it belongs to.
     fn attach_event_at(run_id: &str, bytes: &[u8], history_from: u64, epoch: u64) -> Event {
-        let mut source = crate::terminal::VtTerminal::new(PANE_ROWS, PANE_COLS, 0);
+        let mut source = dock_pty::terminal::VtTerminal::new(PANE_ROWS, PANE_COLS, 0);
         source.feed(bytes);
         Event::PaneAttached {
             run_id: run_id.into(),
@@ -9481,7 +9487,7 @@ mod tests {
 
     fn snapshot() -> RuntimeSnapshot {
         RuntimeSnapshot {
-            binding_kind: crate::protocol::BindingKind::Repository,
+            binding_kind: dock_model::protocol::BindingKind::Repository,
             repository_root: "/repo/real".into(),
             external_task_ref: "TASK-61".into(),
             run_id: "dock_real".into(),
@@ -9501,7 +9507,7 @@ mod tests {
             rows: 24,
             cols: 80,
             agent: None,
-            agent_state: crate::detect::AgentState::Idle,
+            agent_state: dock_detect::AgentState::Idle,
             title: None,
             cwd: None,
             diagnostic: None,
@@ -10769,7 +10775,7 @@ mod tests {
 
     fn handoff(run_id: &str, task_id: &str) -> HandoffRecord {
         HandoffRecord {
-            packet: crate::model::HandoffPacket {
+            packet: dock_model::model::HandoffPacket {
                 schema_version: 1,
                 run_id: run_id.into(),
                 task_id: task_id.into(),
@@ -10780,12 +10786,12 @@ mod tests {
                 base_sha: "abc".into(),
                 summary: "Retry added; one bounded decision remains.".into(),
                 question: Some("Accept V0.1 scope?".into()),
-                checks: vec![crate::model::Check {
+                checks: vec![dock_model::model::Check {
                     name: "cargo test".into(),
                     passed: true,
                 }],
             },
-            evidence: crate::model::HandoffEvidence {
+            evidence: dock_model::model::HandoffEvidence {
                 branch: "dock/fixture".into(),
                 base_sha: "abc".into(),
                 head_sha: "def".into(),
@@ -10926,8 +10932,8 @@ mod tests {
         /// `<workspace>` directory is removed on drop, not just its `tasks` subdirectory,
         /// because that whole directory is the unit `board::boards()` lists.
         fn new(id: &str) -> Self {
-            let tasks =
-                crate::board::workspace_tasks_dir(id).expect("HOME is set in the test environment");
+            let tasks = dock_model::board::workspace_tasks_dir(id)
+                .expect("HOME is set in the test environment");
             let root = tasks.parent().unwrap_or(&tasks).to_path_buf();
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&tasks).unwrap();
@@ -10975,7 +10981,7 @@ mod tests {
         let mut dashboard = dashboard_with_agents(&[AdapterId::Amp, AdapterId::ClaudeCode]);
         dashboard.set_board_tasks(
             vec![board_task(1, "do the thing", "backlog")],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         dashboard.board.as_mut().unwrap().writable = true;
         // The fixture sits first in the profile list and last_launch_profile starts at zero, so a
@@ -10993,7 +10999,7 @@ mod tests {
         assert_eq!(bare.dispatch_adapter(), None);
         bare.set_board_tasks(
             vec![board_task(1, "do the thing", "backlog")],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         bare.board.as_mut().unwrap().writable = true;
         assert!(
@@ -11019,10 +11025,10 @@ mod tests {
         // silently refused. `PersonalBoard` also cleans up on drop, unwind included.
         let personal = PersonalBoard::new(&format!("card-move-{}", std::process::id()));
         let dir = personal.tasks_dir();
-        crate::board::create(&dir, "wire the parser").expect("seed a task");
+        dock_model::board::create(&dir, "wire the parser").expect("seed a task");
 
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir.clone());
         assert_eq!(
             dashboard.board.as_ref().unwrap().view.status(),
             Some("backlog")
@@ -11031,7 +11037,7 @@ mod tests {
         // `>` is the one thing a board does that a list cannot do at all.
         dashboard.key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
         assert_eq!(
-            crate::board::load(&dir)[0].status,
+            dock_model::board::load(&dir)[0].status,
             "in-progress",
             "the file moved"
         );
@@ -11044,7 +11050,7 @@ mod tests {
         assert_eq!(board.view.selected().map(|task| task.id), Some(1));
 
         dashboard.key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
-        assert_eq!(crate::board::load(&dir)[0].status, "backlog");
+        assert_eq!(dock_model::board::load(&dir)[0].status, "backlog");
     }
 
     /// Selecting text with the pointer must not make the pane deaf.
@@ -11693,7 +11699,7 @@ mod tests {
     /// week. The board declares them, so they are the board's colours to choose, not Dock's.
     #[test]
     fn a_card_takes_the_colour_its_board_declares_for_its_age() {
-        use crate::board_config::AgeThreshold;
+        use dock_model::board_config::AgeThreshold;
         let rungs = [
             AgeThreshold {
                 after: 0,
@@ -12278,7 +12284,7 @@ mod tests {
                 board_task(1, "open work", "backlog"),
                 board_task(2, "finished toy", "done"),
             ],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         let hidden = render_to_string(&mut dashboard, 130, 32);
         assert!(!hidden.contains("finished toy"), "{hidden:?}");
@@ -12763,7 +12769,7 @@ mod tests {
             awaiting_ack: false,
             holding_because: None,
             entries: (1..=entries)
-                .map(|entry_id| crate::protocol::QueueEntrySnapshot {
+                .map(|entry_id| dock_model::protocol::QueueEntrySnapshot {
                     entry_id: entry_id as u64,
                     label: format!("task {entry_id}"),
                     preview: "rewrite the parser".into(),
@@ -12845,7 +12851,7 @@ mod tests {
         // sitting behind, and the daemon's own sentence is the only one that knows.
         let mut dashboard = board_pane_with_two_agents();
         let mut holding = pane_queue("a", 4, true);
-        holding.holding_because = Some(crate::queue::DISARMED_BY_RESTART.into());
+        holding.holding_because = Some(dock_model::queue::DISARMED_BY_RESTART.into());
         dashboard.set_queues(vec![holding], false);
         // Onto the entry that is stuck. The reason is seventy characters and a card is thirty,
         // so the pane's footer is where it fits whole — which is also where the cursor is about
@@ -12855,7 +12861,7 @@ mod tests {
 
         let frame = render_to_string(&mut dashboard, 400, 40);
         assert!(
-            frame.contains(crate::queue::DISARMED_BY_RESTART),
+            frame.contains(dock_model::queue::DISARMED_BY_RESTART),
             "the daemon's own words, not a house paraphrase: {frame:?}"
         );
 
@@ -12863,11 +12869,11 @@ mod tests {
         // uninteresting reason that there was nothing to feed, and printing that on every idle
         // row would bury the one row that is actually stuck.
         let mut empty = pane_queue("a", 0, true);
-        empty.holding_because = Some(crate::queue::DISARMED_BY_RESTART.into());
+        empty.holding_because = Some(dock_model::queue::DISARMED_BY_RESTART.into());
         dashboard.set_queues(vec![empty], false);
         let frame = render_to_string(&mut dashboard, 400, 40);
         assert!(
-            !frame.contains(crate::queue::DISARMED_BY_RESTART),
+            !frame.contains(dock_model::queue::DISARMED_BY_RESTART),
             "{frame:?}"
         );
     }
@@ -13109,12 +13115,12 @@ mod tests {
         ));
 
         dashboard.apply_queue_response(Response::Error {
-            code: crate::protocol::ErrorCode::QueueRefused,
-            message: crate::queue::ARM_WITHOUT_REPORTED_STATE.into(),
+            code: dock_model::protocol::ErrorCode::QueueRefused,
+            message: dock_model::queue::ARM_WITHOUT_REPORTED_STATE.into(),
         });
         let frame = render_to_string(&mut dashboard, 240, 40);
         assert!(
-            frame.contains(crate::queue::ARM_WITHOUT_REPORTED_STATE),
+            frame.contains(dock_model::queue::ARM_WITHOUT_REPORTED_STATE),
             "verbatim, not paraphrased and not truncated to a house message: {frame:?}"
         );
         assert!(
@@ -13313,7 +13319,7 @@ mod tests {
         .unwrap();
 
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir.clone());
         dashboard.board.as_mut().unwrap().writable = true;
 
         let frame = render_to_string(&mut dashboard, 130, 32);
@@ -13332,7 +13338,7 @@ mod tests {
         // a column only a card already in it could conjure: it could be put here by hand and
         // never taken out again.
         dashboard.key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
-        assert_eq!(crate::board::load(&dir)[0].status, "in-progress");
+        assert_eq!(dock_model::board::load(&dir)[0].status, "in-progress");
         assert_eq!(
             dashboard.board.as_ref().unwrap().view.status(),
             Some("in-progress"),
@@ -13353,14 +13359,14 @@ mod tests {
         )
         .unwrap();
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir.clone());
         dashboard.board.as_mut().unwrap().writable = true;
         dashboard.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
-        let claimed = crate::board::load(&dir);
+        let claimed = dock_model::board::load(&dir);
         assert_eq!(claimed[0].claimed_by.as_deref(), Some("dock"));
         assert_eq!(claimed[0].status, "in-progress");
         dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert!(crate::board::load(&dir)[0].archived);
+        assert!(dock_model::board::load(&dir)[0].archived);
         dashboard.key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
         assert!(dashboard.board.as_ref().unwrap().view.revealing());
         let _ = std::fs::remove_dir_all(&root);
@@ -13375,7 +13381,7 @@ mod tests {
                 board_task(12, "Dashboard real agent dispatch", "in-progress"),
                 board_task(13, "Write the docs", "backlog"),
             ],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         let frame = render_to_string(&mut dashboard, 130, 32);
         // The shape is the information: where work has piled up, what is in flight, what waits on
@@ -13425,11 +13431,11 @@ mod tests {
         // failing assertion below must not leave one sitting in it.
         let board = PersonalBoard::new(&format!("reveal-survives-{}", std::process::id()));
         let dir = board.tasks_dir();
-        crate::board::create(&dir, "finished work").expect("seed a task");
-        let id = crate::board::load(&dir)[0].id;
+        dock_model::board::create(&dir, "finished work").expect("seed a task");
+        let id = dock_model::board::load(&dir)[0].id;
 
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir.clone());
         render_to_string(&mut dashboard, 130, 32);
 
         // Not revealing, so `a` archives it.
@@ -13438,8 +13444,11 @@ mod tests {
             UiCommand::LoadBoard
         );
         // What the real event loop does with that command: read the board back off disk.
-        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
-        assert!(crate::board::load(&dir)[0].archived, "archived on disk");
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir.clone());
+        assert!(
+            dock_model::board::load(&dir)[0].archived,
+            "archived on disk"
+        );
         assert_eq!(
             dashboard
                 .board
@@ -13489,9 +13498,12 @@ mod tests {
             dashboard.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
             UiCommand::LoadBoard
         );
-        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir.clone());
 
-        assert!(!crate::board::load(&dir)[0].archived, "unarchived on disk");
+        assert!(
+            !dock_model::board::load(&dir)[0].archived,
+            "unarchived on disk"
+        );
         assert!(
             dashboard.board.as_ref().unwrap().view.revealing(),
             "the reload an archive action triggers must not silently re-hide what was revealed"
@@ -13508,15 +13520,15 @@ mod tests {
         // happened.
         let board = PersonalBoard::new(&format!("archive-noop-{}", std::process::id()));
         let dir = board.tasks_dir();
-        crate::board::create(&dir, "not yet finished").expect("seed a task");
-        let id = crate::board::load(&dir)[0].id;
-        crate::board::set_status(&dir, id, "done").expect("move it to done");
-        let file = crate::board::load(&dir)[0].file.clone();
+        dock_model::board::create(&dir, "not yet finished").expect("seed a task");
+        let id = dock_model::board::load(&dir)[0].id;
+        dock_model::board::set_status(&dir, id, "done").expect("move it to done");
+        let file = dock_model::board::load(&dir)[0].file.clone();
         let before = std::fs::read_to_string(&file).expect("the seeded file");
         assert!(!before.contains("archived:"), "no field yet: {before:?}");
 
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir.clone());
         render_to_string(&mut dashboard, 130, 32);
 
         // Reveal, then `a` on the one card there — not archived, so bringing it back is a
@@ -13547,13 +13559,13 @@ mod tests {
         // and the two surfaces disagreed about whether the board was revealing at all.
         let board = PersonalBoard::new(&format!("shift-keeps-reveal-{}", std::process::id()));
         let dir = board.tasks_dir();
-        crate::board::create(&dir, "already retired").expect("seed a task");
-        let id = crate::board::load(&dir)[0].id;
-        crate::board::set_status(&dir, id, "done").expect("move it to done");
-        crate::board::set_archived(&dir, id, true).expect("archive it");
+        dock_model::board::create(&dir, "already retired").expect("seed a task");
+        let id = dock_model::board::load(&dir)[0].id;
+        dock_model::board::set_status(&dir, id, "done").expect("move it to done");
+        dock_model::board::set_archived(&dir, id, true).expect("archive it");
 
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir.clone());
         render_to_string(&mut dashboard, 130, 32);
 
         // Reveal, then put the cursor directly on the one archived card reveal just made
@@ -13574,7 +13586,7 @@ mod tests {
         // `<` moves it back to `review` — a real move, not a saturated no-op at an edge column.
         dashboard.key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE));
         assert_eq!(
-            crate::board::load(&dir)[0].status,
+            dock_model::board::load(&dir)[0].status,
             "review",
             "the card actually moved"
         );
@@ -13604,23 +13616,23 @@ mod tests {
         // not genuinely personal would have the second move silently refused.
         let board = PersonalBoard::new(&format!("heading-{}", std::process::id()));
         let dir = board.tasks_dir();
-        crate::board::create(&dir, "wire the parser").expect("seed a task");
+        dock_model::board::create(&dir, "wire the parser").expect("seed a task");
 
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir.clone());
         let frame = render_to_string(&mut dashboard, 130, 32);
         assert!(frame.contains("ACTIVE"), "{frame:?}");
 
         // Backlog to in-progress, which is one column to the right of where it started — and
         // `ACTIVE` is the heading over `in-progress`, which is the point of this test.
         dashboard.key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
-        assert_eq!(crate::board::load(&dir)[0].status, "in-progress");
+        assert_eq!(dock_model::board::load(&dir)[0].status, "in-progress");
         assert_eq!(
             dashboard.board.as_ref().unwrap().view.status(),
             Some("in-progress"),
             "and the cursor followed the card into the column it is actually in"
         );
-        assert!(crate::board::STATUSES.contains(&"in-progress"));
+        assert!(dock_model::board::STATUSES.contains(&"in-progress"));
     }
 
     #[test]
@@ -13633,13 +13645,13 @@ mod tests {
         let dir = root.join("tasks");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&dir).unwrap();
-        crate::board::create(&dir, "wire the parser").expect("seed a task");
-        let id = crate::board::load(&dir)[0].id;
-        crate::board::set_status(&dir, id, "in-progress").expect("dispatch it");
+        dock_model::board::create(&dir, "wire the parser").expect("seed a task");
+        let id = dock_model::board::load(&dir)[0].id;
+        dock_model::board::set_status(&dir, id, "in-progress").expect("dispatch it");
 
         let mut dashboard = board_pane_with_two_agents();
         dashboard.runs[0].external_task_ref = id.to_string();
-        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir.clone());
         dashboard.board.as_mut().unwrap().writable = true;
         render_to_string(&mut dashboard, 400, 40);
 
@@ -13701,7 +13713,7 @@ mod tests {
         let mut dashboard = bound_dashboard();
         dashboard.set_board_tasks(
             Vec::new(),
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         // An empty board is the normal first state of every board, not an error.
         assert!(dashboard.board.is_some(), "an empty board still opens");
@@ -13808,14 +13820,14 @@ mod tests {
         dashboard.set_git_review(
             facts,
             vec![
-                crate::git::GitFile {
+                dock_git::GitFile {
                     path: "one.rs".into(),
                     untracked: false,
                     insertions: 1,
                     deletions: 0,
                     diff: "+one\n".into(),
                 },
-                crate::git::GitFile {
+                dock_git::GitFile {
                     path: "two.rs".into(),
                     untracked: true,
                     insertions: 0,
@@ -13840,14 +13852,14 @@ mod tests {
     fn ctrl_b_q_opens_the_queue_panel_with_holding_reason() {
         let mut dashboard = bound_dashboard();
         dashboard.set_queues(
-            vec![crate::protocol::PaneQueueSnapshot {
+            vec![dock_model::protocol::PaneQueueSnapshot {
                 workspace_id: "w".into(),
                 pane_id: "a".into(),
                 run_id: Some("run_1".into()),
                 auto_feed: true,
                 awaiting_ack: false,
                 holding_because: Some("the agent is still working".into()),
-                entries: vec![crate::protocol::QueueEntrySnapshot {
+                entries: vec![dock_model::protocol::QueueEntrySnapshot {
                     entry_id: 1,
                     label: "card 7".into(),
                     preview: "keep going".into(),
@@ -13976,7 +13988,7 @@ mod tests {
                 board_task(9, "later", "backlog"),
                 board_task(7, "this pane", "in-progress"),
             ],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         assert_eq!(dashboard.cursor_card(), Some(7));
     }
@@ -13992,7 +14004,7 @@ mod tests {
         dashboard.runs = vec![run];
         dashboard.set_board_tasks(
             vec![board_task(7, "this pane", "in-progress")],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         let asked = dashboard.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         let UiCommand::Request(request) = asked else {
@@ -14029,7 +14041,7 @@ mod tests {
             .run_id = Some("run_2".into());
         dashboard.set_board_tasks(
             vec![board_task(7, "this pane", "in-progress")],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         let asked = dashboard.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         let UiCommand::Request(request) = asked else {
@@ -14057,7 +14069,7 @@ mod tests {
         dashboard.runs = vec![run];
         dashboard.set_board_tasks(
             vec![board_task(7, "this pane", "in-progress")],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         let asked = dashboard.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         assert!(matches!(asked, UiCommand::None), "{asked:?}");
@@ -14076,7 +14088,7 @@ mod tests {
         let mut dashboard = dashboard_with_agents(&[AdapterId::ClaudeCode]);
         dashboard.set_board_tasks(
             vec![board_task(7, "fresh", "backlog")],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         dashboard.board.as_mut().unwrap().writable = true;
         let asked = dashboard.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
@@ -14095,7 +14107,7 @@ mod tests {
                 board_task(1, "first", "backlog"),
                 board_task(2, "second", "backlog"),
             ],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         dashboard.board.as_mut().unwrap().writable = true;
         assert!(dashboard.aim_at_card(2));
@@ -14111,10 +14123,10 @@ mod tests {
     fn enter_with_no_card_selected_dispatches_the_next_ready() {
         let personal = PersonalBoard::new(&format!("next-ready-{}", std::process::id()));
         let dir = personal.tasks_dir();
-        crate::board::create(&dir, "first").expect("seed");
-        crate::board::create(&dir, "second").expect("seed");
+        dock_model::board::create(&dir, "first").expect("seed");
+        dock_model::board::create(&dir, "second").expect("seed");
         let mut dashboard = dashboard_with_agents(&[AdapterId::ClaudeCode]);
-        dashboard.set_board_tasks(crate::board::load(&dir), dir);
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir);
         dashboard.board.as_mut().unwrap().writable = true;
         let review = dashboard
             .board
@@ -14140,7 +14152,7 @@ mod tests {
         let mut dashboard = dashboard_with_agents(&[AdapterId::Amp, AdapterId::ClaudeCode]);
         dashboard.set_board_tasks(
             vec![board_task(4, "unbound work", "backlog")],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         dashboard.board.as_mut().unwrap().writable = true;
         let UiCommand::DispatchTask(task) =
@@ -14654,7 +14666,7 @@ mod tests {
     #[test]
     fn attach_then_delta_events_reconstruct_the_pane_screen() {
         let mut dashboard = dashboard();
-        let mut source = crate::terminal::VtTerminal::new(24, 80, 0);
+        let mut source = dock_pty::terminal::VtTerminal::new(24, 80, 0);
         source.feed(b"first line\r\n");
         dashboard.apply_event(Event::PaneAttached {
             run_id: "run_1".into(),
@@ -14666,7 +14678,7 @@ mod tests {
             epoch: 1,
             screen: STANDARD.encode(source.state_bytes()),
         });
-        let mut sync = crate::terminal::ScreenSync::new(24, 80);
+        let mut sync = dock_pty::terminal::ScreenSync::new(24, 80);
         sync.apply(&source.state_bytes());
         source.feed(b"second line\r\n");
         let delta = sync.delta_from(&source);
@@ -14714,7 +14726,7 @@ mod tests {
             epoch: 1,
             screen: String::new(),
         });
-        let mut source = crate::terminal::VtTerminal::new(10, 40, 0);
+        let mut source = dock_pty::terminal::VtTerminal::new(10, 40, 0);
         source.feed(b"seed\r\n");
         dashboard.apply_event(Event::PaneAttached {
             run_id: "run_1".into(),
@@ -14805,15 +14817,15 @@ mod tests {
         let mut dashboard = dashboard();
         dashboard.apply_event(Event::AgentStateChanged {
             run_id: "run_1".into(),
-            agent: Some(crate::detect::AgentKind::Claude),
-            state: crate::detect::AgentState::Working,
+            agent: Some(dock_detect::AgentKind::Claude),
+            state: dock_detect::AgentState::Working,
             activity: None,
         });
         assert_eq!(
             dashboard.agents.get("run_1"),
             Some(&(
-                Some(crate::detect::AgentKind::Claude),
-                crate::detect::AgentState::Working
+                Some(dock_detect::AgentKind::Claude),
+                dock_detect::AgentState::Working
             ))
         );
 
@@ -16154,7 +16166,7 @@ mod tests {
         dashboard.set_review_inbox(vec![(handoff("dock_01J9", "DOCK-7"), None)]);
         dashboard.set_board_tasks(
             vec![board_task(1, "do the thing", "backlog")],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         dashboard.set_git(git_facts(), "diff --git a/x b/x".into());
         dashboard.queue_open = true;
@@ -17853,7 +17865,8 @@ mod tests {
                 .collect();
             let mut fastest = f64::MAX;
             for _ in 0..7 {
-                let mut screen = PaneScreen::new(40, 160, crate::terminal::PANE_HISTORY_MAX_ROWS);
+                let mut screen =
+                    PaneScreen::new(40, 160, dock_pty::terminal::PANE_HISTORY_MAX_ROWS);
                 let start = std::time::Instant::now();
                 screen.feed(&log);
                 fastest = fastest.min(start.elapsed().as_secs_f64() * 1000.0);
@@ -17888,7 +17901,11 @@ mod tests {
             // 2000 is the depth a replica held before pane history; 50,000 is the cap this
             // branch first shipped and then withdrew. Both are here so the row that matters —
             // the current constant, in the middle — is read against what it replaced.
-            for capacity in [2_000usize, crate::terminal::PANE_HISTORY_MAX_ROWS, 50_000] {
+            for capacity in [
+                2_000usize,
+                dock_pty::terminal::PANE_HISTORY_MAX_ROWS,
+                50_000,
+            ] {
                 let mut screen = PaneScreen::new(rows, cols, capacity);
                 // Enough lines to fill the scrollback to its capacity and then some, so the
                 // clone is of a full replica rather than of a half-empty one.
@@ -17960,7 +17977,8 @@ mod tests {
                     board_task(
                         id,
                         "a card with a title long enough to need ellipsising",
-                        crate::board::STATUSES[(id as usize) % crate::board::STATUSES.len()],
+                        dock_model::board::STATUSES
+                            [(id as usize) % dock_model::board::STATUSES.len()],
                     )
                 })
                 .collect(),
@@ -18521,14 +18539,14 @@ mod tests {
     fn archiving_from_a_cards_menu_archives_that_card_not_the_one_the_cursor_was_on() {
         let board = PersonalBoard::new(&format!("menu-archives-{}", std::process::id()));
         let dir = board.tasks_dir();
-        crate::board::create(&dir, "first finished thing").expect("seed a task");
-        crate::board::create(&dir, "second finished thing").expect("seed a task");
-        let ids: Vec<u64> = crate::board::load(&dir)
+        dock_model::board::create(&dir, "first finished thing").expect("seed a task");
+        dock_model::board::create(&dir, "second finished thing").expect("seed a task");
+        let ids: Vec<u64> = dock_model::board::load(&dir)
             .iter()
             .map(|task| task.id)
             .collect();
         let mut dashboard = bound_dashboard();
-        dashboard.set_board_tasks(crate::board::load(&dir), dir.clone());
+        dashboard.set_board_tasks(dock_model::board::load(&dir), dir.clone());
         render_terminal(&mut dashboard, 130, 32);
         // The premise: the cursor is on the first card, so archiving "the selected card" would
         // take that one. Without it the assertion below would pass for the wrong reason.
@@ -18565,7 +18583,7 @@ mod tests {
         dashboard.menu.as_mut().expect("the card menu").cursor = index;
         dashboard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        let on_disk = crate::board::load(&dir);
+        let on_disk = dock_model::board::load(&dir);
         let archived: Vec<u64> = on_disk
             .iter()
             .filter(|task| task.archived)
@@ -18893,7 +18911,7 @@ mod tests {
         pane.run_id = None;
         dashboard.set_board_pane_tasks(
             vec![board_task(7, "a card inside a pane", "backlog")],
-            crate::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
+            dock_model::board::workspace_tasks_dir("workspace_1").expect("a workspace board"),
         );
         let terminal = render_terminal(&mut dashboard, 130, 34);
         let area = dashboard.pane_areas["b"];

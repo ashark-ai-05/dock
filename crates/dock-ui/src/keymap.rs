@@ -1,9 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::{
-    layout::SplitAxis,
-    terminal::{KeyEncoding, encode_key},
-};
+use dock_model::layout::SplitAxis;
+use dock_pty::terminal::{KeyEncoding, encode_key};
 
 /// `Ctrl+B`, matching tmux so the binding is the least surprising available.
 const PREFIX: u8 = 0x02;

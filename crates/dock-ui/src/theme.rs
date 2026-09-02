@@ -1,6 +1,6 @@
 use ratatui::{style::Color, widgets::BorderType};
 
-use crate::detect::AgentState;
+use dock_detect::AgentState;
 
 /// Semantic tokens rather than raw colours, so P4 can load alternative palettes as data
 /// without touching any render code. No colour may be hardcoded outside this module.
@@ -154,7 +154,7 @@ pub mod glyph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detect::AgentState;
+    use dock_detect::AgentState;
 
     /// Parameterised over both palettes, not just `cool`, so `warm` cannot silently drift out
     /// of compliance while every test written for the new palette watches only `cool`.

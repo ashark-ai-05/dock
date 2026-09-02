@@ -9,6 +9,7 @@ use std::{
 use crate::{
     model::{HandoffPacket, HandoffRecord, ReviewDecision},
     protocol::{DurablePaneQueue, DurableProgrammeGate},
+    receipt::{RECEIPT_SCHEMA_VERSION, Receipt},
 };
 use serde::Serialize;
 
@@ -32,6 +33,10 @@ pub struct HandoffInbox {
     pub records: Vec<HandoffRecord>,
     pub skipped: Vec<(String, String)>,
 }
+
+/// Receipts that parsed, plus the `(run_id, reason)` of poison files that did not. A bare tuple
+/// return type trips `clippy::type_complexity`; naming it is the fix, not an exemption.
+type ReceiptListing = Result<(Vec<Receipt>, Vec<(String, String)>), String>;
 
 /// Where the queues live, and where a queue file that cannot be parsed goes instead.
 const QUEUES: &str = "queues";
@@ -121,6 +126,55 @@ impl LocalStore {
         records.sort_by(|a, b| a.packet.run_id.cmp(&b.packet.run_id));
         skipped.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(HandoffInbox { records, skipped })
+    }
+
+    /// `.dock/local/receipts/<run_id>.json`, 0600, written once.
+    ///
+    /// Append-only in the sense that matters: `atomic_save` hard-links onto the destination and
+    /// refuses an existing name, so a receipt cannot be rewritten after the fact by anything —
+    /// including Dock.
+    pub fn save_receipt(&self, receipt: &Receipt) -> Result<PathBuf, String> {
+        if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
+            return Err("unsupported receipt schema version".into());
+        }
+        self.atomic_save("receipts", &receipt.run_id, receipt, CreateKind::Receipt)
+    }
+
+    pub fn load_receipt(&self, run_id: &str) -> Result<Receipt, String> {
+        let receipt: Receipt = self.load("receipts", run_id)?;
+        if receipt.run_id != run_id {
+            return Err("stored receipt run_id does not match its requested filename".into());
+        }
+        Ok(receipt)
+    }
+
+    /// Every receipt that parsed, plus the ones that did not, so one corrupt file cannot hide
+    /// the rest — the same contract `list_handoff_inbox` has, for the same reason.
+    pub fn list_receipts(&self) -> ReceiptListing {
+        let directory = self.root.join("receipts");
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            Err(error) => return Err(format!("could not read receipts: {error}")),
+        };
+        let mut records = Vec::new();
+        let mut skipped = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("could not read receipts: {error}"))?;
+            let name = entry.file_name();
+            let Some(run_id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            match self.load_receipt(run_id) {
+                Ok(receipt) => records.push(receipt),
+                Err(reason) => skipped.push((run_id.to_owned(), reason)),
+            }
+        }
+        records.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+        skipped.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((records, skipped))
     }
 
     pub fn save_decision(&self, decision: &ReviewDecision) -> Result<PathBuf, String> {
@@ -586,6 +640,7 @@ enum CreateKind {
     Handoff,
     Decision,
     ProgrammeGate,
+    Receipt,
 }
 
 impl CreateKind {
@@ -594,6 +649,7 @@ impl CreateKind {
             Self::Handoff => "handoff",
             Self::Decision => "decision",
             Self::ProgrammeGate => "programme gate",
+            Self::Receipt => "receipt",
         }
     }
 }
@@ -638,6 +694,7 @@ fn packet_filename(run_id: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::model::{Check, HandoffEvidence};
+    use crate::receipt::fixture as receipt_fixture;
 
     fn packet() -> HandoffPacket {
         HandoffPacket {
@@ -663,6 +720,20 @@ mod tests {
             std::env::temp_dir().join(format!("dock-storage-{test_name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         LocalStore::new(path)
+    }
+
+    #[test]
+    fn a_receipt_is_written_once_at_0600_and_read_back_whole() {
+        let store = temporary_store("receipt-store");
+        let receipt = receipt_fixture();
+        let path = store.save_receipt(&receipt).expect("save receipt");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(store.load_receipt(&receipt.run_id).unwrap(), receipt);
+        // A second write of the same run is refused rather than silently overwriting evidence.
+        assert!(store.save_receipt(&receipt).is_err());
     }
 
     #[test]

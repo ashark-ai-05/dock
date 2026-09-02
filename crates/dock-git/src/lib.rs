@@ -1,3 +1,6 @@
+// Spawns `git` and `delta`, both with argv fixed at compile time. Dock wrote every argument.
+#![allow(clippy::disallowed_methods)]
+
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},

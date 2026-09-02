@@ -12,6 +12,9 @@
 //! crate (for `protocol` and friends) — an illegal cycle. Moving them here is the same
 //! resolution the plan already applied to `dock-ui`'s `clipboard`/`files` split: place a module
 //! where its real dependency need puts it, not where its original file grouping suggested.
+// A crate that only holds shapes, or only draws, has no business starting a process. The
+// workspace already warns; this makes it an error even when clippy runs without -D warnings.
+#![deny(clippy::disallowed_methods)]
 pub mod adapter;
 pub mod board;
 pub mod board_config;

@@ -3,6 +3,8 @@
 //! Every module below lives in a workspace crate and is re-exported here under the name it
 //! had when it was a module, so `crate::protocol::…` and the rest keep resolving in
 //! `src/main.rs` and `src/cli/`.
+// The binaries: spawn `dockd`, and `cargo` when rebuilding a sibling daemon in a dev tree.
+#![allow(clippy::disallowed_methods)]
 pub mod cli;
 
 pub use dock_daemon::{client, discovery, dispatch, hook, server};

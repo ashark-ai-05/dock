@@ -2,6 +2,8 @@
 //!
 //! `adapter` and `layout` live in `dock-model`, not here — `protocol` imports from both, and
 //! `protocol` is `dock-model`.
+// Spawns `git` and `ps` with argv fixed at compile time.
+#![allow(clippy::disallowed_methods)]
 pub mod client;
 pub mod discovery;
 pub mod dispatch;

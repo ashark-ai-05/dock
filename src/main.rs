@@ -1,3 +1,6 @@
+// The binaries: spawn `dockd`, and `cargo` when rebuilding a sibling daemon in a dev tree.
+#![allow(clippy::disallowed_methods)]
+
 use std::{
     collections::VecDeque,
     error::Error,

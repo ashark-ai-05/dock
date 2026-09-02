@@ -1,5 +1,9 @@
 //! Wall-clock budgets for tests that wait on real subprocesses, PTYs, and sockets.
 
+// A crate that only holds shapes, or only draws, has no business starting a process. The
+// workspace already warns; this makes it an error even when clippy runs without -D warnings.
+#![deny(clippy::disallowed_methods)]
+
 use std::{
     env,
     sync::OnceLock,

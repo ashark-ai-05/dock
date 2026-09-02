@@ -261,7 +261,34 @@ mod tests {
             let band = contrast(theme.selection, theme.surface);
             assert!(band >= 3.0, "{theme_name}: band on surface is {band:.2}:1");
             let on_band = contrast(theme.text, theme.selection);
-            assert!(on_band >= 4.5, "{theme_name}: text on band is {on_band:.2}:1");
+            assert!(
+                on_band >= 4.5,
+                "{theme_name}: text on band is {on_band:.2}:1"
+            );
+        }
+    }
+
+    /// The structural lines: the pane grid, the tab separator, the menu rule, the board's
+    /// column rules. 3:1 is the wrong floor for these — they are not text and cannot clear
+    /// it by design — but 1.32:1 is what `cool.border` measured before `a99d44a`, and at
+    /// that ratio a grid of twelve panes photographs as one undifferentiated field of text.
+    ///
+    /// 2:1 is the line between dim and absent, and this is what holds it.
+    #[test]
+    fn every_structural_line_clears_two_to_one() {
+        for (theme_name, theme) in Theme::all() {
+            for (name, colour) in [
+                ("border", theme.border),
+                ("border_focused", theme.border_focused),
+            ] {
+                for (ground, surface) in [("surface", theme.surface), ("panel", theme.panel)] {
+                    let ratio = contrast(colour, surface);
+                    assert!(
+                        ratio >= 2.0,
+                        "{theme_name}: {name} on {ground} is only {ratio:.2}:1"
+                    );
+                }
+            }
         }
     }
 

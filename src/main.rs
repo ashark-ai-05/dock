@@ -747,6 +747,26 @@ fn run_dashboard(
                 cols,
             }));
         }
+        let mut closed_a_pane = false;
+        for (workspace_id, pane_id) in dashboard.take_pane_closes() {
+            // The same request `Ctrl+B x` sends, and sent the same way that one is. `send`, which
+            // the resize above can afford, is wrong here: closing a pane changes the topology and
+            // the daemon pushes no event for it, so a fire-and-forget close left the daemon with
+            // an empty workspace and the dashboard still painting the pane that used to be in it
+            // until some unrelated event happened along.
+            if let Response::Error { message, .. } =
+                client.request(&Request::Workspace(WorkspaceRequest::Close {
+                    workspace_id,
+                    pane_id,
+                }))?
+            {
+                dashboard.error = Some(message);
+            }
+            closed_a_pane = true;
+        }
+        if closed_a_pane {
+            refresh(client, &mut dashboard)?;
+        }
         for (workspace_id, pane_id, prompt) in dashboard.take_opening_prompts() {
             // Submitted, not merely typed. The user dispatched this card seconds ago and a Claude
             // pane dispatched the same way is already working on it; leaving Amp's task sitting

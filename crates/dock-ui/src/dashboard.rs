@@ -187,6 +187,8 @@ pub struct Dashboard {
     /// Opening prompts whose moment arrived, waiting for the render loop to send them.
     pending_opening_prompts: Vec<(String, String, String)>,
     needs_refresh: bool,
+    /// Panes whose process left nothing to read, waiting for the render loop to close them.
+    pending_pane_closes: Vec<(String, String)>,
     pending_resizes: Vec<(String, String, u16, u16)>,
     /// The run and inner geometry last announced for each pane, so an unchanged frame
     /// announces nothing.
@@ -1427,9 +1429,11 @@ impl Dashboard {
             }
             // Queue depth lives only in the daemon, so unlike agent state nothing else a
             // subscriber receives would tell the client a queue drained.
-            Event::PaneState { .. } | Event::LayoutChanged | Event::QueueChanged { .. } => {
+            Event::PaneState { run_id, state } => {
+                self.note_finished_pane(&run_id, &state);
                 self.needs_refresh = true
             }
+            Event::LayoutChanged | Event::QueueChanged { .. } => self.needs_refresh = true,
         }
     }
 
@@ -1664,6 +1668,44 @@ impl Dashboard {
     /// Opening prompts whose agent has come up, as `(workspace_id, pane_id, prompt)`.
     pub fn take_opening_prompts(&mut self) -> Vec<(String, String, String)> {
         std::mem::take(&mut self.pending_opening_prompts)
+    }
+
+    /// A plain shell that said goodbye takes its pane with it.
+    ///
+    /// Retention exists so that a dead pane's last frame stays readable — a crash, a killed
+    /// process, an agent's closing screen. `exit` at a shell prompt is none of those: it leaves
+    /// nothing to read, and a slot held by a shell the user deliberately dismissed is the one
+    /// case where every other multiplexer reflows and Dock did not. So a clean exit from a pane
+    /// that was running nothing but a shell closes it, and every other ending is kept.
+    ///
+    /// Three conditions, each load-bearing. `Some(0)` is a goodbye; a non-zero code is a failure
+    /// worth reading and `None` is a signal, which is a death rather than an exit. `adapter`
+    /// cannot answer this alone, because every agent Dock launches is launched into a shell and
+    /// the daemon calls those panes shells too — the detected agent is what separates them. And
+    /// a run this dashboard has never seen cannot be classified at all, so it is left alone.
+    fn note_finished_pane(&mut self, run_id: &str, state: &ProcessState) {
+        if !matches!(state, ProcessState::Exited { code: Some(0) }) {
+            return;
+        }
+        let Some(run) = self.runs.iter().find(|run| run.run_id == run_id) else {
+            return;
+        };
+        if run.adapter != AdapterId::Shell || run.agent.is_some() {
+            return;
+        }
+        let pane = (run.workspace_id.clone(), run.pane_id.clone());
+        if !self.pending_pane_closes.contains(&pane) {
+            self.pending_pane_closes.push(pane);
+        }
+    }
+
+    /// Panes to close because their shell exited cleanly, as `(workspace_id, pane_id)`.
+    ///
+    /// Drained rather than read: the daemon reflows the workspace around a closed pane and may
+    /// hand the id straight back out, so a request kept past its send would close a pane that
+    /// only shares a name with the one that ended.
+    pub fn take_pane_closes(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.pending_pane_closes)
     }
 
     /// True once when a pushed event invalidated the run list or layout. The render loop uses
@@ -3254,7 +3296,15 @@ impl Dashboard {
                     // nobody asked about a pane that will never have a run.
                     " ▤ board ".to_owned()
                 } else if exited {
-                    format!(" ✗ {visible} · exited · Ctrl+B R restarts ")
+                    // Two keys, not one. A pane kept for its last frame is a pane somebody
+                    // eventually wants gone, and until now the title only ever offered the way
+                    // back — so a dead shell read as permanent furniture.
+                    match self.failure_code(run_id) {
+                        Some(code) => {
+                            format!(" ✗ {visible} · exited {code} · Ctrl+B R restarts · x closes ")
+                        }
+                        None => format!(" ✗ {visible} · exited · Ctrl+B R restarts · x closes "),
+                    }
                 } else {
                     let queued = self
                         .queue_for(workspace.workspace_id.as_str(), pane_id)
@@ -6203,6 +6253,22 @@ impl Dashboard {
             .map(|workspace| workspace.workspace_id.as_str())
     }
 
+    /// The exit code a pane's run failed with, when it failed.
+    ///
+    /// `None` for a clean exit, for a signal (which reports no code at all), and for a run this
+    /// dashboard holds no snapshot of — in none of those is there a number worth putting on a
+    /// title, and a zero printed there would read as a failure code of zero.
+    fn failure_code(&self, run_id: Option<&str>) -> Option<i32> {
+        let run_id = run_id?;
+        self.runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .and_then(|run| match run.state {
+                ProcessState::Exited { code: Some(code) } if code != 0 => Some(code),
+                _ => None,
+            })
+    }
+
     /// The run bound to the focused pane, if it has one.
     pub fn focused_run(&self) -> Option<&RuntimeSnapshot> {
         let run_id = self.focused_run_id()?;
@@ -6227,7 +6293,9 @@ impl Dashboard {
     fn send_to_pane(&mut self, bytes: Vec<u8>) -> UiCommand {
         match self.focused_pane() {
             Some(pane) if pane.runtime == PaneRuntime::Exited => {
-                self.error = Some("pane exited · Ctrl+B R restarts a shell here".into());
+                self.error = Some(
+                    "pane exited · Ctrl+B R restarts a shell here · Ctrl+B x closes it".into(),
+                );
                 UiCommand::None
             }
             // A pane that never had a run is not a pane that stopped working, and the daemon
@@ -9578,6 +9646,117 @@ mod tests {
                 if matches!(request.as_ref(), Request::Workspace(WorkspaceRequest::Respawn { workspace_id, pane_id })
                     if workspace_id == "w" && pane_id == "a")
         ));
+    }
+
+    /// A shell that was told to exit has nothing left to show, so its pane goes with it.
+    ///
+    /// Retention is for panes whose last frame is worth reading. `exit` at a prompt produces no
+    /// such frame, and every other multiplexer reflows the layout on it.
+    #[test]
+    fn a_shell_that_exits_cleanly_takes_its_pane_with_it() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_runs(vec![RuntimeSnapshot {
+            run_id: "run_1".into(),
+            workspace_id: "w".into(),
+            pane_id: "a".into(),
+            adapter: AdapterId::Shell,
+            ..snapshot()
+        }]);
+        dashboard.apply_event(Event::PaneState {
+            run_id: "run_1".into(),
+            state: ProcessState::Exited { code: Some(0) },
+        });
+        assert_eq!(
+            dashboard.take_pane_closes(),
+            vec![("w".to_owned(), "a".to_owned())]
+        );
+        // Drained rather than latched: the pane id is about to be reused by whatever the daemon
+        // reflows into that slot, and closing that would be closing the wrong pane.
+        assert!(dashboard.take_pane_closes().is_empty());
+    }
+
+    /// A shell that died rather than left keeps its pane, and the title carries both ways out.
+    #[test]
+    fn a_shell_that_died_badly_keeps_its_pane_and_says_so() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_runs(vec![RuntimeSnapshot {
+            run_id: "run_1".into(),
+            workspace_id: "w".into(),
+            pane_id: "a".into(),
+            adapter: AdapterId::Shell,
+            state: ProcessState::Exited { code: Some(137) },
+            ..snapshot()
+        }]);
+        dashboard.apply_event(Event::PaneState {
+            run_id: "run_1".into(),
+            state: ProcessState::Exited { code: Some(137) },
+        });
+        assert!(dashboard.take_pane_closes().is_empty());
+        dashboard.layout.workspaces[0]
+            .panes
+            .get_mut("a")
+            .unwrap()
+            .runtime = PaneRuntime::Exited;
+        let text = render_to_string(&mut dashboard, 180, 28);
+        // The code is the whole reason this pane was kept, so it is on the title rather than
+        // only in the frame the process happened to leave behind.
+        assert!(text.contains("exited 137"), "{text:?}");
+        // Both ways out, because a retained pane the reader cannot get rid of is the bug this
+        // pair of keys exists to answer.
+        assert!(text.contains("Ctrl+B R restarts"), "{text:?}");
+        assert!(text.contains("x closes"), "{text:?}");
+    }
+
+    /// A pane that was running an agent keeps its final screen whatever its exit code.
+    ///
+    /// `adapter` alone cannot answer this: every agent Dock launches is launched into a shell,
+    /// so the daemon calls those panes shells too. The detected agent is what separates them.
+    #[test]
+    fn an_agent_pane_keeps_its_last_screen_even_after_a_clean_exit() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_runs(vec![RuntimeSnapshot {
+            run_id: "run_1".into(),
+            workspace_id: "w".into(),
+            pane_id: "a".into(),
+            adapter: AdapterId::Shell,
+            agent: Some(AgentKind::Claude),
+            ..snapshot()
+        }]);
+        dashboard.apply_event(Event::PaneState {
+            run_id: "run_1".into(),
+            state: ProcessState::Exited { code: Some(0) },
+        });
+        assert!(dashboard.take_pane_closes().is_empty());
+    }
+
+    /// A signal leaves no exit code, and a shell that was killed is not a shell that said
+    /// goodbye — that is exactly the case whose last frame someone needs to read.
+    #[test]
+    fn a_shell_killed_by_a_signal_keeps_its_pane() {
+        let mut dashboard = bound_dashboard();
+        dashboard.set_runs(vec![RuntimeSnapshot {
+            run_id: "run_1".into(),
+            workspace_id: "w".into(),
+            pane_id: "a".into(),
+            adapter: AdapterId::Shell,
+            ..snapshot()
+        }]);
+        dashboard.apply_event(Event::PaneState {
+            run_id: "run_1".into(),
+            state: ProcessState::Exited { code: None },
+        });
+        assert!(dashboard.take_pane_closes().is_empty());
+    }
+
+    /// A run the dashboard has never seen is not one it can classify, so the pane is kept.
+    #[test]
+    fn a_clean_exit_from_an_unknown_run_closes_nothing() {
+        let mut dashboard = bound_dashboard();
+        dashboard.apply_event(Event::PaneState {
+            run_id: "a_run_from_before_this_dashboard_attached".into(),
+            state: ProcessState::Exited { code: Some(0) },
+        });
+        assert!(dashboard.take_pane_closes().is_empty());
     }
 
     #[test]

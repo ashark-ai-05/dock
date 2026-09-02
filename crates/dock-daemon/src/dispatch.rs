@@ -7254,6 +7254,58 @@ mod tests {
         assert_eq!(snapshot.run_id, "dock_layout_rollback");
     }
 
+    /// Closing a pane whose process already ended on its own must succeed.
+    ///
+    /// Until now a `Close` only ever arrived from somebody pressing `Ctrl+B x`, and the pane
+    /// under it was usually still running. The dashboard now sends the same request by itself
+    /// the moment a plain shell exits cleanly, so the close path meets an already-dead runtime
+    /// as a matter of routine rather than as an edge case. `stop()` on a group that has already
+    /// left must read as success, or every clean `exit` would end in an error in the footer and
+    /// a pane that stayed put anyway.
+    #[test]
+    fn a_pane_whose_process_already_exited_still_closes() {
+        let repo = Repo::new("close-after-process-exit");
+        let registry = RuntimeRegistry::with_capacity(
+            &repo.state,
+            64,
+            CapacityPolicy {
+                global_run_capacity: 1,
+                per_repository_run_capacity: 1,
+                human_review_reserved: 0,
+            },
+        )
+        .unwrap();
+        // `pwd` and exit — the fixture's default, and the closest thing to a shell that was told
+        // to leave.
+        let snapshot = registry
+            .dispatch(repo.request("dock_close_after_exit"))
+            .unwrap();
+        let process_group_id = snapshot.process_group_id.expect("owned process group");
+        wait_for_owned_group_exit(process_group_id);
+
+        assert!(
+            registry
+                .workspace(WorkspaceRequest::Close {
+                    workspace_id: snapshot.workspace_id.clone(),
+                    pane_id: snapshot.pane_id.clone(),
+                })
+                .unwrap()
+                .is_none()
+        );
+        // The pane is gone, and with it the workspace that held nothing else.
+        assert!(registry.layout().workspaces.is_empty());
+        assert!(matches!(
+            registry.inspect(Some(&snapshot.run_id)),
+            Err((ErrorCode::RunNotFound, _))
+        ));
+        // Capacity came back, so a run that ends this way does not leak a slot.
+        assert!(
+            registry
+                .dispatch(repo.request("dock_close_after_exit_probe"))
+                .is_ok()
+        );
+    }
+
     #[test]
     fn workspace_close_stop_failure_keeps_binding_and_capacity_for_retry() {
         let repo = Repo::new("workspace-close-stop-failure");

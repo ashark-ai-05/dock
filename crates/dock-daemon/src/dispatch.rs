@@ -34,6 +34,7 @@ use dock_model::{
         RuntimeSnapshot, WorkspaceRequest,
     },
     queue::{AutoFeedTrust, MAX_PROMPT_BYTES, MAX_QUEUED_TOTAL, PaneQueue, QueueEntry},
+    receipt::ToolCall,
     storage::LocalStore,
 };
 use dock_pty::{
@@ -272,6 +273,39 @@ impl StateTracker {
     }
 }
 
+/// How many tool calls each run's activity ring keeps. Bounded so a long run costs the same to
+/// track as a short one; old entries fall off the front as new ones arrive at the back.
+const ACTIVITY_RING_CAPACITY: usize = 200;
+
+/// The longest a single tool call's `detail` is stored, in bytes. A receipt is not a transcript,
+/// so this is generous rather than exact — generous enough that `destructive_command` still sees
+/// the substring it matches, since that substring sits near the start of a real command line.
+const TOOL_DETAIL_LIMIT: usize = 2_000;
+
+/// Cuts `detail` to `TOOL_DETAIL_LIMIT` bytes, on a char boundary so the result is still valid
+/// UTF-8. The cut end, not the start, is dropped: a destructive substring near the front of a
+/// command line survives even when the tail is discarded.
+fn cap_tool_detail(detail: String) -> String {
+    if detail.len() <= TOOL_DETAIL_LIMIT {
+        return detail;
+    }
+    let mut end = TOOL_DETAIL_LIMIT;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail[..end].to_owned()
+}
+
+/// Wall-clock milliseconds since the Unix epoch, for the observed column's timestamps. A clock
+/// that cannot go backward relative to itself: `SystemTime` before the epoch has nothing sensible
+/// to report, so that case reads as "now" rather than panicking a hook report.
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub struct RuntimeRegistry {
     runs: Mutex<HashMap<String, RuntimeSlot>>,
     receipts: PathBuf,
@@ -300,8 +334,9 @@ pub struct RuntimeRegistry {
     /// anything read from the screen: an agent firing its own turn-start and turn-end events knows
     /// what a pattern can only infer.
     reported_states: Mutex<HashMap<String, AgentState>>,
-    /// Bounded per-run notes from hook reports: what the agent last said it was doing.
-    activity_rings: Mutex<HashMap<String, VecDeque<String>>>,
+    /// Bounded per-run history of hook-reported tool calls, timestamped: what the observed column
+    /// needs, and what the roster's "last seen doing" line is built from.
+    activity_rings: Mutex<HashMap<String, VecDeque<ToolCall>>>,
     /// When each run's output last grew. Not memoisable the way classification is: the answer it
     /// feeds changes with the passage of time rather than with new bytes, so it is read afresh.
     output_marks: Mutex<HashMap<String, StateTracker>>,
@@ -2509,40 +2544,76 @@ impl RuntimeRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(run_id.to_owned(), request.state);
+        let tool_name = request.tool_name.clone().filter(|s| !s.is_empty());
+        // `tool_detail` is the untruncated field a receipt needs; `tool_input` is what an older
+        // hook payload put on the wire before that field existed. Either stands in for the other.
+        let raw_detail = request
+            .tool_detail
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| request.tool_input.clone().filter(|s| !s.is_empty()));
         if let Some(summary) = request
             .activity
             .clone()
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                request
-                    .tool_name
-                    .as_ref()
-                    .map(|tool| match &request.tool_input {
-                        Some(input) if !input.is_empty() => format!("{tool} {input}"),
-                        _ => tool.clone(),
-                    })
+                tool_name.as_ref().map(|tool| match &raw_detail {
+                    Some(detail) => format!("{tool} {detail}"),
+                    None => tool.clone(),
+                })
             })
         {
-            const MAX_ACTIVITY_RING: usize = 32;
+            // No fallback to `hook_event_name` here: a hook firing without a tool (a
+            // `UserPromptSubmit` or a `Stop`) has already put its event name in `summary`, and
+            // repeating it as `tool` too would print it twice in `latest_activity`.
+            let tool = tool_name.unwrap_or_default();
+            let detail = cap_tool_detail(raw_detail.unwrap_or(summary));
+            let call = ToolCall {
+                at_unix_ms: unix_ms_now(),
+                tool,
+                detail,
+            };
             let mut rings = self
                 .activity_rings
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let ring = rings.entry(run_id.to_owned()).or_default();
-            ring.push_back(summary);
-            while ring.len() > MAX_ACTIVITY_RING {
+            ring.push_back(call);
+            while ring.len() > ACTIVITY_RING_CAPACITY {
                 ring.pop_front();
             }
         }
         Ok(())
     }
 
+    /// The roster's "last seen doing" line, built from the newest recorded tool call.
     fn latest_activity(&self, run_id: &str) -> Option<String> {
         self.activity_rings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(run_id)
-            .and_then(|ring| ring.back().cloned())
+            .and_then(|ring| ring.back())
+            .map(|call| {
+                if call.tool.is_empty() {
+                    call.detail.clone()
+                } else if call.detail.is_empty() {
+                    call.tool.clone()
+                } else {
+                    format!("{} {}", call.tool, call.detail)
+                }
+            })
+    }
+
+    /// The observed column's tool calls for one run, oldest first, exactly as recorded — the
+    /// ring this reads is already bounded and each entry's detail already capped, so nothing is
+    /// truncated further here.
+    pub fn tool_calls(&self, run_id: &str) -> Vec<ToolCall> {
+        self.activity_rings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(run_id)
+            .map(|ring| ring.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Forgets everything remembered about runs that have ended.
@@ -4561,6 +4632,22 @@ mod tests {
             tool_name: None,
             tool_input: None,
             activity: None,
+            tool_detail: None,
+        }
+    }
+
+    /// A report naming a tool call, the way a hook actually sends one: a tool name plus the
+    /// untruncated command or path it acted on. `state` is fixed at `Working` — these tests are
+    /// about the activity ring, not the state machine.
+    fn tool_call_report(
+        run_id: impl Into<String>,
+        tool: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> dock_model::protocol::ReportAgentStateRequest {
+        dock_model::protocol::ReportAgentStateRequest {
+            tool_name: Some(tool.into()),
+            tool_detail: Some(detail.into()),
+            ..state_report(run_id, AgentState::Working)
         }
     }
 
@@ -4610,6 +4697,89 @@ mod tests {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         let registry = RuntimeRegistry::with_capacity(&state, 2000, capacity).unwrap();
         TestRegistry { registry, state }
+    }
+
+    /// Creates a workspace and launches a fixture pane wearing `run_id` — `report_agent_state`
+    /// refuses a run it does not own, so a test that reports state needs a real one first.
+    fn launch_fixture_run(registry: &TestRegistry, run_id: &str) {
+        registry
+            .workspace(WorkspaceRequest::Create {
+                workspace_id: "w-activity".into(),
+                name: "W".into(),
+                pane_id: "p1".into(),
+            })
+            .expect("create workspace");
+        registry
+            .terminal_launch(dock_model::protocol::TerminalLaunchRequest {
+                workspace_id: "w-activity".into(),
+                pane_id: "p1".into(),
+                run_id: run_id.to_owned(),
+                profile: DashboardProfile::Fixture,
+                runtime_directory: registry.state.display().to_string(),
+                arguments: Vec::new(),
+                external_task_ref: String::new(),
+            })
+            .expect("launch run");
+    }
+
+    /// The ring keeps what a receipt needs — when, what tool, and what it was pointed at — and
+    /// stays bounded, because a long run must cost the same as a short one.
+    ///
+    /// The brief names this run `run_1`; `terminal_launch` requires Dock-generated ids
+    /// (`dock_` followed by letters, numbers, hyphens or underscores), so it is `dock_run_1`
+    /// here — the id's value plays no other part in what this test checks.
+    #[test]
+    fn the_activity_ring_keeps_timestamped_tool_calls_and_stays_bounded() {
+        let registry = registry();
+        launch_fixture_run(&registry, "dock_run_1");
+        for index in 0..(ACTIVITY_RING_CAPACITY + 25) {
+            registry
+                .report_agent_state(&tool_call_report(
+                    "dock_run_1",
+                    "Bash",
+                    format!("echo {index}"),
+                ))
+                .expect("report tool call");
+        }
+        let calls = registry.tool_calls("dock_run_1");
+        assert_eq!(calls.len(), ACTIVITY_RING_CAPACITY);
+        assert!(calls.first().unwrap().at_unix_ms <= calls.last().unwrap().at_unix_ms);
+        assert!(calls.last().unwrap().detail.contains("echo 224"));
+    }
+
+    /// The detail is capped, because a receipt is not a transcript — but the cap is generous
+    /// enough that `destructive_command` still sees the command it has to match.
+    #[test]
+    fn a_very_long_tool_detail_is_cut_rather_than_stored_whole() {
+        let registry = registry();
+        launch_fixture_run(&registry, "dock_run_1");
+        registry
+            .report_agent_state(&tool_call_report("dock_run_1", "Bash", "x".repeat(9_000)))
+            .expect("report tool call");
+        assert!(registry.tool_calls("dock_run_1")[0].detail.len() <= TOOL_DETAIL_LIMIT);
+    }
+
+    /// A hook can fire with no tool at all — `UserPromptSubmit`, `Stop` — and `activity_summary`
+    /// then reports the event name on its own. That name must not double: `tool` stays empty
+    /// rather than borrowing `hook_event_name`, so the roster line reads the event once.
+    #[test]
+    fn a_hook_event_without_a_tool_names_itself_once_not_twice() {
+        let registry = registry();
+        launch_fixture_run(&registry, "dock_run_1");
+        registry
+            .report_agent_state(&dock_model::protocol::ReportAgentStateRequest {
+                hook_event_name: Some("UserPromptSubmit".into()),
+                activity: Some("UserPromptSubmit".into()),
+                ..state_report("dock_run_1", AgentState::Working)
+            })
+            .expect("report tool call");
+        let calls = registry.tool_calls("dock_run_1");
+        assert_eq!(calls[0].tool, "");
+        assert_eq!(calls[0].detail, "UserPromptSubmit");
+        assert_eq!(
+            registry.latest_activity("dock_run_1").as_deref(),
+            Some("UserPromptSubmit")
+        );
     }
 
     #[test]

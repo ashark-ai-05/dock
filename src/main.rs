@@ -1693,6 +1693,7 @@ fn agent_state_command(args: &[String]) -> io::Result<()> {
                     })
                 }),
                 activity: hook.as_ref().and_then(dock::hook::activity_summary),
+                tool_detail: hook.as_ref().and_then(dock::hook::tool_detail),
             }
         }))?,
     ] {

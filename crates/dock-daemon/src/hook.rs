@@ -44,7 +44,7 @@ pub fn activity_summary(payload: &HookPayload) -> Option<String> {
     let detail = payload
         .tool_input
         .as_ref()
-        .and_then(tool_detail)
+        .and_then(extract_tool_detail)
         .map(|detail| truncate(&detail, 72));
     match (tool, detail, payload.hook_event_name.as_deref()) {
         (Some(tool), Some(detail), _) => Some(format!("{tool} {detail}")),
@@ -54,7 +54,17 @@ pub fn activity_summary(payload: &HookPayload) -> Option<String> {
     }
 }
 
-fn tool_detail(input: &Value) -> Option<String> {
+/// The same identifying argument `activity_summary` finds, but untruncated.
+///
+/// A receipt needs the whole command line — `destructive_command` matches substrings like
+/// `"git reset --hard"` against it, and a 72-character cut made for a roster row would sever
+/// exactly the commands worth flagging. The caller is responsible for the bound (see
+/// `TOOL_DETAIL_LIMIT` in `dispatch.rs`); this returns the field whole.
+pub fn tool_detail(payload: &HookPayload) -> Option<String> {
+    payload.tool_input.as_ref().and_then(extract_tool_detail)
+}
+
+fn extract_tool_detail(input: &Value) -> Option<String> {
     let object = input.as_object()?;
     for key in [
         "file_path",
@@ -130,5 +140,19 @@ mod tests {
         assert_eq!(payload.hook_event_name.as_deref(), Some("PreToolUse"));
         assert_eq!(payload.tool_name.as_deref(), Some("Bash"));
         assert_eq!(activity_summary(&payload).as_deref(), Some("Bash ls"));
+    }
+
+    #[test]
+    fn tool_detail_returns_the_field_activity_summary_truncates() {
+        let long_command = "git ".to_owned() + &"a".repeat(200);
+        let payload = parse_stdin(&format!(
+            r#"{{"tool_name":"Bash","tool_input":{{"command":"{long_command}"}}}}"#
+        ))
+        .expect("valid hook JSON");
+        assert_eq!(
+            tool_detail(&payload).as_deref(),
+            Some(long_command.as_str())
+        );
+        assert!(activity_summary(&payload).unwrap().len() < long_command.len());
     }
 }

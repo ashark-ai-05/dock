@@ -8,7 +8,7 @@ use crate::{
 };
 use dock_detect::{AgentKind, AgentState};
 
-pub const PROTOCOL_VERSION: u16 = 17;
+pub const PROTOCOL_VERSION: u16 = 18;
 pub const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,6 +439,12 @@ pub struct ReportAgentStateRequest {
     pub tool_input: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
+    /// The identifying argument untruncated — a command line, a full path — for the receipt's
+    /// observed column. `activity` stays a truncated summary for the roster; this is what a
+    /// verdict rule matches against, so a client built against v17 (which never sends it) must
+    /// still parse: additive and defaulted, never required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -852,7 +858,28 @@ mod tests {
 
     #[test]
     fn the_protocol_version_records_the_pane_history_request() {
-        assert_eq!(PROTOCOL_VERSION, 17);
+        assert_eq!(PROTOCOL_VERSION, 18);
+    }
+
+    /// The field is additive and defaulted, so a client built against v17 still parses.
+    #[test]
+    fn a_state_report_may_carry_the_untruncated_tool_detail() {
+        assert_eq!(PROTOCOL_VERSION, 18);
+        // Deserialized directly into the inner struct (not through the `Request` enum), so no
+        // `type` tag field here — `ReportAgentStateRequest` carries `deny_unknown_fields` and has
+        // no member by that name.
+        let request: ReportAgentStateRequest = serde_json::from_str(
+            r#"{"run_id":"dock_1","state":"working","session_id":"s","tool_name":"Bash","activity":"Bash git reset --hard","tool_detail":"git reset --hard HEAD~3"}"#,
+        ).expect("parse v18 report");
+        assert_eq!(
+            request.tool_detail.as_deref(),
+            Some("git reset --hard HEAD~3")
+        );
+        // A v17 report has no such field and must still parse.
+        let older: ReportAgentStateRequest =
+            serde_json::from_str(r#"{"run_id":"dock_1","state":"working","session_id":"s"}"#)
+                .expect("parse v17 report");
+        assert_eq!(older.tool_detail, None);
     }
 
     #[test]

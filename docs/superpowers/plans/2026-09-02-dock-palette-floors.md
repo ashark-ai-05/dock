@@ -19,7 +19,7 @@
 - **Selection band floors: 3.0:1** for the band against `surface`, **4.5:1** for `text` on the band.
 - Tests live in the existing `#[cfg(test)] mod tests` in `src/theme.rs` unless a task says otherwise.
 - Run the full suite with **`cargo test`**, not `cargo test --lib`. 44 tests live in `src/main.rs`, which is the `dock` binary target and is invisible to `--lib`. Every task must leave it green.
-- **Test-count arithmetic**, so a wrong expectation never reads as a failure. Before this plan: **843 registered** = 831 passed + 12 ignored, across the lib (787 passed + 12 ignored) and bin (44 passed) targets. This plan adds **six** tests — one in Task 1, one in Task 4, one in Task 5, three in Task 6 — ending at **849 registered = 837 passed + 12 ignored**. Tasks 2, 3 and 7 rewrite or verify; they add none.
+- **Test-count arithmetic.** Before this plan: **843 registered** = 831 passed + 12 ignored, across the lib (787 passed + 12 ignored) and bin (44 passed) targets. Net change per task: Task 1 **+1**, Task 2 **0** (rewrites), Task 3 **0** (rewrites), Task 4 **0** (adds `every_structural_line_clears_two_to_one`, deletes the superseded `unfocused_borders_clear_two_to_one_on_both_surfaces`), Task 5 **+1**, Task 6 **+3**, Task 7 **0**. Expected end state: **848 registered = 836 passed + 12 ignored**. If the real count differs, reconcile it against this table before proceeding — do not edit the expectation to match what you observed.
 - Gates are pass/fail and must be **read**, not grepped for a line count: `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`. A clippy failure once reached `main` because a count of matching lines looked like zero.
 - Measurement harnesses are `#[ignore]`d tests, run deliberately. Grep for them with `#\[ignore` — **not** `#\[ignore\]`, which misses the `#[ignore = "reason"]` form most of them use.
 - This plan touches no render code paths and must not change any frame timing. No measurement run is required.
@@ -570,7 +570,7 @@ The plan's claim is that nothing here touched a render path. That is worth check
 - [ ] **Step 1: Run the whole suite**
 
 Run: `cargo test`
-Expected: PASS. **837 passed + 12 ignored = 849 registered**, across the lib and bin targets. That is the pre-plan 843 plus the six this plan adds: one in Task 1, one in Task 4, one in Task 5, and three in Task 6. Tasks 2 and 3 rewrite existing tests rather than adding any.
+Expected: PASS, **836 passed + 12 ignored = 848 registered** across the lib and bin targets. Derive it from the per-task table in Global Constraints rather than trusting this line alone; if the two disagree, the table is authoritative and something needs reconciling.
 
 Do not use `cargo test --lib` here: it silently omits the 44 tests in `src/main.rs`.
 

@@ -444,12 +444,13 @@ dock-testing   budget/deadline helpers. dev-dependency only, depended on by noth
 dock-detect    manifests, heuristics, state classification, AgentKind, AgentState
 dock-git       read-only git facts: SHA, diffstat, dirty, worktrees, and the file listing
                behind the picker, which is a `git ls-files` query wearing a picker's name
-dock-model     protocol, queue, storage, model, board, board_config, Receipt, Finding, Verdict
+dock-model     protocol, queue, storage, model, board, board_config, adapter, layout,
+               Receipt, Finding, Verdict
 dock-pty       terminal, vt, keys, runtime: PTY spawn and process groups; clipboard, whose
                OSC 52 writes and pbcopy/wl-copy/xclip helpers are terminal integration
 dock-receipt   checks: the only crate that runs argv it did not author
 dock-ui        theme, verdict glyphs, widgets, dashboard, the Split Spine. Spawns nothing
-dock-daemon    dispatch, server, client, layout, adapter — the daemon and its protocol handling
+dock-daemon    dispatch, server, client, discovery, hook — the daemon and its socket handling
 dock / dockd   binaries
 ```
 

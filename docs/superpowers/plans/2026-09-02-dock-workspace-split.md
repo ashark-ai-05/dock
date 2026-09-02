@@ -358,16 +358,17 @@ Smallest possible proof that the workspace plumbing is right."
 
 ### Task 4: `dock-model`, and `runtime.rs` finally moves
 
-The big one. `protocol`, `queue`, `storage`, `model`, `board`, `board_config`, `board_watch` and `paths` move together, because two pairs among them reference each other and cannot be separated:
+The big one. `protocol`, `queue`, `storage`, `model`, `board`, `board_config`, `board_watch`, `paths`, `adapter` and `layout` move together, because three dependencies among them cannot be separated:
 
 - `board::STATUSES` is defined as `board_config::KANBAN_MD_STATUSES`, and `board_config`'s default reads back through `board::STATUSES`.
 - `protocol` holds `From` impls converting `queue::AutoFeedTrust` to its wire form.
+- `protocol` imports types from `adapter` and `layout` — `use crate::{adapter::{AdapterCapabilities, AdapterId, …}, layout::{LayoutSnapshot, PaneKind, …}}`. Both would otherwise be `dock-daemon`, which depends on `dock-model`; keeping them there is a cycle. Both are leaves, so they come here.
 
 Once `dock-model` exists, `runtime.rs` can finally move into `dock-pty` — its one outside call is `board::resolve_tasks_dir` (`runtime.rs:728`).
 
 **Files:**
 - Create: `crates/dock-model/Cargo.toml`, `crates/dock-model/src/lib.rs`
-- Move into `crates/dock-model/src/`: `protocol.rs`, `queue.rs`, `storage.rs`, `model.rs`, `board.rs`, `board_config.rs`, `board_watch.rs`, `paths.rs`
+- Move into `crates/dock-model/src/`: `protocol.rs`, `queue.rs`, `storage.rs`, `model.rs`, `board.rs`, `board_config.rs`, `board_watch.rs`, `paths.rs`, `adapter.rs`, `layout.rs`
 - Move: `src/runtime.rs` → `crates/dock-pty/src/runtime.rs`
 - Modify: `src/lib.rs`, root `Cargo.toml`, `crates/dock-pty/Cargo.toml`, `crates/dock-pty/src/lib.rs`
 
@@ -613,7 +614,9 @@ The last extraction, and the one that makes the safety claim structural. What re
 
 **Files:**
 - Create: `crates/dock-daemon/Cargo.toml`, `crates/dock-daemon/src/lib.rs`
-- Move into `crates/dock-daemon/src/`: `dispatch.rs`, `server.rs`, `client.rs`, `layout.rs`, `adapter.rs`, `discovery.rs`, `hook.rs`
+- Move into `crates/dock-daemon/src/`: `dispatch.rs`, `server.rs`, `client.rs`, `discovery.rs`, `hook.rs`
+
+`adapter.rs` and `layout.rs` are NOT here. Task 4 moved them into `dock-model`, because `protocol.rs` imports types from both (`use crate::{adapter::{…}, layout::{…}}`) and `protocol` is `dock-model`. Leaving them for this task would have made `dock-model` depend on `dock-daemon`, which already depends on `dock-model` — a cycle. Both are dependency leaves (`adapter` imports nothing from the crate; `layout` imports only `adapter`), so they sit in `dock-model` without pulling anything else in.
 - Modify: `src/lib.rs`, root `Cargo.toml`
 
 **Interfaces:**
@@ -624,21 +627,22 @@ The last extraction, and the one that makes the safety claim structural. What re
 
 ```bash
 mkdir -p crates/dock-daemon/src
-git mv src/dispatch.rs src/server.rs src/client.rs src/layout.rs \
-       src/adapter.rs src/discovery.rs src/hook.rs \
+git mv src/dispatch.rs src/server.rs src/client.rs \
+       src/discovery.rs src/hook.rs \
        crates/dock-daemon/src/
 ```
 
 Create `crates/dock-daemon/src/lib.rs`:
 
 ```rust
-//! The daemon: the socket server, dispatch, and the adapters that launch agents.
-pub mod adapter;
+//! The daemon: the socket server, dispatch, and the hooks agents report through.
+//!
+//! `adapter` and `layout` live in `dock-model`, not here — `protocol` imports from both, and
+//! `protocol` is `dock-model`.
 pub mod client;
 pub mod discovery;
 pub mod dispatch;
 pub mod hook;
-pub mod layout;
 pub mod server;
 ```
 
@@ -672,8 +676,8 @@ dock-testing = { path = "../dock-testing" }
 cd crates/dock-daemon/src
 sed -i '' -e 's/crate::detect::/dock_detect::/g' \
           -e 's/crate::git::/dock_git::/g' \
-          -e 's/crate::\(board\|board_config\|board_watch\|model\|paths\|protocol\|queue\|storage\)::/dock_model::\1::/g' \
-          -e 's/crate::\(terminal\|runtime\)::/dock_pty::\1::/g' \
+          -e 's/crate::\(adapter\|board\|board_config\|board_watch\|layout\|model\|paths\|protocol\|queue\|storage\)::/dock_model::\1::/g' \
+          -e 's/crate::\(terminal\|runtime\|clipboard\)::/dock_pty::\1::/g' \
           -e 's/crate::testing::/dock_testing::/g' \
           *.rs
 cd -
@@ -692,10 +696,12 @@ Root `Cargo.toml`: `dock-daemon = { path = "crates/dock-daemon" }`.
 //! `src/main.rs` and `src/cli/`.
 pub mod cli;
 
-pub use dock_daemon::{adapter, client, discovery, dispatch, hook, layout, server};
+pub use dock_daemon::{client, discovery, dispatch, hook, server};
 pub use dock_detect as detect;
 pub use dock_git as git;
-pub use dock_model::{board, board_config, board_watch, model, paths, protocol, queue, storage};
+pub use dock_model::{
+    adapter, board, board_config, board_watch, layout, model, paths, protocol, queue, storage,
+};
 pub use dock_git::files;
 pub use dock_pty::{clipboard, runtime, terminal};
 pub use dock_ui::{attention, copy, dashboard, keymap, picker, theme, verdict};

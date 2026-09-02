@@ -1,8 +1,10 @@
 //! Real PTYs: the terminal emulator, key encoding, and the process groups Dock owns.
-// Spawns `$SHELL`, agent executables named by a manifest, clipboard helpers, and `ps` when
-// checking whether an owned process group still has a live member — all into PTYs and
-// process groups Dock owns. Dock wrote the argv; an agent binary is named, never composed,
-// plus `env`, `sleep` and `sh` as fixture processes in tests.
+// Spawns `/bin/sh` on every pane launch — a guardian wrapper that then `exec`s the real
+// target, so `$SHELL` and the agent binary are exec targets inside it rather than arguments
+// to `Command::new` here. Also spawns clipboard helpers, and `ps` when checking whether an
+// owned process group still has a live member. Everything lands in a PTY and process group
+// Dock owns, and Dock wrote every argv; an agent binary is named, never composed. Tests
+// additionally spawn `env` and `sleep` as fixtures.
 #![allow(clippy::disallowed_methods)]
 pub mod clipboard;
 pub mod runtime;

@@ -12,6 +12,7 @@ pub mod prompt;
 pub mod read;
 pub mod review;
 pub mod split;
+pub mod verdict;
 pub mod wait;
 pub mod wire;
 pub mod workspace;

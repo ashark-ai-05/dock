@@ -210,6 +210,11 @@ const VERBS: &[Verb] = &[
         run: run_task,
     },
     Verb {
+        name: "verdict",
+        summary: "why a run got the verdict it got",
+        run: dock::cli::verdict::run,
+    },
+    Verb {
         name: "wait",
         summary: "block until a run is blocked, done or idle",
         run: dock::cli::wait::run,
@@ -3534,11 +3539,11 @@ mod terminal_tests {
             VERBS.windows(2).all(|pair| pair[0].name < pair[1].name),
             "VERBS is listed in the order --help prints, so it is kept sorted"
         );
-        // Sixteen: every non-interactive verb lives in this table, so a command dispatched
+        // Seventeen: every non-interactive verb lives in this table, so a command dispatched
         // outside it would move this count.
         assert_eq!(
             VERBS.len(),
-            16,
+            17,
             "a verb was added to or removed from dispatch without this count following"
         );
         assert!(

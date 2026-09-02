@@ -41,6 +41,7 @@ dock-detect = { path = "crates/dock-detect", version = "0.1.0" }
 dock-git = { path = "crates/dock-git", version = "0.1.0" }
 dock-model = { path = "crates/dock-model", version = "0.1.0" }
 dock-pty = { path = "crates/dock-pty", version = "0.1.0" }
+dock-receipt = { path = "crates/dock-receipt", version = "0.1.0" }
 dock-ui = { path = "crates/dock-ui", version = "0.1.0" }
 
 [dev-dependencies]

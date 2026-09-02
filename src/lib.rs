@@ -11,6 +11,9 @@ pub mod cli;
 pub use dock_daemon::{client, dispatch, hook, server};
 pub use dock_detect as detect;
 pub use dock_git as git;
-pub use dock_model::{adapter, board, board_watch, layout, model, paths, protocol, queue, storage};
+pub use dock_model::{
+    adapter, board, board_watch, layout, model, paths, protocol, queue, receipt, storage,
+};
 pub use dock_pty::terminal;
+pub use dock_receipt::rules;
 pub use dock_ui::dashboard;

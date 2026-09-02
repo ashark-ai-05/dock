@@ -325,11 +325,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dock-testing"
+version = "0.1.0"
+
+[[package]]
 name = "dock-tui"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "crossterm",
+ "dock-testing",
  "nix",
  "notify",
  "pretty_assertions",

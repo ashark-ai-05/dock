@@ -25,7 +25,5 @@ pub mod runtime;
 pub mod server;
 pub mod storage;
 pub mod terminal;
-#[cfg(test)]
-pub mod testing;
 pub mod theme;
 pub mod verdict;

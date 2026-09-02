@@ -984,7 +984,7 @@ mod tests {
     }
 
     fn wait_for_group_exit(process_group_id: i32) {
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         while process_group_exists(process_group_id) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -1003,7 +1003,7 @@ mod tests {
     /// macOS and fails on Linux against identical, correct runtime behaviour. Tests that drive a
     /// `Runtime` never need this: the runtime's supervisor thread reaps the worker for them.
     fn reap_then_wait_for_group_exit(child: &mut Child, process_group_id: i32) {
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         while child.try_wait().expect("poll a Dock-owned child").is_none() {
             assert!(
                 Instant::now() < deadline,
@@ -1073,7 +1073,7 @@ mod tests {
         runtime: &OwnedRuntime,
         predicate: impl Fn(&RuntimeSnapshot) -> bool,
     ) -> RuntimeSnapshot {
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         loop {
             let snapshot = runtime.snapshot();
             if predicate(&snapshot) || Instant::now() >= deadline {
@@ -1090,7 +1090,7 @@ mod tests {
     /// The fixtures below echo a descendant PID as their only output, so the emulated screen
     /// holds exactly one numeric line once the child has written it.
     fn wait_for_screen_pid(runtime: &OwnedRuntime) -> u32 {
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         loop {
             if let Ok(pid) = screen_text(runtime).trim().parse::<u32>() {
                 return pid;
@@ -1193,7 +1193,7 @@ mod tests {
             200,
             FIXTURE_SIZE,
         );
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         while !runtime.lifecycle_is_terminal() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -1274,7 +1274,7 @@ mod tests {
         let started = Instant::now();
         runtime.stop().expect("bounded stop owned runtime");
 
-        assert!(started.elapsed() < crate::testing::budget(4));
+        assert!(started.elapsed() < dock_testing::budget(4));
         assert!(!process_group_exists(process_group_id));
         assert!(matches!(
             runtime.snapshot().state,
@@ -1302,7 +1302,7 @@ mod tests {
         runtime.interrupt().expect("interrupt owned runtime");
         // Give the fixture the same window it always had to react to SIGINT; what this test
         // proves is that an interrupt-capable process is still running afterwards.
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         while !screen_text(&runtime).contains("interrupted") && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -1562,7 +1562,7 @@ mod tests {
             },
         );
         reaped_rx
-            .recv_timeout(crate::testing::budget(3))
+            .recv_timeout(dock_testing::budget(3))
             .expect("leader must be reaped before the test probe");
         let group = runtime
             .owned_process_group
@@ -1655,7 +1655,7 @@ mod tests {
         assert!(process_exists(descendant));
         drop(runtime);
         wait_for_group_exit(process_group_id);
-        let deadline = crate::testing::deadline(2);
+        let deadline = dock_testing::deadline(2);
         while process_exists(descendant) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -1679,7 +1679,7 @@ mod tests {
             FIXTURE_SIZE,
         );
         let pid = runtime.pid.expect("launched child") as i32;
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         loop {
             if matches!(
                 *runtime
@@ -1960,7 +1960,7 @@ mod tests {
         unsafe { nix::libc::kill(-group, nix::libc::SIGKILL) };
         // Deliberately left unreaped: this is the state macOS keeps inside the process group and
         // reports as EPERM, which is the whole reason the process table has to be consulted.
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         while owned_group_has_live_member(group).expect("read the process table")
             && Instant::now() < deadline
         {

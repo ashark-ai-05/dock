@@ -1123,7 +1123,7 @@ mod tests {
     }
 
     fn connect(path: &Path) -> UnixStream {
-        let deadline = crate::testing::deadline(2);
+        let deadline = dock_testing::deadline(2);
         loop {
             match UnixStream::connect(path) {
                 Ok(stream) => return stream,
@@ -1155,7 +1155,7 @@ mod tests {
     /// How long a subscribed exchange is allowed to stream before the loop returns. Production
     /// passes `None` here; a test cannot, because `exchange` waits for the server side to close.
     fn test_stream_window() -> Duration {
-        crate::testing::budget_millis(400)
+        dock_testing::budget_millis(400)
     }
 
     fn exchange(lines: &[&str], runtime: &RuntimeRegistry) -> Vec<Response> {
@@ -1434,7 +1434,7 @@ mod tests {
             )
         });
         client
-            .set_read_timeout(Some(crate::testing::budget(30)))
+            .set_read_timeout(Some(dock_testing::budget(30)))
             .expect("read timeout");
         let mut reader = BufReader::new(client.try_clone().expect("clone client"));
         send_line(&mut client, &hello());
@@ -1467,7 +1467,7 @@ mod tests {
             "a departed client must end its handler cleanly on EOF"
         );
         assert!(
-            reclaimed < crate::testing::budget(30),
+            reclaimed < dock_testing::budget(30),
             "a departed client waited {reclaimed:?} to be noticed, out of an idle bound of \
              {idle:?}, so a deadline reclaimed it rather than its EOF"
         );
@@ -1579,11 +1579,11 @@ mod tests {
                 ReadTimeouts::PRODUCTION,
                 // Long enough that reaching it would be a failure rather than the answer: the
                 // loop has to stop because its client left, not because it ran out of time.
-                Some(Instant::now() + crate::testing::budget(120)),
+                Some(Instant::now() + dock_testing::budget(120)),
             )
         });
         client
-            .set_read_timeout(Some(crate::testing::budget(30)))
+            .set_read_timeout(Some(dock_testing::budget(30)))
             .expect("read timeout");
         let mut reader = BufReader::new(client.try_clone().expect("clone client"));
         send_line(&mut client, &hello());
@@ -1610,7 +1610,7 @@ mod tests {
             "a subscriber whose client has gone must end its loop cleanly"
         );
         assert!(
-            started.elapsed() < crate::testing::budget(30),
+            started.elapsed() < dock_testing::budget(30),
             "the push loop took {:?} to notice its client had gone",
             started.elapsed()
         );
@@ -1950,7 +1950,7 @@ mod tests {
     /// which is a genuine failure, not a slow machine. It is generous for that reason: a
     /// subscriber that has converged returns immediately regardless of how large this is.
     fn convergence_backstop() -> Duration {
-        crate::testing::budget(15)
+        dock_testing::budget(15)
     }
 
     /// How long a subscriber waits for a frame before re-checking whether it has converged.
@@ -2220,7 +2220,7 @@ mod tests {
                 .contains("DONEMARK")
             {
                 assert!(
-                    Instant::now() + crate::testing::budget(1) < deadline,
+                    Instant::now() + dock_testing::budget(1) < deadline,
                     "the shell never produced the requested output"
                 );
                 thread::sleep(Duration::from_millis(50));
@@ -2591,7 +2591,7 @@ mod tests {
 
             let headroom = |what: &str| {
                 assert!(
-                    Instant::now() + crate::testing::budget(1) < deadline,
+                    Instant::now() + dock_testing::budget(1) < deadline,
                     "{what} did not happen inside the stream window"
                 );
             };

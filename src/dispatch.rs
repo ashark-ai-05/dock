@@ -6019,7 +6019,7 @@ mod tests {
     }
 
     fn wait_for_owned_group_exit(process_group_id: i32) {
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         while unsafe { nix::libc::kill(-process_group_id, 0) } == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -6708,7 +6708,7 @@ mod tests {
     }
 
     fn wait_for_run_screen_text(registry: &RuntimeRegistry, run_id: &str, needle: &str) -> String {
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         loop {
             let text = run_screen_text(registry, run_id);
             if text.contains(needle) || Instant::now() >= deadline {
@@ -6730,7 +6730,7 @@ mod tests {
     /// shell writes, so seeing it means the whole pid is on disk. The deadline is a liveness
     /// backstop, there to turn a fixture that never starts into a message rather than a hang.
     fn wait_for_fixture_pid(marker: &Path) -> i32 {
-        let deadline = crate::testing::deadline(15);
+        let deadline = dock_testing::deadline(15);
         loop {
             if let Some(pid) = fs::read_to_string(marker)
                 .ok()
@@ -7086,7 +7086,7 @@ mod tests {
             .unwrap()
             .display()
             .to_string();
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         let observed = loop {
             // The emulated screen wraps at the pane width, so a long path can span rows;
             // rejoining the rows compares the path itself rather than the wrap points.
@@ -7964,7 +7964,7 @@ mod tests {
             let downstream_id = downstream_id.clone();
             thread::spawn(move || registry.release_gate(&downstream_id))
         };
-        entered_rx.recv_timeout(crate::testing::budget(3)).unwrap();
+        entered_rx.recv_timeout(dock_testing::budget(3)).unwrap();
 
         let (inspection_tx, inspection_rx) = std::sync::mpsc::channel();
         let inspector = {
@@ -7973,14 +7973,12 @@ mod tests {
         };
         assert!(
             inspection_rx
-                .recv_timeout(crate::testing::budget_millis(100))
+                .recv_timeout(dock_testing::budget_millis(100))
                 .is_err()
         );
         commit_barrier.wait();
         release.join().unwrap().unwrap();
-        let portfolio = inspection_rx
-            .recv_timeout(crate::testing::budget(3))
-            .unwrap();
+        let portfolio = inspection_rx.recv_timeout(dock_testing::budget(3)).unwrap();
         inspector.join().unwrap();
         assert!(portfolio.gates.is_empty());
         assert_eq!(
@@ -8358,7 +8356,7 @@ mod tests {
         ));
         // Already on disk: the hook above did not return until it was.
         let pid = wait_for_fixture_pid(&marker);
-        let deadline = crate::testing::deadline(15);
+        let deadline = dock_testing::deadline(15);
         while unsafe { nix::libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -8431,7 +8429,7 @@ mod tests {
         );
         assert!(!receipt.exists());
         let pid = wait_for_fixture_pid(&marker);
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         while unsafe { nix::libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -8859,7 +8857,7 @@ mod tests {
         for _ in 0..2 {
             results.push(
                 receiver
-                    .recv_timeout(crate::testing::budget(5))
+                    .recv_timeout(dock_testing::budget(5))
                     .expect("dispatch/release lock ordering deadlocked"),
             );
         }
@@ -9066,7 +9064,7 @@ mod tests {
         let started = Instant::now();
         let during = registry.inspect(Some("dock_nonblocking")).unwrap();
         assert!(
-            started.elapsed() < crate::testing::budget(5),
+            started.elapsed() < dock_testing::budget(5),
             "registry inspection never returned while a restart held its preparation locks"
         );
         assert_eq!(during.len(), 1);
@@ -9134,7 +9132,7 @@ mod tests {
             ),
         ];
         let first = registry.dispatch(blocked).unwrap();
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         while !ready.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -9163,7 +9161,7 @@ mod tests {
         // A one-millisecond poll rather than ten: what follows has to be observed while the reap
         // is still parked, and the window is only a few hundred milliseconds wide, so the delay
         // between the reap parking and this loop noticing is margin spent for nothing.
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         while !term_seen.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
         }
@@ -9201,7 +9199,7 @@ mod tests {
             })
         };
         let (inspected, created, workspaces) = received
-            .recv_timeout(crate::testing::budget(10))
+            .recv_timeout(dock_testing::budget(10))
             .expect("unrelated inspect/layout/workspace work blocked behind the restart reap");
 
         assert!(
@@ -9256,7 +9254,7 @@ mod tests {
             ),
         ];
         let first = registry.dispatch(blocked).unwrap();
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         while !ready.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -9279,7 +9277,7 @@ mod tests {
             })
         };
         // A one-millisecond poll, for the reason the restart test above gives.
-        let deadline = crate::testing::deadline(3);
+        let deadline = dock_testing::deadline(3);
         while !term_seen.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
         }
@@ -9304,7 +9302,7 @@ mod tests {
             })
         };
         let inspected = received
-            .recv_timeout(crate::testing::budget(10))
+            .recv_timeout(dock_testing::budget(10))
             .expect("unrelated registry/layout work blocked behind the close reap");
 
         assert!(
@@ -9881,7 +9879,7 @@ mod tests {
         // machine and 426ms under load. Forty milliseconds sits between them with room on both
         // sides, and scales with the suite's timeout scale for a contended runner.
         assert!(
-            slowest < crate::testing::budget_millis(40),
+            slowest < dock_testing::budget_millis(40),
             "a poll took {slowest:?}, which is long enough to have taken a process table on the \
              thread the event stream is polling from"
         );

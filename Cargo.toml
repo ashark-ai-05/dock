@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/*"]
+
 [package]
 name = "dock-tui"
 version = "0.1.0"
@@ -36,3 +39,4 @@ vt100 = "0.16"
 
 [dev-dependencies]
 pretty_assertions = "1"
+dock-testing = { path = "crates/dock-testing" }

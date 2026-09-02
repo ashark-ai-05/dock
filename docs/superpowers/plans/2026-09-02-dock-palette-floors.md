@@ -602,8 +602,13 @@ That is a **known, unfixed violation**, not a regression from this plan: the boa
 git commit --allow-empty -F - <<'MSG'
 test: palette floors hold for every shipped theme
 
-843 + 6 tests green. Render measurement unchanged: this plan touched
-no render path, only the values and the assertions over them.
+848 tests green, up from 843: net +5 across the plan. Task 1 added the
+palette enumerator's test, Task 4 added a structural-line guard and its
+fix round deleted the one it superseded, Task 5 added one and Task 6
+three. Tasks 2, 3 and 7 rewrite or verify and add none.
+
+Render measurement unchanged: this plan touched no render path, only
+the palette values and the assertions over them.
 
 Baseline for the Split Spine work, fastest of three runs:
   <paste the render_measurement figures here>

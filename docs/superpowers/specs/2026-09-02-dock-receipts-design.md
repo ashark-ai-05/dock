@@ -345,7 +345,7 @@ The fix separates by **value within the amber hue**, which is how `cool` solves 
 problem (its `working` sits 70.8 from its accent at the same hue):
 
     warm.working := Rgb(168, 120, 56)
-      accent 86.2 · blocked 70.7 · done 129.6 · idle 74.6 · contrast 4.47:1 on both grounds
+      accent 86.2 · blocked 70.7 · done 173.8 · idle 83.5 · 4.82:1 on surface, 4.47:1 on panel
 
 Row 0 parameterises every palette test over every shipped theme, so the third and fourth
 palettes cannot ship broken the way the second did.

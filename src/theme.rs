@@ -185,19 +185,6 @@ mod tests {
         assert_eq!(Theme::border_type(), BorderType::Rounded);
     }
 
-    /// Unfocused pane chrome has to be a line you can see, not a 1.2:1 ghost.
-    /// 3:1 is the text floor; structural borders sit at 2:1 so they stay quieter than
-    /// `border_focused` while remaining visible on both surfaces.
-    #[test]
-    fn unfocused_borders_clear_two_to_one_on_both_surfaces() {
-        for theme in [Theme::warm(), Theme::cool()] {
-            for (ground, surface) in [("surface", theme.surface), ("panel", theme.panel)] {
-                let ratio = contrast(theme.border, surface);
-                assert!(ratio >= 2.0, "border on {ground} is only {ratio:.2}:1");
-            }
-        }
-    }
-
     /// Relative luminance, as WCAG defines it.
     fn luminance(colour: Color) -> f64 {
         let Color::Rgb(r, g, b) = colour else {
@@ -273,7 +260,10 @@ mod tests {
     /// it by design — but 1.32:1 is what `cool.border` measured before `a99d44a`, and at
     /// that ratio a grid of twelve panes photographs as one undifferentiated field of text.
     ///
-    /// 2:1 is the line between dim and absent, and this is what holds it.
+    /// 2:1 is the line between dim and absent, and this is what holds it. Measured today:
+    /// `warm.border` 2.254:1 on surface, 2.092:1 on panel; `cool.border` 2.263:1 on
+    /// surface, 2.041:1 on panel — `cool` clears the panel floor by only 0.041, which is
+    /// why this guard is load-bearing rather than decorative.
     #[test]
     fn every_structural_line_clears_two_to_one() {
         for (theme_name, theme) in Theme::all() {

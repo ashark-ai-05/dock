@@ -150,7 +150,7 @@ impl AgentState {
 #[cfg(test)]
 mod tests {
     use super::{AgentKind, AgentState, classify_screen, classify_screen_titled};
-    use crate::terminal::VtTerminal;
+    use dock_pty::terminal::VtTerminal;
 
     #[test]
     fn each_agent_state_has_its_own_glyph() {

@@ -5,10 +5,12 @@ pub mod board_config;
 pub mod board_watch;
 pub mod cli;
 pub mod client;
-pub mod clipboard;
 pub mod copy;
 pub mod dashboard;
-pub mod detect;
+// The extracted crates keep their old paths so every `crate::detect::…` and
+// `crate::terminal::…` call site in this crate resolves unchanged.
+pub use dock_detect as detect;
+pub use dock_pty::{clipboard, terminal};
 pub mod discovery;
 pub mod dispatch;
 pub mod files;
@@ -24,6 +26,5 @@ pub mod queue;
 pub mod runtime;
 pub mod server;
 pub mod storage;
-pub mod terminal;
 pub mod theme;
 pub mod verdict;

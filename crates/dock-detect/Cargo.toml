@@ -1,0 +1,18 @@
+[package]
+name = "dock-detect"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Which coding agent is in a pane, and whether it is working, blocked, done or idle."
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+dock-testing = { path = "../dock-testing" }
+# A dependency cycle, and a legal one: detect needs a real terminal only to test
+# classification against captured screens. Cargo forbids cycles among normal
+# dependencies and permits them among dev-dependencies.
+dock-pty = { path = "../dock-pty" }

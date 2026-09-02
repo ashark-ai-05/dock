@@ -20,7 +20,7 @@ use std::{
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 
-use crate::detect::AgentKind;
+use crate::AgentKind;
 
 /// The rules for one agent. Every field is optional: a manifest that defines only `blocked` keeps
 /// the built-in rules for everything else, so narrowing one state does not mean restating them all.
@@ -108,7 +108,7 @@ pub fn resolve(agent: AgentKind) -> &'static Resolved {
         // stream's hot path and has nowhere to say anything.
         Ok(None) | Err(_) => (Source::BuiltIn, Manifest::default()),
     };
-    let built_in = crate::detect::heuristic::built_in(agent);
+    let built_in = crate::heuristic::built_in(agent);
     let pick = |chosen: Option<Vec<String>>, fallback: &[&str]| -> Vec<String> {
         chosen.unwrap_or_else(|| fallback.iter().map(|p| (*p).to_owned()).collect())
     };

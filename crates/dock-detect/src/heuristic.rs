@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use regex::RegexSet;
 
-use crate::detect::{AgentKind, AgentState};
+use crate::{AgentKind, AgentState};
 
 /// Screen-tail rules. This is the zero-configuration tier: it works for every agent on
 /// first run with nothing installed. P1 replaces the producer with exact hook-reported
@@ -104,7 +104,7 @@ const DONE_PATTERNS: &[&str] = &[
 /// handed the turn back, and one regex over one string is a single point of failure: the roster
 /// flipped to "working" every time the footer hint rotated or a frame was sampled part-way through
 /// a repaint. Both tolerate whitespace where the footer has spaces, because a narrow pane wraps
-/// that line and [`visible_text`](crate::terminal::VtTerminal::visible_text) joins rows with a
+/// that line and [`visible_text`](dock_pty::terminal::VtTerminal::visible_text) joins rows with a
 /// newline — `\s` matches it, and the leading indent of the row it wrapped onto, so the phrase
 /// survives being split at any of its spaces.
 ///
@@ -186,7 +186,7 @@ pub(crate) fn built_in(
 /// anywhere on the screen, and the screen keeps whatever the last turn left on it — so it is
 /// trusted to say an agent has *stopped* and never that it is going. `title_working` is read from
 /// the one line the agent actively rewrites as it changes state, which makes it the only part of
-/// a screen whose *absence* is evidence too. [`crate::dispatch`] treats them accordingly.
+/// a screen whose *absence* is evidence too. `dispatch` treats them accordingly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScreenRead {
     /// The state the screen's chrome argues for, or `Idle` when no rule matched — which means
@@ -227,7 +227,7 @@ pub fn classify_screen(agent: AgentKind, tail: &str) -> AgentState {
 pub fn classify_screen_titled(agent: AgentKind, tail: &str, title: Option<&str>) -> AgentState {
     static DONE: OnceLock<RegexSet> = OnceLock::new();
     // Through the manifest, so a rule someone edited is the rule that runs.
-    let rules = crate::detect::manifest::resolve(agent);
+    let rules = crate::manifest::resolve(agent);
     if rules.blocked.is_match(tail) {
         return AgentState::Blocked;
     }
@@ -257,7 +257,7 @@ pub fn classify_screen_titled(agent: AgentKind, tail: &str, title: Option<&str>)
 #[cfg(test)]
 mod classification_cost {
     use super::*;
-    use crate::terminal::VtTerminal;
+    use dock_pty::terminal::VtTerminal;
     use std::time::Instant;
 
     #[test]

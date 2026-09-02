@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::detect::AgentKind;
+use crate::AgentKind;
 
 /// Finds the agent executable running anywhere beneath one Dock-owned process-group leader.
 ///

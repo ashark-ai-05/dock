@@ -325,6 +325,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "dock-detect"
+version = "0.1.0"
+dependencies = [
+ "dock-pty",
+ "dock-testing",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dock-pty"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "crossterm",
+ "dock-detect",
+ "dock-testing",
+ "nix",
+ "vt100",
+]
+
+[[package]]
 name = "dock-testing"
 version = "0.1.0"
 
@@ -334,6 +357,8 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "crossterm",
+ "dock-detect",
+ "dock-pty",
  "dock-testing",
  "nix",
  "notify",

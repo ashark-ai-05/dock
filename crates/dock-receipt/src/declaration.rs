@@ -135,8 +135,22 @@ pub fn load_permits() -> Result<Vec<String>, String> {
         .join(".config")
         .join("dock")
         .join("checks.toml");
-    let Ok(source) = std::fs::read_to_string(&path) else {
-        return Ok(Vec::new());
+    load_permits_from(&path)
+}
+
+/// The part of `load_permits` that touches a concrete path, split out so a test can point it at
+/// a path it controls instead of the real `~/.config/dock/checks.toml`.
+///
+/// Mirrors `Checks::load`: a missing file is the ordinary "nothing permitted yet" state, not an
+/// error, but any other read failure — permission denied, the path being a directory, and so on
+/// — is reported by name rather than folded into the same "not permitted" outcome a missing file
+/// produces. Conflating the two would tell someone their config denies a variable when the truth
+/// is Dock could not read the config at all.
+fn load_permits_from(path: &Path) -> Result<Vec<String>, String> {
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
     let file: PermitFile = toml::from_str(&source)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
@@ -261,5 +275,27 @@ needs_env = ["NPM_TOKEN"]
         );
         assert!(parse_timeout(Some("soon")).is_err());
         assert!(parse_timeout(Some("0m")).is_err());
+    }
+
+    /// A permission file that cannot be *read* — here, because the path is a directory rather
+    /// than a file — must be reported, not folded into "the user permitted nothing." That
+    /// conflation would send someone to edit a config that may already say what they intended;
+    /// the real fault is that Dock could not read it at all.
+    #[test]
+    fn an_unreadable_permit_file_is_reported_rather_than_treated_as_no_permits() {
+        let directory = std::env::temp_dir().join(format!(
+            "dock-receipt-test-permit-dir-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create directory fixture");
+
+        let error = load_permits_from(&directory).expect_err("a directory is not a readable file");
+        assert!(
+            error.contains(&directory.display().to_string()),
+            "error should name the unreadable path, got: {error}"
+        );
+
+        std::fs::remove_dir(&directory).expect("clean up directory fixture");
     }
 }

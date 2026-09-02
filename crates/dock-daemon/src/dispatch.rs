@@ -21,10 +21,10 @@ use std::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use dock_detect::{AgentKind, AgentState, ScreenRead, process::ProcessTree, read_screen_titled};
+use dock_git::GitAdapter;
+use dock_model::{
     adapter::AdapterSelection,
-    detect::{AgentKind, AgentState, ScreenRead, process::ProcessTree, read_screen_titled},
-    git::GitAdapter,
     layout::{LayoutRegistry, LayoutSnapshot, PaneKind, PaneRuntime, WorkspaceLayout},
     model::{HandoffEvidence, HandoffPacket, HandoffRecord, ReviewDecision, ReviewRoute},
     protocol::{
@@ -34,8 +34,10 @@ use crate::{
         RuntimeSnapshot, WorkspaceRequest,
     },
     queue::{AutoFeedTrust, MAX_PROMPT_BYTES, MAX_QUEUED_TOTAL, PaneQueue, QueueEntry},
-    runtime::{OwnedRuntime, PtySize, RunBinding, RunPulse},
     storage::LocalStore,
+};
+use dock_pty::{
+    runtime::{OwnedRuntime, PtySize, RunBinding, RunPulse},
     terminal::{PaneOutput, PaneScreen},
 };
 
@@ -400,14 +402,14 @@ enum RuntimeSlotState {
     ReceiptRollbackStopping {
         repository_root: PathBuf,
         entry: RuntimeEntry,
-        layout: crate::layout::BindRollback,
+        layout: dock_model::layout::BindRollback,
         receipt: PathBuf,
     },
     /// The launched process has been retired, but its exact pane binding and receipt reservation
     /// remain authoritative until their independently tracked rollback steps are persisted.
     RollbackPending {
         repository_root: PathBuf,
-        layout: Option<crate::layout::BindRollback>,
+        layout: Option<dock_model::layout::BindRollback>,
         receipt: PathBuf,
     },
 }
@@ -500,12 +502,12 @@ struct DispatchReceipt {
     pane_id: String,
     pid: Option<u32>,
     process_group_id: Option<i32>,
-    state: crate::protocol::ProcessState,
+    state: dock_model::protocol::ProcessState,
     diagnostic: Option<String>,
-    adapter: crate::adapter::AdapterId,
-    process_capabilities: crate::adapter::ProcessCapabilities,
-    adapter_capabilities: crate::adapter::AdapterCapabilities,
-    provider_state: crate::protocol::ProviderState,
+    adapter: dock_model::adapter::AdapterId,
+    process_capabilities: dock_model::adapter::ProcessCapabilities,
+    adapter_capabilities: dock_model::adapter::AdapterCapabilities,
+    provider_state: dock_model::protocol::ProviderState,
 }
 
 impl RuntimeRegistry {
@@ -589,7 +591,7 @@ impl RuntimeRegistry {
             runs: Mutex::new(HashMap::new()),
             receipts,
             scrollback_rows,
-            pane_history_bytes: crate::terminal::PANE_HISTORY_BYTES,
+            pane_history_bytes: dock_pty::terminal::PANE_HISTORY_BYTES,
             store,
             programme: Mutex::new(programme),
             capacity,
@@ -659,9 +661,9 @@ impl RuntimeRegistry {
     /// positional argument list here.
     pub fn terminal_launch(
         &self,
-        launch: crate::protocol::TerminalLaunchRequest,
+        launch: dock_model::protocol::TerminalLaunchRequest,
     ) -> Result<RuntimeSnapshot, (ErrorCode, String)> {
-        let crate::protocol::TerminalLaunchRequest {
+        let dock_model::protocol::TerminalLaunchRequest {
             workspace_id,
             pane_id,
             run_id,
@@ -673,16 +675,16 @@ impl RuntimeRegistry {
         validate_external_run_id(&run_id).map_err(|m| (ErrorCode::InvalidBinding, m))?;
         // Bounded before it reaches the binding, so the one field this deliberately closed shape
         // gained can never be walked into a path by anything downstream.
-        crate::protocol::validate_external_task_ref(&external_task_ref)
+        dock_model::protocol::validate_external_task_ref(&external_task_ref)
             .map_err(|m| (ErrorCode::InvalidBinding, m))?;
         let directory = canonical_terminal_directory(Path::new(&runtime_directory))
             .map_err(|m| (ErrorCode::InvalidBinding, m))?;
-        let adapter_id = crate::adapter::AdapterId::from(profile);
+        let adapter_id = dock_model::adapter::AdapterId::from(profile);
         // Supplied arguments win, which is how a resume reaches the agent. The fixture keeps its
         // built-in script when nothing is supplied, so an ordinary launch is unchanged.
         let arguments = if !supplied_arguments.is_empty() {
             supplied_arguments
-        } else if adapter_id == crate::adapter::AdapterId::Fixture {
+        } else if adapter_id == dock_model::adapter::AdapterId::Fixture {
             vec![
                 "-c".into(),
                 "printf 'Dock-owned fixture ready\\n'; sleep 30".into(),
@@ -764,7 +766,7 @@ impl RuntimeRegistry {
             run_id: run_id.clone(),
             worktree: directory.display().to_string(),
             adapter: AdapterSelection {
-                id: crate::adapter::AdapterId::Shell,
+                id: dock_model::adapter::AdapterId::Shell,
                 executable: None,
                 arguments: vec!["-l".into()],
             },
@@ -803,7 +805,7 @@ impl RuntimeRegistry {
     /// Called once at daemon start-up rather than from the constructor, because constructing a
     /// registry is not by itself a statement that panes should start running.
     pub fn revive_restored_panes(&self) {
-        let targets: Vec<(String, String, Option<crate::adapter::AdapterId>)> = self
+        let targets: Vec<(String, String, Option<dock_model::adapter::AdapterId>)> = self
             .layout
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -831,17 +833,17 @@ impl RuntimeRegistry {
         &self,
         workspace_id: &str,
         pane_id: &str,
-        adapter: Option<crate::adapter::AdapterId>,
+        adapter: Option<dock_model::adapter::AdapterId>,
     ) {
         let Some(id) = adapter else {
             self.launch_pane_shell(workspace_id, pane_id);
             return;
         };
         match id {
-            crate::adapter::AdapterId::ClaudeCode
-            | crate::adapter::AdapterId::CodexCli
-            | crate::adapter::AdapterId::Amp
-            | crate::adapter::AdapterId::GithubCopilotCli => {
+            dock_model::adapter::AdapterId::ClaudeCode
+            | dock_model::adapter::AdapterId::CodexCli
+            | dock_model::adapter::AdapterId::Amp
+            | dock_model::adapter::AdapterId::GithubCopilotCli => {
                 let arguments = id
                     .resume_arguments()
                     .unwrap_or(&[])
@@ -858,7 +860,7 @@ impl RuntimeRegistry {
         &self,
         workspace_id: &str,
         pane_id: &str,
-        adapter_id: crate::adapter::AdapterId,
+        adapter_id: dock_model::adapter::AdapterId,
         arguments: Vec<String>,
     ) {
         let kind = self
@@ -866,7 +868,7 @@ impl RuntimeRegistry {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .pane_kind(workspace_id, pane_id);
-        if kind == Some(crate::layout::PaneKind::Board) {
+        if kind == Some(dock_model::layout::PaneKind::Board) {
             return;
         }
         #[cfg(test)]
@@ -885,12 +887,12 @@ impl RuntimeRegistry {
         };
         self.reclaim_pane_shell_identity(workspace_id, pane_id);
         let run_id = format!("dock_rv_{workspace_id}_{pane_id}");
-        let request = crate::protocol::DispatchRequest {
+        let request = dock_model::protocol::DispatchRequest {
             repository_root: directory.display().to_string(),
             external_task_ref: String::new(),
             run_id: run_id.clone(),
             worktree: directory.display().to_string(),
-            adapter: crate::adapter::AdapterSelection {
+            adapter: dock_model::adapter::AdapterSelection {
                 id: adapter_id,
                 executable: None,
                 arguments,
@@ -1052,7 +1054,7 @@ impl RuntimeRegistry {
                 let entry = slot.active()?;
                 let state = if matches!(
                     entry.runtime.snapshot().state,
-                    crate::protocol::ProcessState::Running
+                    dock_model::protocol::ProcessState::Running
                 ) {
                     PaneRuntime::Running
                 } else {
@@ -1198,7 +1200,7 @@ impl RuntimeRegistry {
                     .is_some_and(|entry| {
                         matches!(
                             entry.runtime.snapshot().state,
-                            crate::protocol::ProcessState::Running
+                            dock_model::protocol::ProcessState::Running
                         )
                     })
             });
@@ -1561,7 +1563,7 @@ impl RuntimeRegistry {
         {
             hook();
         }
-        let commit_error = if snapshot.state == crate::protocol::ProcessState::FailedToLaunch {
+        let commit_error = if snapshot.state == dock_model::protocol::ProcessState::FailedToLaunch {
             Some(
                 snapshot
                     .diagnostic
@@ -1669,7 +1671,7 @@ impl RuntimeRegistry {
             } else {
                 format!("{message}; {}", failures.join("; "))
             };
-            let code = if snapshot.state == crate::protocol::ProcessState::FailedToLaunch {
+            let code = if snapshot.state == dock_model::protocol::ProcessState::FailedToLaunch {
                 ErrorCode::AdapterUnavailable
             } else {
                 ErrorCode::Internal
@@ -1699,9 +1701,9 @@ impl RuntimeRegistry {
         );
         if !pane_shell {
             let identity = match request.adapter.id {
-                crate::adapter::AdapterId::Shell
-                | crate::adapter::AdapterId::Fixture
-                | crate::adapter::AdapterId::Generic => None,
+                dock_model::adapter::AdapterId::Shell
+                | dock_model::adapter::AdapterId::Fixture
+                | dock_model::adapter::AdapterId::Generic => None,
                 id => Some(id),
             };
             let _ = self
@@ -2489,7 +2491,7 @@ impl RuntimeRegistry {
     /// nobody observed — which is the whole failing of guessing from a screen.
     pub fn report_agent_state(
         &self,
-        request: &crate::protocol::ReportAgentStateRequest,
+        request: &dock_model::protocol::ReportAgentStateRequest,
     ) -> Result<(), (ErrorCode, String)> {
         let run_id = request.run_id.as_str();
         if !self
@@ -3883,7 +3885,7 @@ fn canonical_terminal_directory(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn validate_durable_adapter(request: &DispatchRequest) -> Result<(), String> {
-    if request.adapter.id == crate::adapter::AdapterId::Generic
+    if request.adapter.id == dock_model::adapter::AdapterId::Generic
         || request.adapter.executable.is_some()
         || !request.adapter.arguments.is_empty()
     {
@@ -3927,7 +3929,7 @@ fn validate_upstream_dispatch_receipt(
         .map_err(|error| format!("could not read exact upstream dispatch receipt: {error}"))?;
     let receipt: DispatchReceipt = serde_json::from_slice(&bytes)
         .map_err(|error| format!("could not parse exact upstream dispatch receipt: {error}"))?;
-    if receipt.protocol_version != crate::protocol::PROTOCOL_VERSION {
+    if receipt.protocol_version != dock_model::protocol::PROTOCOL_VERSION {
         return Err("exact upstream dispatch receipt has an invalid protocol version".into());
     }
     if receipt.run_id != gate.upstream_run_id {
@@ -4138,7 +4140,7 @@ fn dispatch_receipt_is_committed(path: &Path, run_id: &str) -> bool {
         .and_then(|bytes| serde_json::from_slice::<DispatchReceipt>(&bytes).ok())
         .is_some_and(|receipt| {
             receipt.run_id == run_id
-                && receipt.protocol_version == crate::protocol::PROTOCOL_VERSION
+                && receipt.protocol_version == dock_model::protocol::PROTOCOL_VERSION
                 && receipt.repository_root_canonical
                 && receipt.worktree_canonical
                 && receipt.shared_git_common_directory
@@ -4152,7 +4154,7 @@ fn save_receipt(path: &Path, snapshot: &RuntimeSnapshot) -> Result<(), String> {
         .strip_prefix(repository_root)
         .map_err(|_| "validated worktree no longer belongs to its repository root")?;
     let receipt = DispatchReceipt {
-        protocol_version: crate::protocol::PROTOCOL_VERSION,
+        protocol_version: dock_model::protocol::PROTOCOL_VERSION,
         repository_id: repository_id(repository_root),
         worktree_relative: if relative.as_os_str().is_empty() {
             ".".into()
@@ -4209,7 +4211,7 @@ fn save_receipt(path: &Path, snapshot: &RuntimeSnapshot) -> Result<(), String> {
 }
 
 fn is_capacity_active(snapshot: &RuntimeSnapshot) -> bool {
-    matches!(snapshot.state, crate::protocol::ProcessState::Running)
+    matches!(snapshot.state, dock_model::protocol::ProcessState::Running)
 }
 
 fn slot_reserves_capacity(slot: &RuntimeSlot) -> bool {
@@ -4261,7 +4263,7 @@ struct QueueObservation {
 /// One queue in the form that goes to disk. Entries and the id counter; nothing else, by design.
 fn durable_queue(key: &QueueKey, queue: &PaneQueue) -> DurablePaneQueue {
     DurablePaneQueue {
-        schema_version: crate::storage::QUEUE_SCHEMA_VERSION,
+        schema_version: dock_model::storage::QUEUE_SCHEMA_VERSION,
         workspace_id: key.0.clone(),
         pane_id: key.1.clone(),
         next_entry_id: queue.next_entry_id(),
@@ -4533,10 +4535,10 @@ fn repository_id(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Check;
+    use dock_model::model::Check;
     // Only the tests build launch requests by hand now; the runtime destructures the one the
     // protocol already typed.
-    use crate::protocol::DashboardProfile;
+    use dock_model::protocol::DashboardProfile;
     use std::{
         os::unix::fs::symlink,
         sync::atomic::{AtomicU64, Ordering},
@@ -4548,8 +4550,8 @@ mod tests {
     fn state_report(
         run_id: impl Into<String>,
         state: AgentState,
-    ) -> crate::protocol::ReportAgentStateRequest {
-        crate::protocol::ReportAgentStateRequest {
+    ) -> dock_model::protocol::ReportAgentStateRequest {
+        dock_model::protocol::ReportAgentStateRequest {
             run_id: run_id.into(),
             state,
             session_id: None,
@@ -4615,7 +4617,7 @@ mod tests {
         let registry = registry();
         assert_eq!(
             registry.pane_history_bytes(),
-            crate::terminal::PANE_HISTORY_BYTES,
+            dock_pty::terminal::PANE_HISTORY_BYTES,
             "an unconfigured registry uses the default budget"
         );
         drop(registry);
@@ -4672,7 +4674,7 @@ mod tests {
                 workspace_id: "w1".into(),
                 pane_id: "p1".into(),
                 new_pane_id: "p2".into(),
-                axis: crate::layout::SplitAxis::Vertical,
+                axis: dock_model::layout::SplitAxis::Vertical,
                 kind: PaneKind::Terminal,
             })
             .expect("split pane");
@@ -4768,18 +4770,22 @@ mod tests {
         fs::create_dir_all(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         {
-            let mut layout = crate::layout::LayoutRegistry::load(&state).unwrap();
+            let mut layout = dock_model::layout::LayoutRegistry::load(&state).unwrap();
             layout
                 .create_workspace("w1".into(), "Daily".into(), "shell".into())
                 .unwrap();
             for (from, new, adapter) in [
-                ("shell", "claude", crate::adapter::AdapterId::ClaudeCode),
-                ("claude", "codex", crate::adapter::AdapterId::CodexCli),
-                ("codex", "amp", crate::adapter::AdapterId::Amp),
+                (
+                    "shell",
+                    "claude",
+                    dock_model::adapter::AdapterId::ClaudeCode,
+                ),
+                ("claude", "codex", dock_model::adapter::AdapterId::CodexCli),
+                ("codex", "amp", dock_model::adapter::AdapterId::Amp),
                 (
                     "amp",
                     "copilot",
-                    crate::adapter::AdapterId::GithubCopilotCli,
+                    dock_model::adapter::AdapterId::GithubCopilotCli,
                 ),
             ] {
                 layout
@@ -4787,7 +4793,7 @@ mod tests {
                         "w1",
                         from,
                         new.into(),
-                        crate::layout::SplitAxis::Vertical,
+                        dock_model::layout::SplitAxis::Vertical,
                         PaneKind::Terminal,
                     )
                     .unwrap();
@@ -4877,7 +4883,7 @@ mod tests {
                     workspace_id: "w1".into(),
                     pane_id: "p1".into(),
                     new_pane_id: "board".into(),
-                    axis: crate::layout::SplitAxis::Vertical,
+                    axis: dock_model::layout::SplitAxis::Vertical,
                     kind: PaneKind::Board,
                 })
                 .expect("split a board onto the canvas");
@@ -5048,13 +5054,13 @@ mod tests {
                 workspace_id: "w1".into(),
                 pane_id: "p1".into(),
                 new_pane_id: "p2".into(),
-                axis: crate::layout::SplitAxis::Vertical,
+                axis: dock_model::layout::SplitAxis::Vertical,
                 kind: PaneKind::Terminal,
             })
             .expect("split pane");
         let directory = registry.state.display().to_string();
         registry
-            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+            .terminal_launch(dock_model::protocol::TerminalLaunchRequest {
                 workspace_id: "w1".into(),
                 pane_id: "p2".into(),
                 run_id: "dock_taken".into(),
@@ -5065,7 +5071,7 @@ mod tests {
             })
             .expect("first launch claims the run id");
 
-        let refused = registry.terminal_launch(crate::protocol::TerminalLaunchRequest {
+        let refused = registry.terminal_launch(dock_model::protocol::TerminalLaunchRequest {
             workspace_id: "w1".into(),
             pane_id: "p1".into(),
             run_id: "dock_taken".into(),
@@ -5086,7 +5092,10 @@ mod tests {
         );
         assert_eq!(pane.runtime, PaneRuntime::Running);
         let snapshot = registry.inspect(Some(&shell_run_id)).expect("shell run");
-        assert_eq!(snapshot[0].state, crate::protocol::ProcessState::Running);
+        assert_eq!(
+            snapshot[0].state,
+            dock_model::protocol::ProcessState::Running
+        );
     }
 
     #[test]
@@ -5102,7 +5111,7 @@ mod tests {
         // This is the shape a resume takes on the unbound path: the same profile, launched with
         // the agent's own "continue where you left off" arguments.
         let snapshot = registry
-            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+            .terminal_launch(dock_model::protocol::TerminalLaunchRequest {
                 workspace_id: "w1".into(),
                 pane_id: "p1".into(),
                 run_id: "dock_resumed".into(),
@@ -5745,7 +5754,7 @@ mod tests {
                     workspace_id: "w1".into(),
                     pane_id: from.into(),
                     new_pane_id: new.into(),
-                    axis: crate::layout::SplitAxis::Vertical,
+                    axis: dock_model::layout::SplitAxis::Vertical,
                     kind: PaneKind::Terminal,
                 })
                 .expect("split pane");
@@ -5765,7 +5774,7 @@ mod tests {
             "pane shells are infrastructure and must not be counted as agent runs"
         );
         registry
-            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+            .terminal_launch(dock_model::protocol::TerminalLaunchRequest {
                 workspace_id: "w1".into(),
                 pane_id: "p1".into(),
                 run_id: "dock_agent_run".into(),
@@ -5789,7 +5798,7 @@ mod tests {
             })
             .expect("create workspace");
         let error = registry
-            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+            .terminal_launch(dock_model::protocol::TerminalLaunchRequest {
                 workspace_id: "w1".into(),
                 pane_id: "p1".into(),
                 run_id: pane_shell_run_id("w1", "p1"),
@@ -5862,7 +5871,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some("injected retirement stop failure".into());
         registry
-            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+            .terminal_launch(dock_model::protocol::TerminalLaunchRequest {
                 workspace_id: "w1".into(),
                 pane_id: "p1".into(),
                 run_id: "dock_replacement".into(),
@@ -5946,7 +5955,10 @@ mod tests {
         assert_eq!(pane.run_id.as_deref(), Some(shell_run_id.as_str()));
         assert_eq!(pane.runtime, PaneRuntime::Running);
         let snapshot = registry.inspect(Some(&shell_run_id)).expect("shell run");
-        assert_eq!(snapshot[0].state, crate::protocol::ProcessState::Running);
+        assert_eq!(
+            snapshot[0].state,
+            dock_model::protocol::ProcessState::Running
+        );
     }
 
     #[test]
@@ -5994,7 +6006,7 @@ mod tests {
             })
             .unwrap();
         let snapshot = registry
-            .terminal_launch(crate::protocol::TerminalLaunchRequest {
+            .terminal_launch(dock_model::protocol::TerminalLaunchRequest {
                 workspace_id: "w".into(),
                 pane_id: "p".into(),
                 run_id: "dock_terminal_1".into(),
@@ -6083,7 +6095,7 @@ mod tests {
     }
 
     /// The one queue a test made, or nothing.
-    fn only_queue(registry: &RuntimeRegistry) -> Option<crate::protocol::PaneQueueSnapshot> {
+    fn only_queue(registry: &RuntimeRegistry) -> Option<dock_model::protocol::PaneQueueSnapshot> {
         registry.queue_snapshots().into_iter().next()
     }
 
@@ -6183,7 +6195,7 @@ mod tests {
         );
         assert_eq!(
             queue.holding_because.as_deref(),
-            Some(crate::queue::DISARMED_BY_RESTART),
+            Some(dock_model::queue::DISARMED_BY_RESTART),
             "and the pane must say why, or a queue that stopped feeding looks broken"
         );
     }
@@ -6251,20 +6263,20 @@ mod tests {
                 pane_id: "p0".into(),
             })
             .expect("create workspace");
-        let panes = crate::queue::MAX_QUEUED_TOTAL / crate::queue::MAX_QUEUE_DEPTH;
+        let panes = dock_model::queue::MAX_QUEUED_TOTAL / dock_model::queue::MAX_QUEUE_DEPTH;
         for index in 1..panes {
             registry
                 .workspace(WorkspaceRequest::Split {
                     workspace_id: "w1".into(),
                     pane_id: format!("p{}", index - 1),
                     new_pane_id: format!("p{index}"),
-                    axis: crate::layout::SplitAxis::Vertical,
+                    axis: dock_model::layout::SplitAxis::Vertical,
                     kind: PaneKind::Terminal,
                 })
                 .expect("split a pane");
         }
         for index in 0..panes {
-            for entry in 0..crate::queue::MAX_QUEUE_DEPTH {
+            for entry in 0..dock_model::queue::MAX_QUEUE_DEPTH {
                 registry
                     .queue_add(
                         "w1",
@@ -6280,7 +6292,7 @@ mod tests {
             .expect_err("the total cap must refuse");
         assert_eq!(code, ErrorCode::QueueRefused);
         assert!(
-            message.contains(&crate::queue::MAX_QUEUED_TOTAL.to_string())
+            message.contains(&dock_model::queue::MAX_QUEUED_TOTAL.to_string())
                 && message.contains("every pane"),
             "the refusal must name the daemon-wide cap: {message}"
         );
@@ -6291,7 +6303,7 @@ mod tests {
             .sum();
         assert_eq!(
             total,
-            crate::queue::MAX_QUEUED_TOTAL,
+            dock_model::queue::MAX_QUEUED_TOTAL,
             "nothing may be dropped to make room"
         );
     }
@@ -6441,7 +6453,7 @@ mod tests {
             .queue_set_auto("w1", "p1", true)
             .expect_err("arming without a reported state must be refused");
         assert_eq!(code, ErrorCode::QueueRefused);
-        assert_eq!(message, crate::queue::ARM_WITHOUT_REPORTED_STATE);
+        assert_eq!(message, dock_model::queue::ARM_WITHOUT_REPORTED_STATE);
         assert!(
             message.contains("dock hooks --install"),
             "the refusal has to say what to do about it"
@@ -6531,7 +6543,7 @@ mod tests {
                 workspace_id: "w1".into(),
                 pane_id: "p1".into(),
                 new_pane_id: "p2".into(),
-                axis: crate::layout::SplitAxis::Vertical,
+                axis: dock_model::layout::SplitAxis::Vertical,
                 kind: PaneKind::Terminal,
             })
             .expect("split a second pane");
@@ -6571,7 +6583,7 @@ mod tests {
             first
                 .store
                 .save_pane_queue(&DurablePaneQueue {
-                    schema_version: crate::storage::QUEUE_SCHEMA_VERSION,
+                    schema_version: dock_model::storage::QUEUE_SCHEMA_VERSION,
                     workspace_id: "w1".into(),
                     pane_id: "gone".into(),
                     next_entry_id: 2,
@@ -6789,8 +6801,8 @@ mod tests {
                 external_task_ref: "TASK-42".into(),
                 run_id: id.into(),
                 worktree: self.root.join("fixture").display().to_string(),
-                adapter: crate::adapter::AdapterSelection {
-                    id: crate::adapter::AdapterId::Fixture,
+                adapter: dock_model::adapter::AdapterSelection {
+                    id: dock_model::adapter::AdapterId::Fixture,
                     executable: None,
                     arguments: vec!["-c".into(), "pwd".into()],
                 },
@@ -6876,7 +6888,7 @@ mod tests {
                 workspace_id: "ui_workspace".into(),
                 pane_id: "selected_pane".into(),
                 new_pane_id: "launch_target".into(),
-                axis: crate::layout::SplitAxis::Vertical,
+                axis: dock_model::layout::SplitAxis::Vertical,
                 kind: PaneKind::Terminal,
             })
             .unwrap();
@@ -6894,8 +6906,8 @@ mod tests {
         fs::write(&broken, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&broken, fs::Permissions::from_mode(0o700)).unwrap();
         let mut request = repo.request("dock_failed_exec_atomic");
-        request.adapter = crate::adapter::AdapterSelection {
-            id: crate::adapter::AdapterId::Generic,
+        request.adapter = dock_model::adapter::AdapterSelection {
+            id: dock_model::adapter::AdapterId::Generic,
             executable: Some(broken.display().to_string()),
             arguments: Vec::new(),
         };
@@ -6917,8 +6929,8 @@ mod tests {
         assert!(!registry.receipt_path(&request.run_id).unwrap().exists());
         assert_eq!(registry.inspect_programme().global_active, 0);
 
-        request.adapter = crate::adapter::AdapterSelection {
-            id: crate::adapter::AdapterId::Fixture,
+        request.adapter = dock_model::adapter::AdapterSelection {
+            id: dock_model::adapter::AdapterId::Fixture,
             executable: None,
             arguments: vec!["-c".into(), "exit 0".into()],
         };
@@ -7281,7 +7293,7 @@ mod tests {
         let still_owned = registry.inspect(Some(&snapshot.run_id)).unwrap().remove(0);
         assert!(matches!(
             still_owned.state,
-            crate::protocol::ProcessState::Running
+            dock_model::protocol::ProcessState::Running
         ));
         assert!(matches!(
             registry.dispatch(repo.request("dock_close_capacity_probe")),
@@ -7398,7 +7410,7 @@ mod tests {
         let retained = registry.inspect(Some(&first.run_id)).unwrap().remove(0);
         assert_eq!(retained.pid, first.pid);
         assert_eq!(retained.process_group_id, first.process_group_id);
-        assert_eq!(retained.state, crate::protocol::ProcessState::Running);
+        assert_eq!(retained.state, dock_model::protocol::ProcessState::Running);
         assert!(matches!(
             registry.dispatch(repo.request("dock_restart_capacity_probe")),
             Err((ErrorCode::CapacityExceeded, _))
@@ -7439,7 +7451,7 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let mut first_request = first_repo.request("dock_restart_launch_failure");
         first_request.adapter = AdapterSelection {
-            id: crate::adapter::AdapterId::Generic,
+            id: dock_model::adapter::AdapterId::Generic,
             executable: Some(executable.display().to_string()),
             arguments: vec![],
         };
@@ -8883,8 +8895,8 @@ mod tests {
         let repo = Repo::new("missing-adapter");
         let registry = RuntimeRegistry::new(&repo.state, 256).unwrap();
         let mut request = repo.request("dock_missing_adapter");
-        request.adapter = crate::adapter::AdapterSelection {
-            id: crate::adapter::AdapterId::Generic,
+        request.adapter = dock_model::adapter::AdapterSelection {
+            id: dock_model::adapter::AdapterId::Generic,
             executable: Some("/definitely/not/a/dock-agent".into()),
             arguments: vec![],
         };
@@ -8904,7 +8916,7 @@ mod tests {
         let repo = Repo::new("pane-capacity");
         let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
         let mut first = None;
-        for index in 0..crate::layout::MAX_PANES_PER_WORKSPACE {
+        for index in 0..dock_model::layout::MAX_PANES_PER_WORKSPACE {
             let snapshot = registry
                 .dispatch(repo.request(&format!("dock_capacity_{index}")))
                 .unwrap();
@@ -9001,7 +9013,7 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let mut request = repo.request("dock_disappearing");
         request.adapter = AdapterSelection {
-            id: crate::adapter::AdapterId::Generic,
+            id: dock_model::adapter::AdapterId::Generic,
             executable: Some(executable.display().to_string()),
             arguments: vec!["-c".into(), "sleep 30".into()],
         };
@@ -9018,7 +9030,10 @@ mod tests {
             .remove(0);
         assert_eq!(still_owned.pid, first.pid);
         assert_eq!(still_owned.process_group_id, first.process_group_id);
-        assert_eq!(still_owned.state, crate::protocol::ProcessState::Running);
+        assert_eq!(
+            still_owned.state,
+            dock_model::protocol::ProcessState::Running
+        );
         registry
             .lifecycle("dock_disappearing", LifecycleOperation::Stop)
             .unwrap();

@@ -97,15 +97,13 @@ impl Drop for ClientPermit {
     }
 }
 
-use crate::{
-    detect::{AgentKind, AgentState},
-    dispatch::RuntimeRegistry,
-    protocol::{
-        ErrorCode, Event, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProcessState, QueueRequest, Request,
-        Response,
-    },
-    terminal::{PaneOutput, ScreenSync},
+use crate::dispatch::RuntimeRegistry;
+use dock_detect::{AgentKind, AgentState};
+use dock_model::protocol::{
+    ErrorCode, Event, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProcessState, QueueRequest, Request,
+    Response,
 };
+use dock_pty::terminal::{PaneOutput, ScreenSync};
 
 /// How often the streaming loop samples the live emulators. Fast enough that a keystroke
 /// echoes without a perceptible lag, and free when nothing changed because an unchanged
@@ -341,12 +339,14 @@ fn handle_connection_with_timeout(
                     portfolio: runtime.inspect_programme(),
                 },
             )?,
-            Ok(Request::Workspace(crate::protocol::WorkspaceRequest::Inspect)) => write_response(
-                stream,
-                &Response::Layout {
-                    layout: runtime.layout(),
-                },
-            )?,
+            Ok(Request::Workspace(dock_model::protocol::WorkspaceRequest::Inspect)) => {
+                write_response(
+                    stream,
+                    &Response::Layout {
+                        layout: runtime.layout(),
+                    },
+                )?
+            }
             Ok(Request::Workspace(request)) => match runtime.workspace(request) {
                 Ok(workspace) => write_response(stream, &Response::WorkspaceChanged { workspace })?,
                 Err((code, message)) => write_response(stream, &Response::Error { code, message })?,
@@ -636,7 +636,7 @@ fn stream_events(
                                 // cells per pane.
                                 scrollback_rows: u32::try_from(
                                     (pane_history_bytes / 8)
-                                        .min(crate::terminal::PANE_HISTORY_MAX_ROWS),
+                                        .min(dock_pty::terminal::PANE_HISTORY_MAX_ROWS),
                                 )
                                 .unwrap_or(u32::MAX),
                                 screen: STANDARD.encode(&bytes),
@@ -1043,10 +1043,10 @@ fn describe_write_failure(error: std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{
+    use dock_model::protocol::{
         HelloRequest, PaneHistoryRequest, PaneInputRequest, PaneResizeRequest, SubscribeRequest,
     };
-    use crate::terminal::PaneScreen;
+    use dock_pty::terminal::PaneScreen;
     use std::{
         net::Shutdown,
         path::PathBuf,
@@ -1080,9 +1080,10 @@ mod tests {
     impl Drop for TestRegistry {
         fn drop(&mut self) {
             for snapshot in self.registry.inspect(None).unwrap_or_default() {
-                let _ = self
-                    .registry
-                    .lifecycle(&snapshot.run_id, crate::protocol::LifecycleOperation::Stop);
+                let _ = self.registry.lifecycle(
+                    &snapshot.run_id,
+                    dock_model::protocol::LifecycleOperation::Stop,
+                );
             }
             let _ = fs::remove_dir_all(&self.state);
         }
@@ -1632,16 +1633,56 @@ mod tests {
 
     #[test]
     fn reconnecting_clients_observe_the_same_owned_process() {
+        // `cargo test` runs this binary with its cwd set to the `dock-daemon` package
+        // directory — a subdirectory of the workspace's own repository, not that repository's
+        // Git top-level — so the ambient working directory can no longer stand in for a
+        // canonical repository root the way it could when this file lived in the root crate.
+        // Build a real one instead, exactly as `dispatch::tests::Repo` does.
+        struct Repo(PathBuf);
+        impl Drop for Repo {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let repo = Repo(
+            std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!(
+                    "dock-socket-reconnect-{}-{}",
+                    std::process::id(),
+                    SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                )),
+        );
+        fs::create_dir_all(&repo.0).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo.0)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "dock@example.invalid"]);
+        git(&["config", "user.name", "Dock Fixture"]);
+        fs::write(repo.0.join("tracked"), "fixture\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "-qm", "fixture"]);
+
         let runtime = registry();
-        let root = std::env::current_dir().unwrap().display().to_string();
+        let root = repo.0.display().to_string();
         let dispatch =
-            serde_json::to_string(&Request::Dispatch(crate::protocol::DispatchRequest {
+            serde_json::to_string(&Request::Dispatch(dock_model::protocol::DispatchRequest {
                 repository_root: root.clone(),
                 external_task_ref: "TASK-SOCKET".into(),
                 run_id: "dock_socket_reconnect".into(),
                 worktree: root,
-                adapter: crate::adapter::AdapterSelection {
-                    id: crate::adapter::AdapterId::Fixture,
+                adapter: dock_model::adapter::AdapterSelection {
+                    id: dock_model::adapter::AdapterId::Fixture,
                     executable: None,
                     arguments: vec!["-c".into(), "sleep 2".into()],
                 },
@@ -1737,7 +1778,7 @@ mod tests {
 
     fn create_workspace(runtime: &RuntimeRegistry) {
         runtime
-            .workspace(crate::protocol::WorkspaceRequest::Create {
+            .workspace(dock_model::protocol::WorkspaceRequest::Create {
                 workspace_id: "w1".into(),
                 name: "Daily".into(),
                 pane_id: "p1".into(),
@@ -2095,8 +2136,8 @@ mod tests {
 
     /// Replays what one subscriber received into a terminal of its own, exactly as a client
     /// must: size the parser from the attach frame, then feed every delta.
-    fn replay(events: &[Event], run_id: &str) -> crate::terminal::VtTerminal {
-        let mut screen: Option<crate::terminal::VtTerminal> = None;
+    fn replay(events: &[Event], run_id: &str) -> dock_pty::terminal::VtTerminal {
+        let mut screen: Option<dock_pty::terminal::VtTerminal> = None;
         for event in events {
             match event {
                 Event::PaneAttached {
@@ -2110,8 +2151,11 @@ mod tests {
                     // The whole point of the geometry fields: this client never saw the
                     // resize request and has no other source for the new size — nor for how
                     // much history the daemon keeps, which decides how far back it can scroll.
-                    let mut fresh =
-                        crate::terminal::VtTerminal::new(*rows, *cols, *scrollback_rows as usize);
+                    let mut fresh = dock_pty::terminal::VtTerminal::new(
+                        *rows,
+                        *cols,
+                        *scrollback_rows as usize,
+                    );
                     fresh.feed(&STANDARD.decode(bytes).expect("attach screen is base64"));
                     screen = Some(fresh);
                 }
@@ -2240,13 +2284,13 @@ mod tests {
             .expect("an attach frame");
         assert_eq!(
             attached as usize,
-            (runtime.pane_history_bytes() / 8).min(crate::terminal::PANE_HISTORY_MAX_ROWS),
+            (runtime.pane_history_bytes() / 8).min(dock_pty::terminal::PANE_HISTORY_MAX_ROWS),
             "the attach frame must carry a capacity derived from the daemon's real history \
              retention, not a client-side guess"
         );
         assert_eq!(
             attached as usize,
-            crate::terminal::PANE_HISTORY_MAX_ROWS,
+            dock_pty::terminal::PANE_HISTORY_MAX_ROWS,
             "and at the default budget it is the row cap that binds, not the byte budget: a \
              replica's rows are parsed cells, so the cap is what actually bounds client memory"
         );
@@ -2258,7 +2302,7 @@ mod tests {
             "the subscriber did not converge on the daemon's live screen"
         );
 
-        let visible = |terminal: &crate::terminal::VtTerminal| {
+        let visible = |terminal: &dock_pty::terminal::VtTerminal| {
             let (rows, _) = terminal.size();
             (0..rows)
                 .map(|row| terminal.visible_row(row))
@@ -2468,7 +2512,7 @@ mod tests {
     #[test]
     #[ignore = "a measurement, not an assertion: cargo test --release --lib -- --ignored --nocapture"]
     fn measure_what_seeding_a_pane_with_its_history_costs() {
-        let mut output = PaneOutput::new(40, 160, 100_000, crate::terminal::PANE_HISTORY_BYTES);
+        let mut output = PaneOutput::new(40, 160, 100_000, dock_pty::terminal::PANE_HISTORY_BYTES);
         for line in 0..200_000 {
             output.feed(format!("line {line} of a long build log\r\n").as_bytes());
         }
@@ -2491,7 +2535,7 @@ mod tests {
         let mut output = PaneOutput::new(5, 20, 100, 16);
         output.feed(b"first\r\n");
         let (mut view, _history_from, seed) = SubscriberView::seeded(&output, 5, 20);
-        let mut client = crate::terminal::VtTerminal::new(5, 20, 100);
+        let mut client = dock_pty::terminal::VtTerminal::new(5, 20, 100);
         client.feed(&seed);
         assert_eq!(client.state_bytes(), output.screen().state_bytes());
 
@@ -3024,7 +3068,7 @@ mod tests {
     /// A workspace of `panes` real pane shells, sized as a dashboard would size them.
     fn bench_workspace(runtime: &RuntimeRegistry, panes: usize) -> Vec<String> {
         runtime
-            .workspace(crate::protocol::WorkspaceRequest::Create {
+            .workspace(dock_model::protocol::WorkspaceRequest::Create {
                 workspace_id: "bench".into(),
                 name: "Bench".into(),
                 pane_id: "p0".into(),
@@ -3034,12 +3078,12 @@ mod tests {
         for index in 1..panes {
             let pane_id = format!("p{index}");
             runtime
-                .workspace(crate::protocol::WorkspaceRequest::Split {
+                .workspace(dock_model::protocol::WorkspaceRequest::Split {
                     workspace_id: "bench".into(),
                     pane_id: pane_ids[index - 1].clone(),
                     new_pane_id: pane_id.clone(),
-                    axis: crate::layout::SplitAxis::Vertical,
-                    kind: crate::layout::PaneKind::Terminal,
+                    axis: dock_model::layout::SplitAxis::Vertical,
+                    kind: dock_model::layout::PaneKind::Terminal,
                 })
                 .expect("split a bench pane");
             pane_ids.push(pane_id);

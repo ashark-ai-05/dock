@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::protocol::{Event, HelloRequest, PROTOCOL_VERSION, Request, Response, SubscribeRequest};
+use dock_model::protocol::{
+    Event, HelloRequest, PROTOCOL_VERSION, Request, Response, SubscribeRequest,
+};
 
 /// The request's kind, for a message about a request that failed.
 ///
@@ -402,7 +404,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::protocol::{ErrorCode, InspectRequest, PaneInputRequest};
+    use dock_model::protocol::{ErrorCode, InspectRequest, PaneInputRequest};
     use std::{
         os::unix::net::UnixListener,
         sync::atomic::{AtomicU64, Ordering},

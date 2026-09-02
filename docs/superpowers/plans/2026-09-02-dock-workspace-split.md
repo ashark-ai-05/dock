@@ -764,7 +764,8 @@ This is the point of the whole plan. Spec section 7: *"`dock-receipt` is the onl
 
 **Files:**
 - Create: `clippy.toml` (workspace root)
-- Modify: `crates/dock-model/src/lib.rs`, `crates/dock-ui/src/lib.rs`, `crates/dock-testing/src/lib.rs`
+- Modify (deny): `crates/dock-model/src/lib.rs`, `crates/dock-ui/src/lib.rs`, `crates/dock-testing/src/lib.rs`
+- Modify (opt out, with a stated reason each): `crates/dock-git/src/lib.rs`, `crates/dock-pty/src/lib.rs`, `crates/dock-daemon/src/lib.rs`, `src/lib.rs`, `src/main.rs`
 
 **Interfaces:**
 - Consumes: the crates from Tasks 1–6.
@@ -782,14 +783,14 @@ pub fn temporary_probe() {
 
 - [ ] **Step 2: Install the lint**
 
-Add to the top of `crates/dock-model/src/lib.rs`, `crates/dock-ui/src/lib.rs` and `crates/dock-testing/src/lib.rs`:
+The mechanism is the opposite of what an earlier draft of this plan described, and the real
+one is better. `clippy::disallowed_methods` is **warn-by-default the moment `clippy.toml`
+populates its list** — verified on clippy 0.1.93 / rustc 1.93.1. So the workspace default is
+*no crate may spawn a process*, and a crate that legitimately does must opt OUT explicitly.
 
-```rust
-// A crate that only holds shapes, or only draws, has no business starting a process. This is
-// the checkable half of the spec's exec-surface rule: dock-receipt will be the only crate
-// permitted to run argv Dock did not author, and these three may not run any argv at all.
-#![deny(clippy::disallowed_methods)]
-```
+That is a stronger posture than the opt-in deny first planned: a crate added to this
+workspace next year is enforced by default rather than silently exempt, and every exception
+is a greppable line carrying its own justification.
 
 Create `clippy.toml` at the workspace root:
 
@@ -799,10 +800,54 @@ disallowed-methods = [
 ]
 ```
 
+Add to the top of `crates/dock-model/src/lib.rs`, `crates/dock-ui/src/lib.rs` and
+`crates/dock-testing/src/lib.rs` — after the `//!` doc comment, before any `use`:
+
+```rust
+// A crate that only holds shapes, or only draws, has no business starting a process. The
+// workspace already warns; this makes it an error even when clippy runs without -D warnings.
+#![deny(clippy::disallowed_methods)]
+```
+
+Then add the four opt-outs, each stating what it spawns and who wrote the argv. At the top of
+`crates/dock-git/src/lib.rs`:
+
+```rust
+// Spawns `git` and `delta`, both with argv fixed at compile time. Dock wrote every argument.
+#![allow(clippy::disallowed_methods)]
+```
+
+`crates/dock-pty/src/lib.rs`:
+
+```rust
+// Spawns `$SHELL`, agent executables named by a manifest, and clipboard helpers — into PTYs
+// and process groups Dock owns. Dock wrote the argv; the agent binary is named, not composed.
+#![allow(clippy::disallowed_methods)]
+```
+
+`crates/dock-daemon/src/lib.rs`:
+
+```rust
+// Spawns `git` and `ps` with argv fixed at compile time.
+#![allow(clippy::disallowed_methods)]
+```
+
+`src/lib.rs` and `src/main.rs` in the root crate (`main.rs` needs its own, being a separate
+crate root):
+
+```rust
+// The binaries: spawn `dockd`, and `cargo` when rebuilding a sibling daemon in a dev tree.
+#![allow(clippy::disallowed_methods)]
+```
+
+**When `dock-receipt` lands in the next plan it gets no opt-out and no deny** — it will carry
+a narrower, per-call allowance at the single site that runs a declared check, so that the one
+place executing argv Dock did not write is the one place a reader has to look.
+
 - [ ] **Step 3: Confirm it fires**
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings`
-Expected: FAIL, naming `temporary_probe` in `crates/dock-ui/src/theme.rs` and citing the reason string.
+Expected: FAIL, naming `temporary_probe` in `crates/dock-ui/src/theme.rs` and citing the reason string — and failing **only** there. If it also fails inside `dock-git`, `dock-pty`, `dock-daemon` or the root crate, an opt-out from Step 2 is missing.
 
 Quote the real failure in your report. A lint nobody has watched fail is not known to work.
 

@@ -62,12 +62,13 @@ impl Theme {
     /// "Graphite and cyan": a cool graphite ground with teal for structure — focus, the active
     /// tab, the keys you can press — and exactly one warm colour in the entire palette.
     ///
-    /// That last part is the design. In `warm` the accent (232,168,88) and `working`
-    /// (226,184,96) are nearly the same colour, and the accent is simultaneously the focused
-    /// border, the active tab and every keybinding in the sidebar — so "an agent is working"
-    /// competed for the same channel as "here is a key", and nothing amber could be urgent.
-    /// Here rose is the only warm token there is, which makes `needs you` structurally
-    /// incapable of being mistaken for chrome.
+    /// That last part is the design. In `warm`, the accent (232,168,88) and `working`
+    /// (226,184,96) used to be nearly the same colour, and the accent was simultaneously the
+    /// focused border, the active tab and every keybinding in the sidebar — so "an agent is
+    /// working" competed for the same channel as "here is a key", and nothing amber could be
+    /// urgent. (`warm.working` has since been moved to (168,120,56), fixing that collision —
+    /// see the comment on `Theme::warm()`.) Here rose is the only warm token there is, which
+    /// makes `needs you` structurally incapable of being mistaken for chrome.
     pub const fn cool() -> Self {
         Self {
             accent: Color::Rgb(79, 209, 197),
@@ -159,7 +160,7 @@ mod tests {
     /// of compliance while every test written for the new palette watches only `cool`.
     #[test]
     fn agent_states_map_to_distinct_colours() {
-        for theme in [Theme::warm(), Theme::cool()] {
+        for (theme_name, theme) in Theme::all() {
             let colours = [
                 theme.agent(AgentState::Blocked),
                 theme.agent(AgentState::Working),
@@ -169,7 +170,7 @@ mod tests {
             for (index, colour) in colours.iter().enumerate() {
                 assert!(
                     !colours[index + 1..].contains(colour),
-                    "state colours must be distinguishable"
+                    "{theme_name}: state colours must be distinguishable"
                 );
             }
         }
@@ -177,23 +178,23 @@ mod tests {
 
     #[test]
     fn the_selection_background_is_distinct_from_every_other_token() {
-        for theme in [Theme::warm(), Theme::cool()] {
-            for other in [
-                theme.accent,
-                theme.surface,
-                theme.panel,
-                theme.muted,
-                theme.border,
-                theme.border_focused,
-                theme.text,
-                theme.blocked,
-                theme.working,
-                theme.done,
-                theme.idle,
+        for (theme_name, theme) in Theme::all() {
+            for (name, other) in [
+                ("accent", theme.accent),
+                ("surface", theme.surface),
+                ("panel", theme.panel),
+                ("muted", theme.muted),
+                ("border", theme.border),
+                ("border_focused", theme.border_focused),
+                ("text", theme.text),
+                ("blocked", theme.blocked),
+                ("working", theme.working),
+                ("done", theme.done),
+                ("idle", theme.idle),
             ] {
                 assert_ne!(
                     theme.selection, other,
-                    "a highlight that matches another token is not a highlight"
+                    "{theme_name}: a highlight that matches another token is not a highlight ({name} matches selection)"
                 );
             }
         }
@@ -201,8 +202,12 @@ mod tests {
 
     #[test]
     fn focused_and_unfocused_borders_differ() {
-        let theme = Theme::warm();
-        assert_ne!(theme.border, theme.border_focused);
+        for (theme_name, theme) in Theme::all() {
+            assert_ne!(
+                theme.border, theme.border_focused,
+                "{theme_name}: border and border_focused must differ"
+            );
+        }
         assert_eq!(Theme::border_type(), BorderType::Rounded);
     }
 

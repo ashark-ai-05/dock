@@ -381,6 +381,53 @@ mod tests {
         receipt
     }
 
+    /// A plainly-named file over the size limit. `sensitive_new_file`'s size clause is the
+    /// entire subject of the controller ruling that put a byte count on `UntrackedFile` in the
+    /// first place — this fixture is the one proof that the clause actually fires, rather than
+    /// only ever being reached by a name that would have fired anyway.
+    fn receipt_with_an_oversized_untracked_file() -> Receipt {
+        let mut receipt = base_receipt();
+        receipt.observed.untracked = vec![UntrackedFile {
+            path: "fixtures/recording.bin".into(),
+            bytes: Some(1_048_577),
+        }];
+        receipt
+    }
+
+    /// The same plain name, at exactly the limit rather than past it. The condition is `>`, not
+    /// `>=`, so this must not fire — and 1,048,576 already exceeds a limit quietly narrowed to
+    /// 1,000,000, so this fixture also pins the constant itself, not just the comparison.
+    fn receipt_with_an_untracked_file_at_exactly_the_size_limit() -> Receipt {
+        let mut receipt = base_receipt();
+        receipt.observed.untracked = vec![UntrackedFile {
+            path: "fixtures/recording.bin".into(),
+            bytes: Some(1_048_576),
+        }];
+        receipt
+    }
+
+    /// A plain name whose size Dock could not read. `None` must not be coerced into "small" or
+    /// "large" by the size clause — it must simply not participate in it.
+    fn receipt_with_an_untracked_file_of_unknown_size() -> Receipt {
+        let mut receipt = base_receipt();
+        receipt.observed.untracked = vec![UntrackedFile {
+            path: "fixtures/recording.bin".into(),
+            bytes: None,
+        }];
+        receipt
+    }
+
+    /// A sensitive name whose size Dock could not read. The name clause is independent of the
+    /// size clause, so an unread size must not suppress it.
+    fn receipt_with_an_untracked_pem_of_unknown_size() -> Receipt {
+        let mut receipt = base_receipt();
+        receipt.observed.untracked = vec![UntrackedFile {
+            path: "config/secret.pem".into(),
+            bytes: None,
+        }];
+        receipt
+    }
+
     /// Every rule fires on the case it names, and no fixture accidentally fires a second rule
     /// beside the one it was built to demonstrate.
     #[test]
@@ -416,6 +463,42 @@ mod tests {
                 rule.name()
             );
         }
+    }
+
+    /// `sensitive_new_file`'s size clause fires on its own, on a name that matches none of
+    /// `.env*`, `*.pem`, `id_*` — proving the clause is implemented, not just present in a name
+    /// match's shadow.
+    #[test]
+    fn an_oversized_untracked_file_fires_on_size_alone() {
+        let (_, findings) = evaluate(&receipt_with_an_oversized_untracked_file());
+        let fired: Vec<Rule> = findings.iter().map(|finding| finding.rule).collect();
+        assert_eq!(fired, vec![Rule::SensitiveNewFile], "{fired:?}");
+    }
+
+    /// The limit is exclusive: a file of exactly 1,048,576 bytes is not "larger than" it, and
+    /// 1,048,576 already exceeds a limit quietly narrowed to 1,000,000, so a wrong `>=` or a
+    /// wrong constant both show up here.
+    #[test]
+    fn an_untracked_file_at_exactly_the_size_limit_does_not_fire() {
+        let (_, findings) = evaluate(&receipt_with_an_untracked_file_at_exactly_the_size_limit());
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    /// An unread size must not be coerced into "large": a plain name with no known size does
+    /// not fire.
+    #[test]
+    fn an_untracked_file_of_unknown_size_and_a_plain_name_does_not_fire() {
+        let (_, findings) = evaluate(&receipt_with_an_untracked_file_of_unknown_size());
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    /// An unread size must not suppress the name clause either: a sensitive name still fires
+    /// even when its size is unknown.
+    #[test]
+    fn an_untracked_file_of_unknown_size_still_fires_on_a_matching_name() {
+        let (_, findings) = evaluate(&receipt_with_an_untracked_pem_of_unknown_size());
+        let fired: Vec<Rule> = findings.iter().map(|finding| finding.rule).collect();
+        assert_eq!(fired, vec![Rule::SensitiveNewFile], "{fired:?}");
     }
 
     /// A clean run fires nothing at all, which is the only way to earn a tick.

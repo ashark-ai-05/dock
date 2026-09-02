@@ -5177,19 +5177,9 @@ impl Dashboard {
                 lines.push(Line::styled(format!("    ? {question}"), heading));
             }
             if !record.packet.checks.is_empty() {
-                let checks = record
-                    .packet
-                    .checks
-                    .iter()
-                    .map(|check| {
-                        format!(
-                            "{} {}",
-                            check.name,
-                            if check.passed { "ok" } else { "failed" }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("   ");
+                // Names only, with no tick beside them: what the agent asked Dock to run is a
+                // claim, and the receipt is where a result earns the right to be printed.
+                let checks = record.packet.checks.join("   ");
                 lines.push(Line::styled(format!("    {checks}"), muted));
             }
             // Evidence the daemon measured, not anything the agent asserted about itself.
@@ -10965,10 +10955,7 @@ mod tests {
                 base_sha: "abc".into(),
                 summary: "Retry added; one bounded decision remains.".into(),
                 question: Some("Accept V0.1 scope?".into()),
-                checks: vec![dock_model::model::Check {
-                    name: "cargo test".into(),
-                    passed: true,
-                }],
+                checks: vec!["cargo test".into()],
             },
             evidence: dock_model::model::HandoffEvidence {
                 branch: "dock/fixture".into(),

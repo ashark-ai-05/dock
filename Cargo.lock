@@ -333,6 +333,7 @@ dependencies = [
  "dock-git",
  "dock-model",
  "dock-pty",
+ "dock-receipt",
  "dock-testing",
  "nix",
  "regex",

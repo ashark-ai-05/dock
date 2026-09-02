@@ -693,7 +693,7 @@ fn packet_filename(run_id: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Check, HandoffEvidence};
+    use crate::model::HandoffEvidence;
     use crate::receipt::fixture as receipt_fixture;
 
     fn packet() -> HandoffPacket {
@@ -708,10 +708,7 @@ mod tests {
             base_sha: "3fa91c2".into(),
             summary: "Bounded explicit handoff.".into(),
             question: None,
-            checks: vec![Check {
-                name: "cargo test".into(),
-                passed: true,
-            }],
+            checks: vec!["cargo test".into()],
         }
     }
 

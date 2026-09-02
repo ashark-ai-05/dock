@@ -1114,7 +1114,7 @@ fn dispatch_prompt(task_id: u64, title: &str, body: &str) -> String {
     format!(
         "{title}{card}\n\nThis is task #{task_id} on the Dock board. When you finish:\n    \
          dock task move {task_id} review\n    \
-         dock handoff \"what you did\" --check=\"cargo test:pass\"\n\
+         dock handoff \"what you did\" --check=test\n\
          The handoff puts your result in front of the human with the evidence Dock measured itself."
     )
 }
@@ -2108,17 +2108,12 @@ fn handoff_command(args: &[String]) -> io::Result<()> {
         .iter()
         .find_map(|argument| argument.strip_prefix("--question="))
         .map(str::to_owned);
+    // A name, and only a name. It is looked up in `.dock/checks.toml` and run by Dock; an agent
+    // reporting its own result here would be the very claim the receipt exists to replace.
     let checks = args
         .iter()
         .filter_map(|argument| argument.strip_prefix("--check="))
-        .map(|check| {
-            // `name:pass` / `name:fail`, so a check can be reported without another flag.
-            let (name, verdict) = check.rsplit_once(':').unwrap_or((check, "pass"));
-            dock::model::Check {
-                name: name.to_owned(),
-                passed: !verdict.eq_ignore_ascii_case("fail"),
-            }
-        })
+        .map(str::to_owned)
         .collect();
     let variable = |name: &str| {
         std::env::var(name).map_err(|_| {

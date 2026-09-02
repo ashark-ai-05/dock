@@ -15,6 +15,7 @@ dock-detect = { path = "../dock-detect", version = "0.1.0" }
 dock-git = { path = "../dock-git", version = "0.1.0" }
 dock-model = { path = "../dock-model", version = "0.1.0" }
 dock-pty = { path = "../dock-pty", version = "0.1.0" }
+dock-receipt = { path = "../dock-receipt", version = "0.1.0" }
 
 [dev-dependencies]
 dock-testing = { path = "../dock-testing", version = "0.1.0" }

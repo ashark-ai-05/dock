@@ -34,13 +34,17 @@ use dock_model::{
         RuntimeSnapshot, WorkspaceRequest,
     },
     queue::{AutoFeedTrust, MAX_PROMPT_BYTES, MAX_QUEUED_TOTAL, PaneQueue, QueueEntry},
-    receipt::ToolCall,
+    receipt::{
+        CheckOutcome, CheckRun, Claimed, Observed, RECEIPT_SCHEMA_VERSION, RULES_VERSION, Receipt,
+        ToolCall, UntrackedFile, Verdict, Witnessed,
+    },
     storage::LocalStore,
 };
 use dock_pty::{
     runtime::{OwnedRuntime, PtySize, RunBinding, RunPulse},
     terminal::{PaneOutput, PaneScreen},
 };
+use dock_receipt::declaration::{Checks, Resolved, load_permits};
 
 /// What one poll has already established about a run before its agent is resolved.
 ///
@@ -337,6 +341,10 @@ pub struct RuntimeRegistry {
     /// Bounded per-run history of hook-reported tool calls, timestamped: what the observed column
     /// needs, and what the roster's "last seen doing" line is built from.
     activity_rings: Mutex<HashMap<String, VecDeque<ToolCall>>>,
+    /// Why a run has no receipt, for the runs whose handoff was filed but whose receipt could not
+    /// be written. A handoff is the agent's work and is saved first; a storage failure after that
+    /// is Dock's problem to report on the run, never a reason to throw the handoff away.
+    receipt_diagnostics: Mutex<HashMap<String, String>>,
     /// When each run's output last grew. Not memoisable the way classification is: the answer it
     /// feeds changes with the passage of time rather than with new bytes, so it is read afresh.
     output_marks: Mutex<HashMap<String, StateTracker>>,
@@ -637,6 +645,7 @@ impl RuntimeRegistry {
             output_marks: Mutex::new(HashMap::new()),
             reported_states: Mutex::new(HashMap::new()),
             activity_rings: Mutex::new(HashMap::new()),
+            receipt_diagnostics: Mutex::new(HashMap::new()),
             queues: Mutex::new(queues),
             queue_paused: AtomicBool::new(paused),
             auto_feed_trust: Mutex::new(AutoFeedTrust::default()),
@@ -2616,6 +2625,15 @@ impl RuntimeRegistry {
             .unwrap_or_default()
     }
 
+    /// What went wrong writing this run's receipt, if anything did.
+    fn receipt_diagnostic(&self, run_id: &str) -> Option<String> {
+        self.receipt_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(run_id)
+            .cloned()
+    }
+
     /// Forgets everything remembered about runs that have ended.
     ///
     /// None of the three maps is keyed to anything but a run id, and run ids come back: a pane
@@ -2672,6 +2690,10 @@ impl RuntimeRegistry {
             .unwrap_or_else(|p| p.into_inner())
             .retain(|run_id, _| live.contains(run_id));
         self.activity_rings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|run_id, _| live.contains(run_id));
+        self.receipt_diagnostics
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|run_id, _| live.contains(run_id));
@@ -2898,6 +2920,12 @@ impl RuntimeRegistry {
                 snapshot.agent = agent;
                 snapshot.agent_state = state;
                 snapshot.activity = self.latest_activity(&snapshot.run_id);
+                // Only when the runtime has nothing of its own to say. A launch failure is the
+                // more fundamental fact about a run, and a run that failed to launch never got
+                // far enough to file a handoff anyway.
+                if snapshot.diagnostic.is_none() {
+                    snapshot.diagnostic = self.receipt_diagnostic(&snapshot.run_id);
+                }
                 snapshot
             })
             .collect())
@@ -3610,6 +3638,52 @@ impl RuntimeRegistry {
                 ),
             ));
         }
+        // The witnessed column, and the only part of this call that runs anything. It is built
+        // before the receipt because everything after it is arithmetic.
+        let witnessed = witness_checks(
+            &packet.checks,
+            Path::new(&snapshot.repository_root),
+            bound_worktree(&snapshot),
+            &facts,
+            &packet.run_id,
+        );
+        // Every field here is Dock's own: `claimed` is the only column the packet reaches, and it
+        // reaches nothing else. `worktree` and `branch` are taken from the snapshot rather than
+        // from the packet even though the two were just proved equal, so that no path exists at
+        // all by which an agent's string could land outside the column it authored.
+        let mut receipt = Receipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            run_id: snapshot.run_id.clone(),
+            task_id: snapshot.external_task_ref.clone(),
+            worktree: snapshot.worktree.clone(),
+            branch: snapshot.branch.clone(),
+            claimed: Claimed {
+                summary: packet.summary.clone(),
+                question: packet.question.clone(),
+                checks: packet.checks.clone(),
+            },
+            observed: Observed {
+                base_sha: facts.base_sha.clone(),
+                head_sha: facts.head_sha.clone(),
+                changed_files: facts.changed_files,
+                insertions: facts.insertions,
+                deletions: facts.deletions,
+                untracked: untracked_files(Path::new(&snapshot.worktree), &facts.base_sha),
+                tool_calls: self.tool_calls(&packet.run_id),
+            },
+            witnessed: Witnessed { checks: witnessed },
+            // Dock never writes this column. A person's decision arrives through `decide`, which
+            // is a different call with a different author, and a receipt Dock wrote must show
+            // that nobody has decided yet rather than quietly answering for them.
+            decided: None,
+            verdict: Verdict::Look,
+            findings: Vec::new(),
+            rules_version: RULES_VERSION,
+        };
+        let (verdict, findings) = dock_receipt::rules::evaluate(&receipt);
+        receipt.verdict = verdict;
+        receipt.findings = findings;
+
         let record = HandoffRecord {
             packet,
             evidence: HandoffEvidence {
@@ -3631,6 +3705,16 @@ impl RuntimeRegistry {
             };
             (code, message)
         })?;
+        // The handoff is saved first, and deliberately: by the time this line runs the agent has
+        // already made its handoff, and refusing the call because Dock could not write its own
+        // file would discard the agent's work to report Dock's storage problem. The failure is
+        // reported on the run instead, where a person looking at that run will see it.
+        if let Err(message) = self.store.save_receipt(&receipt) {
+            self.receipt_diagnostics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(receipt.run_id.clone(), message);
+        }
         Ok(record)
     }
 
@@ -3683,6 +3767,148 @@ impl RuntimeRegistry {
     }
 }
 
+/// The worktree this run's checks may be run in, or the sentence saying why it has none.
+///
+/// Spec section 3: *never on the primary checkout — a run without a bound worktree cannot be
+/// witnessed.* `dock_receipt::runner::run` takes any `&Path` and cannot tell a worktree Dock
+/// bound from the repository a person is sitting in, so the refusal has to happen here, where the
+/// binding is known. A bound run is one bound to a repository whose worktree is not the
+/// repository root itself; `validate_binding` already canonicalised both and proved the
+/// repository root is its own Git top-level, so comparing them is exact rather than a guess about
+/// paths.
+fn bound_worktree(snapshot: &RuntimeSnapshot) -> Result<&Path, String> {
+    if snapshot.binding_kind != BindingKind::Repository {
+        return Err("this run is bound to a terminal rather than to a worktree, so Dock has nowhere it may run a check".into());
+    }
+    if snapshot.worktree == snapshot.repository_root {
+        return Err(format!(
+            "this run is bound to the repository's own checkout at {}, not to a worktree of its own, and Dock never runs a check on the primary checkout",
+            snapshot.repository_root
+        ));
+    }
+    Ok(Path::new(&snapshot.worktree))
+}
+
+/// Everything Dock witnessed of the checks a handoff named.
+///
+/// Never fails: a check Dock could not run is a `CheckRun` saying so, because "nothing was
+/// witnessed, and here is the sentence why" is itself the evidence a receipt has to carry. Only
+/// [`Checks::resolve`] can turn one of `names` into something to spawn, which is the whole
+/// containment argument — a name the declaration does not hold becomes a refusal and never an
+/// argv.
+///
+/// The declaration is read from `repository_root`, never from the run's own worktree. An agent
+/// may write any file in the worktree it was given, `.dock/checks.toml` included, so a
+/// declaration read from there would let the agent author the command Dock spawns on its behalf.
+/// The repository root is the checkout the person reviewing the work is sitting in, and no Dock
+/// run is ever bound to it.
+fn witness_checks(
+    names: &[String],
+    repository_root: &Path,
+    worktree: Result<&Path, String>,
+    facts: &dock_git::GitFacts,
+    run_id: &str,
+) -> Vec<CheckRun> {
+    // A check Dock declined to run, pinned at the commit and dirtiness it declined at. The pins
+    // are the tree the receipt reports rather than blank, so `check_stale` — which asks only
+    // whether a check's after-pin is the head — cannot read "never ran" as "ran somewhere else".
+    let declined = |name: &str, reason: String| CheckRun {
+        name: name.to_owned(),
+        // Empty, and load-bearing: a command is copied here only by the runner, from the
+        // declaration, at the moment of a spawn. An empty one is proof no spawn happened.
+        command: Vec::new(),
+        outcome: CheckOutcome::Unwitnessed,
+        exit_code: None,
+        duration_ms: 0,
+        sha_before: facts.head_sha.clone(),
+        sha_after: facts.head_sha.clone(),
+        dirty_before: facts.status_entries > 0,
+        dirty_after: facts.status_entries > 0,
+        tail: String::new(),
+        reason: Some(reason),
+    };
+    let checks = match Checks::load(repository_root) {
+        Ok(checks) => checks,
+        // A declaration Dock cannot read is not a refused handoff. One entry carrying the parse
+        // error, named for the file rather than for a check, so the reader sees the cause once
+        // instead of once per name — and sees it even when no name was given at all.
+        Err(error) => return vec![declined(".dock/checks.toml", error)],
+    };
+    if names.is_empty() {
+        return Vec::new();
+    }
+    // Before the `auto` question, because this one is unconditional: a run with nowhere safe to
+    // run a check has none available on demand either, and a reason naming `auto` would hide it.
+    let worktree = match worktree {
+        Ok(worktree) => worktree,
+        Err(reason) => {
+            return names
+                .iter()
+                .map(|name| declined(name, reason.clone()))
+                .collect();
+        }
+    };
+    if !checks.auto {
+        // Pending, not failed: the receipt rail's `r` key runs these on demand, so the sentence
+        // has to read as something still to happen rather than as something that went wrong.
+        return names
+            .iter()
+            .map(|name| declined(name, "checks.auto is false; press r to run them".into()))
+            .collect();
+    }
+    let permitted = match load_permits() {
+        Ok(permitted) => permitted,
+        // The same reasoning as an unreadable declaration, one step further out: a user config
+        // Dock cannot read tells it nothing about what a check may see, and guessing "nothing is
+        // permitted" would report a denial the user never wrote.
+        Err(error) => {
+            return names
+                .iter()
+                .map(|name| declined(name, error.clone()))
+                .collect();
+        }
+    };
+    let mut witnessed = Vec::with_capacity(names.len());
+    for name in names {
+        // Sequentially, one check at a time. The runner's lane limit bounds how many checks run
+        // across all runs at once; this loop is the within-run half of the same bound, and it is
+        // what lets one check's SHA pins describe a tree no sibling check was moving underneath.
+        witnessed.push(match checks.resolve(name, &permitted) {
+            Resolved::Check(check) => {
+                dock_receipt::runner::run(&check, worktree, &permitted, run_id)
+            }
+            Resolved::Unwitnessed(reason) => declined(name, reason),
+        });
+    }
+    witnessed
+}
+
+/// The untracked paths in a run's worktree, each with the size Dock could read for it.
+///
+/// `bytes` is `None` rather than `0` wherever the size could not be read — a race with an agent
+/// still writing the file, a permissions error, a symlink to nowhere. Zero reads as "small", and
+/// would silently exempt from `sensitive_new_file`'s size clause exactly the file whose size Dock
+/// could not determine.
+fn untracked_files(worktree: &Path, base_sha: &str) -> Vec<UntrackedFile> {
+    let Ok(review) = GitAdapter::new(worktree).review(base_sha) else {
+        // The same adapter answered `facts` a moment ago, so this is close to unreachable; an
+        // empty list is still the honest answer to "which untracked files did Dock see", because
+        // it saw none.
+        return Vec::new();
+    };
+    review
+        .files
+        .into_iter()
+        .filter(|file| file.untracked)
+        .map(|file| UntrackedFile {
+            bytes: fs::metadata(worktree.join(&file.path))
+                .ok()
+                .map(|metadata| metadata.len()),
+            path: file.path,
+        })
+        .collect()
+}
+
 fn validate_concise_safe_packet(packet: &HandoffPacket) -> Result<(), String> {
     if packet.summary.len() > 2_000
         || packet
@@ -3690,7 +3916,7 @@ fn validate_concise_safe_packet(packet: &HandoffPacket) -> Result<(), String> {
             .as_ref()
             .is_some_and(|value| value.len() > 1_000)
         || packet.checks.len() > 64
-        || packet.checks.iter().any(|check| check.name.len() > 200)
+        || packet.checks.iter().any(|name| name.len() > 200)
     {
         return Err("handoff evidence exceeds concise local record limits".into());
     }
@@ -3703,7 +3929,7 @@ fn validate_concise_safe_packet(packet: &HandoffPacket) -> Result<(), String> {
         || packet
             .checks
             .iter()
-            .any(|check| contains_secret_marker(&check.name))
+            .any(|name| contains_secret_marker(name))
     {
         return Err("handoff evidence contains a prohibited secret marker".into());
     }
@@ -4606,7 +4832,6 @@ fn repository_id(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dock_model::model::Check;
     // Only the tests build launch requests by hand now; the runtime destructures the one the
     // protocol already typed.
     use dock_model::protocol::DashboardProfile;
@@ -7212,10 +7437,7 @@ mod tests {
             base_sha: snapshot.base_sha.clone(),
             summary: "Implemented the bounded fixture change.".into(),
             question: Some("Accept this scope?".into()),
-            checks: vec![Check {
-                name: "cargo test".into(),
-                passed: true,
-            }],
+            checks: vec!["cargo test".into()],
         }
     }
 
@@ -9854,6 +10076,255 @@ mod tests {
         assert!(!requested.git_mutated && !requested.external_task_completed);
     }
 
+    /// The declaration Dock reads is the repository's, so a fixture writes it where the human's
+    /// checkout is rather than in the worktree the agent was given — that asymmetry is the point,
+    /// and `witness_checks` documents why.
+    fn declare_checks(repo: &Repo, body: &str) {
+        fs::create_dir_all(repo.root.join(".dock")).unwrap();
+        fs::write(repo.root.join(".dock/checks.toml"), body).unwrap();
+    }
+
+    /// An untracked file in the run's worktree, so `empty_diff` — which fires on a claim with
+    /// nothing at all behind it — is not what a receipt test ends up measuring.
+    fn touch_worktree_file(repo: &Repo, name: &str, body: &str) {
+        fs::write(repo.root.join("fixture").join(name), body).unwrap();
+    }
+
+    /// Success criterion 1: the receipt shows a command Dock ran, an exit code Dock observed and
+    /// the SHA it ran at — none of which the agent could have written.
+    #[test]
+    fn a_handoff_writes_a_receipt_the_agent_could_not_have_forged() {
+        let repo = Repo::new("handoff-receipt");
+        declare_checks(&repo, "[check.test]\nrun = [\"true\"]\ntimeout = \"1m\"\n");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let snapshot = registry.dispatch(repo.request("dock_receipt_1")).unwrap();
+        touch_worktree_file(&repo, "note.txt", "work happened here\n");
+        let mut packet = packet(&snapshot);
+        packet.checks = vec!["test".into()];
+
+        registry.submit_handoff(packet).expect("submit handoff");
+
+        let receipt = LocalStore::new(&repo.state)
+            .load_receipt("dock_receipt_1")
+            .expect("a handoff leaves a receipt");
+        let witnessed = &receipt.witnessed.checks[0];
+        assert_eq!(witnessed.command, ["true"]);
+        assert_eq!(witnessed.outcome, CheckOutcome::Passed);
+        assert_eq!(witnessed.exit_code, Some(0));
+        assert_eq!(witnessed.sha_after, receipt.observed.head_sha);
+        assert_eq!(receipt.verdict, Verdict::Clear, "{:?}", receipt.findings);
+        // The agent named the check and nothing else. Everything above is Dock's own record of
+        // running it, and `decided` is the column Dock may never write.
+        assert_eq!(receipt.claimed.checks, ["test"]);
+        assert_eq!(receipt.decided, None);
+        assert_eq!(
+            receipt.observed.untracked,
+            vec![UntrackedFile {
+                path: "note.txt".into(),
+                bytes: Some(19),
+            }]
+        );
+    }
+
+    /// Success criterion 3: a repository with no `.dock/checks.toml` is never shown a tick.
+    #[test]
+    fn a_repository_that_declared_nothing_is_never_shown_a_tick() {
+        let repo = Repo::new("handoff-receipt-undeclared");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let snapshot = registry.dispatch(repo.request("dock_receipt_2")).unwrap();
+        touch_worktree_file(&repo, "note.txt", "work happened here\n");
+        let mut packet = packet(&snapshot);
+        packet.checks = Vec::new();
+
+        registry.submit_handoff(packet).expect("submit handoff");
+
+        let receipt = LocalStore::new(&repo.state)
+            .load_receipt("dock_receipt_2")
+            .expect("a handoff leaves a receipt");
+        assert!(receipt.witnessed.checks.is_empty());
+        assert_eq!(receipt.verdict, Verdict::Look);
+        assert!(
+            receipt
+                .findings
+                .iter()
+                .any(|finding| finding.rule == dock_model::receipt::Rule::NoChecksDeclared),
+            "{:?}",
+            receipt.findings
+        );
+    }
+
+    /// Success criterion 2: a stale green is caught. `check_stale` asks one question — is this
+    /// check's after-pin the head the receipt reports? — and a check that moved the tree answers
+    /// no, so its green describes a commit the receipt does not name.
+    #[test]
+    fn an_edit_after_a_green_check_is_caught_as_stale() {
+        let repo = Repo::new("handoff-receipt-stale");
+        declare_checks(
+            &repo,
+            "[check.test]\nrun = [\"true\"]\n\n\
+             [check.edit]\nrun = [\"git\", \"commit\", \"--allow-empty\", \"-q\", \"-m\", \"later\"]\n",
+        );
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let snapshot = registry.dispatch(repo.request("dock_receipt_3")).unwrap();
+        touch_worktree_file(&repo, "note.txt", "work happened here\n");
+        let mut packet = packet(&snapshot);
+        packet.checks = vec!["test".into(), "edit".into()];
+
+        registry.submit_handoff(packet).expect("submit handoff");
+
+        let receipt = LocalStore::new(&repo.state)
+            .load_receipt("dock_receipt_3")
+            .expect("a handoff leaves a receipt");
+        // Run in the order the packet named them, one at a time.
+        let names: Vec<&str> = receipt
+            .witnessed
+            .checks
+            .iter()
+            .map(|check| check.name.as_str())
+            .collect();
+        assert_eq!(names, ["test", "edit"]);
+        assert_eq!(receipt.witnessed.checks[0].outcome, CheckOutcome::Passed);
+        assert!(
+            receipt
+                .findings
+                .iter()
+                .any(|finding| finding.rule == dock_model::receipt::Rule::CheckStale),
+            "{:?}",
+            receipt.findings
+        );
+        assert_eq!(receipt.verdict, Verdict::Look);
+    }
+
+    /// The containment claim, asserted rather than described: a name nobody declared is recorded
+    /// and never spawned.
+    #[test]
+    fn an_undeclared_check_name_is_recorded_unwitnessed_and_never_run() {
+        let repo = Repo::new("handoff-receipt-unknown");
+        declare_checks(&repo, "[check.test]\nrun = [\"true\"]\n");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let snapshot = registry.dispatch(repo.request("dock_receipt_4")).unwrap();
+        touch_worktree_file(&repo, "note.txt", "work happened here\n");
+        let mut packet = packet(&snapshot);
+        packet.checks = vec!["definitely-not-declared".into()];
+
+        registry.submit_handoff(packet).expect("submit handoff");
+
+        let receipt = LocalStore::new(&repo.state)
+            .load_receipt("dock_receipt_4")
+            .expect("a handoff leaves a receipt");
+        let witnessed = &receipt.witnessed.checks[0];
+        assert_eq!(witnessed.outcome, CheckOutcome::Unwitnessed);
+        // A command reaches a receipt only by being copied out of the declaration at the moment
+        // of a spawn, so an empty one is the assertion that nothing was spawned at all.
+        assert!(
+            witnessed.command.is_empty(),
+            "nothing may have been spawned"
+        );
+        assert_eq!(witnessed.exit_code, None);
+        assert_eq!(
+            witnessed.reason.as_deref(),
+            Some("no check named `definitely-not-declared` in .dock/checks.toml")
+        );
+    }
+
+    /// A run bound to the repository's own checkout has nowhere Dock may run a check, so every
+    /// name it gives is recorded unwitnessed rather than spawned. `runner::run` takes any path
+    /// and cannot make this refusal for itself; this is the call site that can.
+    #[test]
+    fn a_run_on_the_primary_checkout_witnesses_nothing() {
+        let repo = Repo::new("handoff-receipt-primary");
+        declare_checks(&repo, "[check.test]\nrun = [\"true\"]\n");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let mut request = repo.request("dock_receipt_5");
+        request.worktree = repo.root.display().to_string();
+        let snapshot = registry.dispatch(request).unwrap();
+        fs::write(repo.root.join("note.txt"), "work happened here\n").unwrap();
+        let mut packet = packet(&snapshot);
+        packet.checks = vec!["test".into()];
+
+        registry.submit_handoff(packet).expect("submit handoff");
+
+        let receipt = LocalStore::new(&repo.state)
+            .load_receipt("dock_receipt_5")
+            .expect("a handoff leaves a receipt");
+        let witnessed = &receipt.witnessed.checks[0];
+        assert_eq!(witnessed.outcome, CheckOutcome::Unwitnessed);
+        assert!(
+            witnessed.command.is_empty(),
+            "nothing may have been spawned"
+        );
+        assert!(
+            witnessed
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not to a worktree of its own")),
+            "{:?}",
+            witnessed.reason
+        );
+    }
+
+    /// A repository that turned automatic checks off is told they are pending, not that they
+    /// failed: the receipt rail's `r` key runs them on demand, and a reason worded as a failure
+    /// would read as a verdict on work nobody has checked yet.
+    #[test]
+    fn checks_that_do_not_run_automatically_are_recorded_as_pending() {
+        let repo = Repo::new("handoff-receipt-manual");
+        declare_checks(
+            &repo,
+            "[checks]\nauto = false\n\n[check.test]\nrun = [\"true\"]\n",
+        );
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let snapshot = registry.dispatch(repo.request("dock_receipt_6")).unwrap();
+        touch_worktree_file(&repo, "note.txt", "work happened here\n");
+        let mut packet = packet(&snapshot);
+        packet.checks = vec!["test".into()];
+
+        registry.submit_handoff(packet).expect("submit handoff");
+
+        let receipt = LocalStore::new(&repo.state)
+            .load_receipt("dock_receipt_6")
+            .expect("a handoff leaves a receipt");
+        let witnessed = &receipt.witnessed.checks[0];
+        assert_eq!(witnessed.outcome, CheckOutcome::Unwitnessed);
+        assert!(
+            witnessed.command.is_empty(),
+            "nothing may have been spawned"
+        );
+        assert_eq!(
+            witnessed.reason.as_deref(),
+            Some("checks.auto is false; press r to run them")
+        );
+    }
+
+    /// A receipt Dock cannot write must not cost the agent its handoff. The handoff is saved
+    /// first and the failure is reported on the run, because by then the agent has already
+    /// handed off and refusing the call would discard its work over Dock's storage problem.
+    #[test]
+    fn a_receipt_that_cannot_be_written_still_keeps_the_handoff() {
+        let repo = Repo::new("handoff-receipt-unwritable");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let snapshot = registry.dispatch(repo.request("dock_receipt_7")).unwrap();
+        touch_worktree_file(&repo, "note.txt", "work happened here\n");
+        // `save_receipt` writes once and refuses an existing name, so a file already standing
+        // there is the failure this test needs without reaching inside the store.
+        fs::create_dir_all(repo.state.join("receipts")).unwrap();
+        fs::write(repo.state.join("receipts/dock_receipt_7.json"), "{}").unwrap();
+
+        let record = registry
+            .submit_handoff(packet(&snapshot))
+            .expect("a storage failure must not cost the agent its handoff");
+
+        assert_eq!(record.packet.run_id, "dock_receipt_7");
+        assert_eq!(registry.review_inbox().unwrap(), vec![record]);
+        let diagnostic = registry.inspect(Some("dock_receipt_7")).unwrap()[0]
+            .diagnostic
+            .clone();
+        assert!(
+            diagnostic.is_some_and(|message| message.contains("already exists")),
+            "the run must say why it has no receipt"
+        );
+    }
+
     #[test]
     fn handoff_rejects_unknown_runs_binding_mismatch_future_schema_and_secret_markers() {
         let repo = Repo::new("handoff-reject");
@@ -9979,7 +10450,7 @@ mod tests {
             match field {
                 0 => candidate.summary = (*secret).into(),
                 1 => candidate.question = Some((*secret).into()),
-                _ => candidate.checks[0].name = (*secret).into(),
+                _ => candidate.checks[0] = (*secret).into(),
             }
             assert!(matches!(
                 registry.submit_handoff(candidate),

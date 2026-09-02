@@ -1,12 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Check {
-    pub name: String,
-    pub passed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffPacket {
     pub schema_version: u16,
@@ -19,7 +13,10 @@ pub struct HandoffPacket {
     pub base_sha: String,
     pub summary: String,
     pub question: Option<String>,
-    pub checks: Vec<Check>,
+    /// The *names* of checks the agent asks Dock to run, and nothing more. A result here would
+    /// be a claim wearing the costume of evidence; the receipt's witnessed column is where that
+    /// question is answered, by a command Dock ran itself.
+    pub checks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,10 +114,7 @@ mod tests {
             base_sha: "3fa91c2".into(),
             summary: "Implementation complete; one bounded decision remains.".into(),
             question: Some("Accept V0.1 scope?".into()),
-            checks: vec![Check {
-                name: "cargo test".into(),
-                passed: true,
-            }],
+            checks: vec!["cargo test".into()],
         }
     }
 
@@ -147,5 +141,15 @@ mod tests {
             "checks":[],"raw_transcript":"prohibited"
         }"#;
         assert!(serde_json::from_str::<HandoffPacket>(unknown_field).is_err());
+    }
+
+    /// An agent names a check. It cannot report one: `passed` was a claim wearing the costume of
+    /// evidence, and the witnessed column is where that question is answered now.
+    #[test]
+    fn a_handoff_names_checks_and_cannot_assert_their_results() {
+        let unknown = r#"{"schema_version":1,"run_id":"r","task_id":"t","workspace_id":"w",
+            "pane_id":"p","worktree":"wt","branch":"b","base_sha":"sha","summary":"s",
+            "question":null,"checks":[{"name":"test","passed":true}]}"#;
+        assert!(serde_json::from_str::<HandoffPacket>(unknown).is_err());
     }
 }

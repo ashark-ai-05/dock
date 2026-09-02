@@ -74,7 +74,7 @@ Panes get `DOCK_BOARD`, `DOCK_WORKSPACE`, `DOCK_PANE`, `DOCK_RUN`, and `DOCK_TAS
 `Ctrl+B q` is the prompt queue. `dock queue add "$DOCK_PANE" "continue"` from a shell. Auto-feed does not trust screen-inferred done unless you set trust explicitly.
 
 ```bash
-dock handoff "added retry with backoff" --check="cargo test:pass"
+dock handoff "added retry with backoff" --check=test
 ```
 
 `Ctrl+B i` reviews claimed vs observed (branch, files, diffstat). `a` accept / `c` changes — recorded only. Dock does not merge.

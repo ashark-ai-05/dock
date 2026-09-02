@@ -52,7 +52,7 @@ impl Theme {
             // The previous Rgb(226,184,96) was 18.9 from this palette's accent — an agent
             // that was working looked exactly like ordinary chrome.
             //
-            // accent 86.2 · blocked 70.7 · done 129.6 · idle 74.6 · 4.47:1 on both grounds.
+            // accent 86.2 · blocked 70.7 · done 173.8 · idle 83.5 · 4.82:1 on surface, 4.47:1 on panel
             working: Color::Rgb(168, 120, 56),
             done: Color::Rgb(122, 176, 214),
             idle: Color::Rgb(108, 122, 114),

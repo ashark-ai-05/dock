@@ -264,7 +264,7 @@ git commit -m "test: legibility and selection floors hold for every palette"
 
 ### Task 4: A floor under the structural line
 
-`border` draws the pane grid, the tab separator, the menu separator, and the board's column rules. The 2026-08-30 review measured it at 1.32:1 in `cool` — "not dim, it is gone" — and commit `a99d44a` fixed it to `Rgb(70, 82, 90)`, now 2.26:1. Nothing enforces that, so it can regress the same way twice.
+`border` draws the pane grid, the tab separator, the menu separator, and the board's column rules. The 2026-08-30 review measured it at 1.32:1 in `cool` — "not dim, it is gone" — and commit `a99d44a` fixed it to `Rgb(70, 82, 90)`, now 2.26:1, **and added `unfocused_borders_clear_two_to_one_on_both_surfaces` to hold it there**. So the floor is already enforced. What that guard does not do is cover `border_focused`, name the failing theme, or iterate `Theme::all()`. This task widens it on those three axes and deletes the original, which the widened version strictly supersedes.
 
 The spec considered adding a separate `border_pane` token and **rejected it**: both palettes already clear 2:1, so a new token would buy a property the palette has. Only the test was missing.
 
@@ -305,7 +305,7 @@ Add to the test module in `src/theme.rs`:
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --lib theme::tests::every_structural_line_clears_two_to_one`
-Expected: PASS. Measured values are `warm.border` 2.25:1 / 2.06:1 and `cool.border` 2.26:1 / 2.04:1; both `border_focused` values are far above the floor.
+Expected: PASS. Measured values are `warm.border` 2.254:1 / 2.092:1 and `cool.border` 2.263:1 / 2.041:1; both `border_focused` values are far above the floor. `cool.border` on `panel` clears by only 0.041, so this guard is genuinely load-bearing.
 
 To prove the guard bites, temporarily restore the pre-`a99d44a` value by setting `cool`'s `border` to `Color::Rgb(38, 46, 51)`, re-run, and confirm it reports `cool: border on surface is only 1.32:1`. Revert before continuing.
 

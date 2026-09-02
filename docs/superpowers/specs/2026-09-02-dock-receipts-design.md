@@ -323,10 +323,16 @@ additions:
 
 **No `border_pane` token.** An earlier draft of this spec proposed one, on the strength of
 the 2026-08-30 review measuring `cool.border` at 1.32:1 against `surface` — "not dim, gone".
-Commit `a99d44a` already fixed it: `cool.border` is now `Rgb(70,82,90)`, measuring **2.26:1**
-on `surface` and 2.04:1 on `panel`, and `warm.border` measures 2.25:1. Both clear the 2:1
-floor a structural line needs. Splitting the token would add a concept to buy a property the
-palette already has. What is missing is only a **test**, so it cannot silently regress again.
+Commit `a99d44a` already fixed it, and shipped a guard with it: `cool.border` is now
+`Rgb(70,82,90)`, measuring **2.26:1** on `surface` and 2.04:1 on `panel`; `warm.border`
+measures 2.25:1 and 2.09:1. Both clear the 2:1 floor a structural line needs, and
+`unfocused_borders_clear_two_to_one_on_both_surfaces` already holds them there.
+
+So a new token would buy a property the palette has, and a new test would restate a
+guarantee that exists. What is actually missing is narrower: the existing guard covers
+`border` but not `border_focused`, names no theme when it fails, and iterates a hardcoded
+pair rather than every shipped palette. Row 0 widens it on those three axes and deletes the
+superseded original rather than leaving two overlapping assertions, one strictly weaker.
 
 ### A shipped palette is currently broken
 

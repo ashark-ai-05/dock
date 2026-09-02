@@ -9,4 +9,3 @@ pub mod dashboard;
 pub mod keymap;
 pub mod picker;
 pub mod theme;
-pub mod verdict;

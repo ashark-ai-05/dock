@@ -24,4 +24,5 @@ pub mod model;
 pub mod paths;
 pub mod protocol;
 pub mod queue;
+pub mod receipt;
 pub mod storage;

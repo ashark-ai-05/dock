@@ -474,8 +474,16 @@ trustworthy to a stranger reading the README.
 settled against real PTY bytes — and none of it is retyped.
 
 **Rewritten.** `dashboard.rs`: 19,294 lines, 565 functions, a 6,500-line `impl Dashboard`.
-It becomes `dock-ui`, one file per surface. The home screen is changing anyway; this is the
-only moment the dissolution costs nothing extra.
+It becomes `dock-ui`, one file per surface.
+
+**When** it is rewritten matters, and an earlier draft of this spec got it wrong. It had the
+workspace split dissolve `dashboard.rs` into `dock-ui` first, and the Split Spine replace
+those surfaces two rows later — the same 19k lines cut apart and then rewritten, with the
+first pass discarded by the second. The dissolution is therefore deferred out of the
+workspace split and folded into the Split Spine row, which is rewriting that code anyway.
+The split extracts only the crates whose seams the code already has; `dashboard.rs` stays
+whole, as a `dock-ui` crate of one large module, until the row that replaces its surfaces
+breaks it up as a by-product.
 
 **New.** `dock-receipt`.
 
@@ -492,9 +500,9 @@ Each row ships and is usable before the next starts.
 | | Ships | Why here |
 |---|---|---|
 | 0 | Palette tests parameterised over every shipped theme; `warm.working` fixed; `border` floor enforced; vocabulary consts | A shipped palette is currently broken and no test catches it |
-| 1 | Workspace split; `dashboard.rs` dissolved into `dock-ui` | Prerequisite for 2–5. No user-visible change; all 843 tests stay green |
+| 1 | Workspace split: `dock-model`, `dock-git`, `dock-pty`, `dock-detect`, `dock-ui`, and the lint that binds the exec surface. `dashboard.rs` moves whole, undissolved | Prerequisite for 2–5. No user-visible change; every test stays green |
 | 2 | `dock-receipt`: `checks.toml`, runner, receipt store, nine rules, verdict | The product |
-| 3 | Split Spine and receipt rail; overlay tiers; scrim; `border_pane`; `age` ramp | The product becomes visible |
+| 3 | Split Spine and receipt rail, dissolving `dashboard.rs` as it goes; overlay tiers; scrim; `age` ramp | The product becomes visible, and the 19k-line file is broken up by the work that was rewriting it anyway |
 | 4 | One manifest per agent; derived capability; cache invalidation | "All agents" becomes true rather than a roster count |
 | 5 | Ledger; `dock peers`; light palette; `theme = "auto"` | The screenshot, and the data the last two rules need |
 

@@ -18,7 +18,8 @@
 - **Separation floor for agent-state colours: 60.0** RGB Euclidean units from each other and from `accent`.
 - **Selection band floors: 3.0:1** for the band against `surface`, **4.5:1** for `text` on the band.
 - Tests live in the existing `#[cfg(test)] mod tests` in `src/theme.rs` unless a task says otherwise.
-- Run the full suite with **`cargo test`**, not `cargo test --lib`. 44 tests live in `src/main.rs`, which is the `dock` binary target and is invisible to `--lib`. Before this plan, `cargo test` reported 832 passed + 12 ignored across the lib (788+12) and bin (44) targets — 844 registered, matching the 844 `#[test]` attributes in `src/`. Every task must leave it green.
+- Run the full suite with **`cargo test`**, not `cargo test --lib`. 44 tests live in `src/main.rs`, which is the `dock` binary target and is invisible to `--lib`. Every task must leave it green.
+- **Test-count arithmetic**, so a wrong expectation never reads as a failure. Before this plan: **843 registered** = 831 passed + 12 ignored, across the lib (787 passed + 12 ignored) and bin (44 passed) targets. This plan adds **six** tests — one in Task 1, one in Task 4, one in Task 5, three in Task 6 — ending at **849 registered = 837 passed + 12 ignored**. Tasks 2, 3 and 7 rewrite or verify; they add none.
 - Gates are pass/fail and must be **read**, not grepped for a line count: `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`. A clippy failure once reached `main` because a count of matching lines looked like zero.
 - Measurement harnesses are `#[ignore]`d tests, run deliberately. Grep for them with `#\[ignore` — **not** `#\[ignore\]`, which misses the `#[ignore = "reason"]` form most of them use.
 - This plan touches no render code paths and must not change any frame timing. No measurement run is required.
@@ -563,7 +564,7 @@ The plan's claim is that nothing here touched a render path. That is worth check
 - [ ] **Step 1: Run the whole suite**
 
 Run: `cargo test`
-Expected: PASS. 838 passed + 12 ignored across the lib and bin targets — 850 registered, which is the pre-plan 844 plus the six this plan adds (one in Task 1, one in Task 4, one in Task 5, three in Task 6; Tasks 2 and 3 modify existing tests rather than adding).
+Expected: PASS. **837 passed + 12 ignored = 849 registered**, across the lib and bin targets. That is the pre-plan 843 plus the six this plan adds: one in Task 1, one in Task 4, one in Task 5, and three in Task 6. Tasks 2 and 3 rewrite existing tests rather than adding any.
 
 Do not use `cargo test --lib` here: it silently omits the 44 tests in `src/main.rs`.
 

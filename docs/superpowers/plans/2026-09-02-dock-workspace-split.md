@@ -20,6 +20,8 @@
 - **Use `git mv`, never copy-and-delete.** History has to follow these files; a copy makes `git log --follow` useless on a 19,000-line file.
 - **No behaviour changes.** No renamed public items, no changed signatures, no "while I'm here" fixes. If you find a bug, report it; do not fix it.
 - **`pub(crate)` becoming `pub` is expected, and is not a behaviour change.** An item marked `pub(crate)` is private to its crate, so the moment its callers are in a different crate it must widen to `pub` or the workspace does not compile. This is an inherent cost of splitting and it will recur in Tasks 4, 5 and 6. Widen it, and add a one-line comment at each site saying it is public because of the crate boundary rather than because the API grew on purpose. Do **not** work around it by moving the caller, duplicating the helper, or re-exporting through a shim — those are worse than an honest `pub`. Do report every widening in your task report so the reviewer can confirm each one was forced rather than convenient.
+- **Use `sed -E`, and plain parentheses, for every alternation.** macOS ships BSD `sed`, which does not understand GNU's `\(a\|b\)` syntax — it does not error, it silently matches nothing, so the rewrite appears to succeed and the build then fails somewhere unrelated. Write `sed -E -i '' -e 's/crate::(a|b)::/dock_x::\1::/g'`. Verify a rule fires before trusting it: `echo "crate::board::X" | sed -E 's/crate::(board|model)::/dock_model::\1::/'` must print the rewritten form.
+- **Every crate's manifest in this plan is a starting point, not a specification.** They were derived from a per-file scan of top-of-file `use` lines, which misses fully-qualified calls (`vt100::Parser`), test-only imports, and braced forms. Task 5 had to add `vt100` and `serde_json` that the plan omitted. Add what the compiler demands, remove nothing the compiler does not complain about, and list every deviation in your report.
 - **A `sed` cannot rewrite a braced import, and the biggest files use them.** `use crate::{ adapter::{…}, board::{…}, detect::{…} }` does not contain the string `crate::adapter::`, so every `sed 's/crate::X::/dock_x::X::/'` in this plan silently skips it. These blocks must be split by hand, one `use` per destination crate. Task 4 did this correctly in `protocol.rs` — follow that shape:
 
   ```rust
@@ -482,7 +484,7 @@ Add to `crates/dock-pty/src/lib.rs`: `pub mod runtime;`
 Fix its outward references:
 
 ```bash
-sed -i '' -e 's/crate::detect::/dock_detect::/g' \
+sed -E -i '' -e 's/crate::detect::/dock_detect::/g' \
           -e 's/crate::board::/dock_model::board::/g' \
           -e 's/crate::terminal::/crate::terminal::/g' \
           crates/dock-pty/src/runtime.rs
@@ -582,10 +584,10 @@ dock-testing = { path = "../dock-testing" }
 
 ```bash
 cd crates/dock-ui/src
-sed -i '' -e 's/crate::detect::/dock_detect::/g' \
+sed -E -i '' -e 's/crate::detect::/dock_detect::/g' \
           -e 's/crate::git::/dock_git::/g' \
-          -e 's/crate::\(adapter\|board\|board_config\|board_watch\|layout\|model\|paths\|protocol\|queue\|storage\)::/dock_model::\1::/g' \
-          -e 's/crate::\(terminal\|clipboard\)::/dock_pty::\1::/g' \
+          -e 's/crate::(adapter|board|board_config|board_watch|layout|model|paths|protocol|queue|storage)::/dock_model::\1::/g' \
+          -e 's/crate::(terminal|clipboard)::/dock_pty::\1::/g' \
           -e 's/crate::files::/dock_git::files::/g' \
           *.rs
 cd -
@@ -677,6 +679,7 @@ description = "Dock's daemon: socket server, dispatch, worktree binding, agent a
 
 [dependencies]
 base64 = "0.23"
+nix = { version = "=0.29.0", features = ["process", "signal", "term"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -693,10 +696,10 @@ dock-testing = { path = "../dock-testing" }
 
 ```bash
 cd crates/dock-daemon/src
-sed -i '' -e 's/crate::detect::/dock_detect::/g' \
+sed -E -i '' -e 's/crate::detect::/dock_detect::/g' \
           -e 's/crate::git::/dock_git::/g' \
-          -e 's/crate::\(adapter\|board\|board_config\|board_watch\|layout\|model\|paths\|protocol\|queue\|storage\)::/dock_model::\1::/g' \
-          -e 's/crate::\(terminal\|runtime\|clipboard\)::/dock_pty::\1::/g' \
+          -e 's/crate::(adapter|board|board_config|board_watch|layout|model|paths|protocol|queue|storage)::/dock_model::\1::/g' \
+          -e 's/crate::(terminal|runtime|clipboard)::/dock_pty::\1::/g' \
           -e 's/crate::testing::/dock_testing::/g' \
           *.rs
 cd -

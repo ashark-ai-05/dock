@@ -13,7 +13,10 @@ pub const RECEIPT_SCHEMA_VERSION: u16 = 1;
 
 /// The rule set that produced a verdict. Stored in the receipt so an old receipt can show the
 /// verdict it was given while `dock verdict recheck` reports where today's rules disagree.
-pub const RULES_VERSION: u16 = 1;
+///
+/// v2 added `untracked_unreadable` and stopped `empty_diff` asserting "no untracked files" over
+/// a list Dock never managed to read.
+pub const RULES_VERSION: u16 = 2;
 
 /// What the agent said. Dock never writes here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +40,12 @@ pub struct Observed {
     pub deletions: usize,
     /// Paths and sizes, not contents. `sensitive_new_file` reads these and nothing else.
     pub untracked: Vec<UntrackedFile>,
+    /// Why the list above is empty, when it is empty because Dock could not read it rather than
+    /// because there was nothing to read. `None` is the ordinary case and means the list is an
+    /// observation; `Some` means it is not one, and no rule may treat it as an absence. Old
+    /// receipts default to `None`, which is what they meant.
+    #[serde(default)]
+    pub untracked_error: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
 }
@@ -147,6 +156,7 @@ pub enum Rule {
     PeerConflict,
     DestructiveCommand,
     SensitiveNewFile,
+    UntrackedUnreadable,
 }
 
 /// How bad a rule's finding is. The verdict is the maximum severity present.
@@ -169,6 +179,7 @@ impl Rule {
             Self::PeerConflict => "peer_conflict",
             Self::DestructiveCommand => "destructive_command",
             Self::SensitiveNewFile => "sensitive_new_file",
+            Self::UntrackedUnreadable => "untracked_unreadable",
         }
     }
 
@@ -182,7 +193,7 @@ impl Rule {
 
     /// Every rule, so `dock verdict explain` can list the ones that did *not* fire and the rule
     /// table test cannot silently miss one.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::CheckFailed,
         Self::CheckStale,
         Self::CheckUnwitnessed,
@@ -192,6 +203,7 @@ impl Rule {
         Self::PeerConflict,
         Self::DestructiveCommand,
         Self::SensitiveNewFile,
+        Self::UntrackedUnreadable,
     ];
 }
 
@@ -257,6 +269,7 @@ pub(crate) fn fixture() -> Receipt {
                 path: ".env.local".into(),
                 bytes: Some(42),
             }],
+            untracked_error: None,
             tool_calls: vec![ToolCall {
                 at_unix_ms: 1_764_000_000_000,
                 tool: "Bash".into(),

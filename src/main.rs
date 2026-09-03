@@ -2132,7 +2132,7 @@ fn handoff_command(args: &[String]) -> io::Result<()> {
         .facts("HEAD")
         .map_err(io::Error::other)?;
     let packet = dock::model::HandoffPacket {
-        schema_version: 1,
+        schema_version: dock::model::HANDOFF_PACKET_SCHEMA_VERSION,
         run_id: variable("DOCK_RUN")?,
         task_id: std::env::var("DOCK_TASK").unwrap_or_else(|_| "untracked".into()),
         workspace_id: variable("DOCK_WORKSPACE")?,

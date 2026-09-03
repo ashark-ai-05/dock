@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+/// The handoff packet format. v2 is the shape in which `checks` names checks rather than
+/// reporting them: v1's `[{name, passed}]` was a claim wearing the costume of evidence, and the
+/// witnessed column answers that question now.
+///
+/// The bump is what makes an old record on disk fail as *"unsupported handoff packet schema
+/// version"* rather than as a `deny_unknown_fields` parse error nobody can act on. Either way
+/// the record cannot be read; only one of them says why.
+pub const HANDOFF_PACKET_SCHEMA_VERSION: u16 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffPacket {
@@ -76,7 +85,7 @@ impl ReviewDecision {
 
 impl HandoffPacket {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema_version != 1 {
+        if self.schema_version != HANDOFF_PACKET_SCHEMA_VERSION {
             return Err("unsupported handoff packet schema version");
         }
         if self.run_id.trim().is_empty() || self.task_id.trim().is_empty() {
@@ -104,7 +113,7 @@ mod tests {
 
     fn valid_packet() -> HandoffPacket {
         HandoffPacket {
-            schema_version: 1,
+            schema_version: HANDOFF_PACKET_SCHEMA_VERSION,
             run_id: "dock_01J9".into(),
             task_id: "DOCK-7".into(),
             workspace_id: "dock".into(),
@@ -130,24 +139,46 @@ mod tests {
     #[test]
     fn packet_rejects_unknown_fields_and_future_schema() {
         let mut packet = valid_packet();
-        packet.schema_version = 2;
+        packet.schema_version = HANDOFF_PACKET_SCHEMA_VERSION + 1;
         assert_eq!(
             packet.validate(),
             Err("unsupported handoff packet schema version")
         );
         let unknown_field = r#"{
-            "schema_version":1,"run_id":"x","task_id":"t","workspace_id":"w","pane_id":"p",
+            "schema_version":2,"run_id":"x","task_id":"t","workspace_id":"w","pane_id":"p",
             "worktree":"wt","branch":"b","base_sha":"sha","summary":"s","question":null,
             "checks":[],"raw_transcript":"prohibited"
         }"#;
         assert!(serde_json::from_str::<HandoffPacket>(unknown_field).is_err());
     }
 
+    /// A record written before `checks` stopped carrying results. One that named a check cannot
+    /// be parsed at all — `deny_unknown_fields` sees `passed` and stops — but one that named
+    /// none parses cleanly into today's shape, and without the version bump it would have been
+    /// read as current. The version is the only thing that tells these two shapes apart.
+    #[test]
+    fn a_v1_record_is_refused_by_version_rather_than_read_as_current() {
+        let named_a_check = r#"{"schema_version":1,"run_id":"r","task_id":"t","workspace_id":"w",
+            "pane_id":"p","worktree":"wt","branch":"b","base_sha":"sha","summary":"s",
+            "question":null,"checks":[{"name":"test","passed":true}]}"#;
+        assert!(serde_json::from_str::<HandoffPacket>(named_a_check).is_err());
+
+        let named_none = r#"{"schema_version":1,"run_id":"r","task_id":"t","workspace_id":"w",
+            "pane_id":"p","worktree":"wt","branch":"b","base_sha":"sha","summary":"s",
+            "question":null,"checks":[]}"#;
+        let parsed: HandoffPacket = serde_json::from_str(named_none)
+            .expect("an empty check list is shaped the same in both versions");
+        assert_eq!(
+            parsed.validate(),
+            Err("unsupported handoff packet schema version")
+        );
+    }
+
     /// An agent names a check. It cannot report one: `passed` was a claim wearing the costume of
     /// evidence, and the witnessed column is where that question is answered now.
     #[test]
     fn a_handoff_names_checks_and_cannot_assert_their_results() {
-        let unknown = r#"{"schema_version":1,"run_id":"r","task_id":"t","workspace_id":"w",
+        let unknown = r#"{"schema_version":2,"run_id":"r","task_id":"t","workspace_id":"w",
             "pane_id":"p","worktree":"wt","branch":"b","base_sha":"sha","summary":"s",
             "question":null,"checks":[{"name":"test","passed":true}]}"#;
         assert!(serde_json::from_str::<HandoffPacket>(unknown).is_err());

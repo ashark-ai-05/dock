@@ -190,7 +190,12 @@ fn parse_timeout(value: Option<&str>) -> Result<Duration, String> {
             "timeout `{value}` is zero, which would witness nothing"
         ));
     }
-    Ok(Duration::from_secs(seconds * scale))
+    // `u64::MAX` parses, and `u64::MAX * 3_600` panics in debug and wraps in release — to a
+    // timeout of a few seconds, which would kill checks a repository asked to run for hours.
+    let seconds = seconds
+        .checked_mul(scale)
+        .ok_or_else(|| format!("timeout `{value}` is longer than Dock can represent"))?;
+    Ok(Duration::from_secs(seconds))
 }
 
 #[cfg(test)]
@@ -275,6 +280,25 @@ needs_env = ["NPM_TOKEN"]
         );
         assert!(parse_timeout(Some("soon")).is_err());
         assert!(parse_timeout(Some("0m")).is_err());
+    }
+
+    /// A number that parses and then does not fit. `u64::MAX * 3_600` panicked in debug and, in
+    /// release, wrapped to a handful of seconds — a repository asking for the longest timeout it
+    /// could write would have got the shortest one there is, and its checks killed mid-run.
+    #[test]
+    fn a_timeout_too_large_to_represent_is_refused_rather_than_wrapped() {
+        let huge = format!("{}h", u64::MAX);
+        let refused = parse_timeout(Some(&huge)).expect_err("an unrepresentable timeout");
+        assert!(
+            refused.contains("longer than Dock can represent"),
+            "{refused}"
+        );
+        // The largest one that does fit still parses, so the guard rejects only the impossible.
+        let largest = format!("{}s", u64::MAX);
+        assert_eq!(
+            parse_timeout(Some(&largest)).unwrap(),
+            Duration::from_secs(u64::MAX)
+        );
     }
 
     /// A permission file that cannot be *read* — here, because the path is a directory rather

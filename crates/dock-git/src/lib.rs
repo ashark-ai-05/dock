@@ -283,13 +283,36 @@ impl GitAdapter {
     /// know which files are new wants only that: `review` runs one `git diff` per changed file to
     /// build the review overlay's per-file hunks, and every one of those diffs would be read from
     /// a pipe and thrown away. A receipt asks this question on every handoff.
+    ///
+    /// `-z` and `-uall` are both load-bearing, and both were wrong before. Porcelain v1 C-quotes
+    /// any path holding a space, a quote, a backslash or a non-ASCII byte, and the quotes reach
+    /// the caller: `".env.my key"` starts with a `"`, so a rule asking whether the name starts
+    /// with `.env` answers no, and an agent evades it by typing a space. NUL separation turns
+    /// quoting off entirely. `--untracked-files=normal` is the other half — it collapses a
+    /// directory the agent has just created into the single entry `secrets/`, so nothing inside
+    /// it is ever named, ever sized, ever examined.
     pub fn untracked_paths(&self) -> Result<Vec<String>, String> {
-        let porcelain = self.git(["status", "--porcelain=v1", "--untracked-files=normal"])?;
-        Ok(porcelain
-            .lines()
-            .filter_map(|line| line.strip_prefix("?? "))
-            .map(str::to_owned)
-            .collect())
+        let porcelain = self.git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+        let mut untracked = Vec::new();
+        let mut records = porcelain.split('\0').filter(|record| !record.is_empty());
+        while let Some(record) = records.next() {
+            let status = record.as_bytes();
+            if status.len() < 3 {
+                continue;
+            }
+            // A rename or a copy spends a second record on its source path, and that record
+            // carries no status letters at all. Consuming it here is what stops a source path
+            // that happens to be named `?? x` from being read as a status line and reported as
+            // an untracked file that does not exist.
+            if matches!(status[0], b'R' | b'C') || matches!(status[1], b'R' | b'C') {
+                records.next();
+                continue;
+            }
+            if let Some(path) = record.strip_prefix("?? ") {
+                untracked.push(path.to_owned());
+            }
+        }
+        Ok(untracked)
     }
 
     /// Porcelain + numstat + per-file diffs + worktrees. Review only: no stage/commit/push.
@@ -632,6 +655,71 @@ mod worktree_tests {
             .map(|file| file.path)
             .collect();
         assert_eq!(adapter.untracked_paths().unwrap(), from_review);
+    }
+
+    /// Porcelain v1 C-quotes any path holding a space, a quote, a backslash or a non-ASCII byte,
+    /// and those quotes used to reach the receipt intact: `".env.my key"` starts with a `"`, so
+    /// `sensitive_new_file`'s `.env` test answered no and an agent evaded the rule by typing a
+    /// space. `-z` is what turns the quoting off, so these names must arrive exactly as typed.
+    #[test]
+    fn untracked_paths_are_the_names_on_disk_and_not_gits_quoting_of_them() {
+        let repo = Repo::new();
+        let awkward = [".env.my key", "wei rd\"name.pem", "café.pem", "back\\slash"];
+        for name in awkward {
+            fs::write(repo.0.join(name), "secret").unwrap();
+        }
+        let mut found = GitAdapter::new(&repo.0)
+            .untracked_paths()
+            .expect("untracked paths");
+        found.sort();
+        let mut expected: Vec<String> = awkward.iter().map(|name| (*name).to_owned()).collect();
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    /// `--untracked-files=normal` reports a directory the agent has just created as the single
+    /// entry `secrets/`, and nothing inside it is named, sized or examined — a `.env` one level
+    /// down produced no finding at all. `review` still collapses it, deliberately: its list
+    /// feeds the diff overlay a person reads, and this one feeds a rule.
+    #[test]
+    fn untracked_paths_look_inside_a_directory_the_agent_created() {
+        let repo = Repo::new();
+        fs::create_dir_all(repo.0.join("secrets/deeper")).unwrap();
+        fs::write(repo.0.join("secrets/.env.local"), "TOKEN=1").unwrap();
+        fs::write(repo.0.join("secrets/deeper/id_rsa"), "key").unwrap();
+        let adapter = GitAdapter::new(&repo.0);
+        let mut found = adapter.untracked_paths().expect("untracked paths");
+        found.sort();
+        assert_eq!(found, ["secrets/.env.local", "secrets/deeper/id_rsa"]);
+        let from_review: Vec<String> = adapter
+            .review("HEAD")
+            .expect("review")
+            .files
+            .into_iter()
+            .filter(|file| file.untracked)
+            .map(|file| file.path)
+            .collect();
+        assert_eq!(
+            from_review,
+            ["secrets/"],
+            "the overlay's list stays collapsed; only this list is per-file"
+        );
+    }
+
+    /// A `git status` Dock could not run is not the sentence "there were no untracked files".
+    /// The caller records the failure on the receipt; what it may never do is read an error as
+    /// an absence.
+    #[test]
+    fn untracked_paths_report_a_failed_status_rather_than_an_empty_list() {
+        let repo = Repo::new();
+        let outside = repo.0.join("not-a-repository");
+        fs::create_dir_all(&outside).unwrap();
+        // A directory that is inside the fixture repo would still answer, so the check is a path
+        // that does not exist at all: `git -C` cannot even start there.
+        let refused = GitAdapter::new(outside.join("missing"))
+            .untracked_paths()
+            .expect_err("a status Dock could not run must not read as no untracked files");
+        assert!(refused.contains("git"), "{refused}");
     }
 
     #[test]

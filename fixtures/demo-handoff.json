@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "run_id": "fixture_DOCK7",
   "task_id": "DOCK-7",
   "workspace_id": "dock-fixture",
@@ -9,7 +9,5 @@
   "base_sha": "3fa91c2",
   "summary": "Implementation complete; one bounded decision remains.",
   "question": "Accept V0.1 scope?",
-  "checks": [
-    { "name": "cargo test", "passed": true }
-  ]
+  "checks": ["cargo test"]
 }

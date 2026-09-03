@@ -10945,7 +10945,7 @@ mod tests {
     fn handoff(run_id: &str, task_id: &str) -> HandoffRecord {
         HandoffRecord {
             packet: dock_model::model::HandoffPacket {
-                schema_version: 1,
+                schema_version: dock_model::model::HANDOFF_PACKET_SCHEMA_VERSION,
                 run_id: run_id.into(),
                 task_id: task_id.into(),
                 workspace_id: "w".into(),

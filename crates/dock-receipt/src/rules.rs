@@ -45,6 +45,7 @@ pub fn evaluate(receipt: &Receipt) -> (Verdict, Vec<Finding>) {
     // peer_conflict is inert — see `inert` above.
     destructive_command(receipt, &mut findings);
     sensitive_new_file(receipt, &mut findings);
+    untracked_unreadable(receipt, &mut findings);
 
     let verdict = if findings
         .iter()
@@ -158,10 +159,16 @@ fn no_checks_declared(receipt: &Receipt, findings: &mut Vec<Finding>) {
 
 /// A claim of work with nothing behind it: the tree is at the same commit it started from and
 /// no untracked file appeared either.
+///
+/// Silent when the untracked list is not an observation. Half of this rule's fact is the
+/// sentence "with no untracked files", and Dock may not write that sentence about a list it
+/// could not read — [`untracked_unreadable`] fires on that receipt instead, so the ignorance is
+/// still in the verdict rather than dressed up as a fact.
 fn empty_diff(receipt: &Receipt, findings: &mut Vec<Finding>) {
     let claimed_something = !receipt.claimed.summary.trim().is_empty();
     let no_diff = receipt.observed.base_sha == receipt.observed.head_sha;
-    let no_new_files = receipt.observed.untracked.is_empty();
+    let no_new_files =
+        receipt.observed.untracked.is_empty() && receipt.observed.untracked_error.is_none();
     if claimed_something && no_diff && no_new_files {
         findings.push(Finding {
             rule: Rule::EmptyDiff,
@@ -216,6 +223,23 @@ fn sensitive_new_file(receipt: &Receipt, findings: &mut Vec<Finding>) {
                 ),
             });
         }
+    }
+}
+
+/// The untracked list Dock could not read, reported as the gap it is.
+///
+/// `sensitive_new_file` reads that list and nothing else, so a failed read is a rule that never
+/// ran — and an empty list standing in for an unread one is the exact shape of failing open this
+/// product exists to refuse. The reason travels from `git` in the same style a declined check's
+/// does, and the finding is what keeps the verdict from reading `clear`.
+fn untracked_unreadable(receipt: &Receipt, findings: &mut Vec<Finding>) {
+    if let Some(reason) = &receipt.observed.untracked_error {
+        findings.push(Finding {
+            rule: Rule::UntrackedUnreadable,
+            fact: format!(
+                "the untracked file list could not be read, so no new file was examined: {reason}"
+            ),
+        });
     }
 }
 
@@ -276,6 +300,7 @@ mod tests {
                 insertions: 40,
                 deletions: 3,
                 untracked: vec![],
+                untracked_error: None,
                 tool_calls: vec![ToolCall {
                     at_unix_ms: 1_764_000_000_000,
                     tool: "Bash".into(),
@@ -461,6 +486,16 @@ mod tests {
         receipt
     }
 
+    /// A `git status` Dock could not run. The list is empty, but it is empty for a reason that
+    /// is not "there was nothing there", and every rule that reads it has to know the difference.
+    fn receipt_with_an_unreadable_untracked_list() -> Receipt {
+        let mut receipt = base_receipt();
+        receipt.observed.untracked = vec![];
+        receipt.observed.untracked_error =
+            Some("git failed (exit status: 128): not a git repository".into());
+        receipt
+    }
+
     /// Every rule fires on the case it names, and no fixture accidentally fires a second rule
     /// beside the one it was built to demonstrate.
     #[test]
@@ -486,6 +521,10 @@ mod tests {
                 receipt_with_a_git_reset_hard_in_its_tool_calls(),
             ),
             (Rule::SensitiveNewFile, receipt_with_an_untracked_pem()),
+            (
+                Rule::UntrackedUnreadable,
+                receipt_with_an_unreadable_untracked_list(),
+            ),
         ] {
             let (_, findings) = evaluate(&receipt);
             let fired: Vec<Rule> = findings.iter().map(|finding| finding.rule).collect();
@@ -496,6 +535,36 @@ mod tests {
                 rule.name()
             );
         }
+    }
+
+    /// The one thing this product may not do is state something false. `empty_diff`'s fact ends
+    /// "with no untracked files", and Dock cannot say that about a list it never read — so on a
+    /// receipt whose read failed, that sentence is absent and the failure is the finding instead.
+    /// The verdict is still not `clear`: the ignorance is reported, not skipped.
+    #[test]
+    fn an_unread_untracked_list_is_never_reported_as_no_untracked_files() {
+        let mut receipt = receipt_with_a_claim_and_no_diff();
+        receipt.observed.untracked_error = Some("git failed (exit status: 128)".into());
+        let (verdict, findings) = evaluate(&receipt);
+        let fired: Vec<Rule> = findings.iter().map(|finding| finding.rule).collect();
+        assert_eq!(fired, vec![Rule::UntrackedUnreadable], "{findings:?}");
+        assert_eq!(verdict, Verdict::Look);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.fact.contains("no untracked files")),
+            "{findings:?}"
+        );
+        // Without the failure, the same receipt is exactly the `empty_diff` case: this is the
+        // read, not the shape of the receipt, that changes the answer.
+        let (_, findings) = evaluate(&receipt_with_a_claim_and_no_diff());
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.rule)
+                .collect::<Vec<_>>(),
+            vec![Rule::EmptyDiff]
+        );
     }
 
     /// `sensitive_new_file`'s size clause fires on its own, on a name that matches none of

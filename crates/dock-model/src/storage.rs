@@ -698,7 +698,7 @@ mod tests {
 
     fn packet() -> HandoffPacket {
         HandoffPacket {
-            schema_version: 1,
+            schema_version: crate::model::HANDOFF_PACKET_SCHEMA_VERSION,
             run_id: "dock_01J9".into(),
             task_id: "DOCK-7".into(),
             workspace_id: "dock".into(),

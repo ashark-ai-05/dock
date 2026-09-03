@@ -300,9 +300,12 @@ fn cap_tool_detail(detail: String) -> String {
     detail[..end].to_owned()
 }
 
-/// Wall-clock milliseconds since the Unix epoch, for the observed column's timestamps. A clock
-/// that cannot go backward relative to itself: `SystemTime` before the epoch has nothing sensible
-/// to report, so that case reads as "now" rather than panicking a hook report.
+/// Wall-clock milliseconds since the Unix epoch, for the observed column's timestamps.
+///
+/// A `SystemTime` before the epoch has nothing sensible to report, so that case reads as the
+/// epoch itself rather than panicking a hook report. Deliberately not "now": Dock has no honest
+/// value for a clock it cannot trust, and 1970 is a timestamp no reader will mistake for an
+/// observation, where a plausible-looking one would be an invention.
 fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3915,13 +3918,21 @@ fn observe(
     let facts = adapter
         .facts(base_sha)
         .unwrap_or_else(|_| before_checks.clone());
+    // A `git status` that failed is not the observation "there were no untracked files". It is
+    // the absence of an observation, and it is recorded as one: `untracked_unreadable` fires on
+    // the reason, and `empty_diff` stops claiming an emptiness nobody looked for.
+    let (untracked, untracked_error) = match untracked_files(adapter, worktree) {
+        Ok(untracked) => (untracked, None),
+        Err(reason) => (Vec::new(), Some(reason)),
+    };
     Observed {
         base_sha: facts.base_sha,
         head_sha: facts.head_sha,
         changed_files: facts.changed_files,
         insertions: facts.insertions,
         deletions: facts.deletions,
-        untracked: untracked_files(adapter, worktree),
+        untracked,
+        untracked_error,
         tool_calls,
     }
 }
@@ -3932,10 +3943,13 @@ fn observe(
 /// still writing the file, a permissions error, a symlink to nowhere. Zero reads as "small", and
 /// would silently exempt from `sensitive_new_file`'s size clause exactly the file whose size Dock
 /// could not determine.
-fn untracked_files(adapter: &GitAdapter, worktree: &Path) -> Vec<UntrackedFile> {
-    adapter
-        .untracked_paths()
-        .unwrap_or_default()
+///
+/// The `Err` is the same argument one level up: a failed read is returned rather than flattened
+/// to an empty list, because "Dock could not look" and "Dock looked and found nothing" are
+/// different sentences and only one of them is true.
+fn untracked_files(adapter: &GitAdapter, worktree: &Path) -> Result<Vec<UntrackedFile>, String> {
+    Ok(adapter
+        .untracked_paths()?
         .into_iter()
         .map(|path| UntrackedFile {
             bytes: fs::metadata(worktree.join(&path))
@@ -3943,7 +3957,7 @@ fn untracked_files(adapter: &GitAdapter, worktree: &Path) -> Vec<UntrackedFile> 
                 .map(|metadata| metadata.len()),
             path,
         })
-        .collect()
+        .collect())
 }
 
 fn validate_concise_safe_packet(packet: &HandoffPacket) -> Result<(), String> {
@@ -5019,6 +5033,33 @@ mod tests {
             .report_agent_state(&tool_call_report("dock_run_1", "Bash", "x".repeat(9_000)))
             .expect("report tool call");
         assert!(registry.tool_calls("dock_run_1")[0].detail.len() <= TOOL_DETAIL_LIMIT);
+    }
+
+    /// The cut lands mid-character, and `detail` is a filename or a command line the *agent*
+    /// chose — so this is input an agent fully controls, arriving on the daemon's connection
+    /// thread. `detail.truncate(TOOL_DETAIL_LIMIT)` would read identically and panic here.
+    #[test]
+    fn a_tool_detail_cut_through_a_multi_byte_character_keeps_whole_characters() {
+        // `€` is three bytes and starts at 1_999, so byte 2_000 sits inside it.
+        let straddling = format!("{}€{}", "a".repeat(1_999), "b".repeat(100));
+        assert!(!straddling.is_char_boundary(TOOL_DETAIL_LIMIT));
+        let capped = cap_tool_detail(straddling);
+        assert_eq!(capped.len(), 1_999, "the cut walks back off the character");
+        assert!(!capped.contains('€'), "a half-written character was kept");
+        assert!(capped.chars().all(|c| c == 'a'));
+
+        // The character that ends exactly on the limit is kept whole rather than walked past.
+        let flush = format!("{}€{}", "a".repeat(1_997), "b".repeat(100));
+        assert!(flush.is_char_boundary(TOOL_DETAIL_LIMIT));
+        let capped = cap_tool_detail(flush);
+        assert_eq!(capped.len(), TOOL_DETAIL_LIMIT);
+        assert!(capped.ends_with('€'));
+
+        // And a detail made entirely of multi-byte characters still comes back valid UTF-8.
+        let wide = "→".repeat(2_000);
+        let capped = cap_tool_detail(wide);
+        assert!(capped.len() <= TOOL_DETAIL_LIMIT);
+        assert!(capped.chars().all(|c| c == '→'));
     }
 
     /// A hook can fire with no tool at all — `UserPromptSubmit`, `Stop` — and `activity_summary`
@@ -7464,7 +7505,7 @@ mod tests {
 
     fn packet(snapshot: &RuntimeSnapshot) -> HandoffPacket {
         HandoffPacket {
-            schema_version: 1,
+            schema_version: dock_model::model::HANDOFF_PACKET_SCHEMA_VERSION,
             run_id: snapshot.run_id.clone(),
             task_id: snapshot.external_task_ref.clone(),
             workspace_id: snapshot.workspace_id.clone(),
@@ -10163,6 +10204,83 @@ mod tests {
         );
     }
 
+    /// A `git status` Dock could not run used to become the sentence "there were no untracked
+    /// files": `unwrap_or_default` turned the error into an empty list, `sensitive_new_file` had
+    /// nothing to examine, and `empty_diff` went on to state the absence as an observed fact.
+    /// The read failure now travels onto the receipt as a reason, in the style a declined check
+    /// already uses, and `untracked_unreadable` is what keeps the verdict from reading clear.
+    #[test]
+    fn an_untracked_list_dock_could_not_read_is_a_recorded_gap_not_an_absence() {
+        let missing = std::env::temp_dir().join(format!(
+            "dock-not-a-repository-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let before_checks = dock_git::GitFacts {
+            worktree: missing.clone(),
+            branch: "dock/fixture".into(),
+            base_sha: "aaaa111".into(),
+            head_sha: "aaaa111".into(),
+            status_entries: 0,
+            changed_files: 0,
+            untracked_files: 0,
+            insertions: 0,
+            deletions: 0,
+        };
+        let observed = observe(
+            &GitAdapter::new(&missing),
+            &missing,
+            "aaaa111",
+            &before_checks,
+            Vec::new(),
+        );
+        assert!(observed.untracked.is_empty());
+        let reason = observed
+            .untracked_error
+            .expect("a failed read must reach the receipt as a reason");
+        assert!(reason.contains("git"), "{reason}");
+    }
+
+    /// Success criterion 3, the other half: a repository with no `.dock/checks.toml` where the
+    /// agent *does* name a check. `no_checks_declared` cannot fire here — a check was declared,
+    /// by the agent — so the tick is withheld by a different rule entirely: `Checks::load`
+    /// returns an empty map for a missing file, `resolve` refuses the name, and the check is
+    /// recorded `Unwitnessed` with a reason that names the declaration nobody wrote. The test
+    /// above would pass unchanged in a repository that has a `checks.toml`; this one would not.
+    #[test]
+    fn a_check_named_where_nothing_was_declared_is_unwitnessed_rather_than_green() {
+        let repo = Repo::new("handoff-receipt-nodeclaration");
+        let registry = RuntimeRegistry::new(&repo.state, 64).unwrap();
+        let snapshot = registry.dispatch(repo.request("dock_receipt_9")).unwrap();
+        touch_worktree_file(&repo, "note.txt", "work happened here\n");
+        let mut packet = packet(&snapshot);
+        packet.checks = vec!["test".into()];
+
+        registry.submit_handoff(packet).expect("submit handoff");
+
+        let receipt = LocalStore::new(&repo.state)
+            .load_receipt("dock_receipt_9")
+            .expect("a handoff leaves a receipt");
+        assert_eq!(receipt.verdict, Verdict::Look, "{:?}", receipt.findings);
+        let witnessed = &receipt.witnessed.checks[0];
+        assert_eq!(witnessed.name, "test");
+        assert_eq!(witnessed.outcome, CheckOutcome::Unwitnessed);
+        assert_eq!(witnessed.exit_code, None);
+        let reason = witnessed.reason.as_deref().expect("a reason, not silence");
+        assert!(
+            reason.contains("no check named `test`") && reason.contains(".dock/checks.toml"),
+            "{reason}"
+        );
+        assert!(
+            receipt
+                .findings
+                .iter()
+                .any(|finding| finding.rule == dock_model::receipt::Rule::CheckUnwitnessed),
+            "{:?}",
+            receipt.findings
+        );
+    }
+
     /// Success criterion 3: a repository with no `.dock/checks.toml` is never shown a tick.
     #[test]
     fn a_repository_that_declared_nothing_is_never_shown_a_tick() {
@@ -10435,7 +10553,7 @@ mod tests {
             Err((ErrorCode::InvalidHandoff, _))
         ));
         let mut future = packet(&snapshot);
-        future.schema_version = 2;
+        future.schema_version = dock_model::model::HANDOFF_PACKET_SCHEMA_VERSION + 1;
         assert!(matches!(
             registry.submit_handoff(future),
             Err((ErrorCode::InvalidHandoff, _))

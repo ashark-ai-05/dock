@@ -451,9 +451,29 @@ mod tests {
         );
     }
 
+    /// A temporary repository that removes itself, shaped exactly like `dispatch.rs`'s `Repo` —
+    /// including its `Drop`, which was the half that did not get copied. Nine git repositories
+    /// were accumulating under `target/` on every `cargo test`.
+    ///
+    /// Derefs to `Path`, so a test still writes `&repo` wherever it did before.
+    struct FixtureRepo(PathBuf);
+
+    impl std::ops::Deref for FixtureRepo {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FixtureRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A temporary repository with one commit, shaped exactly like `dispatch.rs`'s `Repo::new`.
     /// The path is canonicalized because one test compares it with what `pwd` prints.
-    fn fixture_repo(label: &str) -> PathBuf {
+    fn fixture_repo(label: &str) -> FixtureRepo {
         let root = std::env::current_dir()
             .unwrap()
             .join("target")
@@ -469,7 +489,7 @@ mod tests {
         std::fs::write(root.join("tracked"), "fixture\n").unwrap();
         git(&root, &["add", "tracked"]);
         git(&root, &["commit", "-qm", "fixture"]);
-        std::fs::canonicalize(&root).unwrap()
+        FixtureRepo(std::fs::canonicalize(&root).unwrap())
     }
 
     fn check(name: &str, run: &[&str], timeout: Duration) -> Check {

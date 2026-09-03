@@ -222,6 +222,7 @@ mod tests {
                 insertions: 40,
                 deletions: 3,
                 untracked: vec![],
+                untracked_error: None,
                 tool_calls: vec![ToolCall {
                     at_unix_ms: 1_764_000_000_000,
                     tool: "Bash".into(),
@@ -274,7 +275,7 @@ mod tests {
         assert!(text.contains("exit 1"), "{text}");
         assert!(text.contains("empty_diff        did not fire"), "{text}");
         assert!(text.contains("peer_conflict     inert"), "{text}");
-        assert!(text.contains("rules v1"), "{text}");
+        assert!(text.contains(&format!("rules v{RULES_VERSION}")), "{text}");
     }
 
     /// An old receipt keeps the verdict it was given; recheck reports the disagreement rather
@@ -288,7 +289,10 @@ mod tests {
         };
         let text = super::recheck_text(&stored);
         assert!(text.contains("stored: ✓ clear (rules v0)"), "{text}");
-        assert!(text.contains("today:  ✗ failed (rules v1)"), "{text}");
+        assert!(
+            text.contains(&format!("today:  ✗ failed (rules v{RULES_VERSION})")),
+            "{text}"
+        );
     }
 
     /// A receipt where today's rules agree with what was stored says so plainly, rather than

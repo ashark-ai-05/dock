@@ -1,6 +1,6 @@
 //! The verdict is arithmetic over evidence, never judgement of it.
 //!
-//! Nine rules, each reading only the receipt's own columns, each producing a [`Finding`] that
+//! Ten rules, each reading only the receipt's own columns, each producing a [`Finding`] that
 //! names the field it read. A verdict is the maximum [`Severity`] among the findings that fired
 //! — nothing more clever than that — because a reader who does not trust Dock's conclusion must
 //! be able to re-derive it by hand from the receipt's own lines. `dock verdict explain` (a later

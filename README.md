@@ -115,6 +115,13 @@ worktree it was given, that file included. Dock does not confine an agent's proc
 worktree, so this closes only the path that needed no walking out: **Dock never reads a
 declaration from the path it handed the agent.**
 
+That is a check's declaration, not its execution: a check runs the worktree's code; that is
+what a check is. `run = ["./scripts/ci.sh"]` resolves relative to the worktree, and
+`run = ["cargo", "test"]` compiles and runs whatever the agent just wrote, by design. The
+same limit reaches the `~/.config/dock/checks.toml` secrets gate — a permitted variable is
+handed to that same worktree's code, so the gate is only as strong as the confinement
+conceded above, not a boundary against a hostile agent.
+
 ## Agents driving Dock
 
 Inside a pane:

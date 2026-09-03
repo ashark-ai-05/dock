@@ -29,7 +29,18 @@ pub struct Claimed {
     pub checks: Vec<String>,
 }
 
-/// What git and the hook payloads saw. Neither the agent nor the reviewer writes here.
+/// What git and the hook payloads saw.
+///
+/// The two halves are not the same kind of fact. `base_sha`, `head_sha`, the diffstat, and
+/// `untracked` are Dock's own observation: Dock ran `git` itself and read the answer. `tool_calls`
+/// is not — it is what the agent's own hooks chose to report, over a connection (`dock
+/// agent-state`, reading arbitrary JSON from the agent's stdin) that authorises on run-existence
+/// alone, with no check that the reporting pane *is* the run it names. `destructive_command` is
+/// therefore a signal an agent's hooks provided, not a guarantee Dock independently confirmed: an
+/// agent that never fires its hooks reports nothing here, and one pane can currently write into a
+/// sibling run's `tool_calls`. Still, neither the agent nor the reviewer writes this struct
+/// directly: `claimed` is the agent's column, `decided` is the reviewer's, and this one is Dock's,
+/// however much of what lands in it Dock is merely relaying.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Observed {

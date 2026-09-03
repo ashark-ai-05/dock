@@ -103,10 +103,17 @@ severity present.
 | `peer_conflict` | a file in this diff is open in another live run | look |
 | `destructive_command` | a hook payload shows an executed `rm -rf`, `git reset --hard`, `git push`, or `git clean` | look |
 | `sensitive_new_file` | an untracked file matching `.env*`, `*.pem`, `id_*`, or larger than 1 MiB (1,048,576 bytes, the binary sense) | look |
+| `untracked_unreadable` | `git status` could not be read, so the untracked list Dock is reporting on is a gap, not an observation | look |
 
 `check_stale` and `peer_conflict` are only computable because Dock owns the PTYs and reads
 hook payloads. They are the two rules a screen-reading tool cannot implement at any regex
 quality.
+
+`untracked_unreadable` exists because `empty_diff` must not: `empty_diff` only asserts "no
+untracked files" when the list was actually read and came back empty, so a failed read can no
+longer produce a false `clear` by way of a claim nobody observed. The failure has to go
+somewhere, and a fired rule — named, in the findings — is where it goes rather than a
+silently empty list.
 
 ### Verdicts
 
@@ -566,7 +573,7 @@ Each row ships and is usable before the next starts.
 |---|---|---|
 | 0 | Palette tests parameterised over every shipped theme; `warm.working` fixed; `border` floor enforced; vocabulary consts | A shipped palette is currently broken and no test catches it |
 | 1 | Workspace split: `dock-model`, `dock-git`, `dock-pty`, `dock-detect`, `dock-ui`, and the lint that binds the exec surface. `dashboard.rs` moves whole, undissolved | Prerequisite for 2–5. No user-visible change; every test stays green |
-| 2 | `dock-receipt`: `checks.toml`, runner, receipt store, nine rules, verdict | The product |
+| 2 | `dock-receipt`: `checks.toml`, runner, receipt store, ten rules, verdict | The product |
 | 3 | Split Spine and receipt rail, dissolving `dashboard.rs` as it goes; overlay tiers; scrim; `age` ramp | The product becomes visible, and the 19k-line file is broken up by the work that was rewriting it anyway |
 | 4 | One manifest per agent; derived capability; cache invalidation | "All agents" becomes true rather than a roster count |
 | 5 | Ledger; `dock peers`; light palette; `theme = "auto"` | The screenshot, and the data the last two rules need |

@@ -17,7 +17,7 @@ const USAGE: &str = "usage: dock verdict explain <run-id> [--dock-dir=PATH]\n   
 const DEFAULT_DOCK_DIR: &str = ".dock/local";
 
 /// The rule-name column's fixed width. Wide enough that most rule names fit inside it and their
-/// status text lines up; a name longer than this (`check_mutated_worktree`, at 23) simply runs
+/// status text lines up; a name longer than this (`check_mutated_worktree`, at 22) simply runs
 /// past it rather than being truncated, since truncating a rule's own name is the one thing this
 /// command must never do. `column` below still guarantees at least one separating space for
 /// those overflowing names, so the status text never runs directly into the name.
@@ -137,21 +137,29 @@ pub(crate) fn recheck_text(receipt: &Receipt) -> String {
             crate::receipt::RULES_VERSION
         ),
     ];
-    let stored_rules: Vec<Rule> = receipt
-        .findings
-        .iter()
-        .map(|finding| finding.rule)
-        .collect();
-    let today_rules: Vec<Rule> = today_findings.iter().map(|finding| finding.rule).collect();
-    let added: Vec<&Finding> = today_findings
-        .iter()
-        .filter(|finding| !stored_rules.contains(&finding.rule))
-        .collect();
-    let dropped: Vec<&Finding> = receipt
-        .findings
-        .iter()
-        .filter(|finding| !today_rules.contains(&finding.rule))
-        .collect();
+    // A finding-level multiset diff, not a rule-level one: `destructive_command` and
+    // `sensitive_new_file` can each push more than one `Finding` for the same `Rule`, with
+    // different facts. Diffing on `finding.rule` alone would call two distinct findings on the
+    // same rule "no disagreement" as long as that rule fired at all on both sides — exactly the
+    // silent change `recheck` exists to catch. Matching each stored finding against an
+    // unconsumed, *exactly equal* today's finding (order-independent, via `Finding`'s own
+    // `PartialEq`) means two identical findings on both sides cancel one-for-one, a reordering
+    // alone is never reported as a disagreement, and a finding that changed even by fact text
+    // alone is reported as dropped, not shrugged off because its rule still fired elsewhere.
+    let mut today_remaining: Vec<&Finding> = today_findings.iter().collect();
+    let mut dropped: Vec<&Finding> = Vec::new();
+    for finding in &receipt.findings {
+        match today_remaining
+            .iter()
+            .position(|candidate| **candidate == *finding)
+        {
+            Some(index) => {
+                today_remaining.remove(index);
+            }
+            None => dropped.push(finding),
+        }
+    }
+    let added = today_remaining;
     lines.push(String::new());
     if added.is_empty() && dropped.is_empty() {
         lines.push("no disagreement — today's rules find exactly what was stored".to_owned());
@@ -188,8 +196,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use crate::receipt::{
-        CheckOutcome, CheckRun, Claimed, Observed, RECEIPT_SCHEMA_VERSION, RULES_VERSION, Receipt,
-        ToolCall, Verdict, Witnessed,
+        CheckOutcome, CheckRun, Claimed, Finding, Observed, RECEIPT_SCHEMA_VERSION, RULES_VERSION,
+        Receipt, Rule, ToolCall, UntrackedFile, Verdict, Witnessed,
     };
 
     /// One clean receipt to mutate: a real diff, a declared check that passed at head, no
@@ -291,6 +299,50 @@ mod tests {
         assert!(
             text.contains("no disagreement"),
             "an all-green receipt should report agreement: {text}"
+        );
+    }
+
+    /// `sensitive_new_file` (and `destructive_command`) can push more than one `Finding` for the
+    /// same `Rule`. A diff keyed on `finding.rule` alone would see `sensitive_new_file` present
+    /// on both sides and call that "no disagreement" — even though the *specific* finding this
+    /// receipt was given no longer fires. The stored receipt below carries two
+    /// `sensitive_new_file` findings; today's rules, run against this receipt's own
+    /// `observed.untracked` (which lists only one sensitive file), produce only one of them.
+    /// `recheck` must name the one that vanished, by its own fact, not shrug it off because its
+    /// rule fired elsewhere.
+    #[test]
+    fn recheck_reports_a_dropped_finding_even_when_its_rule_still_fires_elsewhere() {
+        let mut receipt = base_receipt();
+        receipt.observed.untracked = vec![UntrackedFile {
+            path: "config/secret.pem".into(),
+            bytes: Some(512),
+        }];
+        let (verdict, mut findings) = crate::rules::evaluate(&receipt);
+        assert_eq!(
+            findings,
+            vec![Finding {
+                rule: Rule::SensitiveNewFile,
+                fact: "untracked file `config/secret.pem` matches `*.pem`".into(),
+            }],
+            "the fixture must fire exactly the one finding this test means to keep"
+        );
+        // A second `sensitive_new_file` finding the stored receipt carries but that today's
+        // rules, run against this same `observed.untracked`, do not reproduce.
+        findings.push(Finding {
+            rule: Rule::SensitiveNewFile,
+            fact: "untracked file `notes.txt` is 2000000 bytes, over the 1048576 byte limit".into(),
+        });
+        receipt.verdict = verdict;
+        receipt.findings = findings;
+
+        let text = super::recheck_text(&receipt);
+        assert!(
+            text.contains("notes.txt"),
+            "the dropped finding must be named by its own fact, not just its rule: {text}"
+        );
+        assert!(
+            !text.contains("no disagreement"),
+            "a genuinely dropped finding is a disagreement: {text}"
         );
     }
 

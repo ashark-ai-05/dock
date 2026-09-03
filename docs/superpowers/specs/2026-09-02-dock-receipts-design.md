@@ -102,7 +102,7 @@ severity present.
 | `empty_diff` | a non-empty claim, but base == head and nothing untracked | look |
 | `peer_conflict` | a file in this diff is open in another live run | look |
 | `destructive_command` | a hook payload shows an executed `rm -rf`, `git reset --hard`, `git push`, or `git clean` | look |
-| `sensitive_new_file` | an untracked file matching `.env*`, `*.pem`, `id_*`, or larger than 1 MB | look |
+| `sensitive_new_file` | an untracked file matching `.env*`, `*.pem`, `id_*`, or larger than 1 MiB (1,048,576 bytes, the binary sense) | look |
 
 `check_stale` and `peer_conflict` are only computable because Dock owns the PTYs and reads
 hook payloads. They are the two rules a screen-reading tool cannot implement at any regex
@@ -198,7 +198,10 @@ no glob, no chaining. A pipeline is written as a committed script and declared a
 | Signals | on timeout, SIGTERM to the process group, SIGKILL after 5s. Dock owns the group, as it does for a pane |
 | Result | `exit_code`, `duration`, `sha_before`, `sha_after`, `tail`, `outcome ∈ {passed, failed, unwitnessed}` |
 
-`checks.auto = false` in `dock.toml` disables automatic running; `r` still works.
+`checks.auto = false` in a `[checks]` table inside `.dock/checks.toml` disables automatic
+running; `r` still works. It lives there rather than in a separate `dock.toml`: one file
+rather than two, the switch sits beside the thing it switches off, and a repository that
+declares no checks needs no config at all.
 
 ### Secrets: the repository may name, only the user may permit
 

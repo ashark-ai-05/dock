@@ -79,6 +79,42 @@ dock handoff "added retry with backoff" --check=test
 
 `Ctrl+B i` reviews claimed vs observed (branch, files, diffstat). `a` accept / `c` changes — recorded only. Dock does not merge.
 
+## Receipts
+
+`dock handoff` writes a receipt: four parts, each authored by exactly one party, plus a
+verdict derived from all four. `claimed` is the agent's summary and the names of checks it
+asks Dock to run. `observed` is git facts and hook payloads Dock collected itself.
+`witnessed` is what Dock's own check runs found. `decided` is the human's accept or
+changes-requested. An agent can never write to `witnessed`. Dock can never write to
+`decided`. That is the whole trust model.
+
+Checks are declared by the repository, never composed by the agent:
+
+```toml
+# .dock/checks.toml — committed to the repository
+[check.test]
+run     = ["cargo", "test", "--locked"]
+timeout = "10m"
+
+[check.lint]
+run     = ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]
+timeout = "5m"
+```
+
+An agent names a check (`--check=test`); a name this file does not hold comes back
+`unwitnessed`, never a command an agent composed. A repository that declares no checks is
+never shown a `✓` — `no_checks_declared` fires, and a run that fires it can never be
+`clear`. The way to earn fast approvals is to write this file.
+
+`dock verdict explain <run-id>` prints every rule and the fact it read, so the verdict a
+receipt carries can be re-derived by hand.
+
+Dock resolves a declared check by name against `.dock/checks.toml` in the repository root,
+never against the copy in the run's own worktree — an agent can write any file in the
+worktree it was given, that file included. Dock does not confine an agent's process to its
+worktree, so this closes only the path that needed no walking out: **Dock never reads a
+declaration from the path it handed the agent.**
+
 ## Agents driving Dock
 
 Inside a pane:

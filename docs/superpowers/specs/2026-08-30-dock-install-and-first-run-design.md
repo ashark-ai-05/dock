@@ -45,7 +45,7 @@ Read from the tree at `ead7408`, not assumed.
   extending a pattern, not inventing one.
 - **`dock handoff` already exists twice, differently.** `main.rs:1691`
   (`handoff_command`) is agent-facing: a positional summary, `--question=`,
-  `--check=name:pass`, and it reads git facts from the current worktree.
+  `--check=name`, and it reads git facts from the current worktree.
   `src/bin/dock-handoff.rs:68` is operator-facing:
   `--submit=PACKET.json | --inbox | --run-id=… --route=… --note=…`. Same word, two
   audiences. §1.2 resolves this.
@@ -124,7 +124,7 @@ queue*. Giving it the name the UI uses costs one rename in a repository nobody h
 installed, and buys a verb that says which side of the desk you are standing on.
 
 ```
-dock handoff "added a retry with backoff" --check="cargo test:pass"
+dock handoff "added a retry with backoff" --check=test
 dock review --inbox
 dock review --submit=packet.json
 dock review --run-id=dock_x --route=accept-scope --note="looks right"

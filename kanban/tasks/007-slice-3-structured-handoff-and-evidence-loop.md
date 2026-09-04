@@ -1,7 +1,7 @@
 ---
 id: 7
 title: 'Slice 3: structured handoff and evidence loop'
-status: review
+status: done
 priority: high
 created: 2026-08-20T15:21:17.258856+10:00
 updated: 2026-08-20T16:06:10.142374+10:00

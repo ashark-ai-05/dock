@@ -1,7 +1,7 @@
 ---
 id: 5
 title: 'Slice 1: owned runtime and reconnectable Control Pane'
-status: review
+status: done
 priority: high
 created: 2026-08-20T13:58:31.855121+10:00
 updated: 2026-08-20T14:49:53.009172+10:00

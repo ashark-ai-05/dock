@@ -1,7 +1,7 @@
 ---
 id: 3
 title: Implement Git worktree facts and delta diff adapter
-status: review
+status: done
 priority: high
 created: 2026-08-20T12:55:13.452842+10:00
 updated: 2026-08-20T12:57:12.08888+10:00

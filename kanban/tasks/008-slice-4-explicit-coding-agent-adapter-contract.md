@@ -1,7 +1,7 @@
 ---
 id: 8
 title: 'Slice 4: explicit coding-agent adapter contract'
-status: review
+status: done
 priority: high
 created: 2026-08-20T16:06:26.330395+10:00
 updated: 2026-08-20T16:55:08.544468+10:00

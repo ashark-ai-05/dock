@@ -1,7 +1,7 @@
 ---
 id: 6
 title: 'Slice 2: repository-bound fixture dispatch'
-status: review
+status: done
 priority: high
 created: 2026-08-20T14:50:31.458046+10:00
 updated: 2026-08-20T15:20:59.591065+10:00

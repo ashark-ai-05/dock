@@ -1,7 +1,7 @@
 ---
 id: 4
 title: Persist local run bindings and handoff packets
-status: review
+status: done
 priority: high
 created: 2026-08-20T13:01:03.405685+10:00
 updated: 2026-08-20T13:18:37.092031+10:00

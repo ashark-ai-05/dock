@@ -1,7 +1,7 @@
 ---
 id: 1
 title: Implement kanban-md task-board adapter
-status: review
+status: done
 priority: high
 created: 2026-08-20T12:52:11.859071+10:00
 updated: 2026-08-20T12:54:23.014331+10:00

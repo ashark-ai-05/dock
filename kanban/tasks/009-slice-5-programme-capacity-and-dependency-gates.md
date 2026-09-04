@@ -1,7 +1,7 @@
 ---
 id: 9
 title: 'Slice 5: programme capacity and dependency gates'
-status: review
+status: done
 priority: high
 created: 2026-08-20T16:59:29.006833+10:00
 updated: 2026-08-20T21:19:32.547368+10:00

@@ -71,7 +71,7 @@ separation of duties.
 | 9 | Citation gate checks facts, while the claim type is `causal` | Wrong causation survives, which is failure mode #2 | Ordering plus a falsifier that is evaluated; new grades `correlated` and `refuted` §13.3 |
 | 10 | `asserted: "max > 480000 sustained 11m"` is free text | Parsing it means inference, which breaks rule 2 | Closed assertion grammar §13.3 |
 | 11 | Capability "enforcement by environment construction" and attested tool-call counts in tier A | Claims more than can be enforced or observed | Verify after the stage, attest only what was checked, `unavailable` otherwise §9.7 |
-| 12 | Hash chain without an external anchor | Whoever holds the file can rewrite it all | Chain head in a commit trailer; the user's signing config §11.2 |
+| 12 | Hash chain without an external anchor | Whoever holds the file can rewrite it all | Chain head in a commit trailer; the user's signing config §11.3 |
 | 13 | "Same evidence → same verdict" silent on flaky gates | Flakes turn into agent retries and wasted spend | `reruns`, `flaky` verdict, no agent retry §9.4 |
 | 14 | `verify` implied more than it proves | An auditor could over-trust it | States its limit; `--rerun` reports drift separately §9.9 |
 | 15 | No threat model; "no context bleed" read like a security claim | Over-promises | Trust model §7; isolation means context, not sandbox |

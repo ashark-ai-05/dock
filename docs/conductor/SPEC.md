@@ -85,7 +85,7 @@ is delivered.
 | same input → same generation            | No  | LLMs. Never claimed. |
 | same recorded evidence → same verdict   | Yes | The verdict is a pure function over **recorded** gate outputs. |
 | same gate re-executed → same result     | No **[new]** | Gates run code: tests flake, live data changes. Handled by §9.4, not assumed away. |
-| same run → same recorded history        | Yes | Hash-chained, append-only, anchored externally (§11.2). |
+| same run → same recorded history        | Yes | Hash-chained, append-only, anchored externally (§11.3). |
 
 ### Where LLM calls occur
 
@@ -131,7 +131,7 @@ What the engine **guarantees**:
   (§9.2). Out-of-scope writes fail the stage, whatever the agent intended.
 - Gates run in the engine's process, never in an agent pane.
 - Once the chain head is pushed, the record cannot be rewritten without rewriting pushed
-  history (§11.2).
+  history (§11.3).
 
 What it does **not** guarantee (stated in every PR body):
 
@@ -234,7 +234,7 @@ boundaries and `unavailable` for usage.
 - Hash-chained, append-only record: every command's argv, exit code, stdout/stderr hash and
   state transition.
 - Git-native for code: one commit per stage, metadata in `git notes --ref=conductor`,
-  chain head in a commit trailer (§11.2). Readable without this tool.
+  chain head in a commit trailer (§11.3). Readable without this tool.
 - Materialised evidence for `troubleshoot` and `analyse`: query results are stored, not just the queries,
   because observability data expires. Subject to §9.8.
 - `evidence_completeness` declares gaps. **[changed]** Anything the engine cannot observe is
@@ -268,7 +268,7 @@ boundaries and `unavailable` for usage.
 
 One event stream feeds two sinks:
 
-- **Receipts**: durable, hash-chained, anchored in git (§11.2). The record of what happened.
+- **Receipts**: durable, hash-chained, anchored in git (§11.3). The record of what happened.
 - **OpenTelemetry**: live traces, metrics and logs over OTLP. How operators watch runs
   and spot trends.
 
@@ -382,7 +382,54 @@ inside the adapter, not in the engine. Public herdr docs describe protocol 15 wh
 spec was verified against protocol 20: the protocol moves, so `doctor` refuses an
 unpinned version rather than guessing.
 
-### 11.2 Record integrity **[new]**
+### 11.2 Pane and tab control **[new]**
+
+Both the orchestrator and the agents it runs can open, close and drive herdr tabs and
+panes. Every such action goes through one door so it is checked against policy and
+recorded.
+
+**Who can do what**
+
+| Actor | Can | Default limits |
+|---|---|---|
+| Orchestrator | open a tab per run; open a pane per stage; close a pane when its stage passes; keep failed or blocked panes open; focus, rename, move | only tabs and panes it created |
+| Agent (from inside its pane) | open panes in its own run's tab (a shell, a dev server, a log tail); send input to and read from those panes; close panes it opened | its own run's tab only; cannot touch other runs' panes or the conductor pane; cannot start another agent unless the workflow allows it |
+| Human | anything, from herdr or from the conductor pane | recorded as `human` events |
+
+**How agents reach it**
+
+- Per run, conductor installs a short **conductor skill** (instructions plus the commands
+  below) into the agent's context, next to the hooks it already installs, and sets
+  `CONDUCTOR_RUN`, `CONDUCTOR_STAGE` and `CONDUCTOR_SOCKET` in the pane's environment.
+- The agent calls `conductor pane open --cmd "cargo watch -x test"`, `conductor pane
+  send`, `conductor pane read`, `conductor pane close`, or `conductor tab list`.
+  Conductor checks the request against the workflow's `herdr` policy, performs it through
+  the herdr adapter, and writes an `observed` event naming the stage and agent that asked.
+- A refused request returns the reason (for example "pane 3.1 belongs to another run"), and
+  the refusal is also recorded.
+
+**Calls that bypass conductor**
+
+Agents can also call herdr's own CLI directly. Conductor subscribes to herdr's read-only
+event stream, so a pane or tab it didn't create or approve is still seen. It is recorded
+as `unmanaged`, listed under **not checked** in the receipt, and flagged live in the
+conductor pane. It is never silently adopted.
+
+**Starting other agents**
+
+Starting another agent from inside a stage is off by default, because it blurs who did
+what. When a workflow allows it (`herdr.agents_may_start_agents: true`), the new agent
+becomes a named sub-stage with its own hooks, evidence and line in the receipt. Frozen
+paths and the scope check apply to every pane working in the run's worktree, so a
+sub-agent can't edit the locked tests either.
+
+**Headless runs**
+
+Under the headless executor, `conductor pane open` starts the same command as a managed
+background process: its output is captured, it is stopped at stage end, and it is
+recorded the same way. A workflow that uses panes still runs in CI unchanged.
+
+### 11.3 Record integrity **[new]**
 - The chain head is written to a `Conductor-Chain:` trailer on the run's final commit. Once
   pushed, rewriting the record means rewriting pushed history, which the remote and every
   clone would notice.
@@ -431,8 +478,14 @@ requires:
 
 runtime:
   artifact_root: ".conductor/{{run_id}}"
-  max_parallel: 1
+  max_parallel: 3                  # parallel runs, each in its own herdr tab
   approvals: manual
+
+herdr:                             # §11.2
+  tab_per_run: true
+  close_passed_panes: true
+  agent_control: own_tab           # none | own_tab
+  agents_may_start_agents: false
 
 budget:
   advisory_max_cost_usd: 5.00

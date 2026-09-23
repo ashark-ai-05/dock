@@ -41,10 +41,10 @@ Ranked by how different it is from what already exists, and how much a reviewer 
    already do it (dock, herdr, and several worktree-per-agent managers). It is not a
    reason to buy.
 
-**Investigate mode** could be *more* valuable than build mode. Nobody verifies RCAs, and
+**Troubleshooting** (`troubleshoot`, formerly "investigate") could be *more* valuable than development. Nobody verifies RCAs, and
 wrong causation is expensive. But it needs connectors, access to production data, and a
 different buyer (SRE). Build mode can be proven locally with repos you already have.
-Investigate is a second bet and should be validated with interviews first.
+It is planned for v0.3, after development and ad-hoc questions have proven the engine.
 
 ## 3. Positioning
 
@@ -61,7 +61,7 @@ separation of duties.
 | # | Gap in the draft | Why it matters | Fix (SPEC section) |
 |---|---|---|---|
 | 1 | No target user, no success metric | Nobody can say whether v0.1 worked | Personas §3, metrics §4 |
-| 2 | v0.1 built on tier A (inferred turns, no usage data, all the herdr quirks) | The weakest foundation goes first, and a third of the spec is workarounds | Tier B first; every invariant must hold without panes §8, §16 |
+| 2 | v0.1 relied on herdr's inferred state (no real turn boundaries, no usage data) | Receipts built on a guess | herdr kept for panes; turns and usage come from agent hooks and session logs; headless for CI §8 |
 | 3 | Red gate `tests_failed > 0` is passed by `assert!(false)` | Repeats the failure mode the product exists to prevent | Red for the right reason, plus mutation in v0.1 §9.2 |
 | 4 | Nothing stops the implementer from editing the tests | The biggest gaming route, left open | `frozen` paths plus scope gate §9.2 |
 | 5 | Gate declarations could live in the agent's worktree | The agent can rewrite its own gates | Workflow and gates read from base SHA §7 |
@@ -75,20 +75,20 @@ separation of duties.
 | 13 | "Same evidence → same verdict" silent on flaky gates | Flakes turn into agent retries and wasted spend | `reruns`, `flaky` verdict, no agent retry §9.4 |
 | 14 | `verify` implied more than it proves | An auditor could over-trust it | States its limit; `--rerun` reports drift separately §9.9 |
 | 15 | No threat model; "no context bleed" read like a security claim | Over-promises | Trust model §7; isolation means context, not sandbox |
-| 16 | Materialised production query results with no data policy | PII and compliance blocker for the investigate buyer | Local-only, redaction, retention §9.8 |
+| 16 | Materialised production query results with no data policy | PII and compliance blocker for troubleshooting and analysis | Local-only, redaction, retention §9.8 |
 | 17 | Seat-licence automation assumed fine | Vendor terms may forbid it, especially in CI | `doctor` reports auth; CI uses API keys §8 |
 | 18 | Only `cargo_json` | Rust-only means a small market | `junit_xml` in v0.2 §9.3 |
 | 19 | Full mutation testing on the budget clock | Hours per run, so the gate would always time out | In-diff only, own budget §9.3, §9.6 |
-| 20 | Four modes; `analyse` and `adhoc` had no gate that could fail | Scope spread with no verification story | Cut; investigate on its own gated track §5 |
-| 21 | Depends on herdr (external, protocol undocumented) while you own dock, which does the same job | Two tools to maintain, and the dependency is on the one you don't control | Headless first; dock discarded; panes only via an optional adapter §8, §11.1 |
+| 20 | Four modes; `analyse` and `adhoc` had no gate that could fail | Scope spread with no verification story | Every kind must name checks that can fail; `adhoc` receipts grade claims and never say "verified" §5 |
+| 21 | Depends on herdr (external, protocol undocumented) while you own dock, which does the same job | Two tools to maintain, and the dependency is on the one you don't control | Dock discarded; herdr behind one pinned adapter, headless alongside; evidence from hooks and session logs, never herdr state §8, §11.1 |
 | 22 | Must-read files "hashed" read as proof they were read | Can't be observed | Hash records what was *provided* §10 |
 
 ## 5. Name
 
 "Conductor" is already used by other developer tools, including an agent-orchestration app
 and a well-known workflow-orchestration engine. That hurts search, package names, and
-possibly trademarks. **Decide before any public release.** Pick a new name before
-any code exists.
+possibly trademarks. The owner chose to keep "conductor"; check package-name
+availability (crates.io, Homebrew) before the first release.
 
 ## 6. How to find out cheaply whether it's worth building
 

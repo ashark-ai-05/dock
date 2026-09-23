@@ -7,9 +7,11 @@ Companion docs: `SPEC.md` (engine contract), `ASSESSMENT.md` (why, risks, pilot)
 
 ## 1. One line
 
-**Agent-written changes your reviewer can trust without re-deriving them.** Conductor runs
-coding agents with separation of duties, proves the tests carry weight, and hands the
-reviewer a PR that says what was proven and what was not.
+**Agentic software work with receipts.** Conductor runs coding agents from YAML
+workflows, in herdr panes when a person wants to watch or headless in CI and overnight.
+Every run ends in a receipt that says what was proven, by which check, and what was not
+checked. Development ships first; QA, ad-hoc questions, troubleshooting and analysis
+follow on the same engine.
 
 ## 2. Product principles
 
@@ -17,11 +19,14 @@ Every feature below was checked against these. A feature that breaks one is cut.
 
 1. **The agent never grades its own work.** Different stages, fresh contexts, frozen outputs.
 2. **Say "unavailable" rather than guess.** Anything not observed is labelled, never estimated.
-3. **The reviewer's time is the product.** Every artifact exists to shrink what a human must read.
+3. **The reader's time is the product.** Every receipt exists to shrink what a human must read or re-check.
 4. **Readable without us.** Records live in git and plain JSON. Uninstalling conductor loses nothing.
 5. **Fail loudly and early.** A run that can't prove itself stops with a report. It never opens a
    hopeful PR.
-6. **Zero setup beyond the repo.** No server, no account, no dashboard to begin with.
+6. **Zero setup beyond the repo.** No server, no account. Observability plugs into the
+   monitoring the team already has (OpenTelemetry), or stays local.
+7. **Watched or unattended, same result.** A workflow's receipt never depends on whether
+   it ran in herdr or headless.
 
 ## 3. Users and jobs
 
@@ -30,6 +35,7 @@ Every feature below was checked against these. A feature that breaks one is cut.
 | **Engineer** | "Turn this ticket into a PR I'm not embarrassed to send" | Run halts with *which* test was weak, instead of a green PR that is wrong |
 | **Reviewer** | "Tell me where to look" | PR lists surviving mutants and unchecked areas; they read 3 places, not 30 files |
 | **Tech lead** | "Set the bar once for every agent PR" | Repo policy (min mutation score, protected paths) enforced on every run and in CI |
+| **Operator** (on-call, QA, analyst) | "Answer this, and show me why I should believe it" | Each claim in the answer is graded against a command or query conductor re-ran |
 | **Audit / risk** | "Show me AI changes were controlled" | One command exports every AI change with its gates, decisions and anchor |
 
 ## 4. Journeys
@@ -112,7 +118,30 @@ provenance when:
 
 Without this check, the PR body is decoration.
 
-### J6 Audit
+### J6 Watch it in herdr, or let it run overnight
+```
+$ conductor run --spec tickets/PTT-1234.md                     # in a terminal: herdr panes
+$ conductor run --spec tickets/PTT-1234.md --executor headless # in CI or cron
+```
+The same workflow and the same checks produce the same kind of receipt either way. In
+herdr, each stage gets its own pane: you can watch, answer a blocked agent, or take over.
+Every intervention is recorded in the receipt. Traces go to your OpenTelemetry backend
+when one is configured.
+
+### J7 Operator asks a question (v0.2)
+```
+$ conductor ask "why did settlement-batch retries double since Monday?"
+  answer   retries doubled after config change c91e (retry_max 3 → 6), deployed Mon 09:12
+  c1  verified    `git log -S retry_max config/settlement.yaml` shows c91e on Mon 09:12
+  c2  verified    `jq` over logs/settlement-*.json: retries ×2.1 from Mon 09:15, not before
+  c3  asserted    "no other deploys that day" — no citation, kept as a lead
+  receipt  .conductor/runs/01JC0A2/receipt.json · trace 4f1c…
+```
+The answer is never labelled "verified" as a whole. Only claims whose evidence conductor
+re-ran can be. In v0.2 citations are shell commands and git; PromQL, LogQL and kubectl
+citations arrive with `troubleshoot` in v0.3.
+
+### J8 Audit
 ```
 $ conductor audit --since 2026-07-01 --format csv
   142 AI-authored PRs · 139 all gates · 3 overridden (reasons attached) · 0 unanchored
@@ -132,21 +161,26 @@ Priority: **M** must (the product fails without it), **S** should, **C** could.
 ### Workflow
 | Feature | P | Release |
 |---|---|---|
-| Built-in `build` workflow: spec → tests → implement | M | 0.1 |
-| Custom workflow YAML (read from base SHA) | M | 0.1 |
+| YAML workflows, read from the base SHA; built-in kinds as templates | M | 0.1 |
+| `build` kind: spec → tests → implement | M | 0.1 |
+| `adhoc` kind: `conductor ask`, answer with graded claims | S | 0.2 |
+| `qa` kind: charter → tests and reproduced findings | S | 0.2 |
 | `fix` workflow: reproduce bug as failing test → fix | S | 0.2 |
 | `refactor` workflow: behaviour unchanged, mutation score must not drop | S | 0.2 |
+| `troubleshoot` kind: timeline and root cause with graded, re-run citations | S | 0.3 |
+| `analyse` kind: claims whose numbers are reproduced from a hashed dataset | C | 0.3 |
 | Parallel stages with disjoint scopes | C | 0.3 |
-| `ask` planner stage → YAML → approval | C | 0.3 |
+| `plan`: planner stage → YAML → approval | C | 0.3 |
 
 ### Execution
 | Feature | P | Release |
 |---|---|---|
-| Headless executor: claude, codex | M | 0.1 |
+| **herdr executor**: each stage in a herdr pane; watch, answer, take over | M | 0.1 |
+| **Headless executor**: claude, codex (CI, overnight) | M | 0.1 |
+| **Evidence plane**: hooks installed per run, session logs read; herdr state only `inferred` | M | 0.1 |
 | Worktree per stage, fresh context per stage | M | 0.1 |
-| **Hook ledger**: record every tool call via Claude/Codex hooks | S | 0.2 |
 | **Hook guard**: `PreToolUse` denies writes to frozen or protected paths *as they happen* | S | 0.2 |
-| More kinds (copilot, gemini, amp) as their headless modes allow | C | 0.3 |
+| More agent kinds (copilot, gemini, amp) as their hooks and headless modes allow | C | 0.3 |
 | OS sandbox (Landlock / sandbox-exec) | C | 0.3 |
 
 Hook guard turns "detected after" into "prevented" for the two main agents, at no
@@ -185,12 +219,15 @@ sandbox cost. The scope gate stays as the backstop for agents without hooks.
 | PR delivery with the J4 body | S | 0.2 |
 | `check-pr` CI status + GitHub Action | S | 0.2 |
 | Usage ledger by run / stage / kind | S | 0.2 |
+| OpenTelemetry export (traces, metrics, logs; GenAI conventions) | M | 0.1 |
+| `conductor trace <run>`: local span view, no backend needed | M | 0.1 |
+| Starter Grafana dashboard (Tempo, Loki, Prometheus) | S | 0.2 |
 | `audit` export | C | 0.3 |
 | `recall`, `promote` | C | 0.3 |
 
 ### Won't do (for now)
-Hosted service or dashboard · a terminal multiplexer or pane UI (dock is discarded) ·
-investigate mode (separate track, see ASSESSMENT) · auto-merge · IDE plugin.
+Hosted service or our own dashboard (OpenTelemetry backends do this) · our own terminal
+multiplexer (herdr does this) · auto-merge · IDE plugin.
 
 ## 6. Why a run costs what it costs
 
@@ -210,27 +247,28 @@ Dock as a product is discarded. These parts carry over as a library, not as feat
 | `dock-receipt::declaration`: checks read from repo root, never the agent's worktree | Gate and policy loading from base SHA |
 | `dock-receipt::rules` + `verdict explain` | Verdict engine with "explain every rule and the fact it read" |
 | `dock-git`: worktree add, diffstat, facts | Stage worktrees, scope gate |
-| `dock-daemon::hook` + `hooks --install` merge logic | Hook ledger and hook guard |
+| `dock-daemon::hook` + `hooks --install` merge logic | Evidence plane (hook ledger) and hook guard |
 | `dock-detect` roster by binary | `doctor` / `init` agent detection |
 | `dock-model::env` allowlist | Stage environment construction |
 | `dock-testing` timeout scaling | Test utilities |
 
 Dropped: PTY runtime, VT emulator, daemon/socket protocol, TUI dashboard, kanban board,
-queue, programme, layout persistence, copy mode. That is roughly 80% of the dock codebase.
+queue, programme, layout persistence, copy mode. herdr covers the terminal side. That is
+roughly 80% of the dock codebase.
 
-## 8. Questions for you
+## 8. Decisions
 
-These change what gets built first:
+| # | Question | Decision |
+|---|---|---|
+| 1 | Runtime | Wrap **herdr** for interactive work; also run **headless** for CI and overnight |
+| 2 | First kind of work | **Development** (`build`) |
+| 3 | Who reads receipts | Anyone operating the system; every kind of work is a YAML workflow |
+| 4 | Observability | **OpenTelemetry (OTLP)**, vendor-neutral; Grafana stack suggested if there is no backend yet |
+| 5 | Name | **conductor** |
 
-1. **First user:** you and your team, or an external audience? The examples (PTT-1234,
-   rulesengine-kafka) suggest a finance team. If so, the audit journey (J6) moves up.
-2. **Languages:** is Rust your real target, or should v0.1 use `junit_xml` so it works on
-   your main codebase from day one?
-3. **Agents:** which seat licences and API keys do you have? Claude plus Codex is assumed.
-4. **Delivery:** GitHub only, or GitLab/Bitbucket too?
-5. **Distribution:** open source CLI, internal tool, or commercial? This decides whether
-   `check-pr` and `audit` are free or paid.
-6. **Name:** keep "conductor" (collides with existing tools) or choose another before any
-   code exists?
-7. **Repo:** build in this repository (clear out dock, keep the reused crates) or a fresh
-   repository that copies them?
+## 9. Still open
+
+1. **Repo:** fresh `conductor` repository (recommended) or clear out `dock` in place?
+2. **Language for v0.1 checks:** Rust only (`cargo_json`), or also `junit_xml` from day one?
+3. **Code host:** GitHub only?
+4. **Distribution:** open source, internal, or commercial?

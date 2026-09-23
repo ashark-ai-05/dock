@@ -1,16 +1,22 @@
 # conductor — product spec
 
-Version 0.2.0-draft · status: revised after product review (see `ASSESSMENT.md`), not yet implemented
+Version 0.3.0-draft · status: design, not yet implemented
 
 Changes from 0.1.0-dev are marked **[changed]** or **[new]**. Reasons are in `ASSESSMENT.md` §4.
+0.3 records the owner's decisions: conductor wraps herdr for interactive work and also
+runs headless for CI and overnight runs; every kind of agentic work is a YAML workflow;
+development ships first; observability is OpenTelemetry.
 
 ---
 
 ## 1. What it is
 
-A command-line tool that runs AI coding agents as verifiable work units. You give it a
-unit of work; it runs agents in isolated contexts, checks the result with deterministic
-gates the agent cannot edit, and records what happened in a form someone else can audit.
+A command-line orchestrator for agentic software work: development, QA, troubleshooting,
+analysis, and ad-hoc questions. It runs agents from a YAML workflow, either in **herdr**
+panes (a person can watch and step in) or **headless** (CI, overnight). Every run
+produces a **receipt**: what was asked, who did what, which checks ran and which could
+have failed, what was not checked, and a record that can't be silently rewritten.
+Correctness checks, observability and receipts are part of the engine, not add-ons.
 
 ## 2. Problem
 
@@ -31,6 +37,7 @@ Two failure modes matter:
 |---|---|---|
 | **Reviewer / tech lead** (primary) | Reviews agent-authored PRs; review is the team's bottleneck | A PR that says what was proven, by what, and what was *not* checked |
 | **Engineer running agents** | Hands tickets to Claude Code / Codex / Copilot | One command that runs author → tester → implementer with separation of duties, and stops on failure instead of reporting "done" |
+| **Operator** (anyone running the system: on-call, QA, analyst) | Asks agents ad-hoc questions, runs QA and troubleshooting workflows | An answer whose every claim is graded against evidence it can re-run, not a well-written guess |
 | **Audit / risk owner** (buyer in regulated orgs) | Must show how AI-generated changes were controlled | A record readable without this tool, that cannot be silently rewritten once pushed |
 
 Not for: interactive pair-programming with one agent. Plain Claude Code or Codex is better
@@ -49,15 +56,25 @@ plain agent.
 | Escaped defects | Reverts or fix commits touching the change within 30 days | Not worse than baseline |
 | Verdict reproducibility | `verify` reproduces the recorded verdict | 100% (invariant, not a target) |
 
-## 5. Modes **[changed]**
+## 5. Workflow kinds **[changed]**
 
-| Mode        | Input        | Output                 | Primary gate                          | Status |
-|-------------|--------------|------------------------|---------------------------------------|--------|
-| build       | ticket, spec | code diff, PR          | frozen tests + mutation score + scope | v0.1 |
-| investigate | symptom, alert | root cause, RCA      | citation re-execution + falsifier     | separate track, gated on discovery (§16) |
+Everything is a YAML workflow (§13.1). A *kind* is a built-in template: a default set of
+stages and the checks its receipt is allowed to rely on. Custom workflows mix stages and
+checks freely. The rule for every kind: **a receipt may only say "passed" about a check
+that could have failed.** Where no such check exists, the receipt says "graded" or
+"not checked", never "verified".
 
-`analyse` and `adhoc` are cut. Neither had a defined gate that could fail. Modes share the
-engine, evidence model and cost ledger, and differ only in gates and delivery.
+| Kind | Input | Output | Checks that can fail | What the receipt can claim | Release |
+|---|---|---|---|---|---|
+| `build` | ticket, spec | diff, PR | frozen tests, red-first, scope, mutation on diff, flaky | pass or fail per check | **v0.1** |
+| `adhoc` | one question (`conductor ask "…"`) | answer with provenance | claims re-executed against cited commands or queries | each claim graded; the answer as a whole is never "verified" | v0.2 |
+| `qa` | a build or change plus a test charter | findings, reproductions, test report | each reported bug has a reproduction that fails on the change and is re-run by the engine; each charter item has an executed test | each finding reproduced or not; charter coverage | v0.2 |
+| `troubleshoot` | symptom, alert | timeline, root cause | citation re-execution, temporal ordering, falsifier (§13.3) | each claim `verified` / `correlated` / `refuted` / `unverified` / `asserted` | v0.3 |
+| `analyse` | question plus dataset or query source | claims with numbers | dataset hash plus query re-execution reproduces every number | each claim reproduced or not | v0.3 |
+
+`troubleshoot` was called `investigate` in 0.2. Kinds share the engine, receipt format,
+observability and cost ledger. They differ only in stages, checks and where the output
+is delivered.
 
 ---
 
@@ -78,10 +95,10 @@ engine, evidence model and cost ledger, and differ only in gates and delivery.
 | Budget, scope and capability checks | 0 | yes |
 | Manifest, hash chain, git notes | 0 | yes |
 | Deterministic gates (test, lint, mutants, hash, scope) | 0 | logic yes; execution may flake (§9.4) |
-| Citation gate (promql, logql, kubectl) | 0 | logic yes, data live |
+| Citation gate (commands, promql, logql, kubectl) | 0 | logic yes, data live |
 | Claim and assertion parsing | 0 | schema plus a small assertion grammar (§13.3), never inference |
 | Acknowledge check | 0 | set equality over a structured `ack.yaml` (§10) |
-| Agent stages, **including the `ask` planner** **[changed]** | 1 prompt each | no |
+| Agent stages, **including the `plan` planner** **[changed]** | 1 prompt each | no |
 | LLM judge gate (opt-in) | 1 | no, advisory only, cannot fail a run |
 
 Hard rules:
@@ -90,7 +107,7 @@ Hard rules:
    retries, admission and budget halts are rule-based.
 2. **Anything an agent emits is parsed against a schema, never interpreted.** A schema
    failure triggers a deterministic retry.
-3. **[new] Natural language never reaches the engine directly.** `conductor ask "…"` runs a
+3. **[new] Natural language never reaches the engine directly.** `conductor plan "…"` runs a
    *planner agent stage* whose output is a workflow YAML. The engine validates it, a human
    approves it (or policy auto-approves listed templates), and only then does it run. This
    removes the contradiction between "no config, one sentence" and rule 1.
@@ -131,26 +148,41 @@ attack the host. Defences target gaming.
 
 ---
 
-## 8. Execution tiers **[changed]**
+## 8. Executors and the evidence plane **[changed]**
 
-Agents are driven through an `Executor` interface. There is no native agent SDK.
+The same workflow runs under either executor. The engine never depends on which one.
 
-| Tier | Mechanism | Turn boundaries | Usage | Auth | Ships |
-|---|---|---|---|---|---|
-| B | Agent headless mode, JSON out (`claude -p --output-format stream-json`, `codex exec --json`, …) | real | measured | seat or API key | **v0.1** |
-| A | Terminal pane via an adapter (herdr) | inferred | unavailable | seat licence | later, optional |
-| C | Provider API direct | real | measured | API key | judge gate only |
+| Executor | For | Mechanism | Ships |
+|---|---|---|---|
+| `herdr` | interactive: watch, step in, pick up where an agent is blocked | herdr CLI for mutations (split, start, prompt); herdr socket read-only for events | **v0.1** |
+| `headless` | CI, overnight, batch | `claude -p --output-format stream-json`, `codex exec --json`, … | **v0.1** |
+| `api` | advisory judge gate only | provider API | v0.3 |
 
-- **Tier B is the default and ships first.** It has real turn boundaries, measured usage,
-  runs in CI and needs no screen inference. Tier A is for a human who wants to watch or
-  intervene. It is a presentation choice, not a correctness dependency.
-- **Every engine invariant must hold under tier B alone.** No gate, confirm step or retry
-  may depend on pane state.
-- `conductor doctor` probes each installed agent kind and reports its tiers, auth mode, and
-  whether a usage log exists.
-- **[new] Licence check.** Driving a seat-licensed agent from automation, and especially
-  from CI, may be restricted by the vendor's terms. `doctor` reports the auth mode it
-  detected. Documentation names the terms per vendor. CI runs default to API-key auth.
+`--executor herdr|headless` picks one. The default is `headless` when a CI environment is
+detected and `herdr` otherwise.
+
+**Evidence never comes from herdr's agent state.** Herdr infers state from process names
+and terminal output, which is good for display and scheduling, but a guess. The evidence
+plane is the same under both executors:
+
+| Fact | Source | Label in the receipt |
+|---|---|---|
+| Turn started or ended, tool called, file written | Agent hooks (Claude Code and Codex `PreToolUse`, `PostToolUse`, `Stop`, `UserPromptSubmit`), installed by conductor per run | `observed` |
+| Tokens, model, full conversation | The agent's own session log (the hook payload gives `transcript_path`), or the headless JSON stream | `measured` |
+| Checks passed or failed | The engine's own process (§9.3) | `witnessed` |
+| Files changed, commits | git | `observed` |
+| Agent state from herdr | herdr socket | `inferred`, used for scheduling and display only |
+
+An agent kind with no hooks falls back to herdr's state for *when* to look, and every
+completion is confirmed only by outputs (§10 step 5). Its receipt says `inferred` for turn
+boundaries and `unavailable` for usage.
+
+- `conductor doctor` checks the herdr version and protocol against the pinned range, and
+  for each agent kind reports headless support, hook support, auth mode, and whether a
+  session log exists.
+- **Licence check.** Driving a seat-licensed agent from automation, especially CI, may be
+  restricted by the vendor's terms. `doctor` reports the auth mode it detected; CI runs
+  default to API-key auth.
 
 ---
 
@@ -184,7 +216,7 @@ Agents are driven through an `Executor` interface. There is no native agent SDK.
 - Differential gates: **mutation score on changed lines only** (`cargo-mutants --in-diff`
   in v0.1), coverage delta, benchmark regression. Full-crate mutation takes hours and
   would blow every wall-clock budget.
-- Citation gates (investigate): re-run every cited query, evaluate its assertion with the
+- Citation gates (`adhoc`, `troubleshoot`, `analyse`): re-run every cited query, evaluate its assertion with the
   grammar in §13.3, **and** evaluate its falsifier.
 - Adversarial review: a challenger agent in a fresh context, tasked with disproof. Its
   output is a list of claims, graded like any other. It cannot pass or fail a run by assertion.
@@ -203,11 +235,11 @@ Agents are driven through an `Executor` interface. There is no native agent SDK.
   state transition.
 - Git-native for code: one commit per stage, metadata in `git notes --ref=conductor`,
   chain head in a commit trailer (§11.2). Readable without this tool.
-- Materialised evidence for investigate: query results are stored, not just the queries,
+- Materialised evidence for `troubleshoot` and `analyse`: query results are stored, not just the queries,
   because observability data expires. Subject to §9.8.
 - `evidence_completeness` declares gaps. **[changed]** Anything the engine cannot observe is
-  labelled `unavailable`, never inferred. In tier A that includes tool calls, files read and
-  usage.
+  labelled `unavailable`, never guessed. Anything taken from herdr's state is labelled
+  `inferred`.
 
 ### 9.6 Cost
 - Usage comes from each agent's own session log or JSON stream and is labelled `measured`.
@@ -219,9 +251,9 @@ Agents are driven through an `Executor` interface. There is no native agent SDK.
 - **[changed]** Capabilities per stage (`write`, `frozen`, `deny`) are **verified after the
   stage** by the scope gate, and attested in the manifest. Prevention (OS sandbox) is an
   optional v0.3 layer. The attestation reports only what was checked. Tool-call counts
-  appear only when tier B supplies them.
+  appear only when hooks or the headless stream supply them.
 - Human stages are first-class actors with recorded decisions and rationale.
-- Live intervention (tier A, v0.2): pause, inject guidance, rerun fresh, accept with reason.
+- Live intervention (herdr executor): pause, inject guidance, rerun fresh, accept with reason.
   Every intervention is a chain event.
 - Resumable: state is persisted after every transition.
 
@@ -232,8 +264,34 @@ Agents are driven through an `Executor` interface. There is no native agent SDK.
   so a redacted blob is still verifiable against its recorded hash.
 - Retention defaults to 90 days for blobs. Manifests and chain heads are kept indefinitely.
 
-### 9.9 Reuse
-- `promote` turns a successful ad-hoc run into a reusable workflow file.
+### 9.9 Observability **[new]**
+
+One event stream feeds two sinks:
+
+- **Receipts**: durable, hash-chained, anchored in git (§11.2). The record of what happened.
+- **OpenTelemetry**: live traces, metrics and logs over OTLP. How operators watch runs
+  and spot trends.
+
+| Signal | Content |
+|---|---|
+| Traces | One trace per run; spans for stage → attempt → agent turn → tool call, and for every check. Uses the OpenTelemetry GenAI semantic conventions for model, token and tool attributes |
+| Metrics | Runs by kind and verdict, check pass/fail/flaky rates, catch rate, retries per rung, tokens and wall clock by stage and agent kind, `inferred` vs `observed` share |
+| Logs | Every chain event, with `run_id`, `stage_id` and `receipt` hash as attributes |
+
+- **Recommendation:** export plain OTLP and don't bind to a vendor. If you have no
+  backend yet, use the Grafana stack (Tempo for traces, Loki for logs, Prometheus or Mimir
+  for metrics). It can be self-hosted, and troubleshoot workflows later cite the same
+  Prometheus and Loki, so one stack serves both. If a team already runs Datadog,
+  Honeycomb or similar, point OTLP at it.
+- Export is off by default and turned on with `CONDUCTOR_OTLP_ENDPOINT` or config.
+  Conductor never phones home.
+- Prompts and agent output are **not** exported unless content capture is turned on.
+  Redaction (§9.8) runs before export.
+- `conductor trace <run>` renders a run's spans locally without any backend. Each receipt
+  carries its trace id; each trace carries its receipt hash.
+
+### 9.10 Reuse
+- `promote` turns a successful `adhoc` or `plan` run into a reusable workflow file.
 - `recall` searches past runs by symptom with lexical search over manifests and claims. No
   embeddings in v0.x.
 - `verify` re-evaluates a past run's verdict from stored evidence, with zero model calls and
@@ -256,12 +314,12 @@ Per stage:
                   brief; modify globs ⊆ write scope. Deterministic.
                   mismatch --> reissue brief once, then halt
                         |
-  3  DISPATCH     tier B: spawn headless process
-                  tier A: split pane, start agent, prompt
+  3  DISPATCH     headless: spawn process
+                  herdr: split pane, start agent, prompt
                           precondition: agent state idle|done
                         |
-  4  OBSERVE      tier B: process exit + JSON stream
-                  tier A: wait for settled state
+  4  OBSERVE      hooks (Stop) or headless JSON stream mark the turn end;
+                  herdr state only says when to look
                   blocked --> surface question, await human
                   unknown --> INDETERMINATE, escalate, never success
                         |
@@ -317,10 +375,12 @@ Formerly "Herdr integration constraints". These invariants apply to **any** pane
 | Transcripts are corroborating only | Alt-screen rows never reach scrollback |
 | Mutations go through the executor's CLI; any socket is read-only | CLIs are the documented surface |
 
-Dock is discarded (PRODUCT.md §7). Pane executors are an optional later adapter, and none
-is owned by this project. A herdr adapter keeps the verified herdr-0.8.2 specifics
-(timeout bounds 3000 < t ≤ 300000 ms, `agent_not_ready` keeps the name usable, etc.)
-inside the adapter, not in the engine.
+The herdr executor lives behind one adapter, pinned to a herdr protocol range and covered
+by contract tests that run against a real herdr. The verified herdr-0.8.2 specifics
+(timeout bounds 3000 < t ≤ 300000 ms, `agent_not_ready` keeps the name usable, etc.) stay
+inside the adapter, not in the engine. Public herdr docs describe protocol 15 while this
+spec was verified against protocol 20: the protocol moves, so `doctor` refuses an
+unpinned version rather than guessing.
 
 ### 11.2 Record integrity **[new]**
 - The chain head is written to a `Conductor-Chain:` trailer on the run's final commit. Once
@@ -334,20 +394,23 @@ inside the adapter, not in the engine.
 ## 12. Architecture
 
 ```
-  conductor run | ask | promote | verify | recall | doctor
+  conductor run | ask | plan | promote | verify | recall | trace | doctor
                           |
             ENGINE  (deterministic, zero LLM calls)
-     workflow loader (base SHA) --> scheduler --> stage loop --> gate runner
+     workflow loader (base SHA) --> scheduler --> stage loop --> check runner
                                         |                          |
-                                   budget, scope              evidence writer
-                                   & admission
-                          |                     |
-                     EXECUTORS              GATE RUNNERS
-              headless (tier B, default)  process  (test, lint, mutants)
-              pane     (tier A, optional)  scope       (diff vs declared globs)
-              api      (judge only)        query    (promql, logql, kubectl)
+                                   budget, scope              event stream
+                                   & admission                 |        |
+                          |                     |          receipts   OTLP
+                     EXECUTORS              CHECK RUNNERS
+              herdr    (interactive)       process  (test, lint, mutants)
+              headless (CI, overnight)     scope    (diff vs declared globs)
+              api      (judge only)        query    (commands, promql, logql, kubectl)
                                            schema   (ack.yaml, claims.yaml)
-                          |                     |
+                          |
+                     EVIDENCE PLANE  (same under every executor)
+              agent hooks · agent session logs · git · engine-run checks
+                          |
                               STORES
               worktrees  artifacts  evidence blobs  git notes  run index  state.json
 ```
@@ -361,10 +424,10 @@ inside the adapter, not in the engine.
 ```yaml
 id: feature-with-independent-tests
 version: 1
-mode: build
+kind: build
 requires:
   conductor: ">=0.1"
-  executor: headless
+  herdr_protocol: "20"      # checked only when --executor herdr
 
 runtime:
   artifact_root: ".conductor/{{run_id}}"
@@ -439,16 +502,18 @@ teardown:
 ### 13.2 Manifest (`manifest.json`) **[changed]**
 
 As in 0.1.0-dev, with:
-- `environment.executor` replacing the herdr fields: `{ "kind": "headless" | "herdr", "version", "protocol" }`.
+- `environment.executor`: `{ "kind": "headless" | "herdr", "version", "protocol" }`.
+- `stages[].turns[]`: each with `source: observed | inferred`, from hooks or herdr.
+- `trace_id`: the OpenTelemetry trace for the run (§9.9).
 - `stages[].gates[]` as an array, each with `verdict: pass | fail | flaky` and `runs[]`.
 - `stages[].scope`: `{ "declared": {...}, "changed_files": [...], "violations": [...] }`.
 - `stages[].mutation`: `{ "tool", "in_diff": true, "caught", "missed", "timeout", "unviable", "score" }`.
 - `capability_attestation` limited to checked facts. Tool-call counts appear only with a
-  tier B source, otherwise `"tool_calls": "unavailable"`.
+  hook or headless source, otherwise `"tool_calls": "unavailable"`.
 - `integrity`: `{ "chain_head", "anchored_in_commit", "commits_signed": true|false }`.
 - `not_checked`: the list printed in the PR body (§7).
 
-### 13.3 Claims and assertion grammar (investigate) **[changed]**
+### 13.3 Claims and assertion grammar (`adhoc`, `troubleshoot`, `analyse`) **[changed]**
 
 ```yaml
 claims:
@@ -501,9 +566,11 @@ not fire. That is the most a query can establish. The RCA says so.
 - Token usage for agents that expose no usage log.
 - Replacing review. Conductor narrows what review must cover and states what it did not check.
 - **[new]** Sandboxing the host from the agent (optional v0.3 layer, not a guarantee).
-- **[new]** Proving causation. Investigate mode grades causal claims only up to temporal
+- **[new]** Proving causation. `troubleshoot` grades causal claims only up to temporal
   precedence plus a falsifier that did not fire.
-- **[new]** Hosted service, telemetry, credential storage.
+- **[new]** Hosted service, phoning home, credential storage. (OTLP export goes only where
+  the user points it.)
+- **[new]** Our own terminal multiplexer. herdr provides it.
 
 ## 15. Open risks **[new]**
 
@@ -513,27 +580,27 @@ not fire. That is the most a query can establish. The RCA says so.
 | Vendor terms restrict automated seat-licence use | `doctor` reports auth mode; CI defaults to API keys; terms documented per vendor |
 | Mutation testing too slow on real repos | In-diff only, own wall-clock budget, timeout recorded as `unavailable`, not pass |
 | Agent CLIs change headless flags or JSON shapes | Executor adapters pinned per version; `doctor` detects drift |
-| Name collision: other agent tools are already called "Conductor" | Resolve before public release (ASSESSMENT §5) |
+| herdr protocol or CLI changes under us | One adapter, pinned protocol range, contract tests against real herdr, `doctor` refuses unknown versions; headless keeps working if herdr breaks |
+| Agent hooks change shape | Parser tolerant of unknown fields; junk never fails a hook; `doctor` checks a hook round-trip |
+| Name collision: other tools are called "Conductor" | Owner chose to keep the name; check package-name availability before first release |
 
 ## 16. Build order **[changed]**
 
-**v0.1 — "independent tests, proven"** (build mode, Rust, tier B only)
-headless executor for claude and codex · workflow read from base SHA · sequential stages,
-one worktree per stage · ack check · scope and frozen-path gate · `command_assert` with
-`cargo_json` and the red-for-the-right-reason asserts · in-diff mutation gate · flaky
-verdict · retry ladder (in-context, fresh) · hash-chained manifest anchored in a commit
-trailer · usage provenance · `verify` (stored evidence only) · `--output jsonl` · local
-report on failure.
+**v0.1 — "verified development, watched or overnight"**
+YAML workflow loader (base SHA) · `build` kind · both executors: `herdr` and `headless`
+for claude and codex · evidence plane: hook install per run, session-log reader ·
+sequential stages, one worktree per stage · ack check · scope and frozen-path check ·
+`command_assert` with `cargo_json` and red-first asserts · in-diff mutation · flaky
+verdict · retry ladder (in-context, fresh) · receipt: hash-chained manifest anchored in a
+commit trailer · `verify` · OTLP export plus `conductor trace` · local report ·
+minimal `doctor` (herdr protocol, hooks, auth).
 
-**v0.2 — "usable on a team"**
-`junit_xml` parser (non-Rust repos) · PR delivery with gate table and not-checked list ·
-hook ledger and hook guard (PRODUCT §5) · human stages · resume · cross-kind retry ·
-`doctor` · git-notes evidence · `verify --rerun`.
+**v0.2 — "operators"**
+`adhoc` kind (`conductor ask`) with claim grading · `qa` kind · `junit_xml` (non-Rust) ·
+PR delivery with check table and not-checked list · `check-pr` for CI · hook guard (block
+writes to frozen paths live) · human stages · resume · cross-kind retry · `verify --rerun`.
 
-**v0.3 — "scale"**
-parallel stages with disjoint scopes · `ask` planner stage · `promote` · `recall` · herdr
-adapter · optional OS sandbox · advisory judge gate.
-
-**Investigate track**: starts only after ≥5 SRE discovery interviews confirm that
-citation-graded RCAs would change a postmortem decision. Then: promql and logql
-connectors, claim ledger, assertion grammar, challenger stage, data handling (§9.8).
+**v0.3 — "troubleshoot and analyse"**
+`troubleshoot` kind with command, promql, logql and kubectl citation checks · `analyse`
+kind · data handling (§9.8) · challenger stage · `plan` · `promote` · `recall` · parallel
+stages with disjoint scopes · optional OS sandbox · advisory judge · `audit` export.

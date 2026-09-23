@@ -4365,7 +4365,7 @@ impl Dashboard {
         lines.push(Line::styled(
             format!(
                 "base {}",
-                &facts.base_sha.chars().take(8).collect::<String>()
+                facts.base_sha.chars().take(8).collect::<String>()
             ),
             muted,
         ));

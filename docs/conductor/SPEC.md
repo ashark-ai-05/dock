@@ -138,7 +138,7 @@ Agents are driven through an `Executor` interface. There is no native agent SDK.
 | Tier | Mechanism | Turn boundaries | Usage | Auth | Ships |
 |---|---|---|---|---|---|
 | B | Agent headless mode, JSON out (`claude -p --output-format stream-json`, `codex exec --json`, …) | real | measured | seat or API key | **v0.1** |
-| A | Terminal pane via **dock** (reference) or herdr (adapter) | inferred | unavailable | seat licence | v0.2 |
+| A | Terminal pane via an adapter (herdr) | inferred | unavailable | seat licence | later, optional |
 | C | Provider API direct | real | measured | API key | judge gate only |
 
 - **Tier B is the default and ships first.** It has real turn boundaries, measured usage,
@@ -302,7 +302,7 @@ Run close:
 ### 11.1 Pane executor contract **[changed]**
 
 Formerly "Herdr integration constraints". These invariants apply to **any** pane executor
-(dock or herdr), because both infer agent state from the terminal.
+(herdr or any other), because they infer agent state from the terminal.
 
 | Invariant | Why |
 |---|---|
@@ -317,9 +317,8 @@ Formerly "Herdr integration constraints". These invariants apply to **any** pane
 | Transcripts are corroborating only | Alt-screen rows never reach scrollback |
 | Mutations go through the executor's CLI; any socket is read-only | CLIs are the documented surface |
 
-**dock** is the reference pane executor. `dock split`, `dock prompt`, `dock read` and
-`dock wait --until=` already exist, the project owns it, and its protocol can be pinned
-(`requires.dock_protocol`). The herdr adapter keeps the verified herdr-0.8.2 specifics
+Dock is discarded (PRODUCT.md §7). Pane executors are an optional later adapter, and none
+is owned by this project. A herdr adapter keeps the verified herdr-0.8.2 specifics
 (timeout bounds 3000 < t ≤ 300000 ms, `agent_not_ready` keeps the name usable, etc.)
 inside the adapter, not in the engine.
 
@@ -345,7 +344,7 @@ inside the adapter, not in the engine.
                           |                     |
                      EXECUTORS              GATE RUNNERS
               headless (tier B, default)  process  (test, lint, mutants)
-              pane     (tier A: dock|herdr) scope    (diff vs declared globs)
+              pane     (tier A, optional)  scope       (diff vs declared globs)
               api      (judge only)        query    (promql, logql, kubectl)
                                            schema   (ack.yaml, claims.yaml)
                           |                     |
@@ -365,7 +364,7 @@ version: 1
 mode: build
 requires:
   conductor: ">=0.1"
-  executor: headless          # or: pane (dock_protocol: 18) in v0.2
+  executor: headless
 
 runtime:
   artifact_root: ".conductor/{{run_id}}"
@@ -440,7 +439,7 @@ teardown:
 ### 13.2 Manifest (`manifest.json`) **[changed]**
 
 As in 0.1.0-dev, with:
-- `environment.executor` replacing the herdr fields: `{ "kind": "headless" | "dock" | "herdr", "version", "protocol" }`.
+- `environment.executor` replacing the herdr fields: `{ "kind": "headless" | "herdr", "version", "protocol" }`.
 - `stages[].gates[]` as an array, each with `verdict: pass | fail | flaky` and `runs[]`.
 - `stages[].scope`: `{ "declared": {...}, "changed_files": [...], "violations": [...] }`.
 - `stages[].mutation`: `{ "tool", "in_diff": true, "caught", "missed", "timeout", "unviable", "score" }`.
@@ -528,7 +527,7 @@ report on failure.
 
 **v0.2 — "usable on a team"**
 `junit_xml` parser (non-Rust repos) · PR delivery with gate table and not-checked list ·
-pane executor on dock (watch plus intervention) · human stages · resume · cross-kind retry ·
+hook ledger and hook guard (PRODUCT §5) · human stages · resume · cross-kind retry ·
 `doctor` · git-notes evidence · `verify --rerun`.
 
 **v0.3 — "scale"**

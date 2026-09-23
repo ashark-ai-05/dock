@@ -80,15 +80,15 @@ separation of duties.
 | 18 | Only `cargo_json` | Rust-only means a small market | `junit_xml` in v0.2 §9.3 |
 | 19 | Full mutation testing on the budget clock | Hours per run, so the gate would always time out | In-diff only, own budget §9.3, §9.6 |
 | 20 | Four modes; `analyse` and `adhoc` had no gate that could fail | Scope spread with no verification story | Cut; investigate on its own gated track §5 |
-| 21 | Depends on herdr (external, protocol undocumented) while you own dock, which does the same job | Two tools to maintain, and the dependency is on the one you don't control | dock is the reference pane executor; herdr becomes an adapter §11.1 |
+| 21 | Depends on herdr (external, protocol undocumented) while you own dock, which does the same job | Two tools to maintain, and the dependency is on the one you don't control | Headless first; dock discarded; panes only via an optional adapter §8, §11.1 |
 | 22 | Must-read files "hashed" read as proof they were read | Can't be observed | Hash records what was *provided* §10 |
 
 ## 5. Name
 
 "Conductor" is already used by other developer tools, including an agent-orchestration app
 and a well-known workflow-orchestration engine. That hurts search, package names, and
-possibly trademarks. **Decide before any public release.** Keeping `dock` as the product
-name, with `dock run` as the verb, is one option: the repository and binary already exist.
+possibly trademarks. **Decide before any public release.** Pick a new name before
+any code exists.
 
 ## 6. How to find out cheaply whether it's worth building
 
@@ -109,19 +109,8 @@ is a developer tool only, and pricing follows from that.
 
 ## 7. What this means for the dock codebase
 
-The dock codebase already provides the tier A executor (PTY runtime, daemon, `split`,
-`prompt`, `read`, `wait`, agent detection, hooks), worktree facts, and a receipt model
-(declared checks read from the repository root, claimed / observed / witnessed / decided)
-that is an early version of conductor's gates and evidence.
-
-| Keep (conductor needs it) | Remove (conductor's engine replaces it) |
-|---|---|
-| dock-pty, dock-daemon, dock-detect, hooks | Kanban board (`dock task`, `Ctrl+B k`, `@board` panes, `kanban/`) — workflows are the unit of work |
-| workspaces, panes, layout, `split/prompt/read/wait/agent/inspect` | Prompt queue and auto-feed (`dock queue`, `Ctrl+B q`) — the engine prompts |
-| dock-git (worktrees, diffs) | `dock programme` and capacity/dependency gates — the scheduler and budget own this |
-| dock-receipt (declared checks, verdict) — becomes the gate runner's core | |
-| review inbox / decide — becomes human stages | |
-| copy mode, clipboard, theme — a human watching a pane still needs them | |
-
-Tier B ships before tier A, so none of this blocks v0.1. The removals simplify the
-codebase that tier A will be built on.
+Dock as a product is discarded. Only its verification and git pieces carry over as library
+code: the check runner, declarations read from the base commit, verdict rules, worktree
+facts, hook parsing and install, and agent detection. The PTY, daemon, TUI, board, queue
+and programme are dropped. See `PRODUCT.md` §7. Pane executors (SPEC §11.1) are therefore
+a later, optional adapter, not something the project owns.
